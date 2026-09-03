@@ -7567,6 +7567,8 @@ dependencies = [
  "flume",
  "futures",
  "insta",
+ "jiff",
+ "omp-catalog",
  "omp-con",
  "omp-core",
  "omp-dom",
@@ -7816,6 +7818,7 @@ dependencies = [
 name = "omp-chat"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "flume",
  "insta",
  "jiff",
@@ -7835,6 +7838,7 @@ dependencies = [
  "omp-voice",
  "omp-walker",
  "parking_lot",
+ "regex",
  "serde",
  "serde_json",
  "smallvec 2.0.0-alpha.12",
@@ -8515,6 +8519,7 @@ dependencies = [
  "pyo3-introspection",
  "serde_json",
  "strum",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
