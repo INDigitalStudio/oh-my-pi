@@ -91,8 +91,14 @@ pub enum TierSetting {
 	Inherit,
 	/// Provider standard tier.
 	Standard,
+	/// OpenAI `auto` tier: the provider picks the processing tier.
+	Auto,
+	/// OpenAI `default` tier: explicit standard processing.
+	Default,
 	/// Provider flex tier.
 	Flex,
+	/// OpenAI `scale` tier.
+	Scale,
 	/// Provider priority tier.
 	Priority,
 }
@@ -103,10 +109,21 @@ impl TierSetting {
 			Self::None => None,
 			Self::Inherit => parent.cloned(),
 			Self::Standard => Some(ServiceTier { name: Str::new_static("standard"), priority: 0 }),
+			// Pi `SERVICE_TIER_OPENAI_VALUES`: auto/default/flex/scale are
+			// OpenAI-family wire names and mean nothing elsewhere.
+			Self::Auto if family == ProviderFamily::OpenAi => {
+				Some(ServiceTier { name: Str::new_static("auto"), priority: 0 })
+			},
+			Self::Default if family == ProviderFamily::OpenAi => {
+				Some(ServiceTier { name: Str::new_static("default"), priority: 0 })
+			},
 			Self::Flex if family == ProviderFamily::OpenAi => {
 				Some(ServiceTier { name: Str::new_static("flex"), priority: -10 })
 			},
-			Self::Flex => None,
+			Self::Scale if family == ProviderFamily::OpenAi => {
+				Some(ServiceTier { name: Str::new_static("scale"), priority: 0 })
+			},
+			Self::Auto | Self::Default | Self::Flex | Self::Scale => None,
 			Self::Priority => {
 				Some(ServiceTier { name: Str::new_static("priority"), priority: 10 })
 			},
@@ -1383,6 +1400,43 @@ mod tests {
 			.set(&ctx, ModelRoleStorage::Project)
 			.expect("set model role storage");
 		assert_eq!(ModelSettings::from_con(&ctx).role_storage, ModelRoleStorage::Project);
+	}
+
+	#[test]
+	fn openai_service_tier_values_match_pi_and_stay_openai_only() {
+		use std::str::FromStr as _;
+
+		for (setting, name, priority) in [
+			(TierSetting::Auto, "auto", 0),
+			(TierSetting::Default, "default", 0),
+			(TierSetting::Flex, "flex", -10),
+			(TierSetting::Scale, "scale", 0),
+			(TierSetting::Priority, "priority", 10),
+		] {
+			assert_eq!(TierSetting::from_str(name).expect("kebab tier name parses"), setting);
+			let mut settings = ModelSettings::default();
+			settings.tier_openai = setting;
+			let tier = settings
+				.service_tier_for_route("openai", Some("gpt-5"), TierAudience::Session, None)
+				.expect("OpenAI tier resolves");
+			assert_eq!(tier.name.as_str(), name);
+			assert_eq!(tier.priority, priority);
+		}
+		for setting in [TierSetting::Auto, TierSetting::Default, TierSetting::Scale] {
+			let mut settings = ModelSettings::default();
+			settings.tier_anthropic = setting.clone();
+			assert!(
+				settings
+					.service_tier_for_route(
+						"anthropic",
+						Some("claude-sonnet-4-6"),
+						TierAudience::Session,
+						None,
+					)
+					.is_none(),
+				"{setting:?} is an OpenAI-family wire name"
+			);
+		}
 	}
 
 	#[test]

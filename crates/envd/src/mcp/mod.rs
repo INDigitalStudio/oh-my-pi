@@ -207,12 +207,8 @@ impl McpService {
 	}
 
 	/// Binds this Environment's native user/project MCP mutation roots.
-	pub fn bind_config_paths(&self, data_dir: &Path, project_root: &Path) {
-		*self.config_paths.write() = Some(McpConfigPaths {
-			user:    data_dir.join("mcp.json"),
-			project: project_root.join(".omp/mcp.json"),
-			root:    project_root.join(".mcp.json"),
-		});
+	pub fn bind_config_paths(&self, paths: McpConfigPaths) {
+		*self.config_paths.write() = Some(paths);
 	}
 
 	/// Binds the supervisor which owns live transports for successful config
@@ -647,11 +643,31 @@ impl McpService {
 	}
 }
 
-#[derive(Clone)]
-struct McpConfigPaths {
-	user:    PathBuf,
-	project: PathBuf,
-	root:    PathBuf,
+/// The three native MCP config files one Environment reads and mutates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpConfigPaths {
+	/// User-owned `<config root>/mcp.json` (`~/.o2/mcp.json`, profile-aware).
+	pub user:    PathBuf,
+	/// Project-owned `<project>/.omp/mcp.json`.
+	pub project: PathBuf,
+	/// Project-root `<project>/.mcp.json` fallback.
+	pub root:    PathBuf,
+}
+
+impl McpConfigPaths {
+	/// Resolves the files under the user configuration root and the project
+	/// root. User configuration lives in `~/.o2`
+	/// ([`omp_core::dirs::user_config_root`]), never under the data or state
+	/// directory, so `omp config mcp` and the Environment's `/mcp` mutations
+	/// address one file.
+	#[must_use]
+	pub fn new(user_config_root: &Path, project_root: &Path) -> Self {
+		Self {
+			user:    user_config_root.join("mcp.json"),
+			project: project_root.join(".omp/mcp.json"),
+			root:    project_root.join(".mcp.json"),
+		}
+	}
 }
 
 fn load_resolved_config(
@@ -846,15 +862,25 @@ mod config_tests {
 		}
 	}
 
+	/// User MCP configuration is a configuration file: it resolves under the
+	/// `~/.o2` configuration root, never under the data or state directory.
+	#[test]
+	fn user_mcp_config_lives_in_the_configuration_root() {
+		let paths = McpConfigPaths::new(Path::new("/home/owner/.o2"), Path::new("/work/proj"));
+		assert_eq!(paths.user, Path::new("/home/owner/.o2/mcp.json"));
+		assert_eq!(paths.project, Path::new("/work/proj/.omp/mcp.json"));
+		assert_eq!(paths.root, Path::new("/work/proj/.mcp.json"));
+	}
+
 	#[tokio::test]
 	async fn startup_loads_persisted_sources_and_honors_project_policy() {
 		let scratch = tempfile::tempdir().expect("scratch");
-		let data = scratch.path().join("data");
+		let user_root = scratch.path().join(".o2");
 		let project = scratch.path().join("project");
 		fs::create_dir_all(project.join(".omp")).expect("project config directory");
-		fs::create_dir_all(&data).expect("data directory");
+		fs::create_dir_all(&user_root).expect("user config root");
 		fs::write(
-			data.join("mcp.json"),
+			user_root.join("mcp.json"),
 			br#"{"mcpServers":{"user-server":{"type":"stdio","command":"user"}}}"#,
 		)
 		.expect("user config");
@@ -864,7 +890,7 @@ mod config_tests {
 		)
 		.expect("root config");
 		let service = McpService::open(scratch.path().join("cache.sqlite3")).expect("service");
-		service.bind_config_paths(&data, &project);
+		service.bind_config_paths(McpConfigPaths::new(&user_root, &project));
 		let manager = McpManager::new(
 			Arc::clone(&service),
 			Arc::new(RejectConnector),
@@ -891,11 +917,11 @@ mod config_tests {
 	#[tokio::test]
 	async fn native_config_rpc_mutates_and_lists_one_environment_store() {
 		let scratch = tempfile::tempdir().expect("scratch");
-		let data = scratch.path().join("data");
+		let user_root = scratch.path().join(".o2");
 		let project = scratch.path().join("project");
 		fs::create_dir_all(&project).expect("project");
 		let service = McpService::open(scratch.path().join("cache.sqlite3")).expect("service");
-		service.bind_config_paths(&data, &project);
+		service.bind_config_paths(McpConfigPaths::new(&user_root, &project));
 		service
 			.config(pb::McpConfigRequest {
 				action:        pb::McpConfigAction::Add as i32,

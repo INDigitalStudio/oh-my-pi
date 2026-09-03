@@ -33,7 +33,9 @@ impl Card for HubCard {
 			(Some("logs"), _) => render_logs(view, args.as_ref(), ui),
 			(Some("send"), _) => render_send(view, args.as_ref(), raw),
 			(Some("inbox"), _) => render_inbox(view, args.as_ref(), raw, false),
-			(Some("wait"), true) | (Some("jobs"), _) => render_jobs(view, args.as_ref(), raw),
+			(Some("wait"), true) | (Some("jobs" | "cancel"), _) => {
+				render_jobs(view, args.as_ref(), raw, op == Some("cancel"))
+			},
 			(Some("wait"), false) => render_inbox(view, args.as_ref(), raw, true),
 			(Some("list"), _) => render_roster(view),
 			(Some("start" | "stop" | "restart" | "describe" | "ps"), _) => {
@@ -419,7 +421,11 @@ fn render_roster(view: &CardView<'_>) -> Component {
 	.into_component()
 }
 
-fn render_jobs(view: &CardView<'_>, args: Option<&Value>, raw: &str) -> Component {
+/// Job snapshots for `wait`/`jobs` and the `cancel` receipt (pi
+/// `jobsRenderCall`/`jobsRenderResult`: `cancel` is a job-style op whose
+/// pending frame reads `cancel <id>` and whose result counts the cancelled
+/// rows instead of falling back to the generic card).
+fn render_jobs(view: &CardView<'_>, args: Option<&Value>, raw: &str, cancel: bool) -> Component {
 	let result = result_value(view);
 	let jobs = result
 		.as_ref()
@@ -432,11 +438,12 @@ fn render_jobs(view: &CardView<'_>, args: Option<&Value>, raw: &str) -> Componen
 		.and_then(Value::as_array)
 		.map(Vec::as_slice)
 		.unwrap_or_default();
+	let verb = if cancel { "cancel" } else { "poll" };
 	if matches!(view.status, CardStatus::StreamingArgs | CardStatus::InProgress) {
 		let count = ids.len();
 		let partial_id = partial_first_array_string(raw, "ids");
 		return dom! {
-			<row gap=1><i:pending/><text bold>{"poll"}</text>
+			<row gap=1><i:pending/><text bold>{verb}</text>
 				if count == 1 { <text>{ids[0].as_str().unwrap_or_default()}</text> }
 				else if count > 1 { <text>{sf!("{count}")}</text><text>{"jobs"}</text> }
 				else if let Some(id) = partial_id { <text>{id}</text> }
@@ -444,6 +451,9 @@ fn render_jobs(view: &CardView<'_>, args: Option<&Value>, raw: &str) -> Componen
 			</row>
 		}
 		.into_component();
+	}
+	if cancel && jobs.is_empty() {
+		return render_cancel_receipt(view, result.as_ref(), ids);
 	}
 	let ok_count = jobs
 		.iter()
@@ -498,6 +508,57 @@ fn render_jobs(view: &CardView<'_>, args: Option<&Value>, raw: &str) -> Componen
 				}
 			</row>
 			if !rows.is_empty() { <col>{rows}</col> }
+		</col>
+	}
+	.into_component()
+}
+
+/// Settled `cancel` without job rows: the backend answers `{cancelled: N}`,
+/// so the card lists the requested ids under the count (pi lists the
+/// `cancelled` outcomes as a warning-tinted meta beside the title).
+fn render_cancel_receipt(view: &CardView<'_>, result: Option<&Value>, ids: &[Value]) -> Component {
+	let requested = ids.len();
+	let title = match ids {
+		[only] => sf!("cancel {}", only.as_str().unwrap_or_default()),
+		_ => sf!("cancel {requested} jobs"),
+	};
+	let cancelled = result
+		.and_then(|value| value.get("cancelled"))
+		.and_then(Value::as_u64)
+		.and_then(|count| usize::try_from(count).ok());
+	let failed = view.status == CardStatus::Failed;
+	let fault = failed.then(|| diag_text(view.diag)).flatten();
+	let partial = cancelled.is_some_and(|count| count < requested);
+	let id_rows = ids
+		.iter()
+		.filter_map(Value::as_str)
+		.map(Str::new)
+		.collect::<Vec<_>>();
+	let last_index = id_rows.len().saturating_sub(1);
+	dom! {
+		<col>
+			<row gap=1>
+				if failed { <i:error/> }
+				else if partial || cancelled.is_none() { <i:warning-status/> }
+				else { <i:done/> }
+				<text bold>{title}</text>
+				if let Some(count) = cancelled {
+					<text fg=warning>{sf!("{count}")}</text><text fg=warning>{"cancelled"}</text>
+					if partial {
+						<text fg=muted>{"·"}</text>
+						<text fg=muted>{sf!("{}", requested - count)}</text><text fg=muted>{"not found"}</text>
+					}
+				}
+			</row>
+			if let Some(fault) = fault { <text fg=error pad-x=2>{fault}</text> }
+			else {
+				for (index, id) in id_rows.into_iter().enumerate() {
+					<row gap=1>
+						if index == last_index { <i:tree-last/> } else { <i:tree-branch/> }
+						<i:cancelled/><text>{id}</text>
+					</row>
+				}
+			}
 		</col>
 	}
 	.into_component()

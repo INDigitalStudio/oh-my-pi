@@ -154,13 +154,16 @@ pub struct StatusFacts {
 	pub cost_nano_usd:     u64,
 	/// The route bills to a subscription rather than metered usage.
 	pub subscription:      bool,
-	/// Premium requests consumed (Copilot-style plans).
-	pub premium_requests:  u64,
-	/// Account label of the resolved credential, when known.
-	pub account:           Option<Str>,
+	/// Premium-request units consumed at millionth precision (GitHub Copilot
+	/// `premium_interactions`: `330_000` is 0.33 of a request).
+	pub premium_requests_millionths: u64,
 	/// Start of the in-flight turn on the presentation clock; `Some` swaps
 	/// the brand glyph for the spinner and elapsed-time timer.
 	pub working:           Option<Duration>,
+	/// Subagent whose session the view shows (pi `focusedAgentId`): the
+	/// brand slot carries the ghost and the agent id in the warning color
+	/// for as long as input goes to that agent.
+	pub focused_agent:     Option<Str>,
 }
 
 impl Default for StatusFacts {
@@ -188,9 +191,9 @@ impl Default for StatusFacts {
 			tokens_per_second: None,
 			cost_nano_usd:     0,
 			subscription:      false,
-			premium_requests:  0,
-			account:           None,
+			premium_requests_millionths: 0,
 			working:           None,
+			focused_agent:     None,
 		}
 	}
 }
@@ -314,6 +317,22 @@ fn elapsed_label(out: &mut String, elapsed: Duration) {
 		let _ = write!(out, "{}m", seconds / 60);
 	} else {
 		let _ = write!(out, "{}h", (seconds / 3_600).min(99));
+	}
+}
+
+/// Premium-request count from millionths, rounded to two decimals with
+/// trailing zeros dropped (pi `normalizePremiumRequests` + `formatNumber`:
+/// `330_000` → `0.33`, `1_500_000` → `1.5`, `2_000_000` → `2`); whole counts
+/// of a thousand or more compact like every other count.
+fn write_premium_requests(out: &mut String, millionths: u64) {
+	let hundredths = millionths.saturating_add(5_000) / 10_000;
+	let (whole, fraction) = (hundredths / 100, hundredths % 100);
+	if fraction == 0 {
+		let _ = write_compact_count(out, whole);
+	} else if fraction % 10 == 0 {
+		let _ = write!(out, "{whole}.{}", fraction / 10);
+	} else {
+		let _ = write!(out, "{whole}.{fraction:02}");
 	}
 }
 
@@ -459,10 +478,19 @@ impl StatusBand {
 		self.cache.as_ref().is_some_and(|cache| cache.key == key)
 	}
 
-	/// Writes the brand label for `now` into the scratch: the spinner and
-	/// elapsed timer while working, else the brand glyph; one trailing pad.
+	/// Writes the brand label for `now` into the scratch: the ghost and
+	/// agent id while a subagent is focused (pi `piSegment`), else the
+	/// spinner and elapsed timer while working, else the brand glyph; one
+	/// trailing pad.
 	fn write_brand(&mut self, charset: Charset, now: Duration) {
 		self.brand.clear();
+		if let Some(agent) = self.facts.focused_agent.as_deref() {
+			self.brand.push_str(charset.icon(Icon::Ghost));
+			self.brand.push(' ');
+			self.brand.push_str(agent);
+			self.brand.push(' ');
+			return;
+		}
 		match self.facts.working {
 			Some(started) => {
 				self.brand.push_str(charset.spinner().at(now));
@@ -630,13 +658,13 @@ impl StatusBand {
 		}
 		let mut cost =
 			String::from(spend_label(facts.cost_nano_usd, facts.subscription, charset).as_str());
-		if facts.premium_requests > 0 {
+		if facts.premium_requests_millionths > 0 {
 			if !cost.is_empty() {
 				cost.push(' ');
 			}
 			cost.push_str(charset.icon(Icon::Star));
 			cost.push(' ');
-			let _ = write_compact_count(&mut cost, facts.premium_requests);
+			write_premium_requests(&mut cost, facts.premium_requests_millionths);
 		}
 		if !cost.is_empty() {
 			labels.push((Chip::Cost, Str::new(cost), theme.secondary));
@@ -804,7 +832,8 @@ impl StatusBand {
 			.filter(|(chip, ..)| *chip == Chip::Brand)
 		{
 			// The brand text is at most a spinner glyph, a timer, and two
-			// pads: inline in `Str`, so this never allocates.
+			// pads: inline in `Str`, so the animated frames never allocate
+			// (a focused agent id is static for as long as it shows).
 			brand.1 = Str::new(&self.brand);
 			brand.2 = brand_color;
 		}
@@ -839,8 +868,11 @@ impl Component for StatusBand {
 		}
 		let theme = pc.ctx.theme;
 		let charset = pc.ctx.charset;
-		// Brand color eases between idle and working (pi `brandFgAnsi`).
-		let target = if self.facts.working.is_some() {
+		// Brand color eases between idle and working (pi `brandFgAnsi`); a
+		// focused subagent holds the warning color instead.
+		let target = if self.facts.focused_agent.is_some() {
+			theme.warn
+		} else if self.facts.working.is_some() {
 			theme.accent
 		} else {
 			theme.muted
@@ -1039,7 +1071,7 @@ pub(crate) mod tests {
 			cache_write: 600,
 			tokens_per_second: Some(42.4),
 			cost_nano_usd: 120_000_000,
-			premium_requests: 2,
+			premium_requests_millionths: 2_000_000,
 			..facts()
 		}
 	}
@@ -1158,10 +1190,35 @@ pub(crate) mod tests {
 		let subscribed = self::row(StatusFacts { subscription: true, ..spending() }, 170);
 		assert!(subscribed.ends_with("< S0.12 ★ 2"), "{subscribed}");
 		let free = self::row(
-			StatusFacts { cost_nano_usd: 0, premium_requests: 0, subscription: true, ..spending() },
+			StatusFacts {
+				cost_nano_usd: 0,
+				premium_requests_millionths: 0,
+				subscription: true,
+				..spending()
+			},
 			170,
 		);
 		assert!(free.ends_with("tok/s < (sub)"), "a zero-cost subscription keeps its marker: {free}");
+	}
+
+	#[test]
+	fn premium_requests_render_millionths_as_a_two_place_decimal() {
+		let label = |millionths: u64| {
+			let mut out = String::new();
+			write_premium_requests(&mut out, millionths);
+			out
+		};
+		assert_eq!(label(330_000), "0.33");
+		assert_eq!(label(1_500_000), "1.5");
+		assert_eq!(label(2_000_000), "2");
+		assert_eq!(label(2_004_999), "2", "rounds to the nearest hundredth");
+		assert_eq!(label(2_005_000), "2.01");
+		assert_eq!(label(12_340_000_000), "12K", "whole thousands compact like counts");
+		let fractional = self::row(
+			StatusFacts { premium_requests_millionths: 330_000, ..spending() },
+			170,
+		);
+		assert!(fractional.ends_with("< $0.12 ★ 0.33"), "{fractional}");
 	}
 
 	#[test]
@@ -1230,6 +1287,34 @@ pub(crate) mod tests {
 		ui.tick(Duration::from_secs(61));
 		let row = frame_text(ui.frame()).lines().next().unwrap().to_owned();
 		assert!(row.contains(" 1m  >"), "{row}");
+	}
+
+	#[test]
+	fn focused_subagent_holds_the_brand_slot_in_the_warning_color() {
+		let ctx = UiContext::default();
+		let theme = ctx.theme;
+		let focused = StatusFacts {
+			focused_agent: Some(Str::new_static("Fx2Cards")),
+			working: Some(Duration::ZERO),
+			..facts()
+		};
+		let mut ui = Ui::from_root(StatusBand::new(focused.clone()), 80, ctx);
+		let row = frame_text(ui.frame()).lines().next().unwrap().to_owned();
+		// pi `piSegment`: the ghost and the agent id replace the brand glyph
+		// and the spinner alike while input goes to the subagent.
+		assert!(row.starts_with(" 👻 Fx2Cards  > ⬢ Sonnet 4.5"), "{row}");
+		assert!(!row.contains('⠋'), "no spinner while focused: {row}");
+		ui.tick(Duration::from_secs(2));
+		let row = frame_text(ui.frame()).lines().next().unwrap().to_owned();
+		assert!(row.starts_with(" 👻 Fx2Cards  >"), "the id persists across ticks: {row}");
+		let column = cell_width(&row[..row.find('F').expect("agent id")]);
+		assert_eq!(ui.frame().cell(column, 0).style().foreground_color(), theme.warn);
+		// Leaving the subagent restores the brand glyph.
+		ui.with_component_mut::<StatusBand, _>(STATUS_ID, |band| {
+			band.set_facts(StatusFacts { focused_agent: None, working: None, ..facts() })
+		});
+		let row = frame_text(ui.frame()).lines().next().unwrap().to_owned();
+		assert!(row.starts_with(" π  > ⬢ Sonnet 4.5"), "{row}");
 	}
 
 	#[test]

@@ -30,7 +30,7 @@ pub const SUPPORTED_PROTOCOL_REVISIONS: [&str; 3] = ["2025-06-18", "2025-03-26",
 pub enum ConfigSourceKind {
 	/// Project-owned `.omp/mcp.json`.
 	Project,
-	/// User-owned `~/.omp/mcp.json`.
+	/// User-owned `~/.o2/mcp.json`.
 	User,
 	/// Native OMP extension manifest mount.
 	Manifest,

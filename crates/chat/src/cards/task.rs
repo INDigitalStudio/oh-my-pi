@@ -35,6 +35,9 @@ impl Card for TaskCard {
 
 fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
 	let result = typed_result::<omp_tools::task::Payload>(view).unwrap_or(Value::Null);
+	if let Some(jobs) = result.get("jobs").and_then(Value::as_array) {
+		return render_started(jobs, ui);
+	}
 	let rows = result
 		.get("results")
 		.or_else(|| result.get("children"))
@@ -129,6 +132,59 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 		.sum();
 	let status = if failed { "failed" } else { "succeeded" };
 	let summary = sf!("⟨{count} {status} · ↓{tokens_in} · ↑{tokens_out}⟩");
+	dom! {
+		<box border=round title={title} title_pad=3 pad="0 1">
+			{rendered_rows}
+			<text fg=muted>{summary}</text>
+		</box>
+	}
+	.into_component()
+}
+
+/// `Payload::Started`: every child was admitted as a detached runtime job
+/// (ADR 0010) and settles later through `<meta><jobs>`. pi
+/// (`task/render.ts` `renderAgentProgress`) keeps such rows static — the
+/// same dot finished rows use, the id, the agent badge, and the job state —
+/// never an error panel: the spawn itself succeeded.
+fn render_started(jobs: &[Value], ui: &UiContext) -> Component {
+	let count = jobs.len();
+	let agent_word = if count == 1 { "agent" } else { "agents" };
+	let title = sf!("{} Task {count} {agent_word}", ui.charset.icon_named("pending").unwrap_or("…"));
+	let mut rendered_rows = Vec::with_capacity(count);
+	for job in jobs {
+		let id = Str::new(job.get("id").and_then(Value::as_str).unwrap_or("agent"));
+		let agent = job
+			.get("agent")
+			.and_then(Value::as_str)
+			.filter(|agent| !agent.is_empty() && *agent != "task")
+			.map(|agent| sf!("⟨{agent}⟩"));
+		let state = sf!(
+			"⟨{}⟩",
+			job.get("status")
+				.and_then(Value::as_str)
+				.unwrap_or("started")
+		);
+		let session = job
+			.get("session_path")
+			.and_then(Value::as_str)
+			.filter(|path| !path.is_empty())
+			.map(Str::new);
+		rendered_rows.push(
+			dom! {
+				<row gap=1>
+					<i:done/>
+					<text bold>{sf!("{id}:")}</text>
+					if let Some(agent) = agent { <text fg=muted>{agent}</text> }
+					<text fg=muted>{state}</text>
+					if let Some(session) = session {
+						<text fg=muted>{"·"}</text><text fg=muted>{session}</text>
+					}
+				</row>
+			}
+			.into_component(),
+		);
+	}
+	let summary = sf!("⟨{count} started · detached⟩");
 	dom! {
 		<box border=round title={title} title_pad=3 pad="0 1">
 			{rendered_rows}

@@ -108,7 +108,7 @@ use super::{
 	memory::ReflectionBridgeHost,
 	search_backend::SearchBridgeHost,
 	security_scan::SecurityScanService,
-	ssh::{HostStore, SshService},
+	ssh::{HostPaths, HostStore, SshService},
 	tool_debug::DocumentDebugControl,
 	tool_document::SessionReadBlobs,
 	tool_lsp::DocumentLspControl,
@@ -117,7 +117,7 @@ use super::{
 	tool_settings::ToolSettings,
 	tool_shell::{AcpExecSlot, ShellExecHost},
 	tool_url::{UrlResolver, production_url_resolvers},
-	vault::VaultService,
+	vault::{VaultPaths, VaultService},
 	worker::{
 		ExtHostSupervisor, SealedRegistryEvidence, SealedRegistryEvidenceError,
 		seal_registry_evidence,
@@ -1988,6 +1988,14 @@ impl HookControlFactory {
 					}
 				},
 			};
+			let result = if row.phase == "domain" {
+				match domain_reply_decision(result)? {
+					Some(decision) => decision,
+					None => continue,
+				}
+			} else {
+				result
+			};
 			let decision = result.as_object().ok_or_else(|| {
 				ControlProtocolError::new(
 					"HookContractError",
@@ -2840,6 +2848,25 @@ fn hook_callback_failure(
 			"code": error.code.as_str(),
 		})
 	})
+}
+
+/// Lifts a domain handler's raw return (Python returns the dataclass itself:
+/// `ContextPatch`, `CustomSummary`, … or `None`) into the five-arm decision
+/// vocabulary the composer folds: `None` contributes nothing, a bare object
+/// is a transform whose fields patch the effective payload, and an object
+/// already spelled as a decision passes through.
+fn domain_reply_decision(result: JsonValue) -> Result<Option<JsonValue>, ControlProtocolError> {
+	match result {
+		JsonValue::Null => Ok(None),
+		JsonValue::Object(object) if object.get("kind").is_some_and(JsonValue::is_string) => {
+			Ok(Some(JsonValue::Object(object)))
+		},
+		JsonValue::Object(object) => Ok(Some(json!({"kind": "modify", "patch": object}))),
+		_ => Err(ControlProtocolError::new(
+			"HookContractError",
+			"domain hook callback returned neither an object nor None",
+		)),
+	}
 }
 
 fn hook_phase_rank(phase: &str) -> u8 {
@@ -4079,11 +4106,12 @@ pub(crate) fn production_registry<
 			}
 		}
 	}
+	let user_config_root = omp_core::dirs::user_config_root()?;
 	let ssh = SshService::new(
-		HostStore::load(&state_dir.join("ssh/hosts.toml"))
+		HostStore::load_layered(&HostPaths::new(&user_config_root, workspace.root()))
 			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 	);
-	let vault = VaultService::load(&state_dir.join("vaults.toml"))
+	let vault = VaultService::load_layered(&VaultPaths::new(&user_config_root, workspace.root()))
 		.map_err(|error| EnvdError::State(Str::new(error.to_string())))?;
 	documents.set_resource_mutations(ResourceMutationServices {
 		ssh:   ssh.clone(),
@@ -5360,6 +5388,20 @@ mod tests {
 				.and_then(|args| args.get("command")),
 			Some(&JsonValue::String(String::from("printf modified"))),
 		);
+	}
+
+	#[test]
+	fn domain_replies_compose_as_transforms_or_nothing() {
+		assert_eq!(domain_reply_decision(JsonValue::Null).expect("none"), None);
+		assert_eq!(
+			domain_reply_decision(json!({"prune": [{"ids": ["3"]}], "note": "trim"})).expect("patch"),
+			Some(json!({"kind": "modify", "patch": {"prune": [{"ids": ["3"]}], "note": "trim"}}))
+		);
+		assert_eq!(
+			domain_reply_decision(json!({"kind": "deny", "reason": "no"})).expect("decision"),
+			Some(json!({"kind": "deny", "reason": "no"}))
+		);
+		assert!(domain_reply_decision(json!("continue")).is_err());
 	}
 
 	#[test]

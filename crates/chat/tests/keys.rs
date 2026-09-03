@@ -459,6 +459,87 @@ fn alt_up_restores_queued_prompts_ahead_of_the_draft() {
 	assert!(h.up.try_recv().is_err(), "no turn: the kernel is not asked");
 }
 
+// ---------------------------------------------------------------- follow-up
+
+/// pi `handleFollowUp` (`app.message.followUp`): while a turn streams the
+/// draft is queued behind it (`streamingBehavior: "followUp"`), never sent
+/// as mid-turn steering; idle, it starts a turn like Enter.
+#[test]
+fn follow_up_queues_behind_a_streaming_turn_and_submits_when_idle() {
+	let mut session = idle_session();
+	open_turn(&mut session);
+	let mut h = harness(session);
+	assert!(h.host.turn_active());
+	type_text(&mut h.host, "after this");
+	h.host.console("cl_followup").expect("follow up");
+	assert_eq!(h.host.composer_text(), "");
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Queue { prompt }) if prompt == "after this"
+	));
+	assert!(h.commands.try_recv().is_err(), "queued once, never also submitted or steered");
+	assert!(h.up.try_recv().is_err(), "the host never steers the kernel directly");
+	assert_eq!(h.host.notice(), Some("Queued message for when the agent yields"));
+	// Up recalls the queued line like any submission.
+	h.host.key(Key::Up).expect("history");
+	assert_eq!(h.host.composer_text(), "after this");
+
+	let mut h = harness(idle_session());
+	type_text(&mut h.host, "right away");
+	h.host.console("cl_followup").expect("follow up");
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Submit(text)) if text == "right away"
+	));
+	assert!(h.host.turn_active(), "idle follow-up is an ordinary submission");
+
+	// `/` lines still run as console statements through the follow-up chord.
+	let mut session = idle_session();
+	open_turn(&mut session);
+	let mut h = harness(session);
+	type_text(&mut h.host, "/help");
+	h.host.console("cl_followup").expect("follow up");
+	assert!(h.commands.try_recv().is_err(), "a slash command never queues");
+	assert_eq!(h.host.composer_text(), "");
+}
+
+/// pi `parseQueueShorthand` + `#queueForYield`: `-> body` starts at once
+/// when the agent is idle with an empty queue, otherwise queues behind the
+/// stream / earlier follow-ups.
+#[test]
+fn queue_shorthand_starts_immediately_when_idle_else_queues() {
+	let mut h = harness(idle_session());
+	type_text(&mut h.host, "-> run tests");
+	h.host.key(Key::Enter).expect("submit");
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Submit(text)) if text == "run tests"
+	));
+	assert_eq!(h.host.notice(), Some("Sent queued message"));
+
+	let mut session = idle_session();
+	queue_prompt(&mut session, "q1", "earlier");
+	let mut h = harness(session);
+	type_text(&mut h.host, "=> then this");
+	h.host.key(Key::Enter).expect("submit");
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Queue { prompt }) if prompt == "then this"
+	));
+	assert!(!h.host.turn_active(), "queueing behind an existing queue starts no turn");
+
+	let mut session = idle_session();
+	open_turn(&mut session);
+	let mut h = harness(session);
+	type_text(&mut h.host, "-> while streaming");
+	h.host.key(Key::Enter).expect("submit");
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Queue { prompt }) if prompt == "while streaming"
+	));
+	assert!(h.up.try_recv().is_err());
+}
+
 #[test]
 fn alt_up_with_nothing_queued_reports_and_keeps_the_draft() {
 	let mut h = harness(idle_session());
@@ -540,7 +621,9 @@ fn paste_chords_request_the_matching_clipboard_read_and_deliver_it() {
 	h.host
 		.deliver_clipboard(Some(omp_tui::paste::Clipboard::Text("a\nb".into())), true);
 	assert_eq!(h.host.composer_text(), "a\nb");
-	// An image lands as an attachment chip referencing the persisted file.
+	// An image persists to a temp file and lands as an attachment chip whose
+	// submitted form is pi's positional marker (the file travels as the
+	// chip's source on submit, never as draft text).
 	// A 1x1 PNG: signature, IHDR, IDAT, IEND.
 	let png = omp_tui::PastedImage::from_bytes(vec![
 		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
@@ -554,7 +637,12 @@ fn paste_chords_request_the_matching_clipboard_read_and_deliver_it() {
 	h.host
 		.deliver_clipboard(Some(omp_tui::paste::Clipboard::Image(png)), false);
 	let text = h.host.composer_text();
-	assert!(text.contains("omp-tui-paste-"), "chip references the temp file: {text:?}");
+	assert_eq!(text, "[Image #1, 1x1] ", "chip expands to the wire marker: {text:?}");
+	let image = omp_tui::Charset::default().icon(omp_tui::Icon::Image);
+	assert!(
+		omp_tui::frame_text(h.host.frame()).contains(&format!("{image} #1")),
+		"the composer shows the chip"
+	);
 	h.host.key(Key::Ctrl('c')).expect("clear");
 	h.host.deliver_clipboard(None, false);
 	assert_eq!(h.host.notice(), Some("Clipboard is empty"));
@@ -567,6 +655,9 @@ struct Probe {
 	anchor:  PanelAnchor,
 	actions: Arc<parking_lot::Mutex<Vec<PanelAction>>>,
 	frame:   Frame,
+	/// Escapes the panel consumes itself (an inline editor cancelling)
+	/// before it ignores the key and lets the host dismiss it.
+	escapes: u8,
 }
 
 impl Panel for Probe {
@@ -588,8 +679,16 @@ impl Panel for Probe {
 			Key::Enter => PanelEvent::Finish(Str::new_static("echo picked")),
 			Key::Char('r') => PanelEvent::Recall(Str::new_static("recalled")),
 			Key::Char('c') => PanelEvent::Copy(Str::new_static("copied")),
+			Key::Esc if self.escapes > 0 => {
+				self.escapes -= 1;
+				PanelEvent::Consumed
+			},
 			_ => PanelEvent::Ignored,
 		}
+	}
+
+	fn paste(&mut self, text: &str) -> PanelEvent {
+		PanelEvent::Copy(Str::new(format!("pasted:{text}")))
 	}
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
@@ -610,6 +709,15 @@ fn open_probe(
 	id: &'static str,
 	anchor: PanelAnchor,
 ) -> Arc<parking_lot::Mutex<Vec<PanelAction>>> {
+	open_probe_absorbing(host, id, anchor, 0)
+}
+
+fn open_probe_absorbing(
+	host: &mut NativeHost,
+	id: &'static str,
+	anchor: PanelAnchor,
+	escapes: u8,
+) -> Arc<parking_lot::Mutex<Vec<PanelAction>>> {
 	let actions = Arc::new(parking_lot::Mutex::new(Vec::new()));
 	let seen = Arc::clone(&actions);
 	host
@@ -619,10 +727,129 @@ fn open_probe(
 				anchor,
 				actions: Arc::clone(&seen),
 				frame: Frame::new(Size::new(10, 1)),
+				escapes,
 			}) as Box<dyn Panel>)
 		})))
 		.expect("open");
 	actions
+}
+
+/// Escape bound to `cl_interrupt` reaches a modal panel's own key handler
+/// first (an inline editor or search cancels itself); the host dismisses
+/// the panel only once it ignores the key.
+#[test]
+fn interrupt_bind_offers_escape_to_a_modal_panel_before_dismissing_it() {
+	let mut h = harness(idle_session());
+	open_probe_absorbing(&mut h.host, "git", PanelAnchor::Center, 1);
+	h.host.key(Key::Esc).expect("esc");
+	assert_eq!(h.host.overlay_id(), Some("git"), "the panel consumed its first Escape");
+	h.host
+		.chord(KeyEvent { chord: Chord::plain(Key::Esc), key: Some(Key::Esc), pressed: true })
+		.expect("physical esc");
+	assert_eq!(h.host.overlay_id(), None, "an ignored Escape dismisses the panel");
+	assert!(
+		h.commands
+			.try_iter()
+			.any(|command| matches!(command, HostCommand::Overlay { open: false, .. }))
+	);
+}
+
+/// pi `handleLargePaste`: a marker-sized paste of at least
+/// `cl_paste_large_menu_threshold` lines opens the large-paste menu instead
+/// of landing; each choice lands it differently, Esc keeps the chip, and a
+/// threshold of 0 disables the menu.
+#[test]
+fn large_paste_menu_gates_on_the_threshold_and_lands_the_choice() {
+	let big = (0..120).map(|n| format!("row {n}")).collect::<Vec<_>>().join("\n");
+	let mut h = harness(idle_session());
+	h.host.paste(&big);
+	assert_eq!(h.host.overlay_id(), Some("paste-menu"), "120 lines >= default 100");
+	assert_eq!(h.host.composer_text(), "", "the menu holds the paste");
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Overlay { ref id, open: true }) if id == "paste-menu"
+	));
+	// Enter on the first row: wrapped block.
+	h.host.key(Key::Enter).expect("choose wrapped");
+	assert_eq!(h.host.overlay_id(), None);
+	assert_eq!(h.host.composer_text().trim_end(), format!("<attachment>\n{big}\n</attachment>"));
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Overlay { ref id, open: false }) if id == "paste-menu"
+	));
+
+	// Esc: default chip, nothing lost.
+	let mut h = harness(idle_session());
+	h.host.paste(&big);
+	h.host.key(Key::Esc).expect("cancel menu");
+	assert_eq!(h.host.overlay_id(), None);
+	assert_eq!(h.host.composer_text().trim_end(), big);
+
+	// Local file without a session store: falls back to the chip and says so.
+	let mut h = harness(idle_session());
+	h.host.paste(&big);
+	h.host.key(Key::Char('2')).expect("choose local file");
+	assert_eq!(h.host.composer_text().trim_end(), big);
+	assert!(
+		h.host
+			.notice()
+			.is_some_and(|notice| notice.starts_with("Failed to save paste to a file")),
+		"{:?}",
+		h.host.notice()
+	);
+
+	// Raise the threshold above the paste: the ordinary chip path.
+	let mut h = harness(idle_session());
+	h.host
+		.console("cl_paste_large_menu_threshold 200")
+		.expect("set threshold");
+	h.host.paste(&big);
+	assert_eq!(h.host.overlay_id(), None);
+	assert_eq!(h.host.composer_text().trim_end(), big);
+
+	// Disabled entirely.
+	let mut h = harness(idle_session());
+	h.host
+		.console("cl_paste_large_menu_threshold 0")
+		.expect("disable menu");
+	h.host.paste(&big);
+	assert_eq!(h.host.overlay_id(), None);
+	assert_eq!(h.host.composer_text().trim_end(), big);
+}
+
+/// Pasted text goes to the active side panel (pi `side-panel.ts`
+/// `handlePaste`) instead of leaking into the composer behind it.
+#[test]
+fn paste_reaches_the_active_side_panel_before_the_composer() {
+	let mut h = harness(idle_session());
+	open_probe(&mut h.host, "btw", PanelAnchor::Side);
+	h.host.paste("hello");
+	assert_eq!(h.host.take_clipboard().as_deref(), Some("pasted:hello"));
+	assert_eq!(h.host.composer_text(), "", "the composer never sees the paste");
+}
+
+/// Terminal mouse tracking follows every stacked overlay, side panels
+/// included, so their scroll and click handlers actually receive reports.
+#[test]
+fn side_panels_keep_terminal_mouse_tracking_on() {
+	let mut h = harness(idle_session());
+	assert!(!h.host.mouse_tracking(), "no overlay: the terminal owns the pointer");
+	open_probe(&mut h.host, "btw", PanelAnchor::Side);
+	assert!(!h.host.overlay_open(), "a side panel is not modal");
+	assert!(h.host.mouse_tracking(), "a side panel still takes pointer reports");
+	h.host
+		.mouse(MouseReport {
+			kind:    Mouse::Click,
+			col:     1,
+			row:     0,
+			button:  MouseButton::Left,
+			mods:    Mods::default(),
+			pressed: true,
+		})
+		.expect("mouse");
+	assert_eq!(h.host.take_clipboard().as_deref(), Some("clicked"));
+	h.host.key(Key::Esc).expect("close");
+	assert!(!h.host.mouse_tracking());
 }
 
 #[test]

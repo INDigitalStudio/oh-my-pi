@@ -4,8 +4,12 @@
 //! copies and closes, exactly like pi's `onPick`; the close rides the
 //! panel's `settled` hook so the host writes the clipboard first.
 //!
-//! `/copy code` and `/copy cmd` are one-shot host calls over the same
-//! transcript walk ([`last_code_block`], [`last_command`]).
+//! Links follow a message's blocks; `o` on a link block hands it to the
+//! system opener (pi `onOpen`).
+//!
+//! `/copy code`, `/copy cmd`, and `/copy link` are one-shot host calls over
+//! the same transcript walk ([`last_code_block`], [`last_command`],
+//! [`crate::markdown::last_link`]).
 
 use std::time::Duration;
 
@@ -16,7 +20,7 @@ use omp_tui::{
 };
 
 use super::{Panel, PanelAction, PanelAnchor, PanelEvent};
-use crate::cards::Component;
+use crate::{cards::Component, markdown::extract_links};
 
 /// Rows the frame chrome occupies: top rule, header, rule, footer hint,
 /// bottom rule.
@@ -36,6 +40,8 @@ pub struct CopyBlock {
 	pub content:  Str,
 	/// Highlight language for the block preview.
 	pub language: Option<Str>,
+	/// Set for link blocks: the URL `o` opens. `content` is the same URL.
+	pub href:     Option<Str>,
 }
 
 /// What kind of command a `/copy cmd` hit came from.
@@ -100,6 +106,9 @@ pub struct CopySelector {
 	closing:        bool,
 	width:          u16,
 	rows:           u16,
+	/// System opener for `o` on a link block ([`omp_core::open::open_path`]
+	/// outside tests).
+	opener:         fn(&str),
 }
 
 impl CopySelector {
@@ -118,6 +127,7 @@ impl CopySelector {
 			closing: false,
 			width: 0,
 			rows: 0,
+			opener: omp_core::open::open_path,
 		};
 		panel.rebuild(80, 20);
 		panel
@@ -134,11 +144,16 @@ impl CopySelector {
 	pub fn hint(&self) -> Str {
 		match self.block_selected {
 			Some(index) => {
-				let total = self
-					.targets
-					.get(self.selected)
-					.map_or(0, |target| target.blocks.len());
-				sf!("{}/{total}  ↑/↓ block  ←/esc back  enter copy", index + 1)
+				let target = self.targets.get(self.selected);
+				let total = target.map_or(0, |target| target.blocks.len());
+				let open = target
+					.and_then(|target| target.blocks.get(index))
+					.is_some_and(|block| block.href.is_some());
+				sf!(
+					"{}/{total}  ↑/↓ block  ←/esc back  enter copy{}",
+					index + 1,
+					if open { "  o open" } else { "" }
+				)
 			},
 			None => {
 				let blocks = self
@@ -218,6 +233,23 @@ impl CopySelector {
 		};
 		self.closing = true;
 		PanelEvent::Copy(content)
+	}
+
+	/// `o` on a link block (pi `onOpen`): hand the URL to the system opener,
+	/// report it, and close. On any other block the key is ignored.
+	fn open_link(&mut self) -> PanelEvent {
+		let Some(block) = self
+			.block_selected
+			.and_then(|index| self.targets.get(self.selected)?.blocks.get(index))
+		else {
+			return PanelEvent::Consumed;
+		};
+		let Some(href) = &block.href else {
+			return PanelEvent::Consumed;
+		};
+		(self.opener)(href.as_str());
+		self.closing = true;
+		PanelEvent::Notice(sf!("Opening {}: {href}", block.label))
 	}
 
 	fn route(&mut self, event: UiEvent) -> PanelEvent {
@@ -446,6 +478,7 @@ impl Panel for CopySelector {
 			Key::Right => self.descend(),
 			Key::Left => self.ascend(),
 			Key::Enter => self.pick(),
+			Key::Char('o' | 'O') => self.open_link(),
 			Key::PageUp | Key::PageDown | Key::Home | Key::End | Key::SelectUp | Key::SelectDown => {
 				let event = self.ui.handle_key(key);
 				self.route(event)
@@ -588,6 +621,7 @@ pub fn collect_targets(dom: &Dom, show_thinking: bool) -> Vec<CopyTarget> {
 							label: Str::new_static(kind.noun()),
 							content: code,
 							language,
+							href: None,
 						});
 					}
 					if let Some(result) = &result {
@@ -595,6 +629,7 @@ pub fn collect_targets(dom: &Dom, show_thinking: bool) -> Vec<CopyTarget> {
 							label:    sf!("{tool} result"),
 							content:  result.clone(),
 							language: None,
+							href:     None,
 						});
 					}
 					target.segments.push(Segment::Tool {
@@ -688,15 +723,49 @@ fn command_of(tool: &str, input: &Node) -> Option<(CommandKind, Str, Option<Str>
 			Some((CommandKind::Bash, Str::new(command), Some(Str::new_static("bash"))))
 		},
 		"eval" => {
-			let code = args.get("code")?.as_str()?;
-			let language = args
-				.get("language")
-				.and_then(serde_json::Value::as_str)
-				.map(Str::new);
-			Some((CommandKind::Eval, Str::new(code), language))
+			let (code, language) = eval_code(&args)?;
+			Some((CommandKind::Eval, code, Some(language)))
 		},
 		_ => None,
 	}
+}
+
+/// pi `extractEvalCode` (`copy-targets.ts:150-176`): an `eval` call carries
+/// either one `code` cell or a `cells` array; the non-empty cell bodies join
+/// with a blank line, and the highlight language is the first cell's,
+/// spelled out (`js` → `javascript`, `rb` → `ruby`, `jl` → `julia`, anything
+/// else → `python`).
+fn eval_code(args: &serde_json::Value) -> Option<(Str, Str)> {
+	let single = std::slice::from_ref(args);
+	let cells = match args.get("cells").and_then(serde_json::Value::as_array) {
+		Some(cells) => cells.as_slice(),
+		None if args.get("code").is_some_and(serde_json::Value::is_string) => single,
+		None => return None,
+	};
+	let mut code = StrMut::new("");
+	let mut language = None;
+	for cell in cells {
+		let Some(body) = cell.get("code").and_then(serde_json::Value::as_str) else {
+			continue;
+		};
+		if body.is_empty() {
+			continue;
+		}
+		if !code.is_empty() {
+			code.push_str("\n\n");
+		}
+		code.push_str(body);
+		language.get_or_insert_with(|| {
+			match cell.get("language").and_then(serde_json::Value::as_str) {
+				Some("js") => Str::new_static("javascript"),
+				Some("rb") => Str::new_static("ruby"),
+				Some("jl") => Str::new_static("julia"),
+				_ => Str::new_static("python"),
+			}
+		});
+	}
+	let language = language?;
+	Some((code.freeze(), language))
 }
 
 /// Model-facing text of a tool result: the settled `<result>` text (the
@@ -739,8 +808,29 @@ fn node_json(node: &Node) -> Option<&str> {
 	}
 }
 
-/// pi `extractBlocks`: fenced code blocks and blockquotes, in order.
+/// pi `pushMarkdownBlocks`: fenced code blocks and blockquotes in order
+/// (`extractBlocks`), then the message's links (`extractLinks`) — the
+/// preview shows the whole URL on one row, so a link the transcript wrapped
+/// is copied or opened intact.
 fn push_markdown_blocks(blocks: &mut Vec<CopyBlock>, text: &str) {
+	push_code_and_quotes(blocks, text);
+	for link in extract_links(text) {
+		let label = if link.text == link.href {
+			Str::new_static("link")
+		} else {
+			sf!("link · {}", link.text)
+		};
+		blocks.push(CopyBlock {
+			label,
+			content: link.href.clone(),
+			language: None,
+			href: Some(link.href),
+		});
+	}
+}
+
+/// pi `extractBlocks`: fenced code blocks and blockquotes, in order.
+fn push_code_and_quotes(blocks: &mut Vec<CopyBlock>, text: &str) {
 	let mut fence: Option<(Str, StrMut)> = None;
 	let mut quote: Option<StrMut> = None;
 	let flush_quote = |quote: &mut Option<StrMut>, blocks: &mut Vec<CopyBlock>| {
@@ -751,6 +841,7 @@ fn push_markdown_blocks(blocks: &mut Vec<CopyBlock>, text: &str) {
 					label:    Str::new_static("quote"),
 					content:  Str::new(content.trim_end()),
 					language: None,
+					href:     None,
 				});
 			}
 		}
@@ -768,6 +859,7 @@ fn push_markdown_blocks(blocks: &mut Vec<CopyBlock>, text: &str) {
 					label,
 					content: code,
 					language: (!language.is_empty()).then(|| language.clone()),
+					href: None,
 				});
 				fence = None;
 			} else {
@@ -803,6 +895,7 @@ fn push_markdown_blocks(blocks: &mut Vec<CopyBlock>, text: &str) {
 				label,
 				content: code,
 				language: (!language.is_empty()).then(|| language),
+				href: None,
 			});
 		}
 	}
@@ -980,6 +1073,107 @@ mod tests {
 		assert_eq!(code, "cargo test");
 		let without = session(false);
 		assert_eq!(last_command(without.dom()), None);
+	}
+
+	/// pi `extractEvalCode`: `cells: [{code}]` joins the non-empty bodies
+	/// with a blank line and names the first cell's language; a bare `code`
+	/// argument is one cell.
+	#[test]
+	fn eval_command_reads_code_from_cells_and_from_a_single_code_argument() {
+		let cells = serde_json::json!({
+			"cells": [
+				{"language": "js", "code": "const a = 1;"},
+				{"code": ""},
+				{"language": "py", "code": "print(a)"}
+			]
+		});
+		assert_eq!(
+			eval_code(&cells),
+			Some((Str::new_static("const a = 1;\n\nprint(a)"), Str::new_static("javascript")))
+		);
+		let single = serde_json::json!({"language": "py", "code": "x = 1"});
+		assert_eq!(eval_code(&single), Some((Str::new_static("x = 1"), Str::new_static("python"))));
+		assert_eq!(eval_code(&serde_json::json!({"cells": [{"code": ""}]})), None);
+		assert_eq!(eval_code(&serde_json::json!({"language": "py"})), None);
+	}
+
+	/// pi `pushMarkdownBlocks` + `copy-selector.ts`: links follow a message's
+	/// code and quote blocks, labeled `link · text` (or `link` for a bare
+	/// URL) with the destination as content; a link block's hint offers `o`,
+	/// which reports the opening and closes the picker, while `o` on a
+	/// non-link block is inert.
+	#[test]
+	fn links_follow_the_blocks_and_o_opens_the_selected_one() {
+		let mut session = session(false);
+		session.begin_turn().expect("turn");
+		session.user("where?", Vec::new()).expect("user");
+		session
+			.assistant_start("test/model", "test", "test/model")
+			.expect("assistant");
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn");
+		let assistant = *session.dom().children(turn).last().expect("assistant");
+		let text = session
+			.stream_open(assistant, PropId::Text.into())
+			.expect("text stream");
+		session
+			.stream_append(
+				text,
+				"> quoted\n\nSee [the docs](https://example.com/docs) or https://plain.example/.",
+			)
+			.expect("text");
+		session.stream_close(text).expect("close");
+		session.assistant_end("stop").expect("end");
+
+		let mut panel = CopySelector::open(session.dom(), true, &UiContext::default());
+		panel.opener = record;
+		let blocks = &panel.targets.last().expect("assistant target").blocks;
+		assert_eq!(
+			blocks
+				.iter()
+				.map(|block| (block.label.as_str(), block.content.as_str(), block.href.as_deref()))
+				.collect::<Vec<_>>(),
+			[
+				("quote", "quoted", None),
+				("link · the docs", "https://example.com/docs", Some("https://example.com/docs")),
+				("link", "https://plain.example/", Some("https://plain.example/")),
+			]
+		);
+		assert_eq!(panel.key(Key::Right), PanelEvent::Consumed);
+		assert!(!panel.hint().contains("o open"), "a quote block offers no opener: {}", panel.hint());
+		assert_eq!(panel.key(Key::Char('o')), PanelEvent::Consumed);
+		assert!(!panel.tick(Duration::ZERO), "`o` on a quote block does not close");
+		assert_eq!(panel.key(Key::Down), PanelEvent::Consumed);
+		assert!(panel.hint().ends_with("enter copy  o open"), "{}", panel.hint());
+		let text = frame_text(panel.frame(Size { width: 80, height: 24 }));
+		assert!(text.contains("2/3 · link · the docs · 1 line"), "{text}");
+		assert_eq!(panel.key(Key::Enter), PanelEvent::Copy(Str::new_static("https://example.com/docs")));
+
+		static OPENED: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+		fn record(href: &str) {
+			OPENED.lock().push(href.to_owned());
+		}
+		let mut panel = CopySelector::open(session.dom(), true, &UiContext::default());
+		panel.opener = record;
+		assert_eq!(panel.key(Key::Right), PanelEvent::Consumed);
+		assert_eq!(panel.key(Key::Char('o')), PanelEvent::Consumed);
+		assert_eq!(panel.key(Key::Down), PanelEvent::Consumed);
+		assert_eq!(panel.key(Key::Down), PanelEvent::Consumed);
+		assert_eq!(
+			panel.key(Key::Char('O')),
+			PanelEvent::Notice(Str::new_static("Opening link: https://plain.example/"))
+		);
+		assert_eq!(*OPENED.lock(), ["https://plain.example/"], "only the link block reached the opener");
+		assert!(panel.tick(Duration::ZERO), "opening closes the picker through `settled`");
+		assert_eq!(panel.settled(), Some(PanelEvent::Close));
+
+		assert_eq!(
+			crate::markdown::last_link(session.dom()).map(|link| link.href),
+			Some(Str::new_static("https://plain.example/"))
+		);
 	}
 
 	#[test]

@@ -10,8 +10,9 @@ use omp_con::{Ctx, RegItem};
 use omp_core::{Str, StrMut};
 use omp_tui::{Command, CommandArgument, Icon};
 
-/// Palette icons for the host's product commands; anything else shows no
-/// type indicator, like pi's extension-registered commands.
+/// Palette icons for the host's console-level commands that no command
+/// module declares in its `PALETTE`; anything else shows no type
+/// indicator, like pi's extension-registered commands.
 const ICONS: [(&str, Icon); 14] = [
 	("cl_model_select", Icon::Model),
 	("cl_model_cycle", Icon::Model),
@@ -29,9 +30,14 @@ const ICONS: [(&str, Icon); 14] = [
 	("exec", Icon::Config),
 ];
 
-/// Builds the slash palette from `con`'s statically registered commands.
+/// Builds the slash palette from `con`'s registered commands: the link-time
+/// `cmd!` declarations, then the dynamic long tail (prompt templates) with
+/// no type indicator, like pi's extension-registered commands.
 #[must_use]
 pub fn roster(con: &Arc<Ctx>) -> Vec<Command> {
+	let dynamic = con
+		.dynamic_cmds()
+		.map(|(name, desc)| Command::new(name, first_line(desc), &[]));
 	con.items()
 		.filter_map(|item| match item {
 			RegItem::Cmd(spec) => Some(spec),
@@ -39,8 +45,14 @@ pub fn roster(con: &Arc<Ctx>) -> Vec<Command> {
 		})
 		.map(|spec| {
 			let mut command = Command::new(spec.name, first_line(spec.desc), &[]);
-			if let Some((_, icon)) = ICONS.iter().find(|(name, _)| *name == spec.name) {
-				command = command.with_icon(*icon);
+			let icon = crate::commands::palette_icon(spec.name).or_else(|| {
+				ICONS
+					.iter()
+					.find(|(name, _)| *name == spec.name)
+					.map(|(_, icon)| *icon)
+			});
+			if let Some(icon) = icon {
+				command = command.with_icon(icon);
 			}
 			let usage = usage(spec.args);
 			if !usage.is_empty() {
@@ -66,6 +78,7 @@ pub fn roster(con: &Arc<Ctx>) -> Vec<Command> {
 			}
 			command
 		})
+		.chain(dynamic)
 		.collect()
 }
 
@@ -122,6 +135,25 @@ mod tests {
 		assert!(labels(&rows).iter().any(|label| *label == "help"), "{:?}", labels(&rows));
 		// The usage ghost lists the declared optional argument.
 		assert_eq!(slash.hint("/help ", 6).as_deref(), Some("[name]"));
+	}
+
+	#[test]
+	fn product_commands_carry_their_module_palette_icon() {
+		// pi `autocomplete.ts:316`: every `/command` row shows its type
+		// indicator; the icon comes from the declaring module's `PALETTE`,
+		// not from the console-level side table.
+		let con = Arc::new(CtxBuilder::default().build());
+		let roster = roster(&con);
+		let by_name = |name: &str| {
+			roster
+				.iter()
+				.find(|command| command.name() == name)
+				.unwrap_or_else(|| panic!("`{name}` is a registered slash command"))
+		};
+		assert_eq!(by_name("settings").icon(), Some(Icon::Gear));
+		assert_eq!(by_name("model").icon(), Some(Icon::Model));
+		assert_eq!(by_name("plan").icon(), Some(Icon::Plan));
+		assert_eq!(by_name("git").icon(), Some(Icon::Branch));
 	}
 
 	#[test]

@@ -643,6 +643,17 @@ pub enum SessionScope {
 	All,
 }
 
+/// One scored internal-URL completion row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UrlCompletion {
+	/// Full URL to insert.
+	pub value:       Str,
+	/// Short description shown beside the value.
+	pub description: Str,
+	/// Provider score; higher ranks first.
+	pub score:       u32,
+}
+
 /// A live or parked agent's transcript as the controller hands it to the
 /// hub viewer: a detached snapshot plus, for a running kernel, the ordered
 /// event stream following it (ADR 0005: the actor never reads a journal).
@@ -858,6 +869,25 @@ pub trait Services: Send + Sync {
 	/// newest first.
 	fn list_local(&self, _suffix: &str) -> ServiceResult<Vec<Str>> {
 		Err(ServiceError::Unavailable("local artifacts"))
+	}
+
+	/// Writes a session-local artifact `name` (`paste-1.md`, no directory
+	/// segments) and returns its `local://` URL.
+	fn write_local(&self, _name: &str, _content: &str) -> ServiceResult<Str> {
+		Err(ServiceError::Unavailable("local artifacts"))
+	}
+
+	/// Internal-URL completions for the composer (pi
+	/// `internal-url-autocomplete.ts`): `input` is the whole token being
+	/// typed (`skill://pro`); every row's `value` is the full URL to insert.
+	/// Served by the Environment's resource catalog (`skill://`, `rule://`,
+	/// `local://`, `omp://`, `memory://`, `agent://`, `artifact://`, …).
+	fn url_completions(
+		&self,
+		_input: &str,
+		_max_results: usize,
+	) -> ServiceResult<Vec<UrlCompletion>> {
+		Err(ServiceError::Unavailable("internal url completion"))
 	}
 
 	/// The live session's journal as a branch DAG (`/tree`): every entry

@@ -534,6 +534,7 @@ mod tests {
 				cache_write:   0,
 				ttft_ms:       Some(400),
 				duration_ms:   Some(1_500),
+				premium_requests_millionths: 0,
 			})
 			.unwrap();
 		let _ = assistant;

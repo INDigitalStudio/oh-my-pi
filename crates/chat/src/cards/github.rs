@@ -2,6 +2,7 @@
 
 use omp_core::Str;
 use omp_dom::{Node, PropId};
+use omp_tools::github::Operation;
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
@@ -17,16 +18,19 @@ impl Card for GithubCard {
 
 	fn render(&self, view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::github::Params>(view).unwrap_or(Value::Null);
-		let detail = operation_title(args.get("op").and_then(Value::as_str).unwrap_or_default());
-		let query = args
-			.get("query")
-			.and_then(Value::as_str)
-			.unwrap_or_default();
-		let repo = args.get("repo").and_then(Value::as_str);
-		let heading = match repo {
-			Some(repo) => format!("GitHub {detail} {query} · {repo}"),
-			None => format!("GitHub {detail} {query}"),
-		};
+		let op = args
+			.get("op")
+			.cloned()
+			.and_then(|value| serde_json::from_value::<Operation>(value).ok());
+		let mut heading = String::from("GitHub");
+		if let Some(op) = op {
+			heading.push(' ');
+			heading.push_str(operation_title(op));
+		}
+		for (index, item) in operation_meta(op, &args).iter().enumerate() {
+			heading.push_str(if index == 0 { " " } else { " · " });
+			heading.push_str(item);
+		}
 		match view.status.as_str() {
 			"ok" => {
 				let title = format!("{} {heading}", ui.charset.icon_named("gh").unwrap_or_default());
@@ -61,15 +65,124 @@ impl Card for GithubCard {
 	}
 }
 
-fn operation_title(op: &str) -> &'static str {
+/// Operation titles (pi `OP_TITLES`, minus the shared `GitHub` prefix), plus
+/// the file and PR-create operations omp adds.
+fn operation_title(op: Operation) -> &'static str {
 	match op {
-		"search_prs" => "Search PRs",
-		"search_issues" => "Search Issues",
-		"search_commits" => "Search Commits",
-		"search_code" => "Search Code",
-		"run_watch" => "Run Watch",
-		_ => "",
+		Operation::RepoView => "Repo",
+		Operation::FileRead => "File",
+		Operation::PrCreate => "PR Create",
+		Operation::PrCheckout => "PR Checkout",
+		Operation::PrPush => "PR Push",
+		Operation::SearchPrs => "Search PRs",
+		Operation::SearchIssues => "Search Issues",
+		Operation::SearchCommits => "Search Commits",
+		Operation::SearchCode => "Search Code",
+		Operation::SearchRepos => "Search Repos",
+		Operation::RunWatch => "Run Watch",
 	}
+}
+
+/// Heading metadata per operation (pi `buildOpMeta`): the PR identifier or
+/// branch for checkout/push, the query for searches, the path for file reads,
+/// the title for PR creation, then the repository.
+fn operation_meta(op: Option<Operation>, args: &Value) -> Vec<String> {
+	let string = |key: &str| {
+		args
+			.get(key)
+			.and_then(Value::as_str)
+			.map(str::trim)
+			.filter(|value| !value.is_empty())
+			.map(str::to_owned)
+	};
+	let mut meta = Vec::with_capacity(3);
+	match op {
+		Some(Operation::PrCheckout | Operation::PrPush) => {
+			if let Some(id) = pr_identifier(args.get("pr")) {
+				meta.push(id);
+			} else if let Some(branch) = string("branch") {
+				meta.push(branch);
+			}
+			meta.extend(string("repo"));
+		},
+		Some(Operation::PrCreate) => {
+			meta.extend(string("title"));
+			if let Some(head) = string("head") {
+				meta.push(match string("base") {
+					Some(base) => format!("{head} -> {base}"),
+					None => head,
+				});
+			}
+			meta.extend(string("repo"));
+		},
+		Some(Operation::FileRead) => {
+			meta.extend(string("path"));
+			meta.extend(string("repo"));
+			meta.extend(string("branch"));
+		},
+		Some(
+			Operation::SearchIssues
+			| Operation::SearchPrs
+			| Operation::SearchCode
+			| Operation::SearchCommits,
+		) => {
+			meta.extend(string("query"));
+			meta.extend(string("repo"));
+		},
+		Some(Operation::SearchRepos) => meta.extend(string("query")),
+		Some(Operation::RepoView) => {
+			meta.extend(string("repo"));
+			meta.extend(string("branch"));
+		},
+		Some(Operation::RunWatch) => {
+			meta.extend(string("run"));
+			meta.extend(string("branch"));
+		},
+		None => meta.extend(string("repo")),
+	}
+	meta
+}
+
+/// `#N` for a number or an issue/pull URL, else the selector itself; batches
+/// list up to three (pi `formatPrIdentifier`).
+fn pr_identifier(pr: Option<&Value>) -> Option<String> {
+	let ids = match pr? {
+		Value::String(one) => vec![issue_id(one)?],
+		Value::Array(many) => many
+			.iter()
+			.filter_map(Value::as_str)
+			.filter_map(issue_id)
+			.collect(),
+		_ => return None,
+	};
+	if ids.is_empty() {
+		return None;
+	}
+	let mut text = ids.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+	if ids.len() > 3 {
+		use std::fmt::Write as _;
+		let _ = write!(text, ", +{} more", ids.len() - 3);
+	}
+	Some(text)
+}
+
+fn issue_id(value: &str) -> Option<String> {
+	let trimmed = value.trim();
+	if trimmed.is_empty() {
+		return None;
+	}
+	if trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+		return Some(format!("#{trimmed}"));
+	}
+	for marker in ["/issues/", "/pull/"] {
+		if let Some((_, tail)) = trimmed.split_once(marker) {
+			let digits = tail.split(|c: char| !c.is_ascii_digit()).next().unwrap_or_default();
+			if !digits.is_empty() {
+				return Some(format!("#{digits}"));
+			}
+		}
+	}
+	Some(trimmed.to_owned())
 }
 fn result_value(view: &CardView<'_>) -> Option<Value> {
 	typed_result::<omp_tools::github::Payload>(view)

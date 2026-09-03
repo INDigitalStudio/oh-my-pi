@@ -12,6 +12,7 @@ description = "Projection-only interactive chat actor for the OMP session DOM"
 workspace = true
 
 [dependencies]
+bytes.workspace = true
 flume.workspace = true
 jiff.workspace = true
 notify.workspace = true
@@ -29,6 +30,7 @@ omp-vcs.workspace = true
 omp-voice.workspace = true
 omp-walker.workspace = true
 parking_lot.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true

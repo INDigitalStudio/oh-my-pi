@@ -113,7 +113,8 @@ pub enum HostAction {
 	/// archive it, or notice `Unknown model`.
 	ModelSet(Str),
 	/// `cl_followup` (pi `app.message.followUp`, Ctrl+Q / Alt+Enter):
-	/// submit the draft as steering while a turn runs, else as a turn.
+	/// queue the draft behind a running turn (it runs when the agent
+	/// yields, never as mid-turn steering), else submit it as a turn.
 	FollowUp,
 	/// `cl_retry` (pi `app.retry`, F5 / Alt+R): resend the last user prompt
 	/// when its turn ended in an error notice.
@@ -329,7 +330,7 @@ omp_con::cmd! {
 		post(ctx, HostAction::ModelSelect { session_only })
 	};
 
-	/// Sends the draft as steering while a turn runs, else as a new turn.
+	/// Queues the draft behind a running turn, else sends it as a new turn.
 	cl_followup() = |ctx, _args| post(ctx, HostAction::FollowUp);
 
 	/// Resends the last prompt after a failed turn.

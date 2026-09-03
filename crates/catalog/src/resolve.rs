@@ -3,7 +3,6 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	error::Error,
 	fmt::{self, Display},
 	iter,
 };
@@ -41,6 +40,12 @@ impl ExactSelector {
 	}
 }
 
+impl Display for ExactSelector {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(formatter, "{}/{}", self.provider, self.model)
+	}
+}
+
 /// A provider-scoped exact alias selector.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct AliasSelector {
@@ -55,6 +60,12 @@ impl AliasSelector {
 	/// spelling.
 	pub fn new(provider: impl Into<ProviderId>, alias: impl IntoStr) -> Self {
 		Self { provider: provider.into(), alias: alias.into_str() }
+	}
+}
+
+impl Display for AliasSelector {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(formatter, "{}/{}", self.provider, self.alias)
 	}
 }
 
@@ -536,9 +547,10 @@ pub struct ResolvedModel {
 }
 
 /// Catalog overlay or resolution failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ResolveError {
 	/// An overlay source was supplied to the wrong precedence tier.
+	#[error("catalog resolution failed: overlay tier expects {expected} sources, got {actual}")]
 	WrongOverlayKind {
 		/// Expected provenance kind for this tier.
 		expected: ProvenanceKind,
@@ -546,22 +558,31 @@ pub enum ResolveError {
 		actual:   ProvenanceKind,
 	},
 	/// A configured endpoint or trust-domain change lacked explicit authority.
+	#[error("catalog resolution failed: route {0} endpoint change lacks explicit authority")]
 	UnsafeEndpointChange(RouteId),
 	/// A configured authentication change lacked explicit authority.
+	#[error("catalog resolution failed: route {0} authentication change lacks explicit authority")]
 	UnsafeAuthChange(RouteId),
 	/// A model addition did not match its selector key.
+	#[error("catalog resolution failed: added model does not match selector {0}")]
 	MismatchedModelAddition(ExactSelector),
 	/// A route addition did not match its declared route id.
+	#[error("catalog resolution failed: added route does not match id {0}")]
 	MismatchedRouteAddition(RouteId),
 	/// An exact provider/model pair was not found.
+	#[error("catalog resolution failed: model {0} not found")]
 	ModelNotFound(ExactSelector),
 	/// A selected provider was not declared.
+	#[error("catalog resolution failed: provider {0} not found")]
 	ProviderNotFound(ProviderId),
 	/// No route connects the selected provider and model.
+	#[error("catalog resolution failed: no eligible route for {0}")]
 	NoEligibleRoute(ExactSelector),
 	/// A provider-scoped alias was not declared exactly.
+	#[error("catalog resolution failed: alias {0} not found")]
 	AliasNotFound(AliasSelector),
 	/// The exact selector failed typed constraints.
+	#[error("catalog resolution failed: {selector} violates constraints {failures:?}")]
 	Constraints {
 		/// Exact selector that failed.
 		selector: ExactSelector,
@@ -569,16 +590,9 @@ pub enum ResolveError {
 		failures: Box<[ConstraintFailure]>,
 	},
 	/// Every explicitly named selector failed.
+	#[error("catalog resolution failed: every fallback failed: {0:?}")]
 	FallbacksExhausted(Box<[Self]>),
 }
-
-impl Display for ResolveError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(formatter, "catalog resolution failed: {self:?}")
-	}
-}
-
-impl Error for ResolveError {}
 
 /// Borrowed immutable bundled catalog input.
 pub struct BundledCatalog<'a> {

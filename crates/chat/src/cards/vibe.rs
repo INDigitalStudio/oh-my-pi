@@ -17,6 +17,16 @@ enum VibeOp {
 }
 
 impl VibeOp {
+	/// The five pi identities (`renderers.ts` `createVibeToolRenderer`), each
+	/// paired with the operation its name fixes.
+	const IDENTITIES: [(&'static str, Self); 5] = [
+		("vibe_spawn", Self::Spawn),
+		("vibe_send", Self::Send),
+		("vibe_wait", Self::Wait),
+		("vibe_kill", Self::Kill),
+		("vibe_list", Self::List),
+	];
+
 	fn from_view(view: &CardView<'_>) -> Self {
 		let args = view.args_json();
 		let op = args
@@ -56,17 +66,43 @@ impl VibeOp {
 	}
 }
 
-/// Shared card for the `vibe_*` tool identities normalized to `vibe` by the
-/// host.
-pub struct VibeCard;
+/// Card for the vibe worker controls: one instance per pi identity
+/// (`vibe_spawn`, `vibe_send`, `vibe_wait`, `vibe_kill`, `vibe_list`), whose
+/// name fixes the operation, plus omp's single `vibe` roster identity, whose
+/// `op` argument does.
+pub struct VibeCard {
+	tool: &'static str,
+	op:   Option<VibeOp>,
+}
+
+impl VibeCard {
+	/// The `vibe` roster identity: the operation comes from the `op`
+	/// argument.
+	#[must_use]
+	pub const fn new() -> Self {
+		Self { tool: "vibe", op: None }
+	}
+
+	/// One card per `vibe_*` identity, in pi's registration order.
+	#[must_use]
+	pub fn identities() -> [Self; 5] {
+		VibeOp::IDENTITIES.map(|(tool, op)| Self { tool, op: Some(op) })
+	}
+}
+
+impl Default for VibeCard {
+	fn default() -> Self {
+		Self::new()
+	}
+}
 
 impl Card for VibeCard {
 	fn tool(&self) -> &'static str {
-		"vibe"
+		self.tool
 	}
 
 	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
-		let op = VibeOp::from_view(view);
+		let op = self.op.unwrap_or_else(|| VibeOp::from_view(view));
 		let title = op.title(ui);
 		match view.status {
 			CardStatus::StreamingArgs | CardStatus::InProgress

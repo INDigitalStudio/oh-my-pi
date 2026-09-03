@@ -19,7 +19,7 @@ impl Card for ReadCard {
 		"read"
 	}
 
-	fn render(&self, view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Component {
+	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::read::Params>(view).unwrap_or(Value::Null);
 		if let Some(targets) = args.get("targets").and_then(Value::as_array) {
 			return render_group(targets, view.status);
@@ -34,13 +34,18 @@ impl Card for ReadCard {
 				</row>
 			}
 			.into_component(),
-			CardStatus::Done => render_done(view, target, ui),
+			CardStatus::Done => render_done(view, target, expanded, ui),
 			CardStatus::Failed => render_failed(view, target, ui),
 		}
 	}
 }
 
-fn render_done(view: &CardView<'_>, target: &str, ui: &UiContext) -> Component {
+/// pi `renderCodeCell` `codeMaxLines`: preview lines a collapsed read card
+/// shows before folding the rest into `… N more lines ⟨Ctrl+O: Expand⟩`
+/// (ADR 0031: the full preview is `@expanded` only).
+const COLLAPSED_LINES: usize = 12;
+
+fn render_done(view: &CardView<'_>, target: &str, expanded: bool, ui: &UiContext) -> Component {
 	let result = typed_result::<omp_tools::read::Payload>(view).unwrap_or(Value::Null);
 	let preview = string_at(&result, "preview_text")
 		.or_else(|| {
@@ -56,13 +61,24 @@ fn render_done(view: &CardView<'_>, target: &str, ui: &UiContext) -> Component {
 		.or_else(|| result.get("preview").and_then(|p| p.get("start")))
 		.and_then(Value::as_u64)
 		.unwrap_or(1);
-	let preview = preview.map(|text| number_preview(text.as_str(), start));
+	let (preview, hidden) = preview.map_or((None, 0), |text| {
+		let total = text.lines().count();
+		let shown = if expanded {
+			total
+		} else {
+			total.min(COLLAPSED_LINES)
+		};
+		let visible = text.lines().take(shown).collect::<Vec<_>>().join("\n");
+		(Some(number_preview(visible.as_str(), start)), total - shown)
+	});
+	let more = sf!("… {hidden} more line{} ⟨Ctrl+O: Expand⟩", if hidden == 1 { "" } else { "s" });
 	let src = string_at(&result, "resolved_path").map(Str::new);
 	let title = sf!("{} Read {target}", icon(ui, "card-bullet"));
 	let images = result_images(&result, target, ui);
 	dom! {
 		<box border=round bc=muted title={title} title_pad=3>
 			if let Some(preview) = preview { <pre wrap=word>{preview}</pre> }
+			if hidden > 0 { <text fg=muted pad-x=1>{more}</text> }
 			for image in images { {image} }
 			if let Some(src) = src {
 				<hr title="Output" title_pad=3/>

@@ -25,6 +25,8 @@ pub mod gitwatch;
 pub mod host;
 /// Terminal input and command bindings.
 pub mod input;
+/// Renderer-faithful Markdown facts (the hyperlinks a message draws).
+pub mod markdown;
 /// Transcript notices, maintenance dividers, usage rows, and the vocalizer.
 pub mod notices;
 /// Desktop notifications on turn completion, error, and pending questions.
@@ -33,6 +35,8 @@ pub mod notify;
 pub mod overlays;
 /// Pure session-DOM transcript projection.
 pub mod project;
+/// Agent reactions: an emoji line opening a reply badges the prompt before it.
+pub mod reaction;
 /// Presentation and interaction pi setting convars.
 pub mod settings;
 /// Composer status band.

@@ -1,9 +1,9 @@
 //! Composer autocomplete providers, chained in pi's precedence
 //! (`prompt-action-autocomplete.ts` + `CombinedAutocompleteProvider`):
 //! slash commands and their arguments, `#<number>` GitHub references,
-//! `#` prompt actions, then `@` project files. The `:emoji` dropdown is the
-//! editor's built-in (`omp_tui::Editor`), consulted after every provider
-//! declines.
+//! `#` prompt actions, `scheme://` internal URLs, then `@` project files.
+//! The `:emoji` dropdown is the editor's built-in (`omp_tui::Editor`),
+//! consulted after every provider declines.
 
 use std::path::Path;
 
@@ -13,15 +13,17 @@ use smallvec::SmallVec;
 
 pub mod files;
 pub mod github_refs;
+pub mod internal_urls;
 pub mod prompt_actions;
 pub mod slash;
 
+pub use internal_urls::{InternalUrls, UrlCandidate, UrlCompleter};
 pub use prompt_actions::{PromptAction, PromptActions};
 
 /// Ordered completion providers: the first one with rows for the current
 /// text owns the dropdown, its ghost hint, Tab, and acceptance.
 pub struct CompletionChain {
-	sources: SmallVec<Box<dyn EditorCompletion>, 4>,
+	sources: SmallVec<Box<dyn EditorCompletion>, 5>,
 	/// Provider that produced the rows currently shown.
 	active:  Option<usize>,
 }
@@ -81,19 +83,23 @@ impl EditorCompletion for CompletionChain {
 	}
 }
 
-/// The production composer chain: slash commands from `roster`, GitHub
-/// references, prompt actions reporting into `actions`, and project files
+/// The production composer chain.
+///
+/// Slash commands from `roster`, GitHub references, prompt actions
+/// reporting into `actions`, internal URLs from `urls`, and project files
 /// under `project_root` (no file provider when the root is unknown).
 #[must_use]
 pub fn composer_chain(
 	roster: Vec<omp_tui::Command>,
 	actions: PromptActions,
+	urls: UrlCompleter,
 	project_root: Option<&Path>,
 ) -> CompletionChain {
 	let chain = CompletionChain::new()
 		.source(omp_tui::SlashCommands::new(roster))
 		.source(github_refs::GithubRefs)
-		.source(actions);
+		.source(actions)
+		.source(InternalUrls::new(urls));
 	match project_root {
 		Some(root) => chain.source(files::ProjectFiles::scan(root)),
 		None => chain,

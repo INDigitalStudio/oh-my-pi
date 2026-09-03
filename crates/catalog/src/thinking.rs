@@ -488,6 +488,18 @@ impl ThinkingRouting {
 			.effort_routing
 			.get(&effort)
 			.map_or_else(|| default_wire_model.to_owned(), Clone::clone);
+		// MiniMax on Anthropic-shaped routes maps every advertised effort onto
+		// the literal `adaptive` tag: the control surface is `thinking.type`,
+		// not `output_config.effort`, so codecs must neither pin an effort nor
+		// treat the model as adaptive-only when thinking is off.
+		let adaptive_tag_only = policy.mode == ThinkingMode::AnthropicAdaptive
+			&& !policy.efforts.is_empty()
+			&& policy.efforts.iter().all(|effort| {
+				self
+					.effort_map
+					.get(effort)
+					.is_some_and(|native| native.as_str() == ADAPTIVE_TAG)
+			});
 		Ok(ThinkingSelection {
 			effort,
 			wire_effort,
@@ -496,9 +508,13 @@ impl ThinkingRouting {
 			wire_model,
 			reasoning_mode: self.reasoning_mode,
 			suppress_when_off: effort == ThinkingEffort::Off && policy.suppress_when_off == Some(true),
+			adaptive_tag_only,
 		})
 	}
 }
+
+/// Native effort spelling that turns `output_config.effort` into a no-op tag.
+const ADAPTIVE_TAG: &str = "adaptive";
 
 /// Fully resolved reasoning controls for one encoded request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -521,6 +537,10 @@ pub struct ThinkingSelection {
 	pub reasoning_mode:    Option<ReasoningMode>,
 	/// Whether the wire reasoning control must be suppressed while off.
 	pub suppress_when_off: bool,
+	/// Whether every advertised effort spells the native `adaptive` tag, so
+	/// the model is driven by `thinking.type` alone and still accepts
+	/// `thinking.type: disabled` (MiniMax on Anthropic-shaped routes).
+	pub adaptive_tag_only: bool,
 }
 
 /// Invalid structural reasoning profile.
@@ -701,6 +721,39 @@ mod tests {
 			.expect("off resolves when effort is optional");
 		assert!(off.suppress_when_off);
 		assert_eq!(off.wire_model, "model-default");
+		assert!(!off.adaptive_tag_only);
+	}
+
+	#[test]
+	fn adaptive_tag_only_requires_every_effort_to_spell_adaptive() {
+		let policy = ThinkingPolicy::new(ThinkingMode::AnthropicAdaptive, [
+			ThinkingEffort::Low,
+			ThinkingEffort::High,
+		])
+		.expect("ordered efforts");
+		let mut routing = ThinkingRouting::default();
+		routing
+			.effort_map
+			.insert(ThinkingEffort::Low, Str::new_static("adaptive"));
+		let partial = routing
+			.resolve(&policy, Some(ThinkingEffort::Off), WireModelId::from_ref("m"))
+			.expect("off resolves");
+		assert!(!partial.adaptive_tag_only, "one mapped effort is not a tag-only profile");
+
+		routing
+			.effort_map
+			.insert(ThinkingEffort::High, Str::new_static("adaptive"));
+		let tag_only = routing
+			.resolve(&policy, Some(ThinkingEffort::Off), WireModelId::from_ref("m"))
+			.expect("off resolves");
+		assert!(tag_only.adaptive_tag_only);
+
+		let budget = ThinkingPolicy::new(ThinkingMode::Budget, [ThinkingEffort::Low, ThinkingEffort::High])
+			.expect("ordered efforts");
+		let budget_selection = routing
+			.resolve(&budget, Some(ThinkingEffort::Off), WireModelId::from_ref("m"))
+			.expect("off resolves");
+		assert!(!budget_selection.adaptive_tag_only, "only anthropic-adaptive profiles qualify");
 	}
 
 	#[test]

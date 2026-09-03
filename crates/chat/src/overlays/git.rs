@@ -1666,13 +1666,6 @@ impl GitWorkbench {
 		self.focus_current();
 	}
 
-	fn first_file_target(&self) -> Option<usize> {
-		self
-			.sidebar_rows
-			.iter()
-			.position(|row| matches!(row.target, SidebarTarget::File { .. }))
-	}
-
 	fn focus_current(&mut self) {
 		let selected_tree_key = self
 			.current_sidebar_target()

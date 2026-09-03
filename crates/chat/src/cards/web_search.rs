@@ -1,5 +1,8 @@
 //! Typed card for web-search answers and citations.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use omp_core::{Str, sf};
 use omp_tui::{Border, IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
@@ -15,7 +18,7 @@ impl Card for WebSearchCard {
 		"web_search"
 	}
 
-	fn render(&self, view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Component {
+	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::web_search::Params>(view).unwrap_or(Value::Null);
 		let query = args
 			.get("query")
@@ -58,7 +61,6 @@ impl Card for WebSearchCard {
 			.and_then(Value::as_str)
 			.unwrap_or_default()
 			.replace("<br>\n", "\n");
-		let ages = ["1w ago", "3d ago", "2w ago", "3w ago"];
 		let usage = result.get("usage").unwrap_or(&Value::Null);
 		let usage_text = format!(
 			"Usage: in {} · out {} · total {} · search {}",
@@ -80,9 +82,18 @@ impl Card for WebSearchCard {
 				.unwrap_or_default(),
 		);
 		let (branch, last, _) = ui.charset.guides(Border::Square);
-		let mut source_rows = Vec::with_capacity(sources.len());
-		for (index, source) in sources.iter().enumerate() {
-			let prefix = if index + 1 == sources.len() {
+		// pi `renderTreeList` (`MAX_COLLAPSED_ITEMS`): a collapsed card lists
+		// the first eight sources and a `… N more sources` tail row; expanded
+		// lists them all.
+		let shown = if expanded {
+			sources.len()
+		} else {
+			sources.len().min(COLLAPSED_SOURCES)
+		};
+		let hidden = sources.len() - shown;
+		let mut source_rows = Vec::with_capacity(shown + usize::from(hidden > 0));
+		for (index, source) in sources.iter().take(shown).enumerate() {
+			let prefix = if index + 1 == shown && hidden == 0 {
 				last
 			} else {
 				branch
@@ -90,17 +101,50 @@ impl Card for WebSearchCard {
 			let name = source
 				.get("title")
 				.and_then(Value::as_str)
-				.unwrap_or_default();
+				.filter(|title| !title.trim().is_empty())
+				.or_else(|| source.get("url").and_then(Value::as_str))
+				.unwrap_or("Untitled");
 			let domain = source
 				.get("url")
 				.and_then(Value::as_str)
 				.map(domain_of)
-				.unwrap_or_default();
-			let age = ages.get(index).copied().unwrap_or_default();
+				.filter(|domain| !domain.is_empty());
+			let head = match domain {
+				Some(domain) => sf!("{prefix} {name} ({domain})"),
+				None => sf!("{prefix} {name}"),
+			};
+			let age = source_age(source).map(|age| match age {
+				SourceAge::Relative(ms) => {
+					dom! { <row gap=1 fg=muted><text>{"·"}</text><time kind="relative" ms={ms}/></row> }
+						.into_component()
+				},
+				SourceAge::Literal(date) => {
+					dom! { <row gap=1 fg=muted><text>{"·"}</text><text>{date}</text></row> }
+						.into_component()
+				},
+			});
 			source_rows.push(
-				dom! { <text>{format!("{prefix} {name} ({domain}) · {age}")}</text> }.into_component(),
+				dom! {
+					<row gap=1>
+						<text>{head}</text>
+						if let Some(age) = age { {age} }
+					</row>
+				}
+				.into_component(),
 			);
 		}
+		if hidden > 0 {
+			let more = sf!("{last} … {hidden} more source{}", if hidden == 1 { "" } else { "s" });
+			source_rows.push(dom! { <text fg=muted>{more}</text> }.into_component());
+		}
+		if source_rows.is_empty() {
+			source_rows.push(dom! { <text fg=muted>{"No sources returned"}</text> }.into_component());
+		}
+		let answer = if answer.trim().is_empty() {
+			Str::new_static("No answer text returned")
+		} else {
+			Str::new(answer)
+		};
 		let query = format!("Query: {query}");
 		let provider_line = format!(
 			"Provider: {} @ {provider} (API)",
@@ -124,6 +168,51 @@ impl Card for WebSearchCard {
 			</box>
 		}
 		.into_component()
+	}
+}
+
+/// pi `PREVIEW_LIMITS.COLLAPSED_ITEMS`: sources listed before the collapsed
+/// card folds the rest into a `… N more sources` row.
+const COLLAPSED_SOURCES: usize = 8;
+
+/// How a source's publication time is painted (pi `formatAge(src.ageSeconds)
+/// || src.publishedDate`).
+enum SourceAge {
+	/// Age in milliseconds for a live `<time kind=relative>` badge.
+	Relative(u64),
+	/// The engine's own date text, shown verbatim.
+	Literal(Str),
+}
+
+/// The source's age: a relative badge when the engine reported an
+/// `age_seconds` or the facade encoded `published_at` as Unix seconds
+/// (`omp_serve::inference`), the date text verbatim when it is an ISO date,
+/// nothing when unknown. Never invented.
+fn source_age(source: &Value) -> Option<SourceAge> {
+	if let Some(age) = source
+		.get("age_seconds")
+		.or_else(|| source.get("ageSeconds"))
+		.and_then(Value::as_u64)
+		.filter(|age| *age > 0)
+	{
+		return Some(SourceAge::Relative(age.saturating_mul(1000)));
+	}
+	let published = source
+		.get("published_at")
+		.or_else(|| source.get("published_date"))
+		.or_else(|| source.get("publishedDate"))
+		.and_then(Value::as_str)
+		.map(str::trim)
+		.filter(|text| !text.is_empty())?;
+	match published.parse::<u64>() {
+		Ok(secs) if secs > 0 => {
+			let now = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.map_or(0, |elapsed| elapsed.as_secs());
+			Some(SourceAge::Relative(now.saturating_sub(secs).saturating_mul(1000)))
+		},
+		Ok(_) => None,
+		Err(_) => Some(SourceAge::Literal(Str::new(published))),
 	}
 }
 

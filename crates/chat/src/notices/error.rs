@@ -9,7 +9,7 @@
 //! `interactive-mode.ts:5321-5338` (`syncRetryHintRow`).
 
 use omp_core::{Str, StrMut, sf};
-use omp_dom::{Dom, Handle, KnownTag, Node, PropId, Tag};
+use omp_dom::{Dom, Handle, KnownTag, Node, PropId, Tag, Value};
 use omp_tui::{
 	Charset, Component as TuiComponent, Icon, IntoComponent as _, PaintCtx, Pipeline as _, Props,
 	Rect, RichSink as _, RichText, Slot, Style, UiContext, cell_width, dom, next_slot,
@@ -397,34 +397,48 @@ pub fn aborted_tool_tail(dom: &Dom) -> bool {
 	false
 }
 
-/// Whether a faulted tool's `<diag>` is an abort rather than a tool fault:
-/// the `CallOutcome::aborted` JSON the dispatcher journals for a tool that
-/// yielded `Ev::Aborted` (`{"kind":"aborted",…}`), or the `Abort::render`
-/// text (`interrupted: …`, `aborted…`, `skipped: …`) of a harness-owned
-/// cancellation.
+/// Whether a faulted tool's `<diag>` is an abort rather than a tool fault —
+/// the same rule the kernel's `retry_tool_tail` precondition applies
+/// (`omp_agent::aborted_tool_tail`), so the hint never advertises a retry
+/// the controller refuses: the journaled fault (`Committer::commit_abort`
+/// writes `CallOutcome::aborted`, `{"kind":"aborted",…}`, folded onto the
+/// `<diag fault=…>` prop), else that JSON or the `Abort::render` text
+/// (`interrupted: …`, `aborted…`, `skipped: …`) as the diag's text.
 fn diag_is_abort(dom: &Dom, tool: Handle) -> bool {
-	dom.children(tool)
+	let Some(diag) = dom
+		.children(tool)
 		.iter()
 		.filter_map(|handle| dom.get(*handle))
 		.find(|node| node.tag == Tag::Known(KnownTag::Diag))
-		.and_then(|diag| {
-			diag
-				.content
-				.clone()
-				.or_else(|| prop_text(diag, PropId::Text))
-		})
+	else {
+		return false;
+	};
+	match diag.prop(&PropId::Fault.into()) {
+		Some(Value::Json(raw)) => return fault_is_abort(raw.get()),
+		Some(Value::Str(text)) => return fault_is_abort(text.as_str()),
+		_ => {},
+	}
+	diag
+		.content
+		.clone()
+		.or_else(|| prop_text(diag, PropId::Text))
 		.is_some_and(|text| {
 			let text = text.as_str().trim_start();
 			if text.starts_with('{') {
-				return serde_json::from_str::<serde_json::Value>(text)
-					.ok()
-					.and_then(|value| value.get("kind")?.as_str().map(|kind| kind == "aborted"))
-					.unwrap_or(false);
+				return fault_is_abort(text);
 			}
 			text.starts_with("interrupted:")
 				|| text.starts_with("aborted")
 				|| text.starts_with("skipped:")
 		})
+}
+
+/// `CallOutcome` JSON whose arm is `aborted`.
+fn fault_is_abort(json: &str) -> bool {
+	serde_json::from_str::<serde_json::Value>(json)
+		.ok()
+		.and_then(|value| value.get("kind")?.as_str().map(|kind| kind == "aborted"))
+		.unwrap_or(false)
 }
 
 /// The idle `<loop> <key> to Retry` status row (pi
@@ -642,6 +656,35 @@ mod tests {
 		assert!(!aborted_tool_tail(session.dom()), "a settled tool leaves nothing to retry");
 		session.begin_turn().expect("next turn");
 		assert!(!aborted_tool_tail(session.dom()));
+	}
+
+	/// The kernel journals an interrupt as a fault (`Committer::commit_abort`:
+	/// `CallOutcome::aborted`), never a `cancelled` status: the tool settles
+	/// `error` with a `<diag fault={"kind":"aborted",…}>`, and that is a
+	/// retryable tail; an ordinary tool fault is not.
+	#[test]
+	fn aborted_tail_detected_from_the_journaled_abort_fault() {
+		let mut session = session();
+		open_tool_call(&mut session);
+		let call = session.head().expect("call entry");
+		let abort = serde_json::value::to_raw_value(&serde_json::json!({
+			"kind": "aborted",
+			"abort": {"kind": "interrupted", "reason": "user interrupt"},
+		}))
+		.expect("abort fault");
+		session.fail(call, abort).expect("fail");
+		assert!(aborted_tool_tail(session.dom()), "an abort fault is a retryable tail");
+
+		let mut faulted = self::session();
+		open_tool_call(&mut faulted);
+		let call = faulted.head().expect("call entry");
+		let fault = serde_json::value::to_raw_value(&serde_json::json!({
+			"kind": "faulted",
+			"fault": {"message": "aborted transaction: disk full"},
+		}))
+		.expect("tool fault");
+		faulted.fail(call, fault).expect("fail");
+		assert!(!aborted_tool_tail(faulted.dom()), "a tool's own fault leaves nothing to replay");
 	}
 
 	#[test]

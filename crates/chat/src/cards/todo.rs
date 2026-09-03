@@ -2,7 +2,7 @@
 
 use omp_core::{Str, sf};
 use omp_dom::{Node, PropId};
-use omp_tools::todo::Status;
+use omp_tools::todo::{CompletionTransition, Phase, Status, Task};
 use omp_tui::{IntoComponent as _, UiContext, components::STRIKE_TOTAL_FRAMES, dom};
 use serde_json::Value;
 
@@ -58,32 +58,174 @@ fn newly_completed(view: &CardView<'_>) -> Option<(Option<Str>, Str)> {
 	Some((phase, item))
 }
 
-fn render_checklist(view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Component {
+/// Collapsed phases show at most this many task rows (pi
+/// `PREVIEW_LIMITS.COLLAPSED_ITEMS`).
+const COLLAPSED_ITEMS: usize = 8;
+
+/// Closed rows kept above the open window so a completion stays visible
+/// (pi `COLLAPSED_CLOSED_CONTEXT`).
+const COLLAPSED_CLOSED_CONTEXT: usize = 1;
+
+/// A task the collapsed viewport hides (pi `isClosedTodo`).
+fn is_closed(task: &Task) -> bool {
+	matches!(task.status, Status::Completed | Status::Abandoned)
+}
+
+/// Collapsed task rows for one phase plus the trailing summary (pi
+/// `selectCollapsedTodos`): the last closed task leads, then in-progress
+/// work, then the pending tasks that follow it, capped at `cap`.
+fn select_collapsed(tasks: &[Task], cap: usize) -> (Vec<&Task>, Option<Str>) {
+	let open = tasks
+		.iter()
+		.filter(|task| !is_closed(task))
+		.collect::<Vec<_>>();
+	if open.is_empty() {
+		return select_within_cap(tasks.iter().collect(), cap);
+	}
+	let closed = tasks
+		.iter()
+		.filter(|task| is_closed(task))
+		.collect::<Vec<_>>();
+	let lead = &closed[closed.len().saturating_sub(COLLAPSED_CLOSED_CONTEXT)..];
+	let (selected, summary) = select_within_cap(open, cap);
+	let mut items = Vec::with_capacity(lead.len() + selected.len());
+	items.extend_from_slice(lead);
+	items.extend(selected);
+	(items, summary)
+}
+
+/// pi `selectWithinCap`: every in-progress task first (in todo order), then
+/// the tasks following the first active one until `cap`; when actives alone
+/// overflow, only they show and the summary counts the hidden actives.
+fn select_within_cap(base: Vec<&Task>, cap: usize) -> (Vec<&Task>, Option<Str>) {
+	if base.len() <= cap {
+		return (base, None);
+	}
+	let active = base
+		.iter()
+		.copied()
+		.filter(|task| task.status == Status::InProgress)
+		.collect::<Vec<_>>();
+	if active.len() > cap {
+		let hidden = active.len() - cap;
+		let noun = if hidden == 1 { "todo" } else { "todos" };
+		return (active[..cap].to_vec(), Some(sf!("… {hidden} more active {noun}")));
+	}
+	let first_active = active
+		.first()
+		.and_then(|first| base.iter().position(|task| std::ptr::eq(*task, *first)))
+		.unwrap_or(0);
+	let mut items = active;
+	for task in base.iter().skip(first_active).copied() {
+		if items.len() >= cap {
+			break;
+		}
+		if task.status != Status::InProgress {
+			items.push(task);
+		}
+	}
+	let hidden = base.len() - items.len();
+	let summary = (hidden > 0).then(|| {
+		let noun = if hidden == 1 { "todo" } else { "todos" };
+		sf!("… {hidden} more {noun}")
+	});
+	(items, summary)
+}
+
+/// Phases this update touched (pi `computeTouchedPhases`): the phase holding
+/// in-progress work, phases with a task just completed, phases named by the
+/// op's `phase`/`task`; `init` replaces the whole list, so every phase counts.
+/// `None` means no usable signal: render every phase in full.
+fn touched_phases(
+	view: &CardView<'_>,
+	phases: &[Phase],
+	completed: &[CompletionTransition],
+) -> Option<Vec<Str>> {
+	let mut touched: Vec<Str> = Vec::new();
+	let mut touch = |name: &Str| {
+		if !touched.contains(name) {
+			touched.push(name.clone());
+		}
+	};
+	for phase in phases {
+		if phase
+			.tasks
+			.iter()
+			.any(|task| task.status == Status::InProgress)
+		{
+			touch(&phase.name);
+		}
+	}
+	for transition in completed {
+		touch(&transition.phase);
+	}
+	if let Some(args) = typed_input::<omp_tools::todo::Params>(view) {
+		if args.get("op").and_then(Value::as_str) == Some("init") {
+			return Some(phases.iter().map(|phase| phase.name.clone()).collect());
+		}
+		if let Some(named) = args.get("phase").and_then(Value::as_str) {
+			if let Some(phase) = phases.iter().find(|phase| phase.name.as_str() == named) {
+				touch(&phase.name);
+			}
+		}
+		if let Some(content) = args.get("task").and_then(Value::as_str) {
+			if let Some(phase) = phases
+				.iter()
+				.find(|phase| phase.tasks.iter().any(|task| task.content.as_str() == content))
+			{
+				touch(&phase.name);
+			}
+		}
+	}
+	(!touched.is_empty()).then_some(touched)
+}
+
+fn render_checklist(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
 	let completed_now = newly_completed(view);
 	let sweep = sf!("{}ms", TODO_STRIKE_FRAME_MS * u64::from(STRIKE_TOTAL_FRAMES));
-	let phases = view
+	let (phases, completed) = view
 		.result::<omp_tools::todo::Payload>()
-		.map(|payload| payload.phases)
+		.map(|payload| (payload.phases, payload.completed_tasks))
 		.unwrap_or_default();
 	let total: usize = phases.iter().map(|phase| phase.tasks.len()).sum();
+	// Collapsed multi-phase lists fold the phases this update did not touch
+	// to a one-line summary; a single phase or the manual expand shows all.
+	let touched = if expanded || phases.len() < 2 {
+		None
+	} else {
+		touched_phases(view, &phases, &completed)
+	};
 	let mut phase_rows = Vec::new();
 	for (phase_index, phase) in phases.iter().enumerate() {
 		let title = phase.name.as_str();
 		let tasks = phase.tasks.as_slice();
-		let done = tasks
-			.iter()
-			.filter(|task| task.status == Status::Completed)
-			.count();
+		let done = tasks.iter().filter(|task| is_closed(task)).count();
 		let heading = sf!("{}. {title}", roman_numeral(phase_index + 1));
+		let folded = touched
+			.as_ref()
+			.is_some_and(|touched| !touched.contains(&phase.name));
+		if folded {
+			phase_rows.push(
+				dom! { <row gap=2><text fg=muted bold>{heading}</text><text fg=muted>{sf!("{done}/{}", tasks.len())}</text></row> }
+					.into_component(),
+			);
+			continue;
+		}
 		phase_rows.push(
 			dom! { <row gap=2><text>{heading}</text><text>{sf!("{done}/{}", tasks.len())}</text></row> }
 				.into_component(),
 		);
-		for (task_index, task) in tasks.iter().enumerate() {
+		let (shown, summary) = if expanded {
+			(tasks.iter().collect(), None)
+		} else {
+			select_collapsed(tasks, COLLAPSED_ITEMS)
+		};
+		let row_count = shown.len();
+		for (task_index, task) in shown.into_iter().enumerate() {
 			let text = task.content.clone();
 			let completed = task.status == Status::Completed;
 			let blocker = task.blocker.clone().filter(|text| !text.is_empty());
-			let last = task_index + 1 == tasks.len();
+			let last = task_index + 1 == row_count && summary.is_none();
 			let sweeping = completed
 				&& completed_now.as_ref().is_some_and(|(phase, item)| {
 					*item == text && phase.as_ref().is_none_or(|phase| phase == title)
@@ -100,6 +242,12 @@ fn render_checklist(view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Com
 					</row>
 				}
 				.into_component(),
+			);
+		}
+		if let Some(summary) = summary {
+			phase_rows.push(
+				dom! { <row gap=1 pad-x=2><i:tree-last/><text fg=muted>{summary}</text></row> }
+					.into_component(),
 			);
 		}
 	}

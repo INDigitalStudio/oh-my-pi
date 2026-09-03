@@ -91,6 +91,32 @@ struct HostFile {
 	hosts: BTreeMap<Str, HostConfig>,
 }
 
+/// The two `hosts.toml` files one process reads and mutates.
+///
+/// User configuration lives under `~/.o2`
+/// ([`omp_core::dirs::user_config_root`], profile-aware) and never under the
+/// data or state directory; project declarations live in
+/// `<project>/.omp/hosts.toml` and shadow user aliases.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostPaths {
+	/// User-owned `<config root>/hosts.toml`.
+	pub user:    PathBuf,
+	/// Project-owned `<project>/.omp/hosts.toml`.
+	pub project: PathBuf,
+}
+
+impl HostPaths {
+	/// Resolves both files from the user configuration root and the project
+	/// root.
+	#[must_use]
+	pub fn new(user_config_root: &Path, project_root: &Path) -> Self {
+		Self {
+			user:    user_config_root.join("hosts.toml"),
+			project: project_root.join(".omp/hosts.toml"),
+		}
+	}
+}
+
 /// Immutable configured-host store, reloadable by its owner.
 #[derive(Clone, Debug, Default)]
 pub struct HostStore {
@@ -98,20 +124,18 @@ pub struct HostStore {
 }
 
 impl HostStore {
+	/// Loads the effective host authority: every user host, shadowed by any
+	/// project host with the same alias. The result is read-only; scoped
+	/// writers load one file with [`HostStore::load`].
+	pub fn load_layered(paths: &HostPaths) -> Result<Self, SshError> {
+		let mut hosts = parse_hosts(&paths.user)?;
+		hosts.extend(parse_hosts(&paths.project)?);
+		Ok(Self { hosts: Arc::new(RwLock::new(hosts)) })
+	}
+
 	/// Loads `hosts.toml`. A missing file produces an empty store.
 	pub fn load(path: &Path) -> Result<Self, SshError> {
-		let body = match fs::read_to_string(path) {
-			Ok(body) => body,
-			Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-			Err(source) => return Err(SshError::ConfigIo { path: path.to_path_buf(), source }),
-		};
-		let parsed: HostFile = toml::from_str(&body)
-			.map_err(|source| SshError::ConfigParse { path: path.to_path_buf(), source })?;
-		for (alias, host) in &parsed.hosts {
-			validate_alias(alias)?;
-			validate_host(host)?;
-		}
-		Ok(Self { hosts: Arc::new(RwLock::new(parsed.hosts)) })
+		Ok(Self { hosts: Arc::new(RwLock::new(parse_hosts(path)?)) })
 	}
 
 	/// Returns a configured host without permitting URI-provided connection
@@ -149,6 +173,21 @@ impl HostStore {
 		}
 		Ok(removed)
 	}
+}
+
+fn parse_hosts(path: &Path) -> Result<BTreeMap<Str, HostConfig>, SshError> {
+	let body = match fs::read_to_string(path) {
+		Ok(body) => body,
+		Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+		Err(source) => return Err(SshError::ConfigIo { path: path.to_path_buf(), source }),
+	};
+	let parsed: HostFile = toml::from_str(&body)
+		.map_err(|source| SshError::ConfigParse { path: path.to_path_buf(), source })?;
+	for (alias, host) in &parsed.hosts {
+		validate_alias(alias)?;
+		validate_host(host)?;
+	}
+	Ok(parsed.hosts)
 }
 
 fn persist_hosts(path: &Path, hosts: &BTreeMap<Str, HostConfig>) -> Result<(), SshError> {
@@ -1036,6 +1075,46 @@ mod tests {
 			.await;
 		assert!(matches!(result, Err(SshError::Timeout)));
 		assert!(started.elapsed() < Duration::from_secs(3));
+	}
+
+	#[test]
+	fn layered_store_reads_user_config_root_and_project_shadows_it() {
+		let temp = tempfile::tempdir().expect("tempdir");
+		let user_root = temp.path().join("o2");
+		let project_root = temp.path().join("project");
+		fs::create_dir_all(&user_root).expect("user root");
+		fs::create_dir_all(project_root.join(".omp")).expect("project root");
+		let paths = HostPaths::new(&user_root, &project_root);
+		assert_eq!(paths.user, user_root.join("hosts.toml"));
+		assert_eq!(paths.project, project_root.join(".omp/hosts.toml"));
+
+		let host = |user: &str| HostConfig {
+			address:      sf!("localhost"),
+			port:         22,
+			user:         Str::new(user),
+			host_key:     sf!("SHA256:test"),
+			auth:         AuthPolicy::Agent,
+			timeout_secs: 30,
+		};
+		HostStore::default()
+			.upsert(&paths.user, sf!("shared"), host("from-user"))
+			.expect("write user host");
+		let user_store = HostStore::load(&paths.user).expect("load user store");
+		user_store
+			.upsert(&paths.user, sf!("user-only"), host("user-only"))
+			.expect("write second user host");
+		HostStore::default()
+			.upsert(&paths.project, sf!("shared"), host("from-project"))
+			.expect("write project host");
+
+		let layered = HostStore::load_layered(&paths).expect("layered load");
+		assert_eq!(layered.aliases(), vec![sf!("shared"), sf!("user-only")]);
+		assert_eq!(layered.get("shared").expect("shared").user, "from-project");
+		assert_eq!(layered.get("user-only").expect("user-only").user, "user-only");
+		assert!(matches!(layered.get("absent"), Err(SshError::UnknownHost { .. })));
+
+		let missing = HostPaths::new(&temp.path().join("nope"), &temp.path().join("nope"));
+		assert!(HostStore::load_layered(&missing).expect("missing files are empty").aliases().is_empty());
 	}
 
 	#[tokio::test]

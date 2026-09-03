@@ -397,6 +397,174 @@ fn explicit_resume_suppresses_intro_even_for_an_empty_journal() {
 	);
 }
 
+/// A host over the fixture journal, opened as pi's `--continue`/`--resume`
+/// path does (`resuming: true`) or as a fresh launch.
+fn fixture_host(resuming: bool) -> NativeHost {
+	let (mut session, _) = fixture();
+	let (snapshot, dom_events) = session.subscribe();
+	let (_, kernel_events) = flume::unbounded();
+	let (commands, _) = flume::unbounded();
+	let (up, _) = flume::unbounded();
+	NativeHost::new(
+		HostOptions {
+			model: omp_chat::ModelBadge::from_identifier("test/model"),
+			snapshot,
+			dom_events,
+			kernel_events,
+			commands,
+			up,
+			con: Arc::new(omp_con::Ctx::new()),
+			models: Vec::new(),
+			cycle: Vec::new(),
+			resize_policy: ResizePolicy::Rebuild,
+			project: std::path::PathBuf::new(),
+			welcome: omp_chat::welcome::WelcomeFacts::default(),
+			ui: UiContext::default(),
+			services: Arc::new(omp_chat::overlays::NoServices),
+			speech: None,
+			resuming,
+			initial_panel: None,
+		},
+		Size::new(80, 24),
+	)
+}
+
+/// pi `setHistoryStorage` at `interactive-mode.ts:968`: a resumed session's
+/// prompts are Up-arrow history from the first keypress.
+#[test]
+fn resumed_session_seeds_up_arrow_history_from_the_journal() {
+	let mut resumed = fixture_host(true);
+	assert_eq!(resumed.composer_text(), "");
+	resumed.key(Key::Up).expect("up");
+	assert_eq!(resumed.composer_text(), "hello", "the journal's user prompt is recalled");
+	resumed.key(Key::End).expect("end");
+	resumed.key(Key::Down).expect("down");
+	assert_eq!(resumed.composer_text(), "", "Down returns to the empty draft");
+
+	let mut fresh = fixture_host(false);
+	fresh.key(Key::Up).expect("up");
+	assert_eq!(fresh.composer_text(), "", "a fresh launch has nothing to recall");
+}
+
+/// Services stub exposing only the session's `local://` artifacts.
+struct LocalArtifacts;
+
+impl omp_chat::overlays::Services for LocalArtifacts {
+	fn list_local(
+		&self,
+		suffix: &str,
+	) -> omp_chat::overlays::services::ServiceResult<Vec<omp_core::Str>> {
+		Ok(["local://omp2-plan.md", "local://notes.txt"]
+			.into_iter()
+			.filter(|url| url.ends_with(suffix))
+			.map(omp_core::Str::new_static)
+			.collect())
+	}
+}
+
+fn host_with_services(
+	services: Arc<dyn omp_chat::overlays::Services>,
+) -> (NativeHost, Session, tempfile::TempDir) {
+	let directory = tempdir().expect("temp directory");
+	let mut session =
+		Session::create(directory.path().join("urls.oms"), ComponentRegistry::standard())
+			.expect("session");
+	let (snapshot, dom_events) = session.subscribe();
+	let (_, kernel_events) = flume::unbounded();
+	let (commands, _) = flume::unbounded();
+	let (up, _) = flume::unbounded();
+	let host = NativeHost::new(
+		HostOptions {
+			model: omp_chat::ModelBadge::from_identifier("test/model"),
+			snapshot,
+			dom_events,
+			kernel_events,
+			commands,
+			up,
+			con: Arc::new(omp_con::Ctx::new()),
+			models: Vec::new(),
+			cycle: Vec::new(),
+			resize_policy: ResizePolicy::Rebuild,
+			project: std::path::PathBuf::new(),
+			welcome: omp_chat::welcome::WelcomeFacts::default(),
+			ui: UiContext::default(),
+			services,
+			speech: None,
+			resuming: false,
+			initial_panel: None,
+		},
+		Size::new(100, 30),
+	);
+	(host, session, directory)
+}
+
+fn type_text(host: &mut NativeHost, text: &str) {
+	for character in text.chars() {
+		host.key(Key::Char(character)).expect("type");
+	}
+}
+
+/// pi `internal-url-autocomplete.ts`: typing `scheme://` offers the
+/// resources the host can name — `local://` artifacts from the services
+/// seam and `agent://` ids from the live `<meta><jobs>` roster, which
+/// follows spawns as the replica changes.
+#[test]
+fn internal_url_tokens_complete_local_artifacts_and_live_agents() {
+	use omp_session::components::jobs::{self, JobSpec};
+	let (mut host, mut session, _dir) = host_with_services(Arc::new(LocalArtifacts));
+	type_text(&mut host, "see local://pl");
+	host.key(Key::Tab).expect("accept");
+	assert_eq!(host.composer_text(), "see local://omp2-plan.md ");
+	host.act(omp_chat::HostAction::Clear).expect("clear draft");
+	assert_eq!(host.composer_text(), "");
+
+	// No agents yet: `agent://` declines rather than offering stale rows.
+	type_text(&mut host, "agent://");
+	host.key(Key::Tab).expect("tab with nothing to accept");
+	assert_eq!(host.composer_text(), "agent://");
+	host.act(omp_chat::HostAction::Clear).expect("clear draft");
+
+	let cause = session.head().expect("head");
+	let txn = jobs::insert(session.dom(), cause, JobSpec {
+		id:      "Fx2Composer".into(),
+		kind:    "subagent".into(),
+		owner:   "Main".into(),
+		started: "0".into(),
+		agent:   Some("task".into()),
+	})
+	.expect("jobs component");
+	session.patch(txn).expect("spawn agent");
+	host.poll().expect("apply spawn");
+	type_text(&mut host, "agent://fx2");
+	host.key(Key::Tab).expect("accept");
+	assert_eq!(host.composer_text(), "agent://Fx2Composer ");
+
+	// An unknown scheme never opens a dropdown, so Tab has nothing to take.
+	host.act(omp_chat::HostAction::Clear).expect("clear draft");
+	type_text(&mut host, "https://exa");
+	host.key(Key::Tab).expect("tab");
+	assert_eq!(host.composer_text(), "https://exa");
+}
+
+/// pi `applySpellingSettings`: the `cl_spelling_*` convars reach the live
+/// editor on the next status sync, not only at boot.
+#[test]
+fn spelling_convars_reach_the_composer_editor() {
+	let mut host = empty_host(false, false);
+	assert_eq!(host.spelling_features(), omp_tui::SpellingFeatures::default());
+	host
+		.console(
+			"cl_spelling_typo_detection 0; cl_spelling_autocomplete 0; cl_spelling_autocorrect 1",
+		)
+		.expect("spelling convars");
+	host.key(Key::Char('a')).expect("type");
+	assert_eq!(host.spelling_features(), omp_tui::SpellingFeatures {
+		typo_detection: false,
+		autocomplete:   false,
+		autocorrect:    true,
+	});
+}
+
 fn row(key: &'static str, efforts: &[&'static str]) -> omp_chat::ModelRow {
 	omp_chat::ModelRow {
 		key:         key.into(),
@@ -937,6 +1105,26 @@ fn ask_dialog_escape_cancels_the_call() {
 	assert!(cancelled, "Esc sends the cancel reply");
 }
 
+/// A real terminal delivers Escape as a physical chord bound to
+/// `cl_interrupt`; the ask dialog still answers `None` so the blocked tool
+/// call settles instead of hanging behind a silently dismissed overlay.
+#[test]
+fn ask_dialog_escape_chord_through_the_interrupt_bind_still_cancels_the_call() {
+	let (mut host, commands, _session) = ask_host();
+	host
+		.chord(omp_tui::KeyEvent {
+			chord:   omp_tui::Chord::plain(Key::Esc),
+			key:     Some(Key::Esc),
+			pressed: true,
+		})
+		.expect("esc chord");
+	assert_eq!(host.overlay_id(), None);
+	let cancelled = commands.try_iter().any(
+		|command| matches!(command, HostCommand::AskAnswer { ref id, answers: None } if id == "ask-7"),
+	);
+	assert!(cancelled, "the bound Esc edge reaches the dialog's cancel");
+}
+
 #[test]
 fn bash_and_eval_prefixes_run_locally_instead_of_prompting_the_model() {
 	let (mut host, commands) = bound_host(vec![row("test/model", &[])]);
@@ -996,6 +1184,34 @@ fn local_prefixes_are_refused_while_a_subagent_is_focused_and_keep_the_draft() {
 		host.console("cl_clear").expect("clear draft");
 		commands.try_iter().for_each(drop);
 	}
+}
+
+/// pi `piSegment`: while a subagent is focused the band's brand slot holds
+/// the ghost and the agent id, so the target of every submit stays visible
+/// after the transient notice has gone; leaving restores the brand glyph.
+#[test]
+fn focused_subagent_is_named_in_the_status_band_brand_slot() {
+	let (mut host, commands) = bound_host(vec![row("test/model", &[])]);
+	let band = |host: &NativeHost| {
+		text_of(host.frame())
+			.lines()
+			.find(|line| line.contains("📁 ") && line.contains(" ▶"))
+			.map(str::to_owned)
+			.expect("status band row")
+	};
+	assert!(band(&host).starts_with(" π  >"), "{}", band(&host));
+	host
+		.act(omp_chat::HostAction::FocusAgent(Some("worker-1".into())))
+		.expect("focus");
+	commands.try_iter().for_each(drop);
+	assert!(band(&host).starts_with(" 👻 worker-1  >"), "{}", band(&host));
+	// The notice clears on the next keystroke; the brand slot does not.
+	host.key(Key::Char('x')).expect("type");
+	assert!(band(&host).starts_with(" 👻 worker-1  >"), "{}", band(&host));
+	host
+		.act(omp_chat::HostAction::FocusAgent(None))
+		.expect("unfocus");
+	assert!(band(&host).starts_with(" π  >"), "{}", band(&host));
 }
 
 /// pi `handleSubmit` collab guest branch: local execution is host-only; the
@@ -1063,4 +1279,60 @@ fn a_refused_local_run_restores_the_draft_and_rolls_back_activity() {
 	assert!(!host.turn_active(), "the activity edge rolled back");
 	assert_eq!(host.composer_text(), "!echo hi");
 	assert_eq!(host.notice(), Some("Paused: resume before running local commands"));
+}
+
+/// Dropping or pasting an image stages a `#1` chip; Enter submits the draft
+/// with pi's positional `[Image #1, WxH]` marker and the image bytes typed
+/// from their header, the controller content-addresses them beside the
+/// journaled prompt, and the transcript bubble shows the same compact chip
+/// the composer used.
+#[test]
+fn pasted_image_chip_submits_attachments_and_the_bubble_shows_the_chip() {
+	let (mut host, commands, mut session) = bound_host_with_session(vec![row("test/model", &[])]);
+	let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x04\0\0\0\x03";
+	let dir = tempdir().expect("image directory");
+	let path = dir.path().join("shot.png");
+	std::fs::write(&path, png).expect("write png");
+	let image_icon = omp_tui::Charset::default().icon(omp_tui::Icon::Image);
+
+	assert_eq!(host.paste(path.to_str().expect("utf-8 path")), NativeEffect::Consumed);
+	let composer = text_of(host.frame());
+	assert!(composer.contains(&format!("{image_icon} #1")), "chip staged:\n{composer}");
+	assert!(!composer.contains("[Image #1"), "the draft shows the chip, not the wire marker");
+	type_text(&mut host, "what is this?");
+	assert_eq!(host.key(Key::Enter).expect("enter"), NativeEffect::Consumed);
+
+	let (text, attachments) = match commands.recv().expect("submit") {
+		HostCommand::SubmitWithAttachments { text, attachments } => (text, attachments),
+		other => panic!("image chips submit attachments, got {other:?}"),
+	};
+	assert_eq!(text, "[Image #1, 4x3] what is this?");
+	assert_eq!(attachments.len(), 1);
+	assert_eq!(attachments[0].mime, "image/png");
+	assert_eq!(attachments[0].bytes.as_ref(), png);
+	assert!(host.take_clipboard().is_none());
+
+	// The controller's side of the seam: content-address and journal.
+	let stored = session
+		.store_attachments(attachments)
+		.expect("attachments store");
+	assert_eq!(session.blobs().get(&stored[0].blob).expect("blob").as_ref(), png);
+	session.begin_turn().expect("turn");
+	session.user(text, stored).expect("user");
+	assert_eq!(host.poll().expect("apply dom events"), NativeEffect::Consumed);
+	let user = host
+		.blocks()
+		.into_iter()
+		.filter(|block| block.kind == BlockKind::User)
+		.last()
+		.expect("user block");
+	assert_eq!(user.text, "[Image #1, 4x3] what is this?", "the block carries the wire text");
+	// The painted bubble collapses the marker back into the composer's chip
+	// (pi `collapseImageMarkers` in `user-message.ts`).
+	let frame = text_of(host.frame());
+	assert!(frame.contains(&format!("{image_icon} #1")), "bubble shows the chip:\n{frame}");
+	assert!(!frame.contains("[Image #1"), "the marker collapses:\n{frame}");
+	assert!(frame.contains("what is this?"), "{frame}");
+	let paperclip = omp_tui::Charset::default().icon(omp_tui::Icon::Paperclip);
+	assert!(!frame.contains(&format!("{paperclip} #1")), "a referenced image is not repeated:\n{frame}");
 }

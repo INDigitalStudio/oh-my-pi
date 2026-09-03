@@ -271,14 +271,14 @@ pub fn guest_bubble(author: &str, text: Str) -> Component {
 	.into_component()
 }
 
-/// pi `user-message.ts` bubble: `userMessageBg` tint with one cell of
-/// padding on every side.
+/// pi `user-message.ts` bubble: Markdown on the `userMessageBg` tint with
+/// one cell of padding on every side.
 fn bubble(text: Str) -> Component {
-	dom! { <text bg=surface pad="1 1">{text}</text> }.into_component()
+	dom! { <md bg=surface pad="1 1">{text}</md> }.into_component()
 }
 
 /// pi `formatBytes` (`utils/format.ts:54-59`): `512B`, `1.5KB`, `2.3MB`.
-fn format_bytes(bytes: usize) -> String {
+pub(crate) fn format_bytes(bytes: usize) -> String {
 	const KB: f64 = 1024.0;
 	#[allow(clippy::cast_precision_loss, reason = "display rounding only")]
 	let n = bytes as f64;
@@ -466,7 +466,11 @@ mod tests {
 		assert_eq!(collapsed, " Session update · 1.2KB · 14 lines · ctrl+o");
 		let expanded = render(synthetic_row(&text, true), 60);
 		assert!(expanded.starts_with(" Session update · 1.2KB · 14 lines · ctrl+o\n"));
-		assert!(expanded.contains("\n # Session update\n line 0 of the replay dump"), "{expanded:?}");
+		// pi `CollapsedSyntheticMessageComponent#renderExpanded`: the body is
+		// the Markdown `UserMessageComponent`, so the heading renders as a
+		// heading rather than its raw `#` source.
+		assert!(expanded.contains("\n Session update\n\n line 0 of the replay dump"), "{expanded:?}");
+		assert!(!expanded.contains("# Session update"), "{expanded:?}");
 	}
 
 	#[test]

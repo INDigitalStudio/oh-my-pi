@@ -5,7 +5,7 @@
 //! `──── 📷 remote-compacted · 256K→20K · ctrl+o ────` — and `ctrl+o`
 //! reveals the summary Markdown in a tinted box below it.
 
-use std::{convert::Infallible, fmt::Write as _, iter, str::FromStr};
+use std::{fmt::Write as _, iter};
 
 use omp_core::{Str, StrMut, Ulid};
 use omp_dom::{Dom, Handle, KnownTag, Node, PropId, Tag};
@@ -16,8 +16,12 @@ use omp_tui::{
 use super::{format_number, prop_text, prop_u64};
 use crate::cards::Component;
 
-/// Maintenance method recorded on a `<compaction>` element.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Maintenance method recorded on a `<compaction>` element. The `method`
+/// prop parses through [`FromStr`](std::str::FromStr) (`auto`, `remote`,
+/// `soft`, `handoff`, `snapcompact`, `shake`, `branch`); an unknown name is
+/// a parse error the caller lowers to [`Method::Other`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, strum::EnumString)]
+#[strum(serialize_all = "lowercase")]
 pub enum Method {
 	/// Automatic threshold compaction (`/compact` without a strategy).
 	#[default]
@@ -34,7 +38,8 @@ pub enum Method {
 	Shake,
 	/// Side branch folded back into the main line.
 	Branch,
-	/// Legacy or extension-provided method.
+	/// Legacy or extension-provided method; never spelled by the journal.
+	#[strum(disabled)]
 	Other,
 }
 
@@ -64,23 +69,6 @@ impl Method {
 			Self::Handoff => "handoff",
 			_ => "camera",
 		}
-	}
-}
-
-impl FromStr for Method {
-	type Err = Infallible;
-
-	fn from_str(name: &str) -> Result<Self, Infallible> {
-		Ok(match name {
-			"auto" => Self::Auto,
-			"remote" => Self::Remote,
-			"soft" => Self::Soft,
-			"handoff" => Self::Handoff,
-			"snapcompact" => Self::SnapCompact,
-			"shake" => Self::Shake,
-			"branch" => Self::Branch,
-			_ => Self::Other,
-		})
 	}
 }
 
@@ -448,13 +436,19 @@ mod tests {
 			("shake", "shaken"),
 			("branch", "branch"),
 			("auto", "compacted"),
-			("extension-provided", "compacted"),
 		];
 		for (name, label) in cases {
 			let method: Method = name.parse().unwrap();
 			assert_eq!(method.label(), label, "{name}");
 		}
-		assert_eq!("bogus".parse::<Method>(), Ok(Method::Other));
+		assert!("bogus".parse::<Method>().is_err(), "unknown methods are not spelled by the journal");
+		assert!("other".parse::<Method>().is_err(), "`Other` is never parsed by name");
+		assert_eq!(
+			SummaryDivider::compaction(&compaction_node(Some("extension-provided"), 0, 0, None), false)
+				.label,
+			"compacted",
+			"an unknown method reads `compacted` like pi"
+		);
 		assert_eq!(
 			SummaryDivider::compaction(&compaction_node(None, 0, 0, None), false).label,
 			"compacted"

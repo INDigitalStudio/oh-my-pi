@@ -18,13 +18,13 @@ use omp_con::{
 	AI_COMPACT_THRESHOLD, AI_FASTMODE, AI_MODEL, AI_THINKING, CL_IME_SAFE_CURSOR, CL_SHOWTHINKING,
 	CL_STATUS_COMPACT_THINKING, Ctx, Source,
 };
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_dom::{Dom, Event, Handle, KnownTag, Op, PropId, Snapshot, Tag, Value};
-use omp_journal::{EntryId, blob::BlobRef};
+use omp_journal::EntryId;
 use omp_tui::{
 	CursorStyle, DebugOp, Dim, Frame, InputEvent, Key, KeyEvent, Layer, MouseReport, OverlayAnchor,
-	OverlayOptions, Progress, Renderer, Size, Terminal, TerminalEvent, TerminalOptions, TtyOut, Ui,
-	UiContext,
+	OverlayOptions, Progress, Renderer, Size, SpellingFeatures, Terminal, TerminalEvent,
+	TerminalOptions, TtyOut, Ui, UiContext,
 	anim::Intro,
 	components::Countdown,
 	negotiate_async,
@@ -38,14 +38,17 @@ use tokio::sync::oneshot;
 
 use crate::{
 	actions::{CL_DOUBLE_ESCAPE, CL_STT_HOLD, EscapeHook, EscapeRung, HostAction, HostMailbox},
-	autocomplete::slash,
+	autocomplete::{UrlCandidate, UrlCompleter, slash},
 	cards::CardRegistry,
 	chrome::{
 		CL_SHOW_PROGRESS, CL_STARTUP_QUIET, CL_TITLE_STATE, ModelBadge, StatusFacts, TerminalTitle,
 		TitleState, Welcome, display_path, tip_for,
 	},
 	commands::{CompactionMethod, Selector},
-	composer::{Composer, ComposerAction, PrefixMode, SpaceHold, SpaceHoldEvent},
+	composer::{
+		Composer, ComposerAction, ComposerSettings, PasteOutcome, PrefixMode, SpaceHold,
+		SpaceHoldEvent,
+	},
 	gitwatch::{GitFacts, GitWatch},
 	notices::{
 		error::{aborted_tool_tail, error_banner, pinned_error, retry_hint_row},
@@ -55,13 +58,103 @@ use crate::{
 	overlays::{
 		HistoryPicker, ModelPicker, ModelRow, Overlay, Overlays, PanelAnchor, PanelCx, PanelEvent,
 		PickerEvent, QuickRoleRow, Services,
+		paste_menu::{PasteChoice, PasteMenu, save_paste_file, wrap_in_attachment_block},
 	},
 	project::{BlockKind, BlockView, RenderedBlock, project},
+	settings::{
+		CL_AUTOCOMPLETE_MAX_VISIBLE, CL_EMOJI_AUTOCOMPLETE, CL_PASTE_LARGE_MENU_THRESHOLD,
+		CL_SPELLING_AUTOCOMPLETE, CL_SPELLING_AUTOCORRECT, CL_SPELLING_TYPO_DETECTION,
+	},
 	status_band::Speculation,
 	status_line::{StatusLine, director_mode},
 	transcript::Projection,
 	welcome::{WelcomeFacts, tip_seeded, welcome_seed},
 };
+
+/// Rows requested per scheme for `scheme://` completion (pi
+/// `MAX_URL_SUGGESTIONS`); the provider ranks and trims them.
+const URL_COMPLETION_ROWS: usize = 25;
+
+/// Live `<meta><jobs>` agents (`id`, agent class) for `agent://`
+/// completion; the presenter refreshes it as the replica changes.
+type AgentRoster = Arc<Mutex<Vec<(Str, Option<Str>)>>>;
+
+/// pi `InternalUrlRouter.complete`: the application's resolver table
+/// answers the composer's `scheme://` completion. When the application
+/// wires no table, the host answers from what it holds itself — the
+/// session's `local://` artifacts and the live `agent://` roster; any other
+/// scheme declines.
+fn url_completer(services: &Arc<dyn Services>, agents: &AgentRoster) -> UrlCompleter {
+	let services = Arc::clone(services);
+	let agents = Arc::clone(agents);
+	Arc::new(move |scheme: &str| {
+		match services.url_completions(&sf!("{scheme}://"), URL_COMPLETION_ROWS) {
+			Ok(rows) => {
+				return Some(
+					rows
+						.into_iter()
+						.map(|row| UrlCandidate {
+							value:       row.value,
+							description: (!row.description.is_empty()).then_some(row.description),
+						})
+						.collect(),
+				);
+			},
+			Err(crate::overlays::services::ServiceError::Unavailable(_)) => {},
+			Err(crate::overlays::services::ServiceError::Failed(_)) => return None,
+		}
+		match scheme {
+			"local" => Some(
+				services
+					.list_local("")
+					.ok()?
+					.into_iter()
+					.map(|value| UrlCandidate { value, description: None })
+					.collect(),
+			),
+			"agent" => Some(
+				agents
+					.lock()
+					.iter()
+					.map(|(id, agent)| UrlCandidate {
+						value:       sf!("agent://{id}"),
+						description: agent.clone(),
+					})
+					.collect(),
+			),
+			_ => None,
+		}
+	})
+}
+
+/// The `agent://` roster as the replica's `<meta><jobs>` names it.
+fn agent_roster(replica: &Dom) -> Vec<(Str, Option<Str>)> {
+	crate::overlays::hub::job_rows(replica)
+		.into_iter()
+		.filter(|row| !row.id.is_empty())
+		.map(|row| (row.id, row.agent))
+		.collect()
+}
+
+/// The editor's native spelling gates as the `cl_spelling_*` convars say.
+fn spelling_features(con: &Ctx) -> SpellingFeatures {
+	SpellingFeatures {
+		typo_detection: CL_SPELLING_TYPO_DETECTION.get(con),
+		autocomplete:   CL_SPELLING_AUTOCOMPLETE.get(con),
+		autocorrect:    CL_SPELLING_AUTOCORRECT.get(con),
+	}
+}
+
+/// The composer's dropdown, emoji, and large-paste knobs as their convars
+/// say (pi `autocompleteMaxVisible`, `emojiAutocomplete`,
+/// `paste.largeMenuThreshold`).
+fn composer_settings(con: &Ctx) -> ComposerSettings {
+	ComposerSettings {
+		autocomplete_max_visible: CL_AUTOCOMPLETE_MAX_VISIBLE.get(con),
+		emoji_autocomplete:       CL_EMOJI_AUTOCOMPLETE.get(con),
+		paste_large_menu_lines:   CL_PASTE_LARGE_MENU_THRESHOLD.get(con),
+	}
+}
 
 /// Console command that engages the plan Director.
 const PLAN_DIRECTOR: &str = "plan";
@@ -98,12 +191,15 @@ pub enum SpawnKind {
 pub enum HostCommand {
 	/// Begin a fresh explicit turn.
 	Submit(Str),
-	/// Begin a turn with content-addressed attachments.
+	/// Begin a turn with user media (pi `pendingImages`): the controller
+	/// content-addresses each input in the session's blob store and journals
+	/// the prompt with the references, `[Image #N]` in `text` naming
+	/// `attachments[N-1]`.
 	SubmitWithAttachments {
-		/// User-authored text.
+		/// User-authored text carrying the wire markers.
 		text:        Str,
-		/// Durable attachment references.
-		attachments: Vec<BlobRef>,
+		/// Media bytes plus MIME in marker order.
+		attachments: Vec<omp_session::AttachmentInput>,
 	},
 	/// Queue steering text at the kernel's next safe point.
 	Steer(Str),
@@ -440,6 +536,8 @@ pub(crate) struct Presenter {
 	pub(crate) clipboard_read: Option<ClipboardRead>,
 	/// Application data feeds for panels.
 	pub(crate) services:       Arc<dyn Services>,
+	/// `agent://` completion roster shared with the composer's URL provider.
+	agents:                    AgentRoster,
 	/// Registered Esc hooks (rungs 1 and 4 of the ladder).
 	pub(crate) escape_hooks:   Vec<EscapeHook>,
 	/// Subagent whose session the view shows (pi `focusedAgentId`).
@@ -520,6 +618,11 @@ pub struct LocalFacts {
 	/// Background compaction summary in flight (`KernelEvent::
 	/// CompactionSpeculating`), pulsing the gauge tick until it settles.
 	pub speculation:      Speculation,
+	/// The active route's provider has a stored OAuth credential, so spend
+	/// bills to a subscription (pi `modelRegistry.isUsingOAuth`). Read from
+	/// the account service at launch, on every model switch, and whenever a
+	/// panel that may have signed in or out closes — never per frame.
+	pub subscription:     bool,
 }
 
 impl Default for LocalFacts {
@@ -534,6 +637,7 @@ impl Default for LocalFacts {
 			fast:             false,
 			compact_thinking: true,
 			speculation:      Speculation::None,
+			subscription:     false,
 		}
 	}
 }
@@ -567,6 +671,17 @@ impl LocalFacts {
 			.clamp(0.0, 100.0) as u8;
 		self.fast = AI_FASTMODE.get(con);
 		self.compact_thinking = CL_STATUS_COMPACT_THINKING.get(con);
+	}
+
+	/// Re-reads whether `badge`'s provider is served by a stored OAuth
+	/// credential (pi `authStorage.hasOAuth(provider)`). An unavailable
+	/// account service reads as metered.
+	fn sync_billing(&mut self, services: &dyn Services, badge: &ModelBadge) {
+		self.subscription = services.accounts().is_ok_and(|accounts| {
+			accounts
+				.iter()
+				.any(|account| account.provider == badge.provider && account.kind == "oauth")
+		});
 	}
 }
 
@@ -646,14 +761,23 @@ impl Presenter {
 		let (git_watch, git_facts) = GitWatch::start(&options.project).unzip();
 		let mut local = LocalFacts::at_launch(git_watch.as_ref().map(GitWatch::launch));
 		local.sync_con(&options.con, &options.model);
-		let facts = status_facts(&replica, &options.model, &local, None);
-		let composer = Composer::new(
+		local.sync_billing(options.services.as_ref(), &options.model);
+		let facts = status_facts(&replica, &options.model, &local, None, None);
+		let agents: AgentRoster = Arc::new(Mutex::new(agent_roster(&replica)));
+		let mut composer = Composer::new(
 			width,
 			options.ui.clone(),
 			facts,
 			slash::roster(&options.con),
+			url_completer(&options.services, &agents),
 			project_root(&replica).as_deref(),
 		);
+		// pi `setHistoryStorage`: a resumed session's prompts are already
+		// Up/Down history, newest first.
+		if resuming {
+			composer.seed_history(crate::overlays::prompt_history(&replica));
+		}
+		composer.set_spelling_features(spelling_features(&options.con));
 		// A resumed or already-running session starts active (pi derives
 		// `isStreaming` from the session, never from a local edge).
 		let turn_active = has_active_turn(&replica);
@@ -716,6 +840,7 @@ impl Presenter {
 			welcome: options.welcome,
 			clipboard_read: None,
 			services: options.services,
+			agents,
 			escape_hooks,
 			focused_agent: None,
 			collab_guest: false,
@@ -819,6 +944,14 @@ impl Presenter {
 			| KernelEvent::ToolReady { .. }
 			| KernelEvent::ToolUpdate { .. }
 			| KernelEvent::ToolSettled { .. } => {},
+			// Delivered jobs, answered workflow actions, and filed approval
+			// prompts land in the DOM (async-result follow-ups, tool results,
+			// `<queues><prompts>`); the patch stream projects them (the
+			// approval overlay opens from `sync_approval`), so the event
+			// itself carries no host state.
+			KernelEvent::JobsDelivered { .. }
+			| KernelEvent::WorkflowActionAnswered { .. }
+			| KernelEvent::ApprovalRequested(_) => {},
 		}
 		routed
 	}
@@ -1098,6 +1231,19 @@ impl Presenter {
 		}
 		let completed = Self::assistant_completed(event);
 		self.replica.apply_event(event)?;
+		// Agents come and go through `ins`/`rm` under `<meta><jobs>`; a
+		// stream or a bare `set` never changes the `agent://` roster.
+		let structural = match event {
+			Event::Reset { .. } => true,
+			Event::Patch(patch) => patch
+				.ops
+				.iter()
+				.any(|op| matches!(op, Op::Ins { .. } | Op::Rm(_) | Op::Mv { .. })),
+			Event::Stream { .. } => false,
+		};
+		if structural {
+			*self.agents.lock() = agent_roster(&self.replica);
+		}
 		if completed && let Some(speech) = &self.speech {
 			let mode = Vocalizer::mode(&self.con);
 			speech.lock().message_completed(mode);
@@ -1228,21 +1374,32 @@ impl Presenter {
 	/// pi `model_changed`: when `ai_model` names a catalog row other than the
 	/// badge's, the badge is rebuilt from that row so the welcome box, the
 	/// context gauge, the thinking gate, and quota polling follow the switch
-	/// (picker, role cycle, console write, or a Director bind alike).
+	/// (picker, role cycle, console write, or a Director bind alike). A
+	/// route the picker does not list (custom provider, direct `provider/
+	/// model` syntax) still replaces the badge, from the identifier alone,
+	/// so nothing keeps reading the previous model's facts.
 	fn adopt_live_model(&mut self) {
 		let live = AI_MODEL.get(&self.con);
 		if live.is_empty() || live == self.model.identifier {
 			return;
 		}
-		if let Some(row) = self.models.iter().find(|row| row.key == live) {
-			self.model = ModelBadge::from_row(row);
-		}
+		self.model = match self.models.iter().find(|row| row.key == live) {
+			Some(row) => ModelBadge::from_row(row),
+			None => ModelBadge::from_identifier(&live),
+		};
+		self.local.sync_billing(self.services.as_ref(), &self.model);
 	}
 
 	fn sync_status(&mut self) -> bool {
 		self.adopt_live_model();
 		self.local.sync_con(&self.con, &self.model);
-		let mut facts = status_facts(&self.replica, &self.model, &self.local, self.turn_started);
+		let mut facts = status_facts(
+			&self.replica,
+			&self.model,
+			&self.local,
+			self.turn_started,
+			self.focused_agent.as_deref(),
+		);
 		facts.mode = director_mode(&self.replica);
 		// The composer wears the rail while the plan Director is engaged. pi's
 		// status row collapses the editor top gap (`EditorTopGap` /
@@ -1253,7 +1410,15 @@ impl Presenter {
 		let ime = self
 			.composer
 			.set_ime_safe_cursor(CL_IME_SAFE_CURSOR.get(&self.con));
-		self.composer.set_status(facts) || reshaped || ime
+		// pi `applySpellingSettings`: the `cl_spelling_*` convars reach the
+		// live editor on every settings write (`/settings`, cfg, console).
+		let spelling = self
+			.composer
+			.set_spelling_features(spelling_features(&self.con));
+		// pi `setAutocompleteMaxVisible` / `emojiAutocomplete` /
+		// `paste.largeMenuThreshold`: same live path as the spelling gates.
+		let knobs = self.composer.set_settings(composer_settings(&self.con));
+		self.composer.set_status(facts) || reshaped || ime || spelling || knobs
 	}
 
 	/// Routes one semantic key from native/debug input. Real terminals use
@@ -1293,6 +1458,9 @@ impl Presenter {
 		}
 		if event.pressed && event.key == Some(Key::Ctrl('c')) && self.ask_open.is_some() {
 			return Ok(self.interrupt_turn());
+		}
+		if event.pressed && event.key == Some(Key::Esc) && self.ask_open.is_some() {
+			return self.route_unbound_key(Key::Esc);
 		}
 		let chord = event.chord.label();
 		if self.con.bound(chord.as_str()).is_some() {
@@ -1417,7 +1585,7 @@ impl Presenter {
 				let event = picker.paste(text);
 				return self.apply_picker_event(event);
 			},
-			Some(Overlay::Panel(panel)) if panel.anchor() != PanelAnchor::Side => {
+			Some(Overlay::Panel(panel)) => {
 				panel.touch(self.clock.elapsed());
 				let event = panel.paste(text);
 				if event != PanelEvent::Ignored {
@@ -1426,8 +1594,54 @@ impl Presenter {
 			},
 			_ => {},
 		}
-		self.composer.paste(text);
-		Ok(Routed::Repaint)
+		Ok(self.paste_into_composer(text))
+	}
+
+	/// Lands pasted text in the composer, or holds it behind the large-paste
+	/// menu when it reaches `cl_paste_large_menu_threshold` lines (pi
+	/// `handleLargePaste`).
+	fn paste_into_composer(&mut self, text: &str) -> Routed {
+		if let PasteOutcome::Menu { lines } = self.composer.paste(text) {
+			let _ = self.commands.send(HostCommand::Overlay {
+				id:   Str::new_static(crate::overlays::paste_menu::ID),
+				open: true,
+			});
+			self.overlays.show(Overlay::Panel(Box::new(PasteMenu::new(
+				Str::new(text),
+				lines,
+				&self.ui,
+			))));
+		}
+		Routed::Repaint
+	}
+
+	/// Applies a large-paste menu choice (pi `presentLargePasteMenu`): a
+	/// failed file save falls back to the chip so the paste is never lost.
+	fn land_paste(&mut self, text: &Str, choice: PasteChoice) -> Routed {
+		match choice {
+			PasteChoice::Wrapped => {
+				self
+					.composer
+					.paste_chip(text, Some(&wrap_in_attachment_block(text)));
+				Routed::Repaint
+			},
+			PasteChoice::Inline => {
+				self.composer.paste_chip(text, None);
+				Routed::Repaint
+			},
+			PasteChoice::LocalFile => match save_paste_file(self.services.as_ref(), text) {
+				Ok(url) => {
+					self.composer.insert_text(&url);
+					self.notice(format!("Saved paste to {url}"))
+				},
+				Err(error) => {
+					self.composer.paste_chip(text, None);
+					self.notice(format!(
+						"Failed to save paste to a file — attached as a text chip instead ({error})"
+					))
+				},
+			},
+		}
 	}
 
 	/// Composer-bound gestures that run before the editor sees the key:
@@ -1475,11 +1689,19 @@ impl Presenter {
 	}
 
 	fn composer_key(&mut self, key: Key) -> Result<Routed, HostError> {
-		Ok(match self.composer.key(key) {
+		let action = self.composer.key(key);
+		self.composer_action(action)
+	}
+
+	/// Routes what the composer produced for a key or a draft submission.
+	fn composer_action(&mut self, action: ComposerAction) -> Result<Routed, HostError> {
+		Ok(match action {
 			ComposerAction::Submit(text) => self.submit(text),
+			ComposerAction::SubmitWithImages { text, images } => self.submit_with_images(text, &images),
 			// A submitted `/name args` line is the console statement
 			// `name args`, exactly like a bound key.
 			ComposerAction::Command(statement) => self.run_console(statement.as_str())?,
+			ComposerAction::Queue(text) => self.queue_for_yield(text),
 			ComposerAction::Copy(text) => {
 				self.clipboard = Some(text);
 				Routed::Repaint
@@ -1736,10 +1958,10 @@ impl Presenter {
 			Some(Clipboard::Text(text)) => {
 				if raw {
 					self.composer.paste_raw(&text);
+					Routed::Repaint
 				} else {
-					self.composer.paste(&text);
+					self.paste_into_composer(&text)
 				}
-				Routed::Repaint
 			},
 			Some(Clipboard::Image(image)) => match image.persist() {
 				Ok(path) => {
@@ -1847,6 +2069,61 @@ impl Presenter {
 		Routed::Repaint
 	}
 
+	/// Sends a draft with its image chips (pi `handleSubmit` with
+	/// `pendingImages`): each staged source is read once and typed from its
+	/// container header, then travels with the text so the controller can
+	/// journal the attachments beside the prompt. An unreadable or
+	/// unrecognized image hands the draft back with the reason shown, like a
+	/// refused local line.
+	pub(crate) fn submit_with_images(&mut self, text: Str, images: &[Str]) -> Routed {
+		if text.trim().is_empty() {
+			return Routed::Ignored;
+		}
+		let mut attachments = Vec::with_capacity(images.len());
+		for source in images {
+			let bytes = match std::fs::read(source.as_str()) {
+				Ok(bytes) => bytes::Bytes::from(bytes),
+				Err(error) => {
+					return self.refuse_local(&text, format!("Could not read image {source}: {error}"));
+				},
+			};
+			let Some(format) = omp_tui::imagefmt::format(&bytes) else {
+				return self.refuse_local(&text, format!("Unsupported image format: {source}"));
+			};
+			attachments.push(omp_session::AttachmentInput {
+				mime: Str::new_static(format.media_type()),
+				bytes,
+			});
+		}
+		if !self.turn_active {
+			self.set_turn_active(true);
+			self.last_prompt = Some(text.clone());
+		}
+		self.dismissed_error = pinned_error(&self.replica).map(|(handle, _)| handle);
+		self.silence_speech();
+		let _ = self
+			.commands
+			.send(HostCommand::SubmitWithAttachments { text, attachments });
+		Routed::Repaint
+	}
+
+	/// pi `#queueForYield` / `streamingBehavior: "followUp"`: while a turn
+	/// runs (or earlier follow-ups wait) the prompt is journaled under
+	/// `<queues><prompts>` and runs when the agent yields — never as
+	/// mid-turn steering. Idle with an empty queue, it starts at once.
+	pub(crate) fn queue_for_yield(&mut self, text: Str) -> Routed {
+		if text.trim().is_empty() {
+			return Routed::Ignored;
+		}
+		if !self.turn_active && self.queued_prompts().is_empty() {
+			let routed = self.submit(text);
+			return routed.max(self.notice("Sent queued message"));
+		}
+		self.last_prompt = Some(text.clone());
+		let _ = self.commands.send(HostCommand::Queue { prompt: text });
+		self.notice("Queued message for when the agent yields")
+	}
+
 	/// Applies one posted host action.
 	pub(crate) fn act(&mut self, action: HostAction) -> Result<Routed, HostError> {
 		Ok(match action {
@@ -1854,12 +2131,14 @@ impl Presenter {
 				if self.overlays.approval().is_some() {
 					return self.route_approval_key(Key::Esc);
 				}
+				// A modal overlay owns Escape first: an ask dialog answers
+				// `None` (unblocking the tool), an editing workbench cancels
+				// its editor, a picker clears its query. Only an overlay that
+				// ignores the key is dismissed.
 				if self.overlays.modal() {
-					self.close_overlay();
-					Routed::Repaint
-				} else {
-					return self.escape();
+					return self.route_unbound_key(Key::Esc);
 				}
+				return self.escape();
 			},
 			HostAction::Clear => {
 				let now = Instant::now();
@@ -1945,14 +2224,19 @@ impl Presenter {
 				}
 			},
 			HostAction::FollowUp => {
-				let text = Str::new(self.composer.text());
-				if text.trim().is_empty() {
-					return Ok(Routed::Ignored);
+				// pi `handleFollowUp`: same classification as Enter (`/`
+				// commands still run, `!`/`$` still run locally), but a plain
+				// prompt during a turn queues behind the stream instead of
+				// steering it. `take_submission` clears the editor first so a
+				// refused local line lands back in the composer.
+				match self.composer.take_submission() {
+					ComposerAction::Submit(text)
+						if self.turn_active && crate::composer::parse_local_input(&text).is_none() =>
+					{
+						self.queue_for_yield(text)
+					},
+					action => self.composer_action(action)?,
 				}
-				// Clear before submitting so a refused local line lands back
-				// in the composer instead of being wiped afterwards.
-				self.composer.clear();
-				self.submit(text)
 			},
 			HostAction::Retry => {
 				if self.turn_active {
@@ -2077,13 +2361,10 @@ impl Presenter {
 				Routed::Repaint
 			},
 			HostAction::SubmitDraft => {
-				let text = Str::new(self.composer.text());
-				if text.trim().is_empty() {
-					Routed::Ignored
-				} else {
-					self.composer.clear();
-					self.submit(text)
-				}
+				// The bound-key submission is the Enter submission: same
+				// history record, same `/` classification.
+				let action = self.composer.take_submission();
+				return self.composer_action(action);
 			},
 			HostAction::EscapeHook(hook) => {
 				self.escape_hooks.retain(|prior| prior.id != hook.id);
@@ -2186,6 +2467,10 @@ impl Presenter {
 				self.composer.set_text(text.as_str());
 				Routed::Repaint
 			},
+			PanelEvent::Paste { text, choice } => {
+				self.close_overlay();
+				self.land_paste(&text, choice)
+			},
 			PanelEvent::Notice(text) => self.notice(text),
 			PanelEvent::Copy(text) => {
 				self.clipboard = Some(text);
@@ -2264,6 +2549,11 @@ impl Presenter {
 			let _ = self
 				.commands
 				.send(HostCommand::Overlay { id: Str::new_static(overlay.id()), open: false });
+			// A panel may have signed the provider in or out (`/login`,
+			// `/logout`, `/setup`): the band's billing marker follows.
+			if matches!(overlay, Overlay::Panel(_)) {
+				self.local.sync_billing(self.services.as_ref(), &self.model);
+			}
 		}
 	}
 
@@ -2658,7 +2948,7 @@ impl Host {
 		let mut clipboard: Option<(oneshot::Receiver<Option<Clipboard>>, bool, Instant)> = None;
 		let mailbox = Arc::clone(&self.presenter.mailbox);
 		loop {
-			terminal.set_mouse(self.presenter.overlays.modal())?;
+			terminal.set_mouse(self.presenter.overlays.pointer())?;
 			self.sync_terminal_state(terminal)?;
 			let deadline = self.next_deadline();
 			if let Some(scope) = self.presenter.clipboard_read.take() {
@@ -3377,6 +3667,13 @@ impl NativeHost {
 		self.presenter.overlays.modal()
 	}
 
+	/// Whether the terminal is asked to report mouse input: any stacked
+	/// overlay, side panels included, takes pointer reports.
+	#[must_use]
+	pub fn mouse_tracking(&self) -> bool {
+		self.presenter.overlays.pointer()
+	}
+
 	/// Frame of the open picker or panel, when one is showing.
 	pub fn picker_frame(&mut self) -> Option<Frame> {
 		self
@@ -3401,6 +3698,13 @@ impl NativeHost {
 	#[must_use]
 	pub fn composer_text(&self) -> String {
 		self.presenter.composer.text()
+	}
+
+	/// Native spelling gates the composer's editor currently applies
+	/// (`cl_spelling_*`).
+	#[must_use]
+	pub const fn spelling_features(&self) -> SpellingFeatures {
+		self.presenter.composer.spelling_features()
 	}
 
 	/// Subagent the view is focused on, when any.
@@ -3617,12 +3921,13 @@ fn project_root(dom: &Dom) -> Option<PathBuf> {
 
 /// Derives the composer status facts from the replica, the launch badge, and
 /// the observer-local facts. `working` is the in-flight turn's start on the
-/// presentation clock.
+/// presentation clock; `focused` is the subagent the view shows.
 fn status_facts(
 	dom: &Dom,
 	badge: &ModelBadge,
 	local: &LocalFacts,
 	working: Option<Duration>,
+	focused: Option<&str>,
 ) -> StatusFacts {
 	let status = StatusLine::from_dom(dom);
 	// A live `ai_model` pick shows before its first turn journals it.
@@ -3634,8 +3939,7 @@ fn status_facts(
 	};
 	let home = (!status.home.is_empty()).then_some(status.home.as_str());
 	let path = display_path(status.session.as_str(), home, local.tmp.as_deref());
-	// Not yet journaled anywhere the replica can see: the advisor roster,
-	// compaction speculation, the credential's billing plan and account.
+	// Not yet journaled anywhere the replica can see: the advisor roster.
 	StatusFacts {
 		model,
 		mode: None,
@@ -3658,10 +3962,10 @@ fn status_facts(
 		cache_write: status.cache_write,
 		tokens_per_second: status.tokens_per_second,
 		cost_nano_usd: status.cost_nano_usd,
-		subscription: false,
-		premium_requests: 0,
-		account: None,
+		subscription: local.subscription,
+		premium_requests_millionths: status.premium_requests_millionths,
 		working,
+		focused_agent: focused.map(Str::new),
 	}
 }
 
@@ -3782,8 +4086,9 @@ pub fn render_surface(
 ) -> Frame {
 	let replica = Dom::from_snapshot(snapshot);
 	let working = has_active_turn(&replica).then_some(Duration::ZERO);
-	let facts = status_facts(&replica, model, local, working);
-	let composer = Composer::new(size.width, ui.clone(), facts, Vec::new(), None);
+	let facts = status_facts(&replica, model, local, working, None);
+	let composer =
+		Composer::new(size.width, ui.clone(), facts, Vec::new(), Arc::new(|_: &str| None), None);
 	let status = StatusLine::from_dom(&replica);
 	let welcome = || RenderedBlock {
 		view:      BlockView {

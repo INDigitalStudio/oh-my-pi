@@ -50,6 +50,28 @@ impl Card for AskCard {
 				Some((id, values))
 			})
 			.collect();
+		// The user's own words beside the choices (`omp_tools::ask::Answer`):
+		// free text through the Other choice, an attached note, and the
+		// headless-timeout marker (pi `renderAnswerOptionLines` /
+		// `renderCustomInputLines` / `renderNoteLines`).
+		let written: BTreeMap<&str, Written<'_>> = answers
+			.iter()
+			.filter_map(|answer| {
+				let id = answer.get("id")?.as_str()?;
+				Some((id, Written {
+					custom_input: answer
+						.get("customInput")
+						.or_else(|| answer.get("custom_input"))
+						.and_then(Value::as_str),
+					note:         answer.get("note").and_then(Value::as_str),
+					timed_out:    answer
+						.get("timed_out")
+						.or_else(|| answer.get("timedOut"))
+						.and_then(Value::as_bool)
+						.unwrap_or(false),
+				}))
+			})
+			.collect();
 		let title = if answered {
 			format!(
 				"{} Ask {} questions",
@@ -116,6 +138,38 @@ impl Card for AskCard {
 					question_rows.push(dom! { <text pad-x=3 fg=muted>{desc}</text> }.into_component());
 				}
 			}
+			if let Some(written) = written.get(id) {
+				if let Some(custom) = written.custom_input {
+					let mut lines = custom.split('\n');
+					let first = Str::new(lines.next().unwrap_or_default());
+					question_rows.push(
+						dom! { <row gap=1 pad-x=1><i:success/><text>{first}</text></row> }
+							.into_component(),
+					);
+					for line in lines {
+						let line = Str::new(line);
+						question_rows.push(dom! { <text pad-x=3>{line}</text> }.into_component());
+					}
+				}
+				if let Some(note) = written.note {
+					let mut lines = note.split('\n');
+					let first = Str::new(lines.next().unwrap_or_default());
+					question_rows.push(
+						dom! { <row gap=1 pad-x=1><text fg=muted>{"Note:"}</text><text>{first}</text></row> }
+							.into_component(),
+					);
+					for line in lines {
+						let line = Str::new(line);
+						question_rows.push(dom! { <text pad-x=7>{line}</text> }.into_component());
+					}
+				}
+				if written.timed_out {
+					question_rows.push(
+						dom! { <text pad-x=1 fg=muted>{"auto-selected after timeout — not a user choice"}</text> }
+							.into_component(),
+					);
+				}
+			}
 		}
 		dom! {
 			<box border=round title={title} title_pad=3 pad="0 1">
@@ -124,6 +178,13 @@ impl Card for AskCard {
 		}
 		.into_component()
 	}
+}
+
+/// What the user wrote for one answer beyond picking options.
+struct Written<'a> {
+	custom_input: Option<&'a str>,
+	note:         Option<&'a str>,
+	timed_out:    bool,
 }
 
 fn partial_args(raw: &str) -> Value {

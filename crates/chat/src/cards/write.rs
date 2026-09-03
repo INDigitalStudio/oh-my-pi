@@ -32,12 +32,33 @@ impl Card for WriteCard {
 	}
 }
 
-fn render_streaming(path: &str, content: &str, _expanded: bool, ui: &UiContext) -> Component {
-	let body = sf!("{}\n  3", number_lines(content.trim_end_matches('\n'), 1));
+/// Collapsed streaming previews follow the edge with a bounded tail window
+/// (pi `WRITE_STREAMING_PREVIEW_LINES`); `@expanded` lifts the cap.
+const STREAMING_PREVIEW_LINES: usize = 12;
+
+/// Numbers every segment of the streamed content the way pi's
+/// `formatStreamingContent` does: a trailing newline yields a numbered empty
+/// row, and the gutter keeps counting past the fixture's two lines.
+fn render_streaming(path: &str, content: &str, expanded: bool, ui: &UiContext) -> Component {
+	let total = content.split('\n').count();
+	let start = if expanded {
+		0
+	} else {
+		total.saturating_sub(STREAMING_PREVIEW_LINES)
+	};
+	let mut body = String::new();
+	if start > 0 {
+		let noun = if start == 1 { "line" } else { "lines" };
+		use std::fmt::Write as _;
+		let _ = writeln!(body, "… ({start} earlier {noun})");
+	}
+	if !content.is_empty() {
+		body.push_str(&number_segments(content.split('\n').skip(start), start + 1));
+	}
 	let title = sf!("Write: {} {path}", icon(ui, "typescript"));
 	dom! {
 		<box border=round title={title} title_pad=3>
-			<pre pad-x=1>{body}</pre>
+			if !body.is_empty() { <pre pad-x=1>{body}</pre> }
 			<row pad-x=1 gap=1>
 				<spinner kind=status/>
 				<text fg=muted>{"… (streaming)"}</text>
@@ -132,15 +153,19 @@ fn render_failed(view: &CardView<'_>, path: &str, ui: &UiContext) -> Component {
 }
 
 fn number_lines(text: &str, start: usize) -> Str {
+	Str::new(number_segments(text.lines(), start))
+}
+
+fn number_segments<'a>(lines: impl Iterator<Item = &'a str>, start: usize) -> String {
 	let mut out = String::new();
-	for (offset, line) in text.lines().enumerate() {
-		if !out.is_empty() {
+	for (offset, line) in lines.enumerate() {
+		if offset > 0 {
 			out.push('\n');
 		}
 		use std::fmt::Write as _;
 		let _ = write!(out, "{:>3} {}", start + offset, line.replace('\t', "   "));
 	}
-	Str::new(out)
+	out
 }
 
 fn icon<'a>(ui: &'a UiContext, name: &str) -> &'a str {

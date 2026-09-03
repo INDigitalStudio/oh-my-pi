@@ -401,7 +401,9 @@ impl Director for PyDirector {
 			),
 			_ => Verdict::Fail(sf!("Python extension Director returned an invalid verdict")),
 		};
-		DirectorEffect { verdict, updates, asides: Vec::new() }
+		let mut effect = DirectorEffect::new(verdict);
+		effect.updates = updates;
+		effect
 	}
 }
 

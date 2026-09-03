@@ -35,22 +35,46 @@ pub(crate) fn render_edit(
 	}
 	.unwrap_or(Value::Null);
 	let result = typed_result::<omp_tools::edit::Payload>(view).unwrap_or(Value::Null);
-	let section = result
+	let sections = result
 		.get("sections")
 		.and_then(Value::as_array)
-		.and_then(|v| v.first());
-	let input = string_at(&args, "input").unwrap_or_default();
+		.map(Vec::as_slice)
+		.unwrap_or_default();
+	// A multi-section transaction (pi `renderMultiFileResult`): every
+	// section is its own card, stacked with one blank row between them, so a
+	// five-file edit shows five diffs, never just the first.
+	if sections.len() > 1 {
+		let cards = sections
+			.iter()
+			.map(|section| render_section(view, Some(section), &args, expanded, ui))
+			.collect::<Vec<_>>();
+		return dom! { <col gap=1>{cards}</col> }.into_component();
+	}
+	render_section(view, sections.first(), &args, expanded, ui)
+}
+
+/// One file's card: the settled section when the transaction has one, else
+/// the streamed or committed arguments (preview while the call runs).
+fn render_section(
+	view: &CardView<'_>,
+	section: Option<&Value>,
+	args: &Value,
+	expanded: bool,
+	ui: &UiContext,
+) -> Component {
+	let input = string_at(args, "input").unwrap_or_default();
 	let source = section
-		.and_then(|v| string_at(v, "source_path"))
-		.or_else(|| string_at(&args, "file_path"))
-		.or_else(|| string_at(&args, "path"))
+		.and_then(|v| string_at(v, "path"))
+		.or_else(|| string_at(args, "file_path"))
+		.or_else(|| string_at(args, "path"))
 		.or_else(|| hashline_path(input))
 		.unwrap_or_default();
 	let destination = section
-		.and_then(|v| string_at(v, "path"))
-		.or_else(|| string_at(&args, "rename"));
-	let op = string_at(&args, "op")
-		.or_else(|| section.and_then(|v| string_at(v, "op")))
+		.and_then(|v| string_at(v, "move_dest"))
+		.or_else(|| string_at(args, "rename"));
+	let op = section
+		.and_then(|v| string_at(v, "op"))
+		.or_else(|| string_at(args, "op"))
 		.unwrap_or_else(|| {
 			if destination.is_some() {
 				"move"
@@ -64,11 +88,11 @@ pub(crate) fn render_edit(
 	if op == "move" || destination.is_some() && destination != Some(source) {
 		return render_move(view, source, destination.unwrap_or_default(), ui);
 	}
-	let path = section.and_then(|v| string_at(v, "path")).unwrap_or(source);
+	let path = source;
 	let diff = section
 		.and_then(|v| string_at(v, "diff"))
-		.or_else(|| string_at(&args, "previewDiff"))
-		.or_else(|| string_at(&args, "preview_diff"))
+		.or_else(|| string_at(args, "previewDiff"))
+		.or_else(|| string_at(args, "preview_diff"))
 		.unwrap_or_default();
 	let (added, removed) = diff_stats(diff);
 	let diff = presented_diff(view.status, diff);

@@ -1,16 +1,19 @@
 //! Observer-local composer: a retained editor tree whose draft never enters
 //! the session DOM until submission.
 
-use std::{cell::Cell, path::Path, rc::Rc, time::Duration};
+use std::{cell::Cell, fmt::Write as _, path::Path, rc::Rc, time::Duration};
 
 use omp_core::Str;
 use omp_tui::{
-	Command, Frame, Key, Ui, UiContext, UiEvent,
-	components::{ComposerStyle, EditorPane},
+	Command, EditorOptions, Frame, Key, SpellingFeatures, Ui, UiContext, UiEvent,
+	components::{
+		AttachmentContent, ComposerStyle, EditorPane, InlineAccent, PrefixAccent,
+		marker_sized_paste,
+	},
 };
 
 use crate::{
-	autocomplete::{PromptAction, PromptActions, composer_chain},
+	autocomplete::{PromptAction, PromptActions, UrlCompleter, composer_chain},
 	chrome::{COMPOSER_ID, GAP_ID, STATUS_ID, StatusBand, StatusFacts, composer_ui, top_gap_shown},
 };
 
@@ -41,12 +44,141 @@ pub enum ComposerAction {
 	Changed,
 	/// Submit the current draft as a prompt.
 	Submit(Str),
+	/// Submit the draft with the image chips it references (pi
+	/// `pendingImages`): `[Image #N]` in `text` is positional against
+	/// `images[N-1]`, each an image file path the host reads once.
+	SubmitWithImages {
+		/// The draft with chips expanded to their wire markers.
+		text:   Str,
+		/// Staged image sources in marker order.
+		images: Vec<Str>,
+	},
 	/// Run a submitted `/…` line as the console statement after the slash.
 	Command(Str),
+	/// Queue the draft behind the active turn (pi `->` / `=>` yield-queue
+	/// shorthand): the body runs when the agent yields, or at once when it
+	/// is idle with an empty queue.
+	Queue(Str),
 	/// Write text to the clipboard (the host owns OSC 52 / native access).
 	Copy(Str),
 	/// No composer action.
 	Ignored,
+}
+
+/// pi `compactImageMarkers`: the submitted images are the visible chips in
+/// marker order, so `[Image #M…]` for the K-th surviving marker `M` is
+/// rewritten to `[Image #K…]` — the positional `[Image #N] ↔ images[N-1]`
+/// contract holds after chips were deleted from the draft. Markers already
+/// dense (the common case) leave the text untouched.
+fn compact_image_markers(text: &str, markers: &[usize]) -> String {
+	if markers
+		.iter()
+		.enumerate()
+		.all(|(index, marker)| *marker == index + 1)
+	{
+		return text.to_owned();
+	}
+	const PREFIX: &str = "[Image #";
+	let mut out = String::with_capacity(text.len());
+	let mut rest = text;
+	while let Some(at) = rest.find(PREFIX) {
+		let (before, tail) = rest.split_at(at + PREFIX.len());
+		out.push_str(before);
+		let digits = tail
+			.find(|c: char| !c.is_ascii_digit())
+			.unwrap_or(tail.len());
+		match tail[..digits]
+			.parse::<usize>()
+			.ok()
+			.and_then(|old| markers.iter().position(|marker| *marker == old))
+		{
+			Some(index) if digits > 0 => {
+				let _ = write!(out, "{}", index + 1);
+			},
+			_ => out.push_str(&tail[..digits]),
+		}
+		rest = &tail[digits..];
+	}
+	out.push_str(rest);
+	out
+}
+
+/// pi `QUEUE_PREFIXES`: the yield-queue shorthand sigils.
+const QUEUE_PREFIXES: [&str; 2] = ["->", "=>"];
+
+/// pi `parseQueueShorthand`: the message body behind a leading `->` / `=>`
+/// on the trimmed draft, `None` when the draft carries no shorthand.
+#[must_use]
+pub fn parse_queue_shorthand(text: &str) -> Option<&str> {
+	let text = text.trim();
+	QUEUE_PREFIXES
+		.iter()
+		.find_map(|prefix| text.strip_prefix(prefix))
+		.map(str::trim)
+}
+
+/// What [`Composer::paste`] did with the text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PasteOutcome {
+	/// The editor took the paste (inline, or collapsed to a chip).
+	Inserted,
+	/// A marker-sized paste of `lines` lines reached
+	/// `cl_paste_large_menu_threshold`: nothing was inserted and the host
+	/// presents the large-paste menu (pi `handleLargePaste`).
+	Menu {
+		/// Line count of the paste, for the menu title.
+		lines: usize,
+	},
+}
+
+/// Composer knobs mirrored from convars (pi editor preferences).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComposerSettings {
+	/// pi `autocompleteMaxVisible`: dropdown window rows.
+	pub autocomplete_max_visible: i64,
+	/// pi `emojiAutocomplete`: `:shortcode:` dropdown and emoticon expansion.
+	pub emoji_autocomplete:       bool,
+	/// pi `paste.largeMenuThreshold`: line count at which a marker-sized
+	/// paste opens the large-paste menu; `<= 0` disables the menu.
+	pub paste_large_menu_lines:   i64,
+}
+
+impl Default for ComposerSettings {
+	fn default() -> Self {
+		Self {
+			autocomplete_max_visible: 10,
+			emoji_autocomplete:       true,
+			paste_large_menu_lines:   100,
+		}
+	}
+}
+
+/// pi `shouldSkipHistory`: whether a submitted line is kept out of Up/Down
+/// recall.
+///
+/// A `/login`, `/join`, or `/mcp add --token` line carries a secret (OAuth
+/// callback, room key, bearer token). The command name is split exactly
+/// like pi's `parseSlashCommand`: at the earliest whitespace or colon.
+#[must_use]
+pub fn should_skip_history(text: &str) -> bool {
+	let Some(body) = text.strip_prefix('/') else {
+		return false;
+	};
+	let separator = body.find(|character: char| character.is_whitespace() || character == ':');
+	let (name, args) = match separator {
+		Some(at) => (&body[..at], Some(body[at + 1..].trim())),
+		None => (body, None),
+	};
+	match name {
+		"login" | "join" => args.is_some(),
+		"mcp" => args.is_some_and(|args| {
+			args.starts_with("add")
+				&& args
+					.split_once("--token")
+					.is_some_and(|(_, rest)| rest.starts_with(char::is_whitespace))
+		}),
+		_ => false,
+	}
 }
 
 /// Composer prefix mode: the leading sigil recolors the chrome and Esc
@@ -183,6 +315,30 @@ fn split_local(text: &str) -> Option<(PrefixMode, usize, &str)> {
 #[must_use]
 pub fn prefix_mode_of(text: &str) -> Option<PrefixMode> {
 	split_local(text).map(|(mode, ..)| mode)
+}
+
+/// The editor chrome accent for a draft: the same grammar as
+/// [`prefix_mode_of`], so `$HOME is set`, `${x}`, and a pasted `$ git
+/// status` never paint eval mode.
+fn prefix_accent_of(text: &str) -> Option<PrefixAccent> {
+	prefix_mode_of(text).map(|mode| match mode {
+		PrefixMode::Bash => PrefixAccent::Bash,
+		PrefixMode::Eval => PrefixAccent::Eval,
+	})
+}
+
+/// Dims the leading `->` / `=>` of a yield-queue shorthand draft (pi's
+/// `QUEUE_LIST_MARKER_RE` editor highlighting).
+fn queue_shorthand_spans(text: &str) -> smallvec::SmallVec<(usize, usize, InlineAccent), 4> {
+	let mut spans = smallvec::SmallVec::new();
+	let start = text.len() - text.trim_start().len();
+	if let Some(prefix) = QUEUE_PREFIXES
+		.iter()
+		.find(|prefix| text[start..].starts_with(*prefix))
+	{
+		spans.push((start, start + prefix.len(), InlineAccent::Dim));
+	}
+	spans
 }
 
 /// Parses a submitted line into a local run (pi `input-controller.ts`
@@ -352,31 +508,86 @@ pub struct Composer {
 	occupied: bool,
 	/// IME-safe caret-row layout (`cl_ime_safe_cursor`).
 	ime_safe: bool,
+	/// Native spelling gates applied to the editor (`cl_spelling_*`).
+	spelling: SpellingFeatures,
+	/// Dropdown, emoji, and large-paste knobs (`cl_autocomplete_max_visible`,
+	/// `cl_emoji_autocomplete`, `cl_paste_large_menu_threshold`).
+	settings: ComposerSettings,
 	/// Prompt action accepted from the `#` menu, applied after the key.
 	pending:  Rc<Cell<Option<PromptAction>>>,
 }
 
 impl Composer {
 	/// Creates a focused composer at `width` for the launch facts, with the
-	/// slash `roster` and `@` file completion under `project_root`.
+	/// slash `roster`, `scheme://` completion from `urls`, and `@` file
+	/// completion under `project_root`.
 	#[must_use]
 	pub fn new(
 		width: u16,
 		ctx: UiContext,
 		facts: StatusFacts,
 		roster: Vec<Command>,
+		urls: UrlCompleter,
 		project_root: Option<&Path>,
 	) -> Self {
 		let actions = PromptActions::new();
 		let pending = actions.slot();
-		let chain = composer_chain(roster, actions, project_root);
+		let chain = composer_chain(roster, actions, urls, project_root);
 		let shape = ComposerStyle::Borderless;
 		let mut ui = composer_ui(facts, shape, width, ctx);
 		ui.with_component_mut::<EditorPane, _>(COMPOSER_ID, |pane| {
 			pane.set_completion(Box::new(chain));
+			// The chrome recolors on the composer's own sigil grammar, not
+			// on a bare leading byte (pi `isPythonMode` after
+			// `pythonCommandPrefixLength` + the pasted-shell-prompt guard).
+			pane.set_prefix_classifier(prefix_accent_of);
+			pane.set_inline_decorator(Some(Box::new(queue_shorthand_spans)));
 		});
 		ui.focus_first();
-		Self { ui, width, shape, occupied: false, ime_safe: false, pending }
+		Self {
+			ui,
+			width,
+			shape,
+			occupied: false,
+			ime_safe: false,
+			spelling: SpellingFeatures::default(),
+			settings: ComposerSettings::default(),
+			pending,
+		}
+	}
+
+	/// Applies the dropdown/emoji/large-paste knobs; returns whether they
+	/// changed.
+	pub fn set_settings(&mut self, settings: ComposerSettings) -> bool {
+		if self.settings == settings {
+			return false;
+		}
+		self.settings = settings;
+		self.ui.update_component::<EditorPane>(COMPOSER_ID, |pane| {
+			let options = pane.editor_options();
+			pane.set_editor_options(EditorOptions {
+				emoji: settings.emoji_autocomplete,
+				picker_rows: usize::try_from(settings.autocomplete_max_visible).unwrap_or(0),
+				..options
+			});
+			true
+		});
+		true
+	}
+
+	/// The dropdown/emoji/large-paste knobs currently applied.
+	#[must_use]
+	pub const fn settings(&self) -> ComposerSettings {
+		self.settings
+	}
+
+	/// The editor's chrome accent for the current draft (`None` is prose).
+	#[must_use]
+	pub fn prefix_accent(&self) -> Option<PrefixAccent> {
+		self
+			.ui
+			.with_component::<EditorPane, _>(COMPOSER_ID, EditorPane::prefix_accent)
+			.flatten()
 	}
 
 	/// Tells the composer whether a status/notice row is painted directly
@@ -388,6 +599,34 @@ impl Composer {
 		}
 		self.occupied = occupied;
 		self.sync_gap()
+	}
+
+	/// Applies the native spelling gates (`cl_spelling_*`); returns whether
+	/// they changed.
+	pub fn set_spelling_features(&mut self, features: SpellingFeatures) -> bool {
+		if self.spelling == features {
+			return false;
+		}
+		self.spelling = features;
+		self.ui.update_component::<EditorPane>(COMPOSER_ID, |pane| {
+			pane.set_spelling_features(features);
+			true
+		});
+		true
+	}
+
+	/// Native spelling gates currently applied to the editor.
+	#[must_use]
+	pub const fn spelling_features(&self) -> SpellingFeatures {
+		self.spelling
+	}
+
+	/// Seeds Up/Down prompt recall with `prompts`, newest first (pi
+	/// `setHistoryStorage` on a resumed session).
+	pub fn seed_history(&mut self, prompts: impl IntoIterator<Item = Str>) {
+		self
+			.ui
+			.with_component_mut::<EditorPane, _>(COMPOSER_ID, |pane| pane.seed_history(prompts));
 	}
 
 	/// Toggles pi's IME-safe cursor layout (`cl_ime_safe_cursor`); returns
@@ -509,9 +748,41 @@ impl Composer {
 		self.ui.height()
 	}
 
-	/// Inserts sanitized pasted text at the caret.
-	pub fn paste(&mut self, text: &str) {
+	/// Inserts sanitized pasted text at the caret, unless the paste is
+	/// marker-sized and reaches `cl_paste_large_menu_threshold` lines: then
+	/// nothing is inserted and the host shows the large-paste menu (pi
+	/// `handleLargePaste`), which lands the text through
+	/// [`Composer::paste_chip`] once the user chooses.
+	pub fn paste(&mut self, text: &str) -> PasteOutcome {
+		let threshold = usize::try_from(self.settings.paste_large_menu_lines).unwrap_or(0);
+		if threshold > 0 && marker_sized_paste(text) {
+			let lines = text.split('\n').count();
+			if lines >= threshold {
+				return PasteOutcome::Menu { lines };
+			}
+		}
 		let _ = self.ui.handle_paste(text);
+		PasteOutcome::Inserted
+	}
+
+	/// Stages pasted text as an attachment chip (pi `insertTextAttachment`):
+	/// the buffer holds a compact token and the submitted form is
+	/// `expansion` (default: the text itself). The large-paste menu's
+	/// "wrapped block" choice passes the `<attachment>`-wrapped text.
+	pub fn paste_chip(&mut self, text: &str, expansion: Option<&str>) {
+		let charset = self.ui.context().charset;
+		self
+			.ui
+			.with_component_mut::<EditorPane, _>(COMPOSER_ID, |pane| {
+				pane.stage_text_attachment(text, expansion, charset)
+			});
+		self.ui.resize(self.width);
+	}
+
+	/// Inserts `text` at the caret verbatim as ordinary draft text (a
+	/// `local://paste-N.md` reference from the large-paste menu).
+	pub fn insert_text(&mut self, text: &str) {
+		let _ = self.ui.handle_paste_raw(text);
 	}
 
 	/// Inserts pasted text verbatim (pi `app.clipboard.pasteTextRaw`): no
@@ -550,32 +821,60 @@ impl Composer {
 			return self.apply_prompt_action(action);
 		}
 		match event {
-			UiEvent::Submit => {
-				let text = self.text();
-				if text.trim().is_empty() {
-					return ComposerAction::Ignored;
-				}
-				self.ui.set_text(COMPOSER_ID, "");
-				// Large pastes collapse into attachment chips; the submitted text
-				// already carries their expansion, so drop the preview band.
-				let staged = self
-					.ui
-					.with_component_mut::<EditorPane, _>(COMPOSER_ID, |pane| pane.attachments().take())
-					.unwrap_or_default();
-				if !staged.is_empty() {
-					self.ui.resize(self.width);
-				}
-				// pi: a leading `/` line is a command, never a prompt.
-				match text.trim_start().strip_prefix('/') {
-					Some(command) if !command.starts_with('/') => {
-						ComposerAction::Command(Str::new(command.trim()))
-					},
-					_ => ComposerAction::Submit(Str::new(text)),
-				}
-			},
+			UiEvent::Submit => self.take_submission(),
 			UiEvent::Copied(text) => ComposerAction::Copy(text),
 			_ if claimed => ComposerAction::Changed,
 			_ => ComposerAction::Ignored,
+		}
+	}
+
+	/// Submits the draft: clears the editor, drops staged paste chips, records
+	/// the line for Up/Down recall (pi `addToHistory`, skipping secret-bearing
+	/// commands), and classifies it as a prompt or a `/` console statement.
+	/// `Ignored` when the draft is blank.
+	pub fn take_submission(&mut self) -> ComposerAction {
+		let text = self.text();
+		if text.trim().is_empty() {
+			return ComposerAction::Ignored;
+		}
+		self.ui.set_text(COMPOSER_ID, "");
+		// Chips leave the band with the draft: a large paste already expanded
+		// into the text, an image expanded into its `[Image #N]` marker and
+		// travels beside it as the N-th source.
+		let staged = self
+			.ui
+			.with_component_mut::<EditorPane, _>(COMPOSER_ID, |pane| pane.attachments().take())
+			.unwrap_or_default();
+		if !staged.is_empty() {
+			self.ui.resize(self.width);
+		}
+		let (markers, images): (Vec<usize>, Vec<Str>) = staged
+			.into_iter()
+			.filter_map(|attachment| match attachment.content {
+				AttachmentContent::Image { source, .. } => Some((attachment.marker, source)),
+				AttachmentContent::Text { .. } => None,
+			})
+			.unzip();
+		let text = compact_image_markers(&text, &markers);
+		if !should_skip_history(text.trim_start()) {
+			self
+				.ui
+				.with_component_mut::<EditorPane, _>(COMPOSER_ID, |pane| pane.add_to_history(&text));
+		}
+		// pi `parseQueueShorthand` runs before slash commands: `-> body`
+		// queues `body` for the next yield.
+		if let Some(body) = parse_queue_shorthand(&text) {
+			return ComposerAction::Queue(Str::new(body));
+		}
+		// pi: a leading `/` line is a command, never a prompt.
+		match text.trim_start().strip_prefix('/') {
+			Some(command) if !command.starts_with('/') => {
+				ComposerAction::Command(Str::new(command.trim()))
+			},
+			_ if !images.is_empty() => {
+				ComposerAction::SubmitWithImages { text: Str::new(text), images }
+			},
+			_ => ComposerAction::Submit(Str::new(text)),
 		}
 	}
 
@@ -673,14 +972,25 @@ mod tests {
 		}
 	}
 
+	fn no_urls() -> UrlCompleter {
+		std::sync::Arc::new(|_scheme: &str| None)
+	}
+
 	fn composer() -> Composer {
 		Composer::new(
 			60,
 			UiContext::default(),
 			facts(),
 			vec![Command::new("help", "Shows a name's description", &[])],
+			no_urls(),
 			None,
 		)
+	}
+
+	fn type_text(composer: &mut Composer, text: &str) {
+		for character in text.chars() {
+			composer.key(Key::Char(character));
+		}
 	}
 
 	fn rows(composer: &Composer) -> Vec<String> {
@@ -705,6 +1015,98 @@ mod tests {
 		assert_eq!(composer.key(Key::Enter), ComposerAction::Submit(Str::new_static("hi")));
 		assert_eq!(composer.text(), "");
 		assert_eq!(composer.frame().cursor(), Some((3, 2)));
+	}
+
+	/// pi `addToHistory` + `navigateHistory`: every submission (prompt,
+	/// `/command`, `!shell`) is recalled by Up on an empty draft; Down walks
+	/// back to the draft the user was writing.
+	#[test]
+	fn submissions_are_recalled_by_up_and_down_on_the_draft_edges() {
+		let mut composer = composer();
+		composer.key(Key::Up);
+		assert_eq!(composer.text(), "", "nothing to recall");
+		type_text(&mut composer, "first prompt");
+		assert!(matches!(composer.key(Key::Enter), ComposerAction::Submit(_)));
+		type_text(&mut composer, "/help");
+		assert!(matches!(composer.key(Key::Enter), ComposerAction::Command(_)));
+		type_text(&mut composer, "!ls");
+		assert!(matches!(composer.key(Key::Enter), ComposerAction::Submit(_)));
+		assert_eq!(composer.text(), "");
+		assert_eq!(composer.key(Key::Up), ComposerAction::Changed);
+		assert_eq!(composer.text(), "!ls");
+		assert_eq!(composer.key(Key::Up), ComposerAction::Changed);
+		assert_eq!(composer.text(), "/help");
+		assert_eq!(composer.key(Key::Up), ComposerAction::Changed);
+		assert_eq!(composer.text(), "first prompt");
+		composer.key(Key::Up);
+		assert_eq!(composer.text(), "first prompt", "oldest entry");
+		composer.key(Key::End);
+		composer.key(Key::Down);
+		composer.key(Key::Down);
+		assert_eq!(composer.key(Key::Down), ComposerAction::Changed);
+		assert_eq!(composer.text(), "", "back to the empty draft");
+		// A non-empty draft keeps Up for the host (transcript scrolling).
+		type_text(&mut composer, "draft");
+		composer.key(Key::Up);
+		assert_eq!(composer.text(), "draft");
+		// Recalling then submitting re-records without duplicates.
+		composer.clear();
+		composer.key(Key::Up);
+		assert!(matches!(composer.key(Key::Enter), ComposerAction::Submit(_)));
+		composer.key(Key::Up);
+		assert_eq!(composer.text(), "!ls");
+		composer.key(Key::Up);
+		assert_eq!(composer.text(), "/help");
+	}
+
+	/// pi `shouldSkipHistory`: secret-bearing commands never enter recall.
+	#[test]
+	fn secret_bearing_commands_are_kept_out_of_history() {
+		assert!(should_skip_history("/login https://x?code=abc&state=1"));
+		assert!(should_skip_history("/login:?code=abc"));
+		assert!(should_skip_history("/join room-link"));
+		assert!(should_skip_history("/mcp add --token abc srv"));
+		assert!(!should_skip_history("/login"));
+		assert!(!should_skip_history("/mcp add srv"));
+		assert!(!should_skip_history("/mcp list --tokens"));
+		assert!(!should_skip_history("login secret"));
+		let mut composer = composer();
+		type_text(&mut composer, "/login secret-code");
+		assert!(matches!(composer.key(Key::Enter), ComposerAction::Command(_)));
+		type_text(&mut composer, "safe");
+		assert!(matches!(composer.key(Key::Enter), ComposerAction::Submit(_)));
+		composer.key(Key::Up);
+		assert_eq!(composer.text(), "safe");
+		composer.key(Key::Up);
+		assert_eq!(composer.text(), "safe", "the login line is absent");
+	}
+
+	/// pi `setHistoryStorage`: a resumed session seeds recall newest first.
+	#[test]
+	fn seeded_history_is_recalled_newest_first() {
+		let mut composer = composer();
+		composer.seed_history([Str::new_static("newest"), Str::new_static("older")]);
+		assert_eq!(composer.key(Key::Up), ComposerAction::Changed);
+		assert_eq!(composer.text(), "newest");
+		assert_eq!(composer.key(Key::Up), ComposerAction::Changed);
+		assert_eq!(composer.text(), "older");
+	}
+
+	/// The `cl_spelling_*` convars reach the live editor.
+	#[test]
+	fn spelling_features_apply_to_the_editor_and_report_change() {
+		let mut composer = composer();
+		assert_eq!(composer.spelling_features(), SpellingFeatures::default());
+		let off =
+			SpellingFeatures { typo_detection: false, autocomplete: false, autocorrect: false };
+		assert!(composer.set_spelling_features(off));
+		assert!(!composer.set_spelling_features(off), "unchanged");
+		assert_eq!(composer.spelling_features(), off);
+		let pane = composer
+			.ui
+			.with_component::<EditorPane, _>(COMPOSER_ID, EditorPane::active_spelling_features)
+			.expect("composer pane");
+		assert_eq!(pane, off);
 	}
 
 	/// pi `useTerminalCursor`: the caret cell is never painted as a block;
@@ -784,7 +1186,7 @@ mod tests {
 		std::fs::write(root.path().join("note.txt"), "hi").expect("fixture");
 		std::fs::create_dir(root.path().join("src")).expect("fixture dir");
 		let mut composer =
-			Composer::new(60, UiContext::default(), facts(), Vec::new(), Some(root.path()));
+			Composer::new(60, UiContext::default(), facts(), Vec::new(), no_urls(), Some(root.path()));
 		composer.key(Key::Char('@'));
 		let deadline = std::time::Instant::now() + Duration::from_secs(5);
 		while !composer.popup_open() && std::time::Instant::now() < deadline {
@@ -996,5 +1398,161 @@ mod tests {
 		// Only the first line decides the command/operator shape.
 		assert!(parse_local_input("$ x = 1\ncd home").is_some());
 		assert!(looks_like_pasted_shell_prompt("cd home\nx = 1"));
+	}
+
+	/// The editor chrome recolors on the composer's grammar, not on a bare
+	/// leading `$`: shell variables and pasted shell prompts stay prose
+	/// (pi `isPythonMode` after `pythonCommandPrefixLength` + the guard).
+	#[test]
+	fn editor_chrome_follows_the_composer_sigil_grammar() {
+		let info = UiContext::default().theme.info;
+		let warn = UiContext::default().theme.warn;
+		let gutter = |composer: &Composer| composer.frame().cell(0, 2).style().foreground_color();
+		for (draft, accent) in [
+			("$HOME is set", None),
+			("${x} costs $5", None),
+			("$ git status", None),
+			("$ cd ~/project && cargo test", None),
+			("$ 1+1", Some(PrefixAccent::Eval)),
+			("$$ git status", Some(PrefixAccent::Eval)),
+			("!ls", Some(PrefixAccent::Bash)),
+			("plain prose", None),
+		] {
+			let mut composer = composer();
+			composer.set_text(draft);
+			assert_eq!(composer.prefix_accent(), accent, "{draft:?}");
+			let painted = gutter(&composer);
+			match accent {
+				Some(PrefixAccent::Eval) => assert_eq!(painted, info, "{draft:?}"),
+				Some(PrefixAccent::Bash) => assert_eq!(painted, warn, "{draft:?}"),
+				None => {
+					assert_ne!(painted, info, "{draft:?} must not paint eval mode");
+					assert_ne!(painted, warn, "{draft:?} must not paint bash mode");
+				},
+			}
+		}
+	}
+
+	/// pi `parseQueueShorthand`: `->` / `=>` on the trimmed draft queues the
+	/// body for the next yield; it wins over `/` classification and the
+	/// draft is still recalled by Up.
+	#[test]
+	fn queue_shorthand_submits_a_queue_action() {
+		assert_eq!(parse_queue_shorthand("-> run tests"), Some("run tests"));
+		assert_eq!(parse_queue_shorthand("  =>check logs  "), Some("check logs"));
+		assert_eq!(parse_queue_shorthand("->"), Some(""));
+		assert_eq!(parse_queue_shorthand("- > nope"), None);
+		assert_eq!(parse_queue_shorthand("a -> b"), None);
+
+		let mut composer = composer();
+		type_text(&mut composer, "-> /help later");
+		assert_eq!(
+			composer.key(Key::Enter),
+			ComposerAction::Queue(Str::new_static("/help later"))
+		);
+		assert_eq!(composer.text(), "");
+		assert_eq!(composer.key(Key::Up), ComposerAction::Changed);
+		assert_eq!(composer.text(), "-> /help later", "history keeps the shorthand");
+		composer.clear();
+		type_text(&mut composer, "=> second");
+		assert_eq!(composer.key(Key::Enter), ComposerAction::Queue(Str::new_static("second")));
+		type_text(&mut composer, "plain -> not shorthand");
+		assert!(matches!(composer.key(Key::Enter), ComposerAction::Submit(_)));
+	}
+
+	/// `cl_autocomplete_max_visible`, `cl_emoji_autocomplete`, and
+	/// `cl_paste_large_menu_threshold` reach the live editor through
+	/// [`Composer::set_settings`].
+	#[test]
+	fn settings_reach_the_editor_and_gate_the_paste_menu() {
+		let mut composer = composer();
+		assert!(!composer.set_settings(ComposerSettings::default()), "defaults are a no-op");
+		// Emoji dropdown follows the switch.
+		type_text(&mut composer, ":joy");
+		assert!(composer.popup_open(), "emoji dropdown opens by default");
+		assert!(composer.set_settings(ComposerSettings {
+			emoji_autocomplete: false,
+			..ComposerSettings::default()
+		}));
+		assert!(!composer.popup_open(), "the switch closes the built-in dropdown");
+		composer.clear();
+
+		// A marker-sized paste at or above the line threshold is held for the
+		// menu; below it, or with the menu disabled, it collapses to a chip.
+		let twelve = (0..12).map(|n| format!("l{n}")).collect::<Vec<_>>().join("\n");
+		composer.set_settings(ComposerSettings {
+			paste_large_menu_lines: 12,
+			..ComposerSettings::default()
+		});
+		assert_eq!(composer.paste(&twelve), PasteOutcome::Menu { lines: 12 });
+		assert_eq!(composer.text(), "", "the menu holds the text; nothing landed");
+		composer.set_settings(ComposerSettings {
+			paste_large_menu_lines: 13,
+			..ComposerSettings::default()
+		});
+		assert_eq!(composer.paste(&twelve), PasteOutcome::Inserted);
+		assert!(composer.text_displayed().contains("#1"), "below the threshold: chip");
+		composer.replace_edited("");
+		composer.set_settings(ComposerSettings {
+			paste_large_menu_lines: 0,
+			..ComposerSettings::default()
+		});
+		assert_eq!(composer.paste(&twelve), PasteOutcome::Inserted, "0 disables the menu");
+		composer.replace_edited("");
+		composer.set_settings(ComposerSettings {
+			paste_large_menu_lines: 2,
+			..ComposerSettings::default()
+		});
+		assert_eq!(
+			composer.paste("a\nb\nc"),
+			PasteOutcome::Inserted,
+			"a small paste is never marker-sized, whatever the threshold"
+		);
+		assert_eq!(composer.text(), "a\nb\nc");
+
+		// Menu choices land through `paste_chip` / `insert_text`.
+		composer.replace_edited("");
+		composer.paste_chip(&twelve, Some(&format!("<attachment>\n{twelve}\n</attachment>")));
+		assert!(composer.text_displayed().contains("#1"), "{}", composer.text_displayed());
+		assert_eq!(composer.text().trim_end(), format!("<attachment>\n{twelve}\n</attachment>"));
+		composer.replace_edited("");
+		composer.insert_text("local://paste-1.md");
+		assert_eq!(composer.text(), "local://paste-1.md");
+	}
+
+	/// pi `compactImageMarkers`: surviving markers renumber densely against
+	/// the images actually submitted; dense drafts and foreign brackets stay
+	/// untouched.
+	#[test]
+	fn image_markers_compact_to_the_submitted_image_order() {
+		assert_eq!(
+			compact_image_markers("[Image #2, 4x3] then [Image #3] x", &[2, 3]),
+			"[Image #1, 4x3] then [Image #2] x"
+		);
+		assert_eq!(compact_image_markers("[Image #1] [Image #2]", &[1, 2]), "[Image #1] [Image #2]");
+		assert_eq!(compact_image_markers("[Image #9] [Image #] [x]", &[3]), "[Image #9] [Image #] [x]");
+		assert_eq!(compact_image_markers("no markers", &[]), "no markers");
+	}
+
+	/// Dropping an image stages a chip whose submission carries the source
+	/// beside pi's wire marker; a text-only draft still submits plainly.
+	#[test]
+	fn image_chips_submit_their_sources_in_marker_order() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let first = dir.path().join("one.png");
+		let second = dir.path().join("two.png");
+		std::fs::write(&first, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x04\0\0\0\x03").expect("png");
+		std::fs::write(&second, b"\x89PNG\r\n\x1a\n").expect("png");
+		let mut composer = composer();
+		composer.paste(&format!("'{}' '{}'", first.display(), second.display()));
+		assert!(composer.text_displayed().contains("#1") && composer.text_displayed().contains("#2"));
+		type_text(&mut composer, "compare");
+		assert_eq!(composer.key(Key::Enter), ComposerAction::SubmitWithImages {
+			text:   Str::new("[Image #1, 4x3] [Image #2] compare"),
+			images: vec![Str::new(first.to_string_lossy()), Str::new(second.to_string_lossy())],
+		});
+		assert_eq!(composer.text(), "");
+		type_text(&mut composer, "plain");
+		assert_eq!(composer.key(Key::Enter), ComposerAction::Submit(Str::new_static("plain")));
 	}
 }

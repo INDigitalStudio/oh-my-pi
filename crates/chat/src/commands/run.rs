@@ -133,6 +133,7 @@ impl Presenter {
 					"Sent queued message"
 				})
 			},
+			CommandAction::Prompt { text } => self.submit(text),
 			CommandAction::Force { tool, prompt } => {
 				let _ = self.commands.send(HostCommand::Director {
 					id:     Str::new_static(FORCE),

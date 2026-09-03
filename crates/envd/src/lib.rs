@@ -1,7 +1,8 @@
 //! Environment-host composition for project-scoped filesystem, process,
 //! document, tool, and extension authority.
 
-mod admission;
+/// Approval-tier resolution and env-owned invocation admission.
+pub mod admission;
 pub mod blobs;
 pub mod browser_daemon;
 pub mod browser_fetch;

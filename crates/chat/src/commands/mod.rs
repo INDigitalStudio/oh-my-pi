@@ -43,6 +43,8 @@ pub mod git;
 pub mod misc;
 /// Plan mode and plan review (`/plan`, `/plan-review`).
 pub mod plan;
+/// Prompt templates as slash commands (`/<template> [args]`).
+pub mod prompts;
 /// Host-side application of posted actions.
 mod run;
 /// Session lifecycle (`/new`, `/resume`, `/rewind`, `/tree`, …).
@@ -228,6 +230,13 @@ pub enum CommandAction {
 	Queue {
 		/// Prompt text run after the active turn.
 		prompt: Str,
+	},
+	/// A prompt-template command (`/<template> args`, pi
+	/// `promptTemplateCommands`): submit the expanded text exactly as a
+	/// typed prompt — a turn when idle, steering while one runs.
+	Prompt {
+		/// The expanded template.
+		text: Str,
 	},
 	/// `/force <tool> [prompt]`: push a `ForceTool` Director for the next
 	/// inference and optionally submit a prompt.

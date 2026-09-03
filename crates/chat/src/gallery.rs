@@ -4,7 +4,7 @@ use omp_core::Str;
 use omp_dom::{Handle, KnownTag, Node, PropId, Snapshot, Tag, Value as DomValue};
 use omp_session::{ComponentRegistry, Session};
 use omp_tool::Part;
-use omp_tui::{Charset, Frame, Ui, UiContext};
+use omp_tui::{Charset, Frame, IntoComponent as _, Ui, UiContext, dom};
 use serde_json::{Value, value::RawValue};
 use thiserror::Error;
 
@@ -217,7 +217,10 @@ fn render_fixture(
 	};
 	let mut ui_context = UiContext::default();
 	ui_context.charset = Charset::NerdFont;
-	let component = registry.render(card_tool(fixture.tool), &view, expanded, &ui_context);
+	let card = registry.render(card_tool(fixture.tool), &view, expanded, &ui_context);
+	// Pi captures tool blocks inside the transcript, where every block
+	// carries a one-row vertical margin; the gallery paints the same block.
+	let component = dom! { <col pad="1 0">{card}</col> }.into_component();
 	let ui = Ui::from_root(component, width, ui_context);
 	Ok(GallerySection { tool: fixture.tool, title: fixture.title, state, frame: ui.frame().clone() })
 }
@@ -447,17 +450,90 @@ fn fixture_payload(
 				"output_total_lines": 0
 			})
 		},
+		"ast_grep" => {
+			let matches = value
+				.get("matches")
+				.and_then(Value::as_array)
+				.into_iter()
+				.flatten()
+				.map(|entry| {
+					let line = entry.get("line").cloned().unwrap_or_else(|| serde_json::json!(1));
+					let bindings = match entry.get("bindings") {
+						Some(Value::Object(fields)) => fields
+							.iter()
+							.map(|(key, value)| format!("${key}={}", value.as_str().map_or_else(|| value.to_string(), str::to_owned)))
+							.collect::<Vec<_>>()
+							.join(", "),
+						Some(Value::String(text)) => text.clone(),
+						_ => String::new(),
+					};
+					serde_json::json!({
+						"path": entry.get("path").cloned().unwrap_or_else(|| serde_json::json!("")),
+						"line": line,
+						"column": entry.get("column").cloned().unwrap_or_else(|| serde_json::json!(1)),
+						"end_line": entry.get("end_line").cloned().unwrap_or(line),
+						"end_column": entry.get("end_column").cloned().unwrap_or_else(|| serde_json::json!(1)),
+						"text": entry.get("text").cloned().unwrap_or_else(|| serde_json::json!("")),
+						"bindings": bindings
+					})
+				})
+				.collect::<Vec<_>>();
+			let total = value
+				.get("match_count")
+				.or_else(|| value.get("total"))
+				.cloned()
+				.unwrap_or_else(|| serde_json::json!(matches.len()));
+			serde_json::json!({
+				"matches": matches,
+				"advisories": [],
+				"total": total,
+				"next_skip": null,
+				"files_searched": value.get("files_searched").cloned().unwrap_or_else(|| serde_json::json!(0))
+			})
+		},
+		"todo" => {
+			let phases = value
+				.get("phases")
+				.and_then(Value::as_array)
+				.into_iter()
+				.flatten()
+				.map(|phase| {
+					let tasks = phase
+						.get("tasks")
+						.or_else(|| phase.get("items"))
+						.and_then(Value::as_array)
+						.into_iter()
+						.flatten()
+						.map(|task| serde_json::json!({
+							"content": task.get("content").or_else(|| task.get("text")).cloned().unwrap_or_else(|| serde_json::json!("")),
+							"status": task.get("status").cloned().unwrap_or_else(|| serde_json::json!("pending")),
+							"blocker": task.get("blocker").cloned()
+						}))
+						.collect::<Vec<_>>();
+					serde_json::json!({
+						"name": phase.get("name").or_else(|| phase.get("phase")).cloned().unwrap_or_else(|| serde_json::json!("")),
+						"tasks": tasks
+					})
+				})
+				.collect::<Vec<_>>();
+			serde_json::json!({
+				"op": args.get("op").cloned().unwrap_or_else(|| serde_json::json!("view")),
+				"phases": phases,
+				"completed_tasks": value.get("completed_tasks").cloned().unwrap_or_else(|| serde_json::json!([]))
+			})
+		},
 		"browser" => serde_json::json!({
 			"action": value.get("action").or_else(|| args.get("action")).cloned().unwrap_or_else(|| serde_json::json!("run")),
 			"name": value.get("name").or_else(|| args.get("name")).cloned().unwrap_or_else(|| serde_json::json!("main")),
 			"url": value.get("url").cloned(),
 			"title": value.get("title").cloned(),
 			"result": value.get("result").cloned().or_else(|| value.get("display").cloned()),
-			"artifacts": value.get("artifacts").cloned().unwrap_or_else(|| serde_json::json!([]))
+			"artifacts": value.get("artifacts").cloned().unwrap_or_else(|| serde_json::json!([])),
+			"browser": value.get("browser").cloned()
 		}),
 		"computer" => serde_json::json!({
-			"code": args.get("code").cloned().unwrap_or_else(|| serde_json::json!("return await desktop.capabilities()")),
-			"results": value.get("results").cloned().unwrap_or_else(|| serde_json::json!([value.clone()])),
+			"code": args.get("code").cloned().unwrap_or_else(|| serde_json::json!("")),
+			"results": value.get("results").cloned().unwrap_or_else(|| serde_json::json!([])),
 			"artifacts": value.get("artifacts").cloned().unwrap_or_else(|| serde_json::json!([]))
 		}),
 		"task" => {
@@ -595,10 +671,14 @@ fn projected_parts(tool: &str, value: &serde_json::Value) -> Result<Vec<Part>, s
 			.collect::<Vec<_>>()
 			.join("\n"),
 		_ => value
-			.get("projected_text")
-			.or_else(|| value.get("output"))
-			.or_else(|| value.get("message"))
-			.and_then(Value::as_str)
+			.as_str()
+			.or_else(|| {
+				value
+					.get("projected_text")
+					.or_else(|| value.get("output"))
+					.or_else(|| value.get("message"))
+					.and_then(Value::as_str)
+			})
 			.map(str::to_owned)
 			.unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
 	};
@@ -682,7 +762,6 @@ fn card_tool(tool: &str) -> &str {
 		"report_tool_issue" => "report_issue",
 		"hub_inbox" | "hub_jobs" | "hub_list" | "hub_logs" | "hub_send" | "hub_start"
 		| "hub_wait" => "hub",
-		"vibe_kill" | "vibe_list" | "vibe_send" | "vibe_spawn" | "vibe_wait" => "vibe",
 		"custom" => "Custom Tool",
 		other => other,
 	}

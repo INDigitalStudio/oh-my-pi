@@ -383,7 +383,7 @@ pub enum ConfigStoreError {
 	/// JSON operation failed.
 	#[error("MCP configuration JSON operation failed for `{path}`")]
 	Json {
-		/// Production `~/.omp/mcp.json`, project `.omp/mcp.json`, or project-root
+		/// Production `~/.o2/mcp.json`, project `.omp/mcp.json`, or project-root
 		/// `.mcp.json` being decoded or encoded.
 		path:   PathBuf,
 		/// JSON parser or serializer error for the scoped configuration document.
@@ -412,7 +412,7 @@ pub enum ConfigStoreError {
 	AlreadyExists {
 		/// Server key already owned by the writable configuration document.
 		name: Str,
-		/// Exact `~/.omp/mcp.json`, project `.omp/mcp.json`, or project-root
+		/// Exact `~/.o2/mcp.json`, project `.omp/mcp.json`, or project-root
 		/// `.mcp.json` file that owns the key.
 		path: PathBuf,
 	},
@@ -422,7 +422,7 @@ pub enum ConfigStoreError {
 		/// Server key requested for removal from the writable configuration
 		/// document.
 		name: Str,
-		/// Exact `~/.omp/mcp.json`, project `.omp/mcp.json`, or project-root
+		/// Exact `~/.o2/mcp.json`, project `.omp/mcp.json`, or project-root
 		/// `.mcp.json` searched without resolving other scopes.
 		path: PathBuf,
 	},

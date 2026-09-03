@@ -5,6 +5,10 @@ use serde_json::Value;
 
 use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_input, typed_result};
 
+/// Collapsed generic responses show the first line plus this many more (pi
+/// `renderGeneric`: `lines.slice(1, 4)`).
+const GENERIC_PREVIEW_LINES: usize = 3;
+
 /// Language-server request and reference-result card.
 pub struct LspCard;
 
@@ -50,6 +54,27 @@ impl Card for LspCard {
 			.filter_map(|file| file.get("locations").and_then(Value::as_array))
 			.map(Vec::len)
 			.sum();
+		// Hover text, symbol tables, diagnostics, and "OK" all ride the
+		// bounded `output` projection (pi `renderGeneric` over the result
+		// text); a zero-reference search never leaves the Response empty.
+		let output_lines = result
+			.as_ref()
+			.and_then(|value| value.get("output"))
+			.and_then(Value::as_str)
+			.map(str::trim_end)
+			.filter(|text| !text.is_empty())
+			.map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
+			.unwrap_or_default();
+		let output_first = output_lines
+			.first()
+			.map_or_else(|| "No output".to_owned(), |line| line.trim().to_owned());
+		let output_preview = output_lines
+			.iter()
+			.skip(1)
+			.take(GENERIC_PREVIEW_LINES)
+			.map(|line| line.trim().to_owned())
+			.collect::<Vec<_>>();
+		let output_hidden = output_lines.len().saturating_sub(1 + GENERIC_PREVIEW_LINES);
 		let fault = diag_text(view).unwrap_or_default();
 		let title = format!(
 			"{} LSP {action}",
@@ -124,6 +149,27 @@ impl Card for LspCard {
 									<row><i:tree-last/><text pad-x=1>{format!("… {} more file", files.len() - 3)}</text></row>
 								}
 							</col>
+						} else if expanded {
+							<row gap=1><i:info-status/><text>{"Output"}</text></row>
+							for (index, line) in output_lines.iter().enumerate() {
+								<row pad-x=1 gap=1>
+									if index + 1 == output_lines.len() { <i:tree-last/> } else { <i:tree-branch/> }
+									<text>{line.replace('\t', "   ")}</text>
+								</row>
+							}
+						} else {
+							<row gap=1><i:info-status/><text fg=muted>{output_first}</text>
+								if output_lines.len() > 1 { <text fg=muted>{"⟨Ctrl+O: Expand⟩"}</text> }
+							</row>
+							for (index, line) in output_preview.iter().enumerate() {
+								<row pad-x=1 gap=1>
+									if index + 1 == output_preview.len() && output_hidden == 0 { <i:tree-last/> } else { <i:tree-branch/> }
+									<text fg=muted>{line.as_str()}</text>
+								</row>
+							}
+							if output_hidden > 0 {
+								<row pad-x=1 gap=1><i:tree-last/><text fg=muted>{format!("… {output_hidden} more {}", if output_hidden == 1 { "line" } else { "lines" })}</text></row>
+							}
 						}
 					</box>
 				},

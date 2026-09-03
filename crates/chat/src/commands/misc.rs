@@ -269,8 +269,8 @@ const SSH_HELP: &str = "**SSH host management**\n\n`/ssh list`\n`/ssh add <alias
                         --user <user> --host-key <SHA256:fingerprint> [--port <1-65535>] [--key \
                         <path>] [--scope user|project]`\n`/ssh remove <alias> [--scope \
                         user|project]`\n`/ssh help`\n\nProject declarations are stored in \
-                        `.omp/hosts.toml`; user declarations are stored in the OMP data \
-                        directory's `hosts.toml`. Project aliases take precedence.";
+                        `.omp/hosts.toml`; user declarations are stored in the user configuration \
+                        root's `hosts.toml` (`~/.o2`). Project aliases take precedence.";
 
 fn ssh_list(cx: &PanelCx<'_>) -> Result<Box<dyn crate::overlays::Panel>, Str> {
 	let hosts = cx.services.ssh_hosts().map_err(|error| sf!("{error}"))?;

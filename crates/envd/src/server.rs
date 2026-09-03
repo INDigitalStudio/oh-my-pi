@@ -104,7 +104,7 @@ use super::{
 	journal_runtime::{ExternalJournalActor, PersistenceControlFactory},
 	lsp_settings::LspSettings,
 	mcp::{
-		McpService, McpServiceError, ServiceSubscription, SubscriptionEvent,
+		McpConfigPaths, McpService, McpServiceError, ServiceSubscription, SubscriptionEvent,
 		control::McpControl,
 		manager::{McpManager, ProductionConnector},
 		settings::McpSettings,
@@ -316,6 +316,9 @@ pub enum EnvdError {
 	/// The non-session durable state authority could not be opened.
 	#[error("state authority failed: {0}")]
 	State(Str),
+	/// The owner's `~/.o2` configuration root could not be resolved.
+	#[error("user configuration root could not be resolved")]
+	ConfigRoot(#[from] omp_core::dirs::DataDirError),
 	/// The embedded Python runtime used by `eval` could not be initialized.
 	#[error("eval runtime failed: {0}")]
 	Eval(Str),
@@ -2379,7 +2382,10 @@ impl EnvServer {
 		let workspace = WorkspaceHost::open(root)?;
 		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-		mcp.bind_config_paths(state_dir, workspace.root());
+		mcp.bind_config_paths(McpConfigPaths::new(
+			&omp_core::dirs::user_config_root()?,
+			workspace.root(),
+		));
 		let lsp_settings = LspSettings::from_con(con);
 		let doc_config = omp_docserver::ServerConfig::new(root)
 			.map_err(|error| EnvdError::Document(Str::from(error.to_string())))?
@@ -2603,7 +2609,10 @@ impl EnvServer {
 		let root = workspace.root().to_path_buf();
 		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-		mcp.bind_config_paths(state_dir, workspace.root());
+		mcp.bind_config_paths(McpConfigPaths::new(
+			&omp_core::dirs::user_config_root()?,
+			workspace.root(),
+		));
 		let lsp_settings = LspSettings::from_con(con);
 		let document_lsp = omp_docserver::NativeLspOptions {
 			enabled: lsp_settings.enabled,
@@ -2867,7 +2876,7 @@ impl EnvServer {
 
 		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-		mcp.bind_config_paths(state_dir, &root);
+		mcp.bind_config_paths(McpConfigPaths::new(&omp_core::dirs::user_config_root()?, &root));
 		let github_cache = Arc::new(
 			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
 				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,

@@ -65,23 +65,44 @@ fn render_recall(view: &CardView<'_>, expanded: bool) -> Component {
 		.cloned()
 		.unwrap_or_default();
 	let result_query = field(&result, "query").unwrap_or(query);
-	let title = format!("Recall: {result_query} {} found", items.len());
+	// pi `recallToolRenderer`: the collapsed view is the header alone with
+	// the expand hint; zero matches is a warning header and nothing else;
+	// expanded bodies stop at `PREVIEW_LIMITS.OUTPUT_EXPANDED`.
+	let found = items.len();
+	let hidden = found.saturating_sub(RECALL_EXPANDED_ITEMS);
+	let title = if found == 0 {
+		format!("Recall: {result_query} no matches")
+	} else {
+		format!("Recall: {result_query} {found} found")
+	};
 	dom! {
 		<col>
-			<row gap=1><icon name="memory-tool"/><text>{title}</text></row>
-			if expanded {
-				for (index, item) in items.iter().enumerate() {
-					<text pad-x=2>{format!("{}. [{:.2}] {}", index + 1, item.get("score").and_then(Value::as_f64).unwrap_or_default(), item.pointer("/memory/content").and_then(Value::as_str).unwrap_or_default())}</text>
-					if let Some(context) = item.pointer("/memory/metadata/context").and_then(Value::as_str) {
-						<text pad-x=5 fg=muted>{format!("({context})")}</text>
+			<row gap=1>
+				if found == 0 { <i:warning-status/> } else { <icon name="memory-tool"/> }
+				<text>{title}</text>
+			</row>
+			if found > 0 {
+				if expanded {
+					for (index, item) in items.iter().take(RECALL_EXPANDED_ITEMS).enumerate() {
+						<text pad-x=2>{format!("{}. [{:.2}] {}", index + 1, item.get("score").and_then(Value::as_f64).unwrap_or_default(), item.pointer("/memory/content").and_then(Value::as_str).unwrap_or_default())}</text>
+						if let Some(context) = item.pointer("/memory/metadata/context").and_then(Value::as_str) {
+							<text pad-x=5 fg=muted>{format!("({context})")}</text>
+						}
 					}
+					if hidden > 0 {
+						<text pad-x=2 fg=muted>{format!("… {hidden} more {}", if hidden == 1 { "memory" } else { "memories" })}</text>
+					}
+				} else {
+					<text pad-x=2 fg=muted>{"⟨Ctrl+O: Expand⟩"}</text>
 				}
-			} else {
-				<text pad-x=2 fg=muted>{"⟨Ctrl+O: Expand⟩"}</text>
 			}
 		</col>
 	}.into_component()
 }
+
+/// Expanded recall bodies show this many memories (pi
+/// `PREVIEW_LIMITS.OUTPUT_EXPANDED`).
+const RECALL_EXPANDED_ITEMS: usize = 10;
 
 fn render_reflect(view: &CardView<'_>, expanded: bool) -> Component {
 	let query = field(

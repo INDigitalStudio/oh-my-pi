@@ -1,6 +1,6 @@
 //! Typed card for `ast_grep@2`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
@@ -38,31 +38,30 @@ impl Card for AstGrepCard {
 			.unwrap_or_default();
 		let match_count = result
 			.as_ref()
-			.and_then(|value| value.get("match_count").or_else(|| value.get("total")))
+			.and_then(|value| value.get("total"))
 			.and_then(Value::as_u64)
 			.unwrap_or(matches.len() as u64);
-		let file_count = result
-			.as_ref()
-			.and_then(|value| value.get("file_count"))
-			.and_then(Value::as_u64)
-			.unwrap_or_else(|| {
-				matches
-					.iter()
-					.filter_map(|entry| entry.get("path").and_then(Value::as_str))
-					.collect::<BTreeSet<_>>()
-					.len() as u64
-			});
+		let file_count = matches
+			.iter()
+			.filter_map(|entry| entry.get("path").and_then(Value::as_str))
+			.collect::<BTreeSet<_>>()
+			.len();
+		// `files_searched` is `0` for lifted `ast_grep@1` calls that never
+		// recorded it; pi only prints the meta when a count exists.
 		let searched = result
 			.as_ref()
 			.and_then(|value| value.get("files_searched"))
-			.and_then(Value::as_u64);
-		let scope = result
-			.as_ref()
-			.and_then(|value| value.get("scope_path"))
-			.and_then(Value::as_str)
-			.unwrap_or(path.as_str())
-			.to_owned();
+			.and_then(Value::as_u64)
+			.filter(|count| *count > 0);
+		let scope = path.clone();
 		let fault = diag_text(view);
+		let groups = directory_groups(&matches);
+		let shown = if expanded {
+			groups.len()
+		} else {
+			fitting_groups(&groups)
+		};
+		let hidden = groups.len() - shown;
 		dom! {
 			<col>
 				match view.status {
@@ -90,11 +89,14 @@ impl Card for AstGrepCard {
 								<text fg=muted>{"·"}</text><text fg=muted>{"searched"}</text><text>{searched.to_string()}</text>
 							}
 						</row>
-						if expanded {
+						for (group_index, (dir, entries)) in groups.iter().take(shown).enumerate() {
 							<col>
-								<row gap=1><i:tree-last/><text>{format!("# {scope}/")}</text></row>
-								for (index, entry) in matches.iter().enumerate() {
-									if index == 0 || matches[index - 1].get("path") != entry.get("path") {
+								<row gap=1>
+									if hidden == 0 && group_index + 1 == shown { <i:tree-last/> } else { <i:tree-branch/> }
+									<text>{format!("# {dir}")}</text>
+								</row>
+								for (index, entry) in entries.iter().enumerate() {
+									if index == 0 || entries[index - 1].get("path") != entry.get("path") {
 										<text pad-x=3>{format!("## {}", file_name(entry))}</text>
 									}
 									<text pad-x=3>{match_line(entry)}</text>
@@ -103,8 +105,9 @@ impl Card for AstGrepCard {
 									}
 								}
 							</col>
-						} else if match_count > 1 {
-							<row gap=1><i:tree-last/><text>{format!("… {} more match", match_count - 1)}</text></row>
+						}
+						if hidden > 0 {
+							<row gap=1><i:tree-last/><text>{format!("… {hidden} more {}", if hidden == 1 { "match" } else { "matches" })}</text></row>
 						}
 					},
 					CardStatus::Failed => {
@@ -115,6 +118,51 @@ impl Card for AstGrepCard {
 		}
 		.into_component()
 	}
+}
+
+/// Collapsed previews spend at most this many rows on match groups (pi
+/// `COLLAPSED_MATCH_LIMIT = PREVIEW_LIMITS.COLLAPSED_LINES * 2`).
+const COLLAPSED_MATCH_LINES: usize = 6;
+
+/// Matches grouped by directory in path order (pi `formatGroupedFiles`
+/// blank-line groups: `# dir/`, then `## file` and its matches).
+fn directory_groups(matches: &[Value]) -> Vec<(String, Vec<&Value>)> {
+	let mut groups: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+	for entry in matches {
+		let path = entry.get("path").and_then(Value::as_str).unwrap_or_default();
+		let dir = path.rsplit_once('/').map_or(".", |(dir, _)| dir);
+		groups.entry(format!("{dir}/")).or_default().push(entry);
+	}
+	groups.into_iter().collect()
+}
+
+/// Rows one directory group paints: its header, each file header, each
+/// match line, and each binding row.
+fn group_rows(entries: &[&Value]) -> usize {
+	let mut rows = 1;
+	for (index, entry) in entries.iter().enumerate() {
+		let new_file = index == 0 || entries[index - 1].get("path") != entry.get("path");
+		rows += usize::from(new_file) + 1 + usize::from(binding_text(entry).is_some());
+	}
+	rows
+}
+
+/// Leading groups that fit the collapsed row budget whole (pi
+/// `renderTreeList` with `maxCollapsedLines`): a group is shown only when
+/// its rows plus the summary row reserved for any group after it fit.
+fn fitting_groups(groups: &[(String, Vec<&Value>)]) -> usize {
+	let mut fitted = 0;
+	let mut shown = 0;
+	for (index, (_, entries)) in groups.iter().enumerate() {
+		let reserved = usize::from(index + 1 < groups.len());
+		let rows = group_rows(entries);
+		if fitted + rows + reserved > COLLAPSED_MATCH_LINES {
+			break;
+		}
+		fitted += rows;
+		shown = index + 1;
+	}
+	shown
 }
 
 fn file_name(entry: &Value) -> String {

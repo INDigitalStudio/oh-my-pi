@@ -61,10 +61,25 @@ pub struct Local {
 	thinking_tokens: u64,
 	/// Last cumulative token count and when it was observed.
 	last_tokens:     Option<(u64, Duration)>,
+	/// Which assistant content stream received the newest delta of the
+	/// in-flight message.
+	head:            Option<StreamHead>,
 	/// Observer-local transcript row left behind by a session reset.
 	banner:          Option<Banner>,
 	/// Distinguishes successive banners so a new one mounts fresh.
 	banner_serial:   u64,
+}
+
+/// The assistant content stream that received the newest delta (pi
+/// `#shouldAnimateThinking`'s `tail`): the DOM keeps reasoning and answer
+/// text as two properties, so which one the model is writing right now is
+/// an observer-local fact read off the delta events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamHead {
+	/// The newest delta was reasoning.
+	Thinking,
+	/// The newest delta was answer text.
+	Text,
 }
 
 /// A transcript row that exists only in this observer (pi `present(...)`
@@ -114,6 +129,13 @@ impl Local {
 		self.thinking_tokens
 	}
 
+	/// The assistant stream the newest delta landed on, once one has been
+	/// observed this message.
+	#[must_use]
+	pub const fn stream_head(&self) -> Option<StreamHead> {
+		self.head
+	}
+
 	/// The observer-local banner row, if one is pending.
 	#[must_use]
 	pub const fn banner(&self) -> Option<&Banner> {
@@ -158,8 +180,15 @@ impl Local {
 				self.last_tokens = None;
 				self.thinking_tokens = 0;
 				self.gauge.reset();
+				self.head = None;
 				false
 			},
+			// pi `#shouldAnimateThinking`: the pulse follows the active tail
+			// block, so the projection re-runs only when the head moves.
+			KernelEvent::ThinkingDelta(_) => {
+				self.head.replace(StreamHead::Thinking) != Some(StreamHead::Thinking)
+			},
+			KernelEvent::TextDelta(_) => self.head.replace(StreamHead::Text) != Some(StreamHead::Text),
 			KernelEvent::Usage { output_tokens, reasoning_tokens } => {
 				// pi: `usage.reasoningTokens ?? usage.output`, fed as deltas so
 				// a fresh turn restarting at zero never spikes the gauge.
@@ -731,7 +760,7 @@ mod tests {
 			blocks(&session),
 			Duration::ZERO,
 		);
-		let mut check = |session: &Session, projection: &mut Projection, step: &str| {
+		let check = |session: &Session, projection: &mut Projection, step: &str| {
 			assert!(
 				projection.reconcile(blocks(session), blocks(session), Duration::ZERO),
 				"reconcile rebuilt at {step}"

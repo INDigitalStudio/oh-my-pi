@@ -17,7 +17,9 @@ pub struct StatusLine {
 	/// User-facing session title from the `<meta>` `name` prop, when the
 	/// session has been named.
 	pub name:              Option<Str>,
-	/// Input tokens of the most recent receipt: the live context size.
+	/// Prompt size of the most recent receipt — uncached input plus the
+	/// cache read/write tokens — the live context size (pi
+	/// `calculatePromptTokens`).
 	pub context:           u64,
 	/// Total input tokens across visible turns.
 	pub tokens_in:         u64,
@@ -29,6 +31,10 @@ pub struct StatusLine {
 	pub cache_write:       u64,
 	/// Total spend across visible turns in nano-US dollars.
 	pub cost_nano_usd:     u64,
+	/// Total premium-request units billed across visible turns at millionth
+	/// precision (GitHub Copilot `premium_interactions`; pi
+	/// `usage.premiumRequests`).
+	pub premium_requests_millionths: u64,
 	/// Output throughput of the most recent receipt (`tokens_out` over
 	/// `duration-ms`), when the receipt journals a duration.
 	pub tokens_per_second: Option<f32>,
@@ -69,6 +75,7 @@ impl StatusLine {
 		let mut cache_read = 0_u64;
 		let mut cache_write = 0_u64;
 		let mut cost_nano_usd = 0_u64;
+		let mut premium_requests_millionths = 0_u64;
 		let mut tokens_per_second = None;
 		let mut turns = 0;
 		for turn in dom.children(dom.body()) {
@@ -91,14 +98,19 @@ impl StatusLine {
 						}
 					},
 					Tag::Known(KnownTag::Usage) => {
-						context = prop_u64(child, PropId::TokensIn);
+						let input = prop_u64(child, PropId::TokensIn);
+						let read = prop_u64(child, PropId::CacheRead);
+						let write = prop_u64(child, PropId::CacheWrite);
 						let out = prop_u64(child, PropId::TokensOut);
-						tokens_in = tokens_in.saturating_add(context);
+						context = input.saturating_add(read).saturating_add(write);
+						tokens_in = tokens_in.saturating_add(input);
 						tokens_out = tokens_out.saturating_add(out);
-						cache_read = cache_read.saturating_add(prop_u64(child, PropId::CacheRead));
-						cache_write = cache_write.saturating_add(prop_u64(child, PropId::CacheWrite));
+						cache_read = cache_read.saturating_add(read);
+						cache_write = cache_write.saturating_add(write);
 						cost_nano_usd =
 							cost_nano_usd.saturating_add(prop_u64(child, PropId::CostNanoUsd));
+						premium_requests_millionths = premium_requests_millionths
+							.saturating_add(prop_u64(child, PropId::PremiumRequests));
 						tokens_per_second = throughput(out, prop_u64(child, PropId::DurationMs));
 					},
 					_ => {},
@@ -116,6 +128,7 @@ impl StatusLine {
 			cache_read,
 			cache_write,
 			cost_nano_usd,
+			premium_requests_millionths,
 			tokens_per_second,
 			turns,
 		}
@@ -378,6 +391,7 @@ mod tests {
 				cache_write:   50,
 				ttft_ms:       None,
 				duration_ms:   Some(4_000),
+				premium_requests_millionths: 330_000,
 			})
 			.expect("receipt");
 
@@ -392,18 +406,48 @@ mod tests {
 				cache_write:   0,
 				ttft_ms:       None,
 				duration_ms:   Some(2_000),
+				premium_requests_millionths: 1_000_000,
 			})
 			.expect("receipt");
 
 		let status = StatusLine::from_dom(session.dom());
 		assert_eq!(status.turns, 2);
-		assert_eq!(status.context, 3_000, "context is the newest receipt's input");
+		assert_eq!(
+			status.context, 5_500,
+			"context is the newest receipt's whole prompt: input + cache read + cache write"
+		);
 		assert_eq!(status.tokens_in, 4_000);
 		assert_eq!(status.tokens_out, 600);
 		assert_eq!(status.cache_read, 3_400);
 		assert_eq!(status.cache_write, 50);
 		assert_eq!(status.cost_nano_usd, 125_000_000);
+		assert_eq!(
+			status.premium_requests_millionths, 1_330_000,
+			"premium units sum across receipts"
+		);
 		assert_eq!(status.tokens_per_second, Some(200.0), "400 tokens over 2s");
+	}
+
+	#[test]
+	fn context_counts_cached_prompt_tokens_so_a_hot_cache_still_shows_pressure() {
+		let mut session = session();
+		session.begin_turn().expect("turn");
+		session.user("one", Vec::new()).expect("user");
+		session
+			.receipt(TurnReceipt {
+				tokens_in:     5_000,
+				tokens_out:    100,
+				cost_nano_usd: 0,
+				cache_read:    95_000,
+				cache_write:   0,
+				ttft_ms:       None,
+				duration_ms:   None,
+				premium_requests_millionths: 0,
+			})
+			.expect("receipt");
+		let status = StatusLine::from_dom(session.dom());
+		assert_eq!(status.context, 100_000, "a 95% cache hit is still a 100k prompt");
+		assert_eq!(status.tokens_in, 5_000, "cumulative input stays uncached-only");
 	}
 
 	#[test]
@@ -419,6 +463,7 @@ mod tests {
 		assert_eq!(status.cache_read, 0);
 		assert_eq!(status.cache_write, 0);
 		assert_eq!(status.cost_nano_usd, 0);
+		assert_eq!(status.premium_requests_millionths, 0);
 		assert_eq!(status.tokens_per_second, None, "no duration journaled");
 	}
 

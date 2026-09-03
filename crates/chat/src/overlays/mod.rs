@@ -30,6 +30,8 @@ pub mod agents;
 pub mod ask;
 /// `/copy` transcript picker.
 pub mod copy;
+/// Extension `input` / `editor` text prompts (`omp.ui.input`, `omp.ui.editor`).
+pub mod ext_input;
 /// `/extensions` Extension Control Center dashboard.
 pub mod extensions;
 /// Codex quota-reset fireworks celebration.
@@ -42,6 +44,8 @@ pub mod hub;
 pub mod info;
 /// Login dialog, logout account selector, and provider picker.
 pub mod login;
+/// Large-paste menu (wrapped block, local file, inline chip).
+pub mod paste_menu;
 /// `/pause` full-screen hold screen.
 pub mod pause;
 /// `/plan-review` plan review dialog.
@@ -102,6 +106,13 @@ pub enum PanelEvent {
 	Finish(Str),
 	/// Close the panel and place text in the composer.
 	Recall(Str),
+	/// Close the large-paste menu and land the held paste as chosen.
+	Paste {
+		/// The pasted text the menu held back.
+		text:   Str,
+		/// How to land it.
+		choice: paste_menu::PasteChoice,
+	},
 	/// Show a transient status notice; the panel stays open.
 	Notice(Str),
 	/// Write text to the clipboard; the panel stays open.
@@ -1144,6 +1155,14 @@ impl Overlays {
 		self.stack.last().is_some_and(Overlay::modal)
 	}
 
+	/// Whether the topmost overlay takes pointer input: every modal overlay
+	/// and a side panel (which scrolls and clicks while the composer stays
+	/// live). Drives terminal mouse tracking.
+	#[must_use]
+	pub fn pointer(&self) -> bool {
+		self.stack.last().is_some()
+	}
+
 	/// Returns the pending approval, when one is stacked.
 	#[must_use]
 	pub fn approval(&self) -> Option<&ApprovalOverlay> {
@@ -1295,6 +1314,60 @@ mod tests {
 		assert!(text.contains("Claude"), "{text}");
 		assert!(text.contains("current"), "{text}");
 		assert!(text.contains("Esc close"), "{text}");
+	}
+
+	/// A fresh picker over a large catalog opens scrolled to the current
+	/// model with the cursor marker on its row, and the facts line names
+	/// the same model (pi `model-selector.ts`: current model preselected and
+	/// visible).
+	#[test]
+	fn picker_opens_scrolled_to_the_current_model_with_the_cursor_on_it() {
+		let rows: Vec<ModelRow> = (0..300)
+			.map(|index| {
+				if index == 250 {
+					row("anthropic", "Claude Opus 5")
+				} else {
+					row("vendor", "model")
+				}
+			})
+			.collect();
+		let mut picker = picker(rows, 250, 0);
+		let frame = picker.frame(Size::new(100, 40));
+		let text = omp_tui::frame_text(frame);
+		let cursor = UiContext::default().charset.cursor().trim().to_owned();
+		let row = text
+			.lines()
+			.find(|line| line.contains("Claude Opus 5") && line.contains("current"))
+			.unwrap_or_else(|| panic!("the current model row is on screen:\n{text}"));
+		assert!(row.contains(&cursor), "the cursor marker sits on the current row: {row:?}");
+		assert!(text.contains("Claude Opus 5 · anthropic"), "facts describe the cursor row:\n{text}");
+		assert_eq!(picker.key(Key::Enter), PickerEvent::Pick(250), "Enter keeps the current model");
+	}
+
+	/// Filtering by a model name ranks whole-word matches ahead of scattered
+	/// subsequences, keeps the current model first among them, and moves the
+	/// cursor and facts line to the best match.
+	#[test]
+	fn picker_filter_ranks_the_current_whole_word_match_first() {
+		let rows = vec![
+			row("abliteration", "llama-3"),
+			row("openrouter", "Qwen Plus"),
+			row("openrouter", "gpt-oss-120b"),
+			row("zai", "glm-4-plus"),
+			row("openrouter", "Claude Opus 5"),
+			row("anthropic", "Claude Opus 5"),
+			row("anthropic", "Claude Opus 4.6"),
+		];
+		let mut picker = picker(rows, 5, 0);
+		for ch in "opus".chars() {
+			assert_eq!(picker.key(Key::Char(ch)), PickerEvent::Consumed);
+		}
+		let text = omp_tui::frame_text(picker.frame(Size::new(100, 40)));
+		assert!(!text.contains("Qwen Plus"), "o-p-u-s across words is not a match:\n{text}");
+		assert!(!text.contains("gpt-oss"), "{text}");
+		assert!(text.contains("3/7"), "three whole-word matches:\n{text}");
+		assert!(text.contains("Claude Opus 5 · anthropic"), "facts follow the best match:\n{text}");
+		assert_eq!(picker.key(Key::Enter), PickerEvent::Pick(5), "the current model ranks first");
 	}
 
 	#[test]

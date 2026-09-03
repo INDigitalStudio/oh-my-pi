@@ -256,6 +256,18 @@ pub(crate) fn elapsed_badge(view: &CardView<'_>) -> Option<Component> {
 	)
 }
 
+/// pi `previewLines` / `renderCodeCell` `*MaxLines`: the first `limit`
+/// lines and a `… N more lines` marker when more follow.
+pub(crate) fn preview_lines(text: &str, limit: usize) -> Str {
+	let total = text.lines().count();
+	if total <= limit {
+		return Str::new(text);
+	}
+	let mut out = text.lines().take(limit).collect::<Vec<_>>().join("\n");
+	out.push_str(&sf!("\n… {} more lines", total - limit));
+	Str::new(out)
+}
+
 pub(crate) fn typed_input<P>(view: &CardView<'_>) -> Option<serde_json::Value>
 where
 	P: DeserializeOwned + serde::Serialize,
@@ -444,7 +456,10 @@ impl CardRegistry {
 		registry.register(utility::SecurityScanCard);
 		registry.register(utility::TtsCard);
 		registry.register(utility::YieldCard);
-		registry.register(vibe::VibeCard);
+		registry.register(vibe::VibeCard::new());
+		for card in vibe::VibeCard::identities() {
+			registry.register(card);
+		}
 		registry.register(web_search::WebSearchCard);
 		registry.register(write::WriteCard);
 		registry

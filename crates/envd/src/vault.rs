@@ -19,33 +19,43 @@ struct VaultFile {
 	vaults: BTreeMap<Str, PathBuf>,
 }
 
+/// The two `vaults.toml` files one process reads.
+///
+/// User configuration lives under `~/.o2`
+/// ([`omp_core::dirs::user_config_root`], profile-aware) and never under the
+/// data or state directory; project declarations live in
+/// `<project>/.omp/vaults.toml` and shadow user vaults with the same name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaultPaths {
+	/// User-owned `<config root>/vaults.toml`.
+	pub user:    PathBuf,
+	/// Project-owned `<project>/.omp/vaults.toml`.
+	pub project: PathBuf,
+}
+
+impl VaultPaths {
+	/// Resolves both files from the user configuration root and the project
+	/// root.
+	#[must_use]
+	pub fn new(user_config_root: &Path, project_root: &Path) -> Self {
+		Self {
+			user:    user_config_root.join("vaults.toml"),
+			project: project_root.join(".omp/vaults.toml"),
+		}
+	}
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct VaultService {
 	roots: Arc<RwLock<BTreeMap<Str, PathBuf>>>,
 }
 
 impl VaultService {
-	pub fn load(path: &Path) -> Result<Self, VaultError> {
-		let body = match fs::read_to_string(path) {
-			Ok(body) => body,
-			Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-			Err(source) => return Err(VaultError::Io { path: path.to_path_buf(), source }),
-		};
-		let parsed: VaultFile = toml::from_str(&body)
-			.map_err(|source| VaultError::Parse { path: path.to_path_buf(), source })?;
-		let mut roots = BTreeMap::new();
-		for (name, root) in parsed.vaults {
-			if name.is_empty() || name.contains(['/', '\\']) {
-				return Err(VaultError::InvalidName { name });
-			}
-			let canonical = root
-				.canonicalize()
-				.map_err(|source| VaultError::Io { path: root.clone(), source })?;
-			if !canonical.is_dir() {
-				return Err(VaultError::NotDirectory { path: canonical });
-			}
-			roots.insert(name, canonical);
-		}
+	/// Loads the effective vault authority: every user vault, shadowed by any
+	/// project vault with the same name.
+	pub fn load_layered(paths: &VaultPaths) -> Result<Self, VaultError> {
+		let mut roots = parse_vaults(&paths.user)?;
+		roots.extend(parse_vaults(&paths.project)?);
 		Ok(Self { roots: Arc::new(RwLock::new(roots)) })
 	}
 
@@ -166,6 +176,30 @@ impl VaultService {
 	}
 }
 
+fn parse_vaults(path: &Path) -> Result<BTreeMap<Str, PathBuf>, VaultError> {
+	let body = match fs::read_to_string(path) {
+		Ok(body) => body,
+		Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+		Err(source) => return Err(VaultError::Io { path: path.to_path_buf(), source }),
+	};
+	let parsed: VaultFile = toml::from_str(&body)
+		.map_err(|source| VaultError::Parse { path: path.to_path_buf(), source })?;
+	let mut roots = BTreeMap::new();
+	for (name, root) in parsed.vaults {
+		if name.is_empty() || name.contains(['/', '\\']) {
+			return Err(VaultError::InvalidName { name });
+		}
+		let canonical = root
+			.canonicalize()
+			.map_err(|source| VaultError::Io { path: root.clone(), source })?;
+		if !canonical.is_dir() {
+			return Err(VaultError::NotDirectory { path: canonical });
+		}
+		roots.insert(name, canonical);
+	}
+	Ok(roots)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
 	#[error("cannot access vault path {path}")]
@@ -190,4 +224,53 @@ pub enum VaultError {
 	Escape,
 	#[error("vault operation exceeded its {limit}-byte bound")]
 	Limit { limit: usize },
+}
+
+#[cfg(test)]
+mod tests {
+	use omp_core::sf;
+
+	use super::*;
+
+	#[test]
+	fn layered_service_reads_user_config_root_and_project_shadows_it() {
+		let temp = tempfile::tempdir().expect("tempdir");
+		let user_root = temp.path().join("o2");
+		let project_root = temp.path().join("project");
+		let user_notes = temp.path().join("user-notes");
+		let project_notes = temp.path().join("project-notes");
+		let user_only = temp.path().join("user-only");
+		for dir in [&user_root, &project_root.join(".omp"), &user_notes, &project_notes, &user_only] {
+			fs::create_dir_all(dir).expect("directory");
+		}
+		fs::write(user_notes.join("a.md"), "user").expect("user note");
+		fs::write(project_notes.join("a.md"), "project").expect("project note");
+
+		let paths = VaultPaths::new(&user_root, &project_root);
+		assert_eq!(paths.user, user_root.join("vaults.toml"));
+		assert_eq!(paths.project, project_root.join(".omp/vaults.toml"));
+		fs::write(
+			&paths.user,
+			format!(
+				"[vaults]\nnotes = {:?}\nextra = {:?}\n",
+				user_notes.display().to_string(),
+				user_only.display().to_string()
+			),
+		)
+		.expect("user vaults");
+		fs::write(
+			&paths.project,
+			format!("[vaults]\nnotes = {:?}\n", project_notes.display().to_string()),
+		)
+		.expect("project vaults");
+
+		let service = VaultService::load_layered(&paths).expect("layered load");
+		assert_eq!(service.names(), vec![sf!("extra"), sf!("notes")]);
+		assert_eq!(service.read("notes", "a.md", 64).expect("shadowed read").as_ref(), b"project");
+		assert!(service.list("extra", "", 8).expect("user-only vault").0.is_empty());
+		assert!(matches!(service.read("absent", "a.md", 64), Err(VaultError::Unknown { .. })));
+
+		let missing = VaultPaths::new(&temp.path().join("nope"), &temp.path().join("nope"));
+		assert!(VaultService::load_layered(&missing).expect("missing files are empty").names().is_empty());
+	}
 }

@@ -7,6 +7,11 @@ use serde_json::Value;
 
 use super::{Card, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result};
 
+/// Command-output rows shown while collapsed (pi `PREVIEW_LIMITS.COLLAPSED_LINES`).
+const OUTPUT_COLLAPSED_LINES: usize = 3;
+/// Command-output rows shown when expanded (pi `PREVIEW_LIMITS.EXPANDED_LINES`).
+const OUTPUT_EXPANDED_LINES: usize = 12;
+
 /// Renders debugger session state and stack frames.
 pub struct DebugCard;
 
@@ -43,6 +48,10 @@ impl Card for DebugCard {
 		};
 		let data = result.get("data").unwrap_or(&Value::Null);
 		let session = data.get("session").unwrap_or(&Value::Null);
+		// Pi renders the Session block only for a snapshot-bearing result and
+		// always renders the command output; breakpoints, evaluations, and
+		// variable reads carry neither a session snapshot nor frames.
+		let has_session = session.is_object();
 		let frames = data
 			.get("frames")
 			.and_then(Value::as_array)
@@ -53,6 +62,27 @@ impl Card for DebugCard {
 		} else {
 			frames.len().min(2)
 		};
+		let output_lines = result
+			.get("output")
+			.and_then(Value::as_str)
+			.map(str::trim_end)
+			.filter(|text| !text.is_empty())
+			.map_or_else(
+				|| vec!["No output".to_owned()],
+				|text| {
+					text
+						.lines()
+						.map(|line| line.replace('\t', "   "))
+						.collect::<Vec<_>>()
+				},
+			);
+		let output_shown = if expanded {
+			OUTPUT_EXPANDED_LINES
+		} else {
+			OUTPUT_COLLAPSED_LINES
+		}
+		.min(output_lines.len());
+		let output_hidden = output_lines.len() - output_shown;
 		let title = format!("{} Debug {action}", ui.charset.icon_named("debug").unwrap_or_default());
 		let location = format!(
 			"{}:{}:{}",
@@ -69,22 +99,31 @@ impl Card for DebugCard {
 		dom! {
 			<box border=round title={title} title_pad=3 pad="0 1">
 				<col>
-					<hr title="Session" title_pad=3/>
-					<text>{format!("Session {}", str_field(session, "id"))}</text>
-					<text>{format!("Adapter: {}", str_field(session, "adapter"))}</text>
-					<text>{format!("Status: {}", str_field(session, "status"))}</text>
-					<text>{format!("CWD: {}", str_field(session, "cwd"))}</text>
-					<text>{format!("Program: {}", str_field(session, "program"))}</text>
-					<text>{format!("Stop reason: {}", str_field(session, "reason"))}</text>
-					<text>{format!("Frame: {}", str_field(session, "frame"))}</text>
-					<text>{format!("Instruction pointer: {}", str_field(session, "instruction_pointer"))}</text>
-					<text>{format!("Location: {location}")}</text>
-					<hr title="Output" title_pad=3/>
-					<text>{"Stack trace:"}</text>
-					for frame in frames.iter().take(shown) {
-						<text>{format!("- #{} {} @ {}:{}:{}", frame.get("id").and_then(Value::as_u64).unwrap_or_default(), str_field(frame, "name"), str_field(frame, "path"), frame.get("line").and_then(Value::as_u64).unwrap_or_default(), frame.get("col").and_then(Value::as_u64).unwrap_or_default())}</text>
+					if has_session {
+						<hr title="Session" title_pad=3/>
+						<text>{format!("Session {}", str_field(session, "id"))}</text>
+						<text>{format!("Adapter: {}", str_field(session, "adapter"))}</text>
+						<text>{format!("Status: {}", str_field(session, "status"))}</text>
+						<text>{format!("CWD: {}", str_field(session, "cwd"))}</text>
+						<text>{format!("Program: {}", str_field(session, "program"))}</text>
+						<text>{format!("Stop reason: {}", str_field(session, "reason"))}</text>
+						<text>{format!("Frame: {}", str_field(session, "frame"))}</text>
+						<text>{format!("Instruction pointer: {}", str_field(session, "instruction_pointer"))}</text>
+						<text>{format!("Location: {location}")}</text>
 					}
-					if shown < frames.len() { <text fg=muted>{format!("… {} more lines ⟨Ctrl+O: Expand⟩", frames.len() - shown)}</text> }
+					<hr title="Output" title_pad=3/>
+					if frames.is_empty() {
+						for line in output_lines.iter().take(output_shown) {
+							<text>{line.as_str()}</text>
+						}
+						if output_hidden > 0 { <text fg=muted>{format!("… {output_hidden} more lines ⟨Ctrl+O: Expand⟩")}</text> }
+					} else {
+						<text>{"Stack trace:"}</text>
+						for frame in frames.iter().take(shown) {
+							<text>{format!("- #{} {} @ {}:{}:{}", frame.get("id").and_then(Value::as_u64).unwrap_or_default(), str_field(frame, "name"), str_field(frame, "path"), frame.get("line").and_then(Value::as_u64).unwrap_or_default(), frame.get("col").and_then(Value::as_u64).unwrap_or_default())}</text>
+						}
+						if shown < frames.len() { <text fg=muted>{format!("… {} more lines ⟨Ctrl+O: Expand⟩", frames.len() - shown)}</text> }
+					}
 				</col>
 			</box>
 		}.into_component()

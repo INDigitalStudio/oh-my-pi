@@ -1,15 +1,16 @@
 //! Pure projection from an actor-owned session DOM replica to transcript
 //! blocks.
 
-use omp_core::{Str, StrMut};
+use omp_core::{Str, StrMut, sf};
 use omp_dom::{Dom, Handle, KnownTag, Node, PropId, Tag, Value};
-use omp_tui::{IntoComponent, UiContext, dom, slots::Mode};
+use omp_journal::data::Attachment;
+use omp_tui::{Charset, Icon, IntoComponent, UiContext, dom, slots::Mode};
 
 use crate::{
 	cards::{CardRegistry, CardStatus, CardView, Component},
 	notices::{cache, custom, divider, error, misc, usage},
-	thinking,
-	transcript::{Local, REVEAL_HORIZON},
+	reaction, thinking,
+	transcript::{Local, REVEAL_HORIZON, StreamHead},
 };
 
 /// Semantic transcript block class.
@@ -108,6 +109,9 @@ pub(crate) fn project(
 	}
 	let turns = dom.children(dom.body());
 	let cache_misses = cache::cache_invalidations(dom);
+	// pi `pickReactionTarget`: the nearest preceding user bubble, looking
+	// past notices and tool cards but never past an earlier reply.
+	let mut reaction_target: Option<ReactionTarget> = None;
 	for (index, turn) in turns.iter().enumerate() {
 		let Some(turn_node) = dom.get(*turn) else {
 			continue;
@@ -123,25 +127,36 @@ pub(crate) fn project(
 			};
 			match &node.tag {
 				Tag::Known(KnownTag::User) => {
-					let text = node.content.clone().unwrap_or_default();
+					let raw = node.content.clone().unwrap_or_default();
+					// Display-only collapse before any branch: guest and synthetic
+					// rows show the same chips as the plain bubble.
+					let text = collapse_image_markers(&raw, ui.charset);
+					let chips = attachment_chips(node, raw.as_str(), ui.charset);
 					let component: Component = if crate::notices::prop_bool(node, PropId::Synthetic) {
-						misc::synthetic_row(text.as_str(), options.expanded)
+						reaction_target = None;
+						with_attachments(misc::synthetic_row(text.as_str(), options.expanded), &chips)
 					} else if let Some(author) = crate::notices::prop_text(node, PropId::Author) {
-						misc::guest_bubble(author.as_str(), text.clone())
+						reaction_target = None;
+						with_attachments(misc::guest_bubble(author.as_str(), text.clone()), &chips)
 					} else {
-						user_bubble(text.clone()).into_component()
+						reaction_target = Some(ReactionTarget {
+							key:   block_key(*handle, BlockKind::User),
+							text:  text.clone(),
+							chips: chips.clone(),
+						});
+						user_bubble(text, None, &chips)
 					};
 					blocks.push(rendered(
 						*handle,
 						BlockKind::User,
-						text,
+						raw,
 						Mode::Mutable,
 						true,
 						component,
 					));
 				},
 				Tag::Known(KnownTag::Assistant) => {
-					assistant_blocks(dom, *handle, node, options, &mut blocks);
+					assistant_blocks(dom, *handle, node, options, &mut blocks, &mut reaction_target);
 				},
 				Tag::Known(KnownTag::Notice) => {
 					let kind = prop_text(node, PropId::Kind).unwrap_or_else(|| Str::new_static("info"));
@@ -234,22 +249,25 @@ pub(crate) fn project(
 
 /// Assistant reasoning and answer blocks (pi `AssistantMessageComponent`).
 ///
-/// Reasoning shown: an append-only head (`<text reveal>`) whose stable
-/// prefix may retire into scrollback mid-stream; reasoning hidden while the
-/// model is still reasoning: the breathing starburst pulse with the speed
-/// badge; the answer: a mutable markdown block typed out through the reveal
-/// cursor, snapped to its full text once a tool call starts (a transcript
-/// order boundary) or the message ends.
+/// Reasoning shown: an append-only Markdown head (`<md reveal>`, pi
+/// `new Markdown(text, 1, 0, …, { italic: true })`) whose stable prefix may
+/// retire into scrollback mid-stream; reasoning hidden while the model is
+/// still reasoning: the breathing starburst pulse with the speed badge; the
+/// answer: a mutable markdown block typed out through the reveal cursor,
+/// snapped to its full text once a tool call starts (a transcript order
+/// boundary) or the message ends.
 fn assistant_blocks(
 	dom: &Dom,
 	handle: Handle,
 	node: &Node,
 	options: &Options<'_>,
 	blocks: &mut Vec<RenderedBlock>,
+	reaction_target: &mut Option<ReactionTarget>,
 ) {
 	let finalized = node.prop(&PropId::StopReason.into()).is_some();
 	let raw_thinking = live_text(dom, handle, node, PropId::Thinking).unwrap_or_default();
-	let text = live_text(dom, handle, node, PropId::Text).unwrap_or_default();
+	let full_text = live_text(dom, handle, node, PropId::Text).unwrap_or_default();
+	let text = apply_reaction(&full_text, finalized, reaction_target.take(), blocks);
 	let thinking = thinking::display_thinking(&raw_thinking, options.prose_only);
 	let thinking = Str::new(thinking.as_str().trim());
 	let has_thinking = thinking::is_displayable(raw_thinking.as_str(), thinking.as_str());
@@ -257,9 +275,9 @@ fn assistant_blocks(
 	let reveal = options.smooth && !finalized && !tool_started;
 	if options.show_thinking && has_thinking {
 		let component = if reveal {
-			dom! { <text id={omp_tui::slots::STREAM_ID} reveal={REVEAL_HORIZON_PROP} fg=muted italic pad-x=1>{thinking.clone()}</text> }
+			dom! { <md id={omp_tui::slots::STREAM_ID} reveal={REVEAL_HORIZON_PROP} fg=muted italic pad-x=1>{thinking.clone()}</md> }
 		} else {
-			dom! { <text id={omp_tui::slots::STREAM_ID} fg=muted italic pad-x=1>{thinking.clone()}</text> }
+			dom! { <md id={omp_tui::slots::STREAM_ID} fg=muted italic pad-x=1>{thinking.clone()}</md> }
 		};
 		let mut block = rendered(
 			handle,
@@ -275,7 +293,7 @@ fn assistant_blocks(
 		&& !finalized
 		&& !tool_started
 		&& thinking::has_content(raw_thinking.as_str())
-		&& !thinking::has_content(text.as_str())
+		&& reasoning_is_head(options.local, text.as_str())
 	{
 		let local = options.local;
 		let pulse = omp_tui::components::Pulse::new()
@@ -302,6 +320,53 @@ fn assistant_blocks(
 			rendered(handle, BlockKind::Assistant, text.clone(), Mode::Mutable, finalized, component);
 		block.stream = Some(text);
 		blocks.push(block);
+	}
+}
+
+/// The user bubble a reply may react to (pi `ReactionTarget`): its block
+/// key plus the facts needed to redraw it with the badge.
+struct ReactionTarget {
+	key:   u64,
+	text:  Str,
+	chips: Vec<Str>,
+}
+
+/// pi `#displayMessage`: the reply's display text with the reaction line
+/// handled — stripped and badged onto the target bubble once resolved,
+/// withheld entirely while a streaming prefix could still become one, and
+/// left verbatim when there is no target. A reply consumes the target
+/// either way: a continuation after tool calls has nothing to react to.
+fn apply_reaction(
+	text: &Str,
+	finalized: bool,
+	target: Option<ReactionTarget>,
+	blocks: &mut [RenderedBlock],
+) -> Str {
+	let Some(target) = target else {
+		return text.clone();
+	};
+	let split = reaction::split_reaction(text.as_str());
+	match split.emoji {
+		Some(emoji) => {
+			if let Some(block) = blocks.iter_mut().rev().find(|block| block.view.key == target.key) {
+				block.component = user_bubble(target.text, Some(Str::new(emoji)), &target.chips);
+			}
+			Str::new(split.body)
+		},
+		None if split.pending && !finalized => Str::default(),
+		None => text.clone(),
+	}
+}
+
+/// pi `#shouldAnimateThinking`: the pulse shows while the model is reasoning
+/// right now — the newest delta was reasoning — so a second reasoning phase
+/// after visible text pulses again. An observer that has seen no delta (a
+/// replica fed by patches alone) falls back to the only order the DOM
+/// keeps: answer text having started means reasoning stopped.
+fn reasoning_is_head(local: &Local, text: &str) -> bool {
+	match local.stream_head() {
+		Some(head) => head == StreamHead::Thinking,
+		None => !thinking::has_content(text),
 	}
 }
 
@@ -561,11 +626,163 @@ fn card_view<'a>(
 	})
 }
 
-/// User message: pi paints the text on the `userMessageBg` tint with one
-/// cell of padding on every side (`new Markdown(text, 1, 1, …)` in
-/// `user-message.ts`: a tinted blank row above and below) and no border.
-fn user_bubble(text: Str) -> impl IntoComponent {
-	dom! { <text zone=prompt bg=surface pad="1 1">{text}</text> }
+/// User message: pi renders the text as Markdown on the `userMessageBg`
+/// tint with one cell of padding on every side (`new Markdown(text, 1, 1,
+/// …)` in `user-message.ts`: a tinted blank row above and below) and no
+/// border; the chrome brackets an OSC 133 prompt zone. An agent reaction
+/// replaces the top padding row with the emoji right-aligned inside the
+/// horizontal padding (`#reactionRow`); journaled attachments the text does
+/// not already reference add a chip row under the prose.
+fn user_bubble(text: Str, reaction: Option<Str>, chips: &[Str]) -> Component {
+	if reaction.is_none() && chips.is_empty() {
+		return dom! { <md zone=prompt bg=surface pad="1 1">{text}</md> }.into_component();
+	}
+	let chips = chips.to_vec();
+	dom! {
+		<col zone=prompt bg=surface>
+			if let Some(emoji) = reaction {
+				<row h=1 justify=end pad-x=1><text>{emoji}</text></row>
+			} else {
+				<spacer h=1/>
+			}
+			<md pad-x=1>{text}</md>
+			if !chips.is_empty() {
+				<row h=1 gap=2 pad-x=1>
+					for chip in chips { <text bold fg=accent>{chip}</text> }
+				</row>
+			}
+			<spacer h=1/>
+		</col>
+	}
+	.into_component()
+}
+
+/// A guest or synthetic user row followed by its attachment chip row, when
+/// the journaled attachment set has entries the text does not reference.
+fn with_attachments(component: Component, chips: &[Str]) -> Component {
+	if chips.is_empty() {
+		return component;
+	}
+	let chips = chips.to_vec();
+	dom! {
+		<col>
+			{component}
+			<row h=1 gap=2 pad-x=1 bg=surface>
+				for chip in chips { <text bold fg=accent>{chip}</text> }
+			</row>
+		</col>
+	}
+	.into_component()
+}
+
+/// Chips for the user node's journaled attachments (`data` = the fold's
+/// `Vec<Attachment>`, addressed as `attachment://N` by ordinal) that the
+/// text does not already carry as a `[Image #N]` / `[Video #N]` marker or
+/// an `attachment://N` reference: `<paperclip> #N · <size>`. A reference
+/// knows only its digest, size, and MIME, so the chip names the ordinal the
+/// model and the `read` tool use.
+fn attachment_chips(node: &Node, text: &str, charset: Charset) -> Vec<Str> {
+	let Some(Value::Json(raw)) = node.prop(&PropId::Data.into()) else {
+		return Vec::new();
+	};
+	let Ok(attachments) = serde_json::from_str::<Vec<Attachment>>(raw.get()) else {
+		return Vec::new();
+	};
+	let icon = charset.icon(Icon::Paperclip);
+	attachments
+		.iter()
+		.enumerate()
+		.filter_map(|(index, attachment)| {
+			let ordinal = index + 1;
+			(!text_references_attachment(text, ordinal)).then(|| {
+				sf!(
+					"{icon} #{ordinal} · {}",
+					misc::format_bytes(usize::try_from(attachment.blob.size).unwrap_or(usize::MAX))
+				)
+			})
+		})
+		.collect()
+}
+
+/// Whether `text` already shows attachment `ordinal`: a vision marker
+/// (`[Image #N`, `[Video #N`) or an `attachment://N` reference.
+fn text_references_attachment(text: &str, ordinal: usize) -> bool {
+	let digits = ordinal.to_string();
+	let follows = |prefix: &str| {
+		text.match_indices(prefix).any(|(at, _)| {
+			text[at + prefix.len()..]
+				.strip_prefix(digits.as_str())
+				.is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
+		})
+	};
+	follows("[Image #") || follows("[Video #") || follows("attachment://")
+}
+
+/// pi `collapseImageMarkers` (`composer-attachments.ts`, called with an
+/// unbounded image count from `user-message.ts`): the stored text carries
+/// bracketed `[Image #N, WxH]` / `[Video #N]` markers, optionally followed
+/// by their ` attachment://N` reference, but the transcript shows the same
+/// compact `<icon> #N` chip the composer used. Runs before Markdown layout
+/// so wrapping and bubble padding are computed on the visible text.
+fn collapse_image_markers(text: &Str, charset: Charset) -> Str {
+	if !text.contains("[Image #") && !text.contains("[Video #") {
+		return text.clone();
+	}
+	let mut out = StrMut::with_capacity(text.len());
+	let mut rest = text.as_str();
+	while let Some(start) = rest.find('[') {
+		out.push_str(&rest[..start]);
+		let candidate = &rest[start..];
+		match parse_vision_marker(candidate) {
+			Some((icon, ordinal, consumed)) => {
+				out.push_str(charset.icon(icon));
+				out.push_str(" #");
+				out.push_str(ordinal);
+				rest = &candidate[consumed..];
+			},
+			None => {
+				out.push_str("[");
+				rest = &candidate[1..];
+			},
+		}
+	}
+	out.push_str(rest);
+	out.freeze()
+}
+
+/// Parses one leading vision marker: `[Image #N]`, `[Image #N, WxH]`, or
+/// `[Video #N…]`, each optionally followed by ` attachment://N` naming the
+/// same ordinal. Returns the chip icon, the ordinal digits, and the byte
+/// length consumed.
+fn parse_vision_marker(candidate: &str) -> Option<(Icon, &str, usize)> {
+	let (icon, body) = if let Some(body) = candidate.strip_prefix("[Image #") {
+		(Icon::Image, body)
+	} else {
+		(Icon::Video, candidate.strip_prefix("[Video #")?)
+	};
+	let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+	if digits == 0 || body.as_bytes()[0] == b'0' {
+		return None;
+	}
+	let ordinal = &body[..digits];
+	let tail = &body[digits..];
+	let close = match *tail.as_bytes().first()? {
+		b']' => 0,
+		b',' => tail
+			.find(|c: char| c == ']' || c == '\n')
+			.filter(|at| tail.as_bytes()[*at] == b']')?,
+		_ => return None,
+	};
+	let mut consumed = candidate.len() - tail.len() + close + 1;
+	let reference = &candidate[consumed..];
+	if let Some(after) = reference.strip_prefix(" attachment://")
+		&& after
+			.strip_prefix(ordinal)
+			.is_some_and(|next| !next.starts_with(|c: char| c.is_ascii_digit()))
+	{
+		consumed += " attachment://".len() + ordinal.len();
+	}
+	Some((icon, ordinal, consumed))
 }
 
 fn rendered(
@@ -662,4 +879,365 @@ fn node_text(node: &Node) -> Option<Str> {
 		.content
 		.clone()
 		.or_else(|| prop_text(node, PropId::Text))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::time::Duration;
+
+	use omp_agent::KernelEvent;
+	use omp_session::{ComponentRegistry, Session};
+	use omp_tui::{Ui, frame_text};
+
+	use super::*;
+
+	fn empty_session() -> Session {
+		let directory = tempfile::tempdir().expect("temp directory");
+		let path = directory.keep().join("project.oms");
+		Session::create(path, ComponentRegistry::standard()).expect("session")
+	}
+
+	/// A session whose newest assistant is still streaming: reasoning, then
+	/// answer text when `text` is non-empty — none of it finalized.
+	fn streaming(thinking: &str, text: &str) -> Session {
+		let mut session = empty_session();
+		session.begin_turn().expect("turn");
+		session.user("hi", Vec::new()).expect("user");
+		session
+			.assistant_start("test/model", "test", "test/model")
+			.expect("assistant");
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn");
+		let assistant = session
+			.dom()
+			.children(turn)
+			.iter()
+			.copied()
+			.find(|handle| {
+				session
+					.dom()
+					.get(*handle)
+					.is_some_and(|node| node.tag == Tag::Known(KnownTag::Assistant))
+			})
+			.expect("assistant handle");
+		let sid = session
+			.stream_open(assistant, PropId::Thinking.into())
+			.expect("thinking stream");
+		session
+			.stream_append(sid, thinking)
+			.expect("thinking delta");
+		if !text.is_empty() {
+			let sid = session
+				.stream_open(assistant, PropId::Text.into())
+				.expect("text stream");
+			session.stream_append(sid, text).expect("text delta");
+		}
+		session
+	}
+
+	fn render(component: Component, width: u16) -> String {
+		let ui = Ui::from_root(component, width, UiContext::default());
+		frame_text(ui.frame())
+	}
+
+	fn projected(session: &Session, options: &Options<'_>) -> Vec<RenderedBlock> {
+		project(session.dom(), &CardRegistry::standard(), &UiContext::default(), options)
+	}
+
+	/// pi `user-message.ts`: `new Markdown(text, 1, 1, …)` on the tinted
+	/// background — inline emphasis renders, fences render as code, and a
+	/// padded blank row sits above and below the text.
+	#[test]
+	fn user_bubble_renders_markdown_with_padding_rows() {
+		let local = Local::default();
+		let options = Options::new(&local);
+		let mut session = empty_session();
+		session.begin_turn().expect("turn");
+		session
+			.user("run **exactly** this:\n\n```sh\necho pong\n```", Vec::new())
+			.expect("user");
+		let block = projected(&session, &options)
+			.into_iter()
+			.find(|block| block.view.kind == BlockKind::User)
+			.expect("user block");
+		let text = render(block.component, 40);
+		let rows: Vec<&str> = text.split('\n').collect();
+		assert!(rows.len() > 2, "{text}");
+		assert!(rows.first().is_some_and(|row| row.trim().is_empty()), "top pad row:\n{text}");
+		assert!(rows.last().is_some_and(|row| row.trim().is_empty()), "bottom pad row:\n{text}");
+		assert!(text.contains("run exactly this:"), "emphasis markers must not leak:\n{text}");
+		assert!(!text.contains("**"), "{text}");
+		assert!(
+			text.contains("  echo pong"),
+			"fenced code renders as an indented code block:\n{text}"
+		);
+		assert!(
+			rows
+				.iter()
+				.all(|row| row.is_empty() || row.starts_with(' ')),
+			"one cell of left padding:\n{text}"
+		);
+	}
+
+	/// pi `assistant-message.ts`: the reasoning trace is a Markdown block
+	/// (`new Markdown(text, 1, 0, …, { italic: true })`), so list bullets and
+	/// emphasis in the trace render instead of leaking their markers.
+	#[test]
+	fn reasoning_trace_renders_as_markdown() {
+		let local = Local::default();
+		let options = Options { smooth: false, ..Options::new(&local) };
+		let session = streaming("- **first** step\n- second step", "");
+		let block = projected(&session, &options)
+			.into_iter()
+			.find(|block| block.view.kind == BlockKind::Thinking)
+			.expect("thinking block");
+		assert_eq!(block.view.mode, Mode::AppendOnly);
+		assert_eq!(block.stream.as_deref(), Some("- **first** step\n- second step"));
+		let text = render(block.component, 40);
+		assert!(!text.contains("**"), "emphasis markers must not leak:\n{text}");
+		assert!(text.contains("- first step") && text.contains("- second step"), "{text}");
+	}
+
+	/// pi `#shouldAnimateThinking`: with reasoning hidden, the pulse shows
+	/// while the model's newest delta is reasoning — including a second
+	/// reasoning phase after visible text — and ends once text is the tail.
+	#[test]
+	fn hidden_thinking_pulse_follows_the_streaming_head_not_prior_text() {
+		let session = streaming("considering", "partial answer");
+		let has_pulse = |local: &Local| {
+			let options = Options { show_thinking: false, ..Options::new(local) };
+			projected(&session, &options)
+				.iter()
+				.any(|block| block.view.kind == BlockKind::Thinking && block.view.text == "Thinking")
+		};
+		let mut local = Local::default();
+		assert!(!local.on_kernel_event(&KernelEvent::InferenceStarted, Duration::ZERO));
+		assert!(local.on_kernel_event(&KernelEvent::ThinkingDelta("c".into()), Duration::ZERO));
+		assert!(!local.on_kernel_event(&KernelEvent::ThinkingDelta("o".into()), Duration::ZERO));
+		assert!(has_pulse(&local), "reasoning is the head");
+		assert!(local.on_kernel_event(&KernelEvent::TextDelta("p".into()), Duration::ZERO));
+		assert!(!has_pulse(&local), "text is the head");
+		assert!(local.on_kernel_event(&KernelEvent::ThinkingDelta("more".into()), Duration::ZERO));
+		assert!(has_pulse(&local), "a later reasoning phase pulses again despite prior text");
+		assert!(!local.on_kernel_event(&KernelEvent::InferenceStarted, Duration::ZERO));
+		assert_eq!(local.stream_head(), None);
+		assert!(!has_pulse(&local), "without a delta observed, started text means reasoning stopped");
+		let fresh = streaming("considering", "");
+		let options = Options { show_thinking: false, ..Options::new(&local) };
+		assert!(
+			projected(&fresh, &options)
+				.iter()
+				.any(|block| block.view.text == "Thinking"),
+			"without a delta observed, reasoning with no text pulses"
+		);
+	}
+
+	/// The handle of the last `<user>` in the newest turn.
+	fn last_user(session: &Session) -> Handle {
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn");
+		session
+			.dom()
+			.children(turn)
+			.iter()
+			.copied()
+			.rev()
+			.find(|handle| {
+				session
+					.dom()
+					.get(*handle)
+					.is_some_and(|node| node.tag == Tag::Known(KnownTag::User))
+			})
+			.expect("user handle")
+	}
+
+	fn set_prop(session: &mut Session, handle: Handle, prop: PropId, value: Value) {
+		session
+			.patch(omp_dom::Txn {
+				cause: session.head().expect("head"),
+				label: None,
+				ops:   vec![omp_dom::Op::Set { h: handle, prop: prop.into(), value }],
+			})
+			.expect("patch");
+	}
+
+	/// A finalized reply of `text` after the user prompt in the newest turn.
+	fn reply(session: &mut Session, text: &str) {
+		session
+			.assistant_start("test/model", "test", "test/model")
+			.expect("assistant");
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn");
+		let assistant = *session.dom().children(turn).last().expect("assistant");
+		let sid = session
+			.stream_open(assistant, PropId::Text.into())
+			.expect("text stream");
+		session.stream_append(sid, text).expect("text delta");
+		session.stream_close(sid).expect("close");
+		session.assistant_end("stop").expect("end");
+	}
+
+	/// The rendered user row and the first reply block, consumed from a
+	/// projection.
+	fn user_and_assistant(blocks: Vec<RenderedBlock>) -> (String, Option<RenderedBlock>) {
+		let mut user = None;
+		let mut assistant = None;
+		for block in blocks {
+			match block.view.kind {
+				BlockKind::User if user.is_none() => user = Some(block),
+				BlockKind::Assistant if assistant.is_none() => assistant = Some(block),
+				_ => {},
+			}
+		}
+		let user = user.expect("user block");
+		(render(user.component, 40), assistant)
+	}
+
+	fn user_and_assistant_text(blocks: Vec<RenderedBlock>) -> (String, Option<Str>) {
+		let (user, assistant) = user_and_assistant(blocks);
+		(user, assistant.map(|block| block.view.text))
+	}
+
+	/// Journaled attachments (`<user data=[BlobRef…]>`) the text does not
+	/// reference render as `<paperclip> #N · size` chips under the prompt,
+	/// while an attachment the text already shows as a vision marker is not
+	/// repeated; the chips ride guest and synthetic rows too.
+	#[test]
+	fn journaled_attachments_render_as_chips_under_the_prompt() {
+		let local = Local::default();
+		let options = Options::new(&local);
+		let blob = |size: u64| Attachment {
+			blob: omp_journal::blob::BlobRef { hash: omp_core::Hash32::new([7; 32]), size },
+			mime: Str::new_static("image/png"),
+		};
+		let mut session = empty_session();
+		session.begin_turn().expect("turn");
+		session
+			.user("look at [Image #1, 640x480] attachment://1 please", vec![blob(2048), blob(300)])
+			.expect("user");
+		let (text, _) = user_and_assistant_text(projected(&session, &options));
+		let clip = Charset::default().icon(Icon::Paperclip);
+		let image = Charset::default().icon(Icon::Image);
+		assert!(text.contains(&format!("{image} #1")), "vision marker collapses:\n{text}");
+		assert!(text.contains(&format!("{clip} #2 · 300B")), "unreferenced attachment chip:\n{text}");
+		assert!(!text.contains(&format!("{clip} #1")), "referenced attachment is not repeated:\n{text}");
+
+		let user = last_user(&session);
+		set_prop(&mut session, user, PropId::Author, Value::Str(Str::new_static("ada")));
+		let (guest, _) = user_and_assistant_text(projected(&session, &options));
+		assert!(guest.contains("«ada» ›"), "{guest}");
+		assert!(guest.contains(&format!("{image} #1")), "guest bubble collapses markers:\n{guest}");
+		assert!(guest.contains(&format!("{clip} #2 · 300B")), "guest bubble keeps chips:\n{guest}");
+
+		set_prop(&mut session, user, PropId::Author, Value::Null);
+		set_prop(&mut session, user, PropId::Synthetic, Value::Bool(true));
+		let (synthetic, _) =
+			user_and_assistant_text(projected(&session, &Options { expanded: true, ..options }));
+		assert!(synthetic.contains("Synthetic input"), "{synthetic}");
+		assert!(synthetic.contains(&format!("{image} #1")), "synthetic row collapses markers:\n{synthetic}");
+		assert!(!synthetic.contains("[Image #1"), "{synthetic}");
+		assert!(synthetic.contains(&format!("{clip} #2 · 300B")), "synthetic row keeps chips:\n{synthetic}");
+	}
+
+	/// pi `reaction.ts` + `#reactionRow`: a reply opening with a lone emoji
+	/// line badges the preceding user bubble (right-aligned in its top
+	/// padding row) and the emoji leaves the prose; the badge survives a
+	/// re-projection because it derives from the journaled text.
+	#[test]
+	fn leading_emoji_line_badges_the_user_bubble_and_leaves_the_prose() {
+		let local = Local::default();
+		let options = Options { smooth: false, ..Options::new(&local) };
+		let mut session = empty_session();
+		session.begin_turn().expect("turn");
+		session.user("ship it", Vec::new()).expect("user");
+		reply(&mut session, "🎉\nShipped.");
+		let (user, assistant) = user_and_assistant(projected(&session, &options));
+		let rows: Vec<&str> = user.split('\n').collect();
+		assert!(rows[0].trim_end().ends_with("🎉"), "badge in the top padding row:\n{user}");
+		assert!(rows[0].starts_with(' '), "badge sits inside the horizontal padding:\n{user}");
+		assert!(user.contains("ship it"), "{user}");
+		assert!(rows.last().is_some_and(|row| row.trim().is_empty()), "bottom pad row:\n{user}");
+		let assistant = assistant.expect("assistant block");
+		assert_eq!(assistant.view.text, "Shipped.", "the emoji line leaves the prose");
+		assert_eq!(assistant.stream.as_deref(), Some("Shipped."));
+		assert!(!render(assistant.component, 40).contains("🎉"));
+	}
+
+	/// No target, no reaction: a reply after tool calls (a continuation)
+	/// keeps a leading emoji line verbatim, and a synthetic prompt takes no
+	/// badge. While streaming, an emoji-only opening run is withheld until
+	/// it proves to be a reaction or ordinary text.
+	#[test]
+	fn reactions_need_a_user_bubble_target_and_are_withheld_while_pending() {
+		let local = Local::default();
+		let options = Options { smooth: false, ..Options::new(&local) };
+		let mut session = empty_session();
+		session.begin_turn().expect("turn");
+		session.user("do two things", Vec::new()).expect("user");
+		reply(&mut session, "First.");
+		reply(&mut session, "👍\nSecond.");
+		let blocks = projected(&session, &options);
+		let second = blocks
+			.iter()
+			.filter(|block| block.view.kind == BlockKind::Assistant)
+			.nth(1)
+			.expect("second reply");
+		assert_eq!(second.view.text, "👍\nSecond.", "a continuation has nothing to react to");
+		let (user, _) = user_and_assistant_text(blocks);
+		assert!(!user.contains("👍"), "{user}");
+
+		let mut session = empty_session();
+		session.begin_turn().expect("turn");
+		session.user("# Session update\nstate", Vec::new()).expect("user");
+		let user = last_user(&session);
+		set_prop(&mut session, user, PropId::Synthetic, Value::Bool(true));
+		reply(&mut session, "👍\nNoted.");
+		let (row, assistant) = user_and_assistant_text(projected(&session, &options));
+		assert!(!row.contains("👍"), "synthetic rows take no badge:\n{row}");
+		assert_eq!(assistant.as_deref(), Some("👍\nNoted."), "left verbatim without a target");
+
+		let live = streaming("", "👍");
+		let blocks = projected(&live, &options);
+		assert!(
+			!blocks.iter().any(|block| block.view.kind == BlockKind::Assistant),
+			"an emoji-only opening run is withheld while it may still become a reaction"
+		);
+		let live = streaming("", "👍 sure");
+		let (_, assistant) = user_and_assistant_text(projected(&live, &options));
+		assert_eq!(assistant.as_deref(), Some("👍 sure"), "proven prose streams through");
+	}
+
+	/// pi `collapseImageMarkers`: bracketed vision markers (and their paired
+	/// `attachment://N` reference) become the composer's `<icon> #N` chip;
+	/// malformed markers and ordinary brackets stay verbatim.
+	#[test]
+	fn image_markers_collapse_into_attachment_chips() {
+		let image = Charset::Unicode.icon(Icon::Image);
+		let video = Charset::Unicode.icon(Icon::Video);
+		let collapse = |text: &str| collapse_image_markers(&Str::new(text), Charset::Unicode);
+		assert_eq!(
+			collapse("see [Image #1, 640x480] attachment://1 and [Video #12] now"),
+			format!("see {image} #1 and {video} #12 now")
+		);
+		assert_eq!(collapse("[Image #2] attachment://21"), format!("{image} #2 attachment://21"));
+		assert_eq!(
+			collapse("[Image #0] [Image #] [Image #1, a\nb] [x] [Image #3"),
+			"[Image #0] [Image #] [Image #1, a\nb] [x] [Image #3"
+		);
+		assert_eq!(collapse("plain [brackets]"), "plain [brackets]");
+		assert_eq!(collapse("[Image #1]"), format!("{image} #1"));
+		assert_eq!(
+			collapse_image_markers(&Str::new("[Image #1]"), Charset::Ascii),
+			format!("{} #1", Charset::Ascii.icon(Icon::Image))
+		);
+	}
 }

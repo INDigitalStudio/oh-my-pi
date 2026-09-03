@@ -11,7 +11,7 @@ use omp_chat::{
 	HostCommand, HostOptions, NativeEffect, NativeHost,
 	overlays::{
 		Panel, PanelEvent,
-		services::{McpOp, McpRun, ServiceError, ServiceResult, Services, WorktreeInfo},
+		services::{AccountRow, McpOp, McpRun, ServiceError, ServiceResult, Services, WorktreeInfo},
 		settings::{Group, SettingRow, SettingsPanel, Widget},
 	},
 };
@@ -24,8 +24,8 @@ use tempfile::tempdir;
 /// Top-level `name:` of every entry in pi's builtin registry —
 /// `/work/pi/packages/coding-agent/src/slash-commands/builtin-*.ts`
 /// (`BUILTIN_*_SLASH_COMMANDS` arrays; subcommand and alias names
-/// excluded), 78 commands as of pi at the time of the omp2 spine rebuild.
-const PI_BUILTIN_COMMANDS: [&str; 78] = [
+/// excluded), 79 commands as of pi at the time of the omp2 spine rebuild.
+const PI_BUILTIN_COMMANDS: [&str; 79] = [
 	"advisor",
 	"export",
 	"trace",
@@ -36,6 +36,7 @@ const PI_BUILTIN_COMMANDS: [&str; 78] = [
 	"leave",
 	"browser",
 	"copy",
+	"open",
 	"force",
 	"live",
 	"pause",
@@ -187,6 +188,21 @@ impl Services for Feed {
 		let (tx, rx) = flume::bounded(1);
 		let _ = tx.send(Ok(Str::new(format!("ran {op:?}"))));
 		Ok(McpRun { done: rx, cancel: None })
+	}
+
+	/// One stored OAuth account on the `sub` provider and an API key on
+	/// `test`: only `sub/*` routes bill to a subscription.
+	fn accounts(&self) -> ServiceResult<Vec<AccountRow>> {
+		let row = |provider: &'static str, kind: &'static str| AccountRow {
+			id:            Str::new(format!("{provider}:acct")),
+			provider:      Str::new_static(provider),
+			provider_name: Str::new_static(provider),
+			label:         Str::new_static("owner@example.com"),
+			detail:        Str::new(format!("stored {kind}")),
+			kind:          Str::new_static(kind),
+			active:        true,
+		};
+		Ok(vec![row("sub", "oauth"), row("test", "api-key")])
 	}
 }
 
@@ -472,6 +488,65 @@ fn model_opens_the_picker_and_model_with_a_selector_sets_ai_model() {
 		"{:?}",
 		h.host.notice()
 	);
+}
+
+/// The composer status band row of the native frame.
+fn band_row(h: &Harness) -> String {
+	frame_text(h.host.frame())
+		.lines()
+		.find(|row| row.contains("📁 session ▶"))
+		.map(|row| row.trim_end().to_owned())
+		.unwrap_or_else(|| panic!("band row in:\n{}", frame_text(h.host.frame())))
+}
+
+#[test]
+fn ai_model_write_to_an_unlisted_route_replaces_the_badge() {
+	let listed = omp_chat::ModelRow {
+		efforts: vec![Str::new_static("low"), Str::new_static("high")],
+		..model_row("test/listed", "Listed Model")
+	};
+	let mut h = harness(vec![listed]);
+	h.host.console("ai_model test/listed").expect("listed");
+	assert_eq!(h.host.model_badge().context_window, Some(200_000));
+	assert!(h.host.model_badge().reasoning);
+	let band = band_row(&h);
+	assert!(band.contains("Listed Model") && band.contains("200K"), "{band}");
+	// pi `model_changed`: a route the picker never listed (custom provider,
+	// direct `provider/model` syntax) still becomes the live badge, so the
+	// gauge, the thinking gate, and the welcome box stop describing the
+	// previous model.
+	h.host
+		.console("ai_model custom/direct-model")
+		.expect("unlisted");
+	let badge = h.host.model_badge();
+	assert_eq!(badge.identifier.as_str(), "custom/direct-model");
+	assert_eq!(badge.provider.as_str(), "custom");
+	assert_eq!(badge.context_window, None);
+	assert!(!badge.reasoning);
+	let band = band_row(&h);
+	assert!(band.contains("⬢ direct-model"), "{band}");
+	assert!(!band.contains("200K"), "the previous window is gone: {band}");
+	assert!(!band.contains("Listed Model"), "{band}");
+}
+
+#[test]
+fn band_marks_subscription_billing_from_the_stored_oauth_account() {
+	let mut h = harness(vec![model_row("test/model", "Test Model"), omp_chat::ModelRow {
+		provider_id: "sub".into(),
+		..model_row("sub/plan", "Plan Model")
+	}]);
+	h.host.console("ai_model test/model").expect("metered");
+	let band = band_row(&h);
+	assert!(!band.contains("(sub)"), "an api-key provider is metered: {band}");
+	// pi `isUsingOAuth`: a provider served by a stored OAuth credential
+	// bills to its subscription; with no spend the `(sub)` marker alone
+	// shows in the cost chip.
+	h.host.console("ai_model sub/plan").expect("subscribed");
+	let band = band_row(&h);
+	assert!(band.ends_with("(sub)"), "{band}");
+	h.host.console("ai_model test/model").expect("back");
+	let band = band_row(&h);
+	assert!(!band.contains("(sub)"), "{band}");
 }
 
 #[test]

@@ -63,7 +63,12 @@ fn render_done(
 		.get("total_files")
 		.and_then(Value::as_u64)
 		.unwrap_or_else(|| groups.iter().map(|group| group.files.len() as u64).sum());
-	let shown_matches = if expanded { match_count } else { 2 };
+	let plan = plan_rows(&groups, expanded);
+	let shown_matches: u64 = plan
+		.iter()
+		.flatten()
+		.map(|shown| *shown as u64)
+		.sum();
 	let hidden = match_count.saturating_sub(shown_matches);
 	dom! {
 		<col pad-x=1 w="100%">
@@ -73,41 +78,91 @@ fn render_done(
 				if let Some(path) = path { <text fg=muted>{"· in"}</text><text>{path}</text> }
 			</row>
 			<col>
-				for (group_index, group) in groups.iter().enumerate() {
-					if expanded || group_index == 0 {
+				for (group_index, files_shown) in plan.iter().enumerate() {
+					if let Some(group) = groups.get(group_index) {
 						<row gap=1>
-							if group_index + 1 == groups.len() { <i:tree-last/> } else { <i:tree-branch/> }
+							if group_index + 1 == plan.len() && hidden == 0 { <i:tree-last/> } else { <i:tree-branch/> }
 							<text>{"#"}</text><text bold>{group.dir.clone()}</text>
 						</row>
-						for (file_index, file) in group.files.iter().enumerate() {
-							if expanded || file_index < 2 {
-								if group_index + 1 == groups.len() {
+						for (file_index, matches_shown) in files_shown.iter().enumerate() {
+							if let Some(file) = group.files.get(file_index) {
+								if group_index + 1 == plan.len() && hidden == 0 {
 									<text pad-x=3>{sf!("## {}", file.name)}</text>
 								} else {
 									<text>{sf!("{}  ## {}", icon(ui, "tree-vertical"), file.name)}</text>
 								}
-								for row in &file.matches {
-									if expanded || file_index == 0 {
-										if group_index + 1 == groups.len() {
-											<text fg=muted pad_x={3_u16.saturating_add(line_padding(file, row))} w="100%">
-												{sf!("*{}│{}", row.line, row.text)}
-											</text>
-										} else {
-											<text fg=muted w="100%">{match_line(file, row, icon(ui, "tree-vertical"))}</text>
-										}
+								for row in file.matches.iter().take(*matches_shown) {
+									if group_index + 1 == plan.len() && hidden == 0 {
+										<text fg=muted pad_x={3_u16.saturating_add(line_padding(file, row))} w="100%">
+											{sf!("*{}│{}", row.line, row.text)}
+										</text>
+									} else {
+										<text fg=muted w="100%">{match_line(file, row, icon(ui, "tree-vertical"))}</text>
 									}
 								}
 							}
 						}
 					}
 				}
-				if !expanded && hidden > 0 {
-					<row gap=1><i:tree-last/><text fg=muted>{"…"}</text><text fg=muted>{&hidden}</text><text fg=muted>{"more matches"}</text></row>
+				if hidden > 0 {
+					<row gap=1><i:tree-last/><text fg=muted>{"…"}</text><text fg=muted>{&hidden}</text><text fg=muted>{if hidden == 1 { "more match" } else { "more matches" }}</text></row>
 				}
 			</col>
 		</col>
 	}
 	.into_component()
+}
+
+/// Collapsed row budget for the match tree (pi `COLLAPSED_TEXT_LIMIT =
+/// PREVIEW_LIMITS.COLLAPSED_LINES * 2`), including directory and file
+/// header rows; one row is reserved for the `… N more matches` summary
+/// whenever the tree overflows.
+const COLLAPSED_ROWS: usize = 6;
+
+/// Rows to paint per group and file: `plan[group][file]` is the number of
+/// matches shown for that file, and only the leading groups/files that fit
+/// the budget appear. Hidden matches are then exactly `total - shown`.
+fn plan_rows(groups: &[Group], expanded: bool) -> Vec<Vec<usize>> {
+	if expanded {
+		return groups
+			.iter()
+			.map(|group| group.files.iter().map(|file| file.matches.len()).collect())
+			.collect();
+	}
+	let total_rows: usize = groups
+		.iter()
+		.map(|group| {
+			1 + group
+				.files
+				.iter()
+				.map(|file| 1 + file.matches.len())
+				.sum::<usize>()
+		})
+		.sum();
+	let mut budget = if total_rows > COLLAPSED_ROWS {
+		COLLAPSED_ROWS - 1
+	} else {
+		COLLAPSED_ROWS
+	};
+	let mut plan = Vec::with_capacity(groups.len());
+	for group in groups {
+		if budget == 0 {
+			break;
+		}
+		budget -= 1;
+		let mut files = Vec::with_capacity(group.files.len());
+		for file in &group.files {
+			if budget == 0 {
+				break;
+			}
+			budget -= 1;
+			let shown = file.matches.len().min(budget);
+			budget -= shown;
+			files.push(shown);
+		}
+		plan.push(files);
+	}
+	plan
 }
 
 fn icon<'a>(ui: &'a UiContext, name: &str) -> &'a str {

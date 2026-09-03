@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use flume::Receiver;
 use omp_con::Ctx;
 use omp_core::{Str, sf};
-use omp_tools::browser::{Action, BrowserHost, Fault, Params, Payload};
+use omp_tools::browser::{Action, BrowserHost, Fault, Params, Payload, mode_name};
 use omp_webview::{Engine, FrameConfig, SurfaceKind, WebView, WebViewBuilder, WindowConfig};
 use serde_json::json;
 
@@ -169,9 +169,10 @@ fn execute(
 				title: None,
 				result: Some(json!({ "remaining_tabs": tabs.len() })),
 				artifacts: Vec::new(),
+				browser: Some(mode_name(headless)),
 			})
 		},
-		Action::Run => run_tab(tabs, name, params),
+		Action::Run => run_tab(tabs, name, headless, params),
 	}
 }
 
@@ -232,10 +233,16 @@ fn open(
 		title: Some(title),
 		result: None,
 		artifacts: Vec::new(),
+		browser: Some(mode_name(headless)),
 	})
 }
 
-fn run_tab(tabs: &mut HashMap<Str, WebView>, name: Str, params: Params) -> Result<Payload, Fault> {
+fn run_tab(
+	tabs: &mut HashMap<Str, WebView>,
+	name: Str,
+	headless: bool,
+	params: Params,
+) -> Result<Payload, Fault> {
 	let view = tabs.get(&name).ok_or_else(|| not_found(&name))?;
 	let tab = view.automation();
 	let timeout = timeout(&params);
@@ -251,6 +258,7 @@ fn run_tab(tabs: &mut HashMap<Str, WebView>, name: Str, params: Params) -> Resul
 		title: Some(view.title()),
 		result: Some(result),
 		artifacts: Vec::new(),
+		browser: Some(mode_name(headless)),
 	})
 }
 

@@ -6,7 +6,6 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	error::Error,
 	fmt::{self, Display},
 	mem::size_of,
 	sync::Arc,
@@ -328,9 +327,10 @@ pub struct ProviderDeclaration {
 }
 
 /// Activation failure for a provider declaration set.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ProviderActivationError {
 	/// Two unrelated declarations had the same winning priority.
+	#[error("provider {provider} has equal-priority declarations {first} and {second}")]
 	EqualPriority {
 		/// Contested provider namespace.
 		provider: ProviderId,
@@ -340,6 +340,7 @@ pub enum ProviderActivationError {
 		second:   ProviderDeclarationId,
 	},
 	/// An extension declaration named a provider base that is unavailable.
+	#[error("provider declaration {declaration} extends unavailable base {base}")]
 	MissingBase {
 		/// Declaration that requested the base.
 		declaration: ProviderDeclarationId,
@@ -347,22 +348,6 @@ pub enum ProviderActivationError {
 		base:        ProviderId,
 	},
 }
-
-impl Display for ProviderActivationError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::EqualPriority { provider, first, second } => write!(
-				formatter,
-				"provider {provider} has equal-priority declarations {first} and {second}"
-			),
-			Self::MissingBase { declaration, base } => {
-				write!(formatter, "provider declaration {declaration} extends unavailable base {base}")
-			},
-		}
-	}
-}
-
-impl Error for ProviderActivationError {}
 
 const _: () = assert!(
 	size_of::<ProviderActivationError>() <= 64,

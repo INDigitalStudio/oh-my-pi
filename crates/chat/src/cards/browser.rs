@@ -1,11 +1,17 @@
 //! Typed card for `browser@1`.
 
+use omp_core::Str;
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
 use super::{
-	Card, CardStatus, CardView, Component, elapsed_badge, result_image, typed_input, typed_result,
+	Card, CardStatus, CardView, Component, elapsed_badge, preview_lines, result_image, typed_input,
+	typed_result,
 };
+
+/// pi `BROWSER_DEFAULT_PREVIEW_LINES`: script and output lines a collapsed
+/// cell shows; `@expanded` lifts both caps.
+const PREVIEW_LINES: usize = 10;
 
 /// Browser automation code-cell card.
 pub struct BrowserCard;
@@ -38,9 +44,11 @@ impl Card for BrowserCard {
 			.and_then(Value::as_str)
 			.unwrap_or_default()
 			.to_owned();
+		// pi `describeBrowser`: the backend mode rides the title after the
+		// URL; payloads journaled before the field existed show nothing.
 		let kind = result
 			.as_ref()
-			.and_then(|value| value.get("action"))
+			.and_then(|value| value.get("browser"))
 			.and_then(Value::as_str)
 			.unwrap_or_default()
 			.to_owned();
@@ -51,12 +59,24 @@ impl Card for BrowserCard {
 			.into_iter()
 			.flatten()
 			.filter_map(Value::as_str)
-			.map(|artifact| result_image(&omp_core::Str::new(artifact), "image/png", None, ui))
+			.map(|artifact| result_image(&Str::new(artifact), "image/png", None, ui))
 			.collect::<Vec<_>>();
+		let code = if expanded {
+			Str::new(code)
+		} else {
+			preview_lines(&code, PREVIEW_LINES)
+		};
 		let returned = result
 			.as_ref()
 			.and_then(|value| value.get("result"))
-			.map(display_value);
+			.map(display_value)
+			.map(|text| {
+				if expanded {
+					Str::new(text)
+				} else {
+					preview_lines(&text, PREVIEW_LINES)
+				}
+			});
 		let fault = diag_text(view).or_else(|| {
 			result
 				.as_ref()

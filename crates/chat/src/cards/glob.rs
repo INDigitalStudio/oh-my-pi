@@ -17,7 +17,7 @@ impl Card for GlobCard {
 		"glob"
 	}
 
-	fn render(&self, view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> Component {
+	fn render(&self, view: &CardView<'_>, expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::glob::Params>(view).unwrap_or(Value::Null);
 		let query = string_at(&args, "path")
 			.or_else(|| partial_string(view.args_text().unwrap_or_default(), "path"))
@@ -37,13 +37,18 @@ impl Card for GlobCard {
 				}
 				.into_component()
 			},
-			CardStatus::Done => render_done(view, query),
+			CardStatus::Done => render_done(view, query, expanded),
 			CardStatus::Failed => render_failed(view),
 		}
 	}
 }
 
-fn render_done(view: &CardView<'_>, query: &str) -> Component {
+/// pi `PREVIEW_LIMITS.COLLAPSED_ITEMS` (`glob.ts` `COLLAPSED_LIST_LIMIT`):
+/// files listed before a collapsed card folds the rest into one
+/// `… N more files` row.
+const COLLAPSED_FILES: usize = 8;
+
+fn render_done(view: &CardView<'_>, query: &str, expanded: bool) -> Component {
 	let result = typed_result::<omp_tools::glob::Payload>(view).unwrap_or(Value::Null);
 	let files = result
 		.get("files")
@@ -57,6 +62,13 @@ fn render_done(view: &CardView<'_>, query: &str) -> Component {
 		.and_then(Value::as_u64)
 		.unwrap_or(files.len() as u64);
 	let scope = glob_scope(query);
+	let shown = if expanded {
+		files.len()
+	} else {
+		files.len().min(COLLAPSED_FILES)
+	};
+	let hidden = files.len() - shown;
+	let more = sf!("… {hidden} more file{}", if hidden == 1 { "" } else { "s" });
 	dom! {
 		<col pad-x=1>
 			<row gap=1>
@@ -64,11 +76,14 @@ fn render_done(view: &CardView<'_>, query: &str) -> Component {
 				<text fg=muted>{"· in"}</text><text>{scope}</text>
 			</row>
 			<col>
-				for (index, file) in files.iter().enumerate() {
+				for (index, file) in files.iter().take(shown).enumerate() {
 					<row gap=1>
-						if index + 1 == files.len() { <i:tree-last/> } else { <i:tree-branch/> }
+						if index + 1 == shown && hidden == 0 { <i:tree-last/> } else { <i:tree-branch/> }
 						<i:typescript/><text>{file_path(file)}</text>
 					</row>
+				}
+				if hidden > 0 {
+					<row gap=1><i:tree-last/><text fg=muted>{more}</text></row>
 				}
 			</col>
 		</col>
