@@ -380,14 +380,44 @@ policy_enum!(/// Additional provider-specific thinking text representation.
 
 policy_enum!(/// Wire operation used to explicitly disable reasoning.
 	ReasoningDisableMode {
+		/// Omit reasoning controls.
+		Omit,
+		/// Send the lowest supported effort.
+		#[serde(rename = "lowest-effort")]
+		#[strum(to_string = "lowest-effort", serialize = "lowest-effort")]
+		LowestEffort,
 		/// Send the `none` effort.
 		#[serde(rename = "none-effort")]
 		#[strum(to_string = "none-effort", serialize = "none-effort")]
 		NoneEffort,
+		/// Send OpenRouter's enabled=false shape.
+		#[serde(rename = "openrouter-enabled-false")]
+		#[strum(to_string = "openrouter-enabled-false", serialize = "openrouter-enabled-false")]
+		OpenRouterEnabledFalse,
+		/// Send Cline's enabled=false shape.
+		#[serde(rename = "cline-enabled-false")]
+		#[strum(to_string = "cline-enabled-false", serialize = "cline-enabled-false")]
+		ClineEnabledFalse,
 		/// Send `venice_parameters.disable_thinking = true`.
 		#[serde(rename = "venice-disable-thinking")]
 		#[strum(to_string = "venice-disable-thinking", serialize = "venice-disable-thinking")]
 		VeniceDisableThinking,
+		/// Send Z.AI's disabled-thinking shape.
+		#[serde(rename = "zai-thinking-disabled")]
+		#[strum(to_string = "zai-thinking-disabled", serialize = "zai-thinking-disabled")]
+		ZaiThinkingDisabled,
+		/// Send Qwen's enabled=false shape.
+		#[serde(rename = "qwen-enable-thinking-false")]
+		#[strum(to_string = "qwen-enable-thinking-false", serialize = "qwen-enable-thinking-false")]
+		QwenEnableThinkingFalse,
+		/// Send Qwen template false.
+		#[serde(rename = "qwen-template-false")]
+		#[strum(to_string = "qwen-template-false", serialize = "qwen-template-false")]
+		QwenTemplateFalse,
+		/// Send generic chat-template false.
+		#[serde(rename = "chat-template-thinking-false")]
+		#[strum(to_string = "chat-template-thinking-false", serialize = "chat-template-thinking-false")]
+		ChatTemplateThinkingFalse,
 	}
 );
 policy_enum!(/// Whether the output-token limit field is emitted.
@@ -474,6 +504,19 @@ pub struct RolePolicy {
 	pub supports_turn_scoped_system:      Option<bool>,
 }
 
+policy_enum!(/// Declared cost of using a native forced-tool selector.
+	NativeToolChoicePenalty {
+		/// Existing prompt-cache identity is invalidated.
+		CacheInvalidated,
+		/// The selector can add billable usage.
+		Billable,
+		/// The selector can increase latency.
+		Latency,
+		/// A provider declares a cost that is not otherwise classified.
+		Unknown,
+	}
+);
+
 /// Tool definition, choice, and transcript projection policy.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -484,6 +527,9 @@ pub struct ToolPolicy {
 	pub named_choice: Option<bool>,
 	/// Whether a tool may be forced.
 	pub forced_choice: Option<bool>,
+	/// Declared cost of sending the native forced-tool selector. Absence means
+	/// the route has affirmatively declared no penalty.
+	pub forced_choice_penalty: Option<NativeToolChoicePenalty>,
 	/// Strictness emission policy.
 	pub strict_mode: Option<ToolStrictMode>,
 	/// Tool parameter schema representation.
@@ -524,6 +570,8 @@ pub struct ToolPolicy {
 	pub requires_mistral_ids: Option<bool>,
 	/// Whether a missing Google thought signature uses the skip sentinel.
 	pub requires_skip_thought_signature: Option<bool>,
+	/// Whether only the first unsigned Google call receives the skip sentinel.
+	pub requires_skip_thought_signature_on_first_function_call: Option<bool>,
 	/// Whether tool results must repeat the tool name.
 	pub requires_result_name: Option<bool>,
 	/// Whether a grammar-size error may retry without strict tools.
@@ -880,6 +928,7 @@ impl WirePolicy {
 				supports_tool_choice: None,
 				named_choice: None,
 				forced_choice: None,
+				forced_choice_penalty: None,
 				strict_mode: None,
 				schema_flavor: None,
 				id_profile: None,
@@ -900,6 +949,7 @@ impl WirePolicy {
 				requires_assistant_after_result: None,
 				requires_mistral_ids: None,
 				requires_skip_thought_signature: None,
+				requires_skip_thought_signature_on_first_function_call: None,
 				requires_result_name: None,
 				retry_without_strict_on_grammar_error: None,
 				strict_responses_pairing: None,

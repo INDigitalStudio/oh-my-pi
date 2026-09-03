@@ -85,6 +85,7 @@ pub const BUNDLED_COMPAT: &[(&str, &str)] = sources![
 	"classes/xai",
 	"providers/agnes",
 	"providers/agnes-plan",
+	"providers/abliteration",
 	"providers/aiand",
 	"providers/aimlapi",
 	"providers/alibaba-coding-plan",
@@ -110,6 +111,7 @@ pub const BUNDLED_COMPAT: &[(&str, &str)] = sources![
 	"providers/gmi-cloud",
 	"providers/google",
 	"providers/google-antigravity",
+	"providers/google-gemini-cli",
 	"providers/google-vertex",
 	"providers/groq",
 	"providers/huggingface",
@@ -1287,11 +1289,10 @@ mod tests {
 		assert_eq!(resolved.thinking["efforts"], serde_json::json!(["low", "high", "max"]));
 	}
 	#[test]
-	fn qwen_effort_and_thinking_tool_conflict_axes_parse_to_wire_policy_keys() {
+	fn qwen_template_effort_axis_parses_to_its_wire_policy_key() {
 		let cascade = parse_one(
 			r#"class "qwen" {
 				template-reasoning-effort #true
-				thinking-tool-choice-conflict "drop_thinking_when_any"
 			}"#,
 		)
 		.expect("new wire axes parse");
@@ -1299,10 +1300,6 @@ mod tests {
 			.resolve(&target("local", "qwen", "qwen3.8-27b", true))
 			.expect("resolves");
 		assert_eq!(resolved.wire["qwen_template_reasoning_effort"], Value::Bool(true));
-		assert_eq!(
-			resolved.wire["thinking_tool_choice_conflict"],
-			Value::from("drop_thinking_when_any")
-		);
 	}
 
 	#[test]

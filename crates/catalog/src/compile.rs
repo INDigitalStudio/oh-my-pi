@@ -5,7 +5,7 @@ use std::{
 	io, str, time,
 };
 
-use omp_core::{Str, hex, sf};
+use omp_core::{SemVer, Str, hex, sf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, value::RawValue};
 use sha2::{Digest, Sha256};
@@ -31,8 +31,8 @@ use crate::{
 	},
 	discover::DiscoveryDefaults,
 	id::{
-		AuthSpecId, CatalogRevision, CodecId, DiscoverySpecId, ModelKey, OAuthSpecId, ProviderId,
-		RouteId, ThinkingPolicyId, WireModelId, WirePolicyId,
+		AuthSpecId, CatalogRevision, ClassId, CodecId, DiscoverySpecId, FamilyId, ModelKey,
+		OAuthSpecId, ProviderId, RouteId, ThinkingPolicyId, WireModelId, WirePolicyId,
 	},
 	model::{
 		ContextStrategy, EvidenceConfidence, ModelAvailability, ModelLimits, ModelProvenance,
@@ -40,10 +40,11 @@ use crate::{
 	},
 	policy::{
 		ApplyPatchWireKind, CacheControlFormat, ComputerUseConfigSupport, ComputerUseWireSupport,
-		ExtendedContextMode, MaxOutputTokensEmission, PromptCacheMode, ReasoningBodyOverride,
+		ExtendedContextMode, MaxOutputTokensEmission, NativeToolChoicePenalty, PromptCacheMode,
+		ReasoningBodyOverride,
 		StreamWatchdog, ToolCallIdProfile, WhenThinkingPolicy, WirePolicy,
 	},
-	pricing::{PremiumMultiplier, Price, PriceTier, PriceUnit, Pricing},
+	pricing::{PremiumMultiplier, Price, PriceTier, PriceUnit, Pricing, ServiceTierPrice},
 	provider::{
 		AccountScope, ApplicationDefaultSource, AuthSpec, AuthSpecKind, CodecProfile,
 		CodexTransportPreference, CredentialSourceSpec, DiscoveryKind, DiscoveryPagination,
@@ -196,6 +197,38 @@ pub struct SourceLongContextCost {
 	pub cache_write:               Number,
 }
 
+/// Source-declared model identity emitted by pi's catalog compiler.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SourceModelIdentity {
+	/// Normalized model class.
+	#[serde(default)]
+	pub class:            Option<ClassId>,
+	/// Product family within the class.
+	#[serde(default)]
+	pub family:           Option<FamilyId>,
+	/// Semantic revision spelling.
+	#[serde(default)]
+	pub revision:         Option<Str>,
+	/// Effort route represented by this row.
+	#[serde(default)]
+	pub effort:           Option<EffortTier>,
+	/// Logical identifier shared by routed siblings.
+	#[serde(default)]
+	pub logical_id:       Option<Str>,
+	/// Whether this row is a reasoning sibling.
+	#[serde(default)]
+	pub thinking_variant: Option<bool>,
+}
+
+fn source_semver(value: &str) -> Option<SemVer> {
+	let mut parts = value.split('.');
+	let major = parts.next()?.parse().ok()?;
+	let minor = parts.next()?.parse().ok()?;
+	let patch = parts.next().map(str::parse).transpose().ok()?.unwrap_or(0);
+	parts.next().is_none().then_some(SemVer::new(major, minor, patch))
+}
+
 /// Closed typed record parsed from one oracle model row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -209,6 +242,9 @@ pub struct SourceModelRecord {
 	/// Optional denormalized provider.
 	#[serde(default)]
 	pub provider: Option<Str>,
+	/// Compiler-declared normalized identity.
+	#[serde(default)]
+	pub identity: Option<SourceModelIdentity>,
 	/// Optional per-model transport override.
 	#[serde(default)]
 	pub api: Option<SourceTransport>,
@@ -303,6 +339,12 @@ pub struct SourceModelRecord {
 	/// compatibility record.
 	#[serde(default)]
 	pub compat_config: Option<SourceWirePolicy>,
+	/// Whether Cursor needs its provider-specific tool schema projection.
+	#[serde(default)]
+	pub requires_cursor_tool_schema_projection: Option<bool>,
+	/// Per-service-tier price multipliers.
+	#[serde(default)]
+	pub service_tier_cost: BTreeMap<Str, Number>,
 	/// Whether the model requires reversible private-use glyph tokenization.
 	#[serde(default)]
 	pub requires_glyph_tokenization: Option<bool>,
@@ -371,6 +413,9 @@ pub struct SourceThinking {
 	/// Effort-specific token budgets.
 	#[serde(default)]
 	pub effort_budgets:    BTreeMap<ThinkingEffort, u64>,
+	/// Prefix-binding support.
+	#[serde(default)]
+	pub prefix_binding:    Option<bool>,
 	/// Adaptive display support.
 	#[serde(default)]
 	pub supports_display:  Option<bool>,
@@ -438,13 +483,16 @@ pub enum SourceAuth {
 	GoogleAdc {
 		/// API-key environment order.
 		#[serde(default)]
-		api_key_env:  Vec<Str>,
+		api_key_env:     Vec<Str>,
 		/// Project environment order.
 		#[serde(default)]
-		project_env:  Vec<Str>,
+		project_env:     Vec<Str>,
 		/// Location environment order.
 		#[serde(default)]
-		location_env: Vec<Str>,
+		location_env:    Vec<Str>,
+		/// Credential-file path environment order.
+		#[serde(default)]
+		credentials_env: Vec<Str>,
 	},
 	/// OAuth flow.
 	Oauth {
@@ -711,6 +759,8 @@ pub struct SourceWirePolicy {
 	pub requires_reasoning_off_juice_instruction: Option<bool>,
 	/// Compiled `requires-skip-thought-signature` compatibility fact.
 	pub requires_skip_thought_signature: Option<bool>,
+	/// Compiled `requires-skip-thought-signature-on-first-function-call` fact.
+	pub requires_skip_thought_signature_on_first_function_call: Option<bool>,
 	/// Compiled `requires-thinking-as-text` compatibility fact.
 	pub requires_thinking_as_text: Option<bool>,
 	/// Compiled `requires-tool-result-name` compatibility fact.
@@ -734,6 +784,8 @@ pub struct SourceWirePolicy {
 	/// Compiled `supports-forced-tool-choice` compatibility fact.
 	#[serde(alias = "forced_tool_choice", alias = "supportsForcedToolChoice")]
 	pub supports_forced_tool_choice: Option<bool>,
+	/// Provider-declared cost of using native forced tool choice.
+	pub forced_tool_choice_penalty: Option<NativeToolChoicePenalty>,
 	/// Compiled `supports-function-part-id` compatibility fact.
 	pub supports_function_part_id: Option<bool>,
 	/// Compiled `supports-long-prompt-cache-retention` compatibility fact.
@@ -2697,7 +2749,12 @@ fn inherit_source_references(models: &mut BTreeMap<Str, BTreeMap<Str, SourceMode
 				if !visited.insert(reference.clone()) {
 					break;
 				}
-				let reference_row = &snapshot[&reference.0][&reference.1];
+				let Some(reference_row) = snapshot
+					.get(&reference.0)
+					.and_then(|models| models.get(&reference.1))
+				else {
+					break;
+				};
 				let inheritance_policy = EXACT_INHERITANCE_POLICIES.iter().find(|policy| {
 					debug_assert!(review_metadata_is_valid(
 						policy.rationale,
@@ -3495,14 +3552,38 @@ fn compile_models(
 			.copied()
 			.ok_or_else(|| CompileError::Invariant(sf!("provider transport is missing")))?;
 		let identities: BTreeMap<Str, ModelClassification> = rows
-			.keys()
-			.map(|model| {
-				let classified = classify(ClassificationInput {
+			.iter()
+			.map(|(model, row)| {
+				let mut classified = classify(ClassificationInput {
 					phase: ClassificationPhase::CatalogCompiler,
 					provider: &provider,
 					model,
 					observed_at_ms: None,
 				});
+				if let Some(identity) = &row.identity {
+					if let Some(logical) = &identity.logical_id {
+						classified.logical_model = logical.clone();
+					}
+					if let Some(class) = &identity.class {
+						classified.class = class.clone();
+					}
+					if let Some(family) = &identity.family {
+						classified.family = Some(family.clone());
+					}
+					if let Some(revision) = identity
+						.revision
+						.as_ref()
+						.and_then(|revision| source_semver(revision.as_str()))
+					{
+						classified.revision = Some(revision);
+					}
+					if let Some(effort) = identity.effort {
+						classified.effort = Some(effort);
+					}
+					if let Some(thinking_variant) = identity.thinking_variant {
+						classified.thinking_variant = thinking_variant;
+					}
+				}
 				(model.clone(), classified)
 			})
 			.collect();
@@ -3608,7 +3689,22 @@ fn compile_models(
 				logical_id.as_str(),
 				&first.1.cost,
 				resolved.catalog.get("longContext"),
-			)?;
+			)?
+			.with_service_tiers(
+				first
+					.1
+					.service_tier_cost
+					.iter()
+					.map(|(tier, multiplier)| {
+						Ok(ServiceTierPrice {
+							tier: tier.clone(),
+							multiplier: PremiumMultiplier::from_millionths(decimal_millionths(
+								multiplier,
+							)?),
+						})
+					})
+					.collect::<Result<Vec<_>, CompileError>>()?,
+			);
 			let edit_revision = resolved
 				.catalog
 				.get("editRevision")
@@ -4022,6 +4118,9 @@ fn compile_wire_policy(
 	policy.tool.forced_choice = source
 		.supports_forced_tool_choice
 		.or(policy.tool.forced_choice);
+	policy.tool.forced_choice_penalty = source
+		.forced_tool_choice_penalty
+		.or(policy.tool.forced_choice_penalty);
 	policy.tool.flatten_root_unions = source
 		.flatten_root_unions
 		.or(policy.tool.flatten_root_unions);
@@ -4268,6 +4367,9 @@ fn compile_wire_policy(
 	policy.tool.requires_skip_thought_signature = source
 		.requires_skip_thought_signature
 		.or(policy.tool.requires_skip_thought_signature);
+	policy.tool.requires_skip_thought_signature_on_first_function_call = source
+		.requires_skip_thought_signature_on_first_function_call
+		.or(policy.tool.requires_skip_thought_signature_on_first_function_call);
 	policy.reasoning.requires_thinking_as_text = source
 		.requires_thinking_as_text
 		.or(policy.reasoning.requires_thinking_as_text);
@@ -4438,10 +4540,10 @@ fn compile_thinking(
 			default_level:     source.default_level,
 			effort_budgets:    source.effort_budgets.clone(),
 			effort_map:        source.effort_map.clone(),
-			prefix_binding:    None,
-			supports_display:  None,
-			suppress_when_off: None,
-			requires_effort:   None,
+			prefix_binding:    source.prefix_binding,
+			supports_display:  source.supports_display,
+			suppress_when_off: source.suppress_when_off,
+			requires_effort:   source.requires_effort,
 		})
 	} else {
 		profile
@@ -5396,19 +5498,22 @@ fn compile_auth(
 					Some(SigV4Spec { service: sf!("bedrock"), region: RegionSource::RouteEndpoint }),
 				)
 			},
-			SourceAuth::GoogleAdc { api_key_env, project_env, location_env } => {
+			SourceAuth::GoogleAdc { api_key_env, project_env, location_env, credentials_env } => {
 				let api_key_env = canonical_env_names(api_key_env)?;
 				let project_env = canonical_env_names(project_env)?;
 				let location_env = canonical_env_names(location_env)?;
+				let credentials_env = canonical_env_names(credentials_env)?;
 				let mut sources = api_key_env
 					.iter()
 					.cloned()
 					.map(|variable| ApplicationDefaultSource::EnvironmentAccessToken { variable })
 					.collect::<Vec<_>>();
-				sources.push(ApplicationDefaultSource::CredentialFile {
-					path_environment: Some(sf!("OMP_GOOGLE_APPLICATION_CREDENTIALS")),
-					default_path:     None,
-				});
+				sources.extend(credentials_env.iter().cloned().map(|variable| {
+					ApplicationDefaultSource::CredentialFile {
+						path_environment: Some(variable),
+						default_path:     None,
+					}
+				}));
 				sources.push(ApplicationDefaultSource::Metadata { url: sf!("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"), headers: Box::new([StaticHeader { name: sf!("metadata-flavor"), value: sf!("Google") }]) });
 				credential_sources.push(CredentialSourceSpec::ApplicationDefault {
 					api_key_env,
@@ -6212,6 +6317,16 @@ facets = ["chat"]
 			.iter()
 			.find(|provider| provider.id.as_str() == "anthropic")
 			.expect("Anthropic provider");
+		let anthropic_policy = compiled
+			.wire_policies
+			.iter()
+			.find(|policy| policy.content_id() == anthropic.wire_policy)
+			.expect("Anthropic wire policy");
+		assert_eq!(
+			anthropic_policy.tool.forced_choice_penalty,
+			Some(NativeToolChoicePenalty::CacheInvalidated),
+		);
+
 		let anthropic_auth = anthropic
 			.auth
 			.iter()
@@ -6230,6 +6345,7 @@ facets = ["chat"]
 			sf!("OMP_ANTHROPIC_API_KEY"),
 			sf!("OMP_ANTHROPIC_FOUNDRY_API_KEY"),
 			sf!("ANTHROPIC_API_KEY"),
+			sf!("ANTHROPIC_FOUNDRY_API_KEY"),
 		]);
 		assert!(
 			!api_key_names
@@ -6245,7 +6361,10 @@ facets = ["chat"]
 				_ => None,
 			})
 			.expect("Anthropic OAuth bearer environment");
-		assert_eq!(bearer_names.as_ref(), &[sf!("OMP_ANTHROPIC_OAUTH_TOKEN")]);
+		assert_eq!(bearer_names.as_ref(), &[
+			sf!("OMP_ANTHROPIC_OAUTH_TOKEN"),
+			sf!("ANTHROPIC_OAUTH_TOKEN"),
+		]);
 
 		let azure = compiled
 			.routes
@@ -6279,6 +6398,86 @@ facets = ["chat"]
 			.expect("GitLab route operations");
 		assert!(operations.contains_kind(OperationKind::Chat));
 		assert!(operations.contains_kind(OperationKind::DiscoverModels));
+	}
+
+	#[test]
+	fn vendor_standard_environment_names_follow_omp_overrides() {
+		let compiled = compile_provider_registry();
+		let provider_auth = |provider: &str| {
+			let provider = compiled
+				.providers
+				.iter()
+				.find(|candidate| candidate.id.as_str() == provider)
+				.unwrap_or_else(|| panic!("{provider} provider"));
+			provider
+				.auth
+				.iter()
+				.filter_map(|id| compiled.auth_specs.iter().find(|auth| &auth.id == id))
+				.collect::<Vec<_>>()
+		};
+
+		let vertex = provider_auth("google-vertex");
+		let adc = vertex
+			.iter()
+			.flat_map(|auth| auth.credential_sources.iter())
+			.find_map(|source| match source {
+				CredentialSourceSpec::ApplicationDefault {
+					api_key_env,
+					project_env,
+					location_env,
+					sources,
+				} => Some((api_key_env, project_env, location_env, sources)),
+				_ => None,
+			})
+			.expect("Vertex application-default source");
+		assert_eq!(
+			adc.0.as_ref(),
+			&[sf!("OMP_GOOGLE_CLOUD_API_KEY"), sf!("GOOGLE_CLOUD_API_KEY")],
+		);
+		assert_eq!(
+			adc.1.as_ref(),
+			&[
+				sf!("OMP_GOOGLE_CLOUD_PROJECT"),
+				sf!("OMP_GCP_PROJECT"),
+				sf!("OMP_GCLOUD_PROJECT"),
+				sf!("GOOGLE_CLOUD_PROJECT"),
+				sf!("GCP_PROJECT"),
+				sf!("GCLOUD_PROJECT"),
+			],
+		);
+		assert_eq!(
+			adc.2.as_ref(),
+			&[
+				sf!("OMP_GOOGLE_VERTEX_LOCATION"),
+				sf!("OMP_GOOGLE_CLOUD_LOCATION"),
+				sf!("OMP_VERTEX_LOCATION"),
+				sf!("GOOGLE_VERTEX_LOCATION"),
+				sf!("GOOGLE_CLOUD_LOCATION"),
+				sf!("VERTEX_LOCATION"),
+			],
+		);
+		assert!(adc.3.iter().any(|source| matches!(
+			source,
+			ApplicationDefaultSource::CredentialFile {
+				path_environment: Some(name),
+				..
+			} if name.as_str() == "GOOGLE_APPLICATION_CREDENTIALS"
+		)));
+
+		let bedrock = provider_auth("amazon-bedrock");
+		let bearer = bedrock
+			.iter()
+			.find(|auth| auth.kind == AuthSpecKind::Bearer)
+			.and_then(|auth| auth.credential_sources.first())
+			.and_then(|source| match source {
+				CredentialSourceSpec::Environment { ordered_names } => Some(ordered_names),
+				_ => None,
+			})
+			.expect("Bedrock bearer source");
+		assert_eq!(bearer.as_ref(), &[
+			sf!("OMP_AWS_BEARER_TOKEN_BEDROCK"),
+			sf!("AWS_BEARER_TOKEN_BEDROCK"),
+		]);
 	}
 
 	#[test]
@@ -6431,7 +6630,6 @@ usage = true
 			r#"class "qwen" {
 				template-reasoning-effort #true
 				thinking-format "chat-template"
-				thinking-tool-choice-conflict "drop_thinking_when_any"
 			}"#,
 		)])
 		.expect("KDL grammar accepts the reasoning axes");
@@ -6453,10 +6651,26 @@ usage = true
 			policy.reasoning.thinking_format,
 			Some(crate::policy::ThinkingFormat::ChatTemplate)
 		);
+	}
+
+	#[test]
+	fn thinking_tool_choice_conflict_is_a_provider_compat_fact_not_a_kdl_axis() {
+		let source: SourceWirePolicy = serde_json::from_str(
+			r#"{"thinking_tool_choice_conflict":"drop_thinking_when_any"}"#,
+		)
+		.expect("provider compat accepts the conflict policy");
+		let policy = compile_wire_policy(WirePolicy::baseline(), &source).expect("compiles");
 		assert_eq!(
 			policy.tool.thinking_conflict,
 			Some(crate::policy::ThinkingToolChoiceConflict::DropThinkingWhenAny)
 		);
+		assert!(matches!(
+			CompatCascade::parse(&[(
+				"conflict.kdl",
+				r#"class "qwen" { thinking-tool-choice-conflict "drop_thinking_when_any" }"#,
+			)]),
+			Err(CascadeError::UnknownDirective { .. })
+		));
 	}
 
 	#[test]

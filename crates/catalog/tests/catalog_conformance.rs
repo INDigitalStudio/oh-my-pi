@@ -747,15 +747,19 @@ fn interactive_oauth_contracts_preserve_provider_parameters_and_identity() {
 			.map(|parameter| parameter.value.as_str()),
 		Some("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")
 	);
-	let OAuthFlowSpec::Pkce { completion, authorize_parameters, .. } = &google.flow else {
-		panic!("Google login must use an authorization-code flow");
+	let OAuthFlowSpec::Custom { exchange, parameters, polling, .. } = &google.flow else {
+		panic!("Google login must use the Gemini CLI project-discovery exchange");
 	};
-	assert_eq!(*completion, omp_catalog::provider::OAuthCompletion::PasteCallbackUrl);
+	assert_eq!(*exchange, OAuthExchangeKind::GoogleGeminiCli);
+	assert!(polling.is_none());
 	assert!(
-		authorize_parameters
+		parameters
 			.iter()
 			.any(|parameter| { parameter.name == "access_type" && parameter.value == "offline" })
 	);
+	assert!(parameters.iter().any(|parameter| {
+		parameter.name == "redirect_uri" && parameter.value == "http://127.0.0.1:8085/oauth2callback"
+	}));
 	assert!(
 		!google
 			.token_parameters

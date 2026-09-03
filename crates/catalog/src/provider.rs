@@ -330,6 +330,8 @@ pub enum OAuthExchangeKind {
 	CursorPoll,
 	/// Completes Google Antigravity PKCE and Cloud Code Assist provisioning.
 	GoogleAntigravity,
+	/// Completes Gemini CLI PKCE and Cloud Code Assist project discovery.
+	GoogleGeminiCli,
 	/// Exchanges a Z.AI authorization result for an API key.
 	ZaiApiKey,
 	/// Exchanges an OpenRouter PKCE authorization result for a durable API key.

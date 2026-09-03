@@ -6,6 +6,7 @@ use std::{
 	fmt::{self, Display},
 };
 
+use omp_core::Str;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
@@ -102,13 +103,24 @@ pub struct PriceTier {
 	pub components:          Box<[Price]>,
 }
 
+/// Price multiplier billed for one provider service tier.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServiceTierPrice {
+	/// Wire tier name (`flex`, `priority`, …).
+	pub tier:       Str,
+	/// Multiplier applied to every component when this tier is served.
+	pub multiplier: PremiumMultiplier,
+}
+
 /// Integer-only model pricing schedule.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Pricing {
 	/// Base component prices in deterministic unit order.
-	pub components: Box<[Price]>,
+	pub components:    Box<[Price]>,
 	/// Threshold tiers in ascending threshold order.
-	pub tiers:      Box<[PriceTier]>,
+	pub tiers:         Box<[PriceTier]>,
+	/// Service-tier multipliers in ascending tier-name order.
+	pub service_tiers: Box<[ServiceTierPrice]>,
 }
 
 impl Pricing {
@@ -121,10 +133,30 @@ impl Pricing {
 			tier.components = prices.into_boxed_slice();
 		}
 		tiers.sort_unstable_by_key(|tier| tier.prompt_tokens_above);
-		let pricing =
-			Self { components: components.into_boxed_slice(), tiers: tiers.into_boxed_slice() };
+		let pricing = Self {
+			components:    components.into_boxed_slice(),
+			tiers:         tiers.into_boxed_slice(),
+			service_tiers: Box::default(),
+		};
 		pricing.validate()?;
 		Ok(pricing)
+	}
+
+	/// Attaches service-tier multipliers, sorted by tier name.
+	pub fn with_service_tiers(mut self, mut service_tiers: Vec<ServiceTierPrice>) -> Self {
+		service_tiers.sort_unstable_by(|left, right| left.tier.as_str().cmp(right.tier.as_str()));
+		service_tiers.dedup_by(|left, right| left.tier == right.tier);
+		self.service_tiers = service_tiers.into_boxed_slice();
+		self
+	}
+
+	/// Returns the declared multiplier for a served tier, if any.
+	pub fn service_tier_multiplier(&self, tier: &str) -> Option<PremiumMultiplier> {
+		self
+			.service_tiers
+			.binary_search_by(|price| price.tier.as_str().cmp(tier))
+			.ok()
+			.map(|index| self.service_tiers[index].multiplier)
 	}
 
 	/// Validates deterministic ordering and uniqueness.

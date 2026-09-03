@@ -312,10 +312,6 @@ pub struct ModelSettings {
 	pub tier_google:              TierSetting,
 	/// Fireworks serving tier.
 	pub tier_fireworks:           TierSetting,
-	/// Spawned-agent tier override.
-	pub tier_subagent:            TierSetting,
-	/// Advisor tier override.
-	pub tier_advisor:             TierSetting,
 	/// Prompt-cache retention policy.
 	pub cache_retention:          CacheRetentionSetting,
 	/// OpenAI Codex websocket preference.
@@ -395,7 +391,7 @@ impl Default for ModelSettings {
 			]),
 			enabled_models:           sync::Arc::from([]),
 			disabled_providers:       sync::Arc::from([]),
-			default_thinking:         ThinkingEffort::Medium,
+			default_thinking:         ThinkingEffort::High,
 			thinking_ceiling:         ThinkingEffort::Max,
 			thinking_budgets:         ThinkingBudgets::default(),
 			provider_order:           sync::Arc::from([]),
@@ -403,8 +399,6 @@ impl Default for ModelSettings {
 			tier_anthropic:           TierSetting::None,
 			tier_google:              TierSetting::None,
 			tier_fireworks:           TierSetting::None,
-			tier_subagent:            TierSetting::Inherit,
-			tier_advisor:             TierSetting::None,
 			cache_retention:          CacheRetentionSetting::Auto,
 			openai_websockets:        WireToggle::Auto,
 			openrouter_variant:       OpenRouterVariant::Default,
@@ -436,8 +430,6 @@ impl ModelSettings {
 			tier_anthropic:           AI_TIER_ANTHROPIC.get(ctx),
 			tier_google:              AI_TIER_GOOGLE.get(ctx),
 			tier_fireworks:           AI_TIER_FIREWORKS.get(ctx),
-			tier_subagent:            AI_TIER_SUBAGENT.get(ctx),
-			tier_advisor:             AI_TIER_ADVISOR.get(ctx),
 			cache_retention:          AI_CACHE_RETENTION.get(ctx),
 			openai_websockets:        AI_OPENAI_WEBSOCKETS.get(ctx),
 			openrouter_variant:       AI_OPENROUTER_VARIANT.get(ctx),
@@ -618,19 +610,9 @@ impl ModelSettings {
 	pub fn service_tier(
 		&self,
 		family: ProviderFamily,
-		audience: TierAudience,
+		_audience: TierAudience,
 		parent: Option<&ServiceTier>,
 	) -> Option<ServiceTier> {
-		let audience_setting = match audience {
-			TierAudience::Session => None,
-			TierAudience::Subagent => Some(&self.tier_subagent),
-			TierAudience::Advisor => Some(&self.tier_advisor),
-		};
-		if let Some(setting) = audience_setting
-			&& !matches!(setting, TierSetting::Inherit)
-		{
-			return setting.resolve(family, parent);
-		}
 		let family_setting = match family {
 			ProviderFamily::OpenAi => &self.tier_openai,
 			ProviderFamily::Anthropic => &self.tier_anthropic,
@@ -1198,132 +1180,123 @@ omp_con::var! {
 	pub static AI_MODEL_ROLES = ai_model_roles: Kv {
 		default: roles_to_kv(&ModelSettings::default().roles),
 		validate: validate_roles,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Persistence scope for model role assignments.
 	pub static AI_MODEL_ROLE_STORAGE = ai_model_role_storage: ModelRoleStorage {
 		default: ModelRoleStorage::Global,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Presentation metadata keyed by model role.
 	pub static AI_MODEL_TAGS = ai_model_tags: Kv {
 		default: tags_to_kv(&ModelSettings::default().tags),
 		validate: validate_tags,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Role names in quick-cycle order.
 	pub static AI_MODEL_CYCLE_ORDER = ai_model_cycle_order: Vec<Str> {
 		default: vec![Str::new_static("smol"), Str::new_static("default"), Str::new_static("slow")],
 		validate: validate_unique,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Optional canonical model selector allow-list.
 	pub static AI_MODEL_ENABLED_MODELS = ai_model_enabled_models: Vec<Kv> {
 		default: path_scoped_to_kv(&ModelSettings::default().enabled_models),
 		validate: validate_path_scoped_models,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Provider ids excluded from discovery, selection, and routing.
 	pub static AI_MODEL_DISABLED_PROVIDERS = ai_model_disabled_providers: Vec<Kv> {
 		default: path_scoped_to_kv(&ModelSettings::default().disabled_providers),
 		validate: validate_path_scoped_providers,
-		flags: archive | inherit,
+		flags: archive,
 	};
-	/// Default thinking effort used when a caller leaves effort unset.
+	/// Default thinking effort used when a caller leaves effort unset (pi
+	/// `defaultThinkingLevel`, default `high`).
 	pub static AI_DEFAULT_THINKING = ai_default_thinking: ThinkingEffort {
-		default: ThinkingEffort::Medium,
-		flags: archive | inherit,
+		default: ThinkingEffort::High,
+		flags: archive,
 	};
 	/// Universal configured reasoning ceiling.
 	pub static AI_THINKING_CEILING = ai_thinking_ceiling: ThinkingEffort {
 		default: ThinkingEffort::Max,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Per-effort reasoning token budgets.
 	pub static AI_THINKING_BUDGETS = ai_thinking_budgets: Kv {
 		default: thinking_budgets_to_kv(ThinkingBudgets::default()),
 		validate: validate_budgets,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Provider ids in preferred routing order.
 	pub static AI_PROVIDER_ORDER = ai_provider_order: Vec<Str> {
 		default: Vec::new(),
 		validate: validate_unique,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// OpenAI-family service tier.
 	pub static AI_TIER_OPENAI = ai_tier_openai: TierSetting {
 		default: TierSetting::None,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Anthropic-family service tier.
 	pub static AI_TIER_ANTHROPIC = ai_tier_anthropic: TierSetting {
 		default: TierSetting::None,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Google-family service tier.
 	pub static AI_TIER_GOOGLE = ai_tier_google: TierSetting {
 		default: TierSetting::None,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Fireworks serving tier.
 	pub static AI_TIER_FIREWORKS = ai_tier_fireworks: TierSetting {
 		default: TierSetting::None,
-		flags: archive | inherit,
-	};
-	/// Spawned-agent tier override.
-	pub static AI_TIER_SUBAGENT = ai_tier_subagent: TierSetting {
-		default: TierSetting::Inherit,
-		flags: archive | inherit,
-	};
-	/// Advisor tier override.
-	pub static AI_TIER_ADVISOR = ai_tier_advisor: TierSetting {
-		default: TierSetting::None,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Prompt-cache retention policy.
 	pub static AI_CACHE_RETENTION = ai_cache_retention: CacheRetentionSetting {
 		default: CacheRetentionSetting::Auto,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// OpenAI Codex websocket preference.
 	pub static AI_OPENAI_WEBSOCKETS = ai_openai_websockets: WireToggle {
 		default: WireToggle::Auto,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Default OpenRouter routing suffix.
 	pub static AI_OPENROUTER_VARIANT = ai_openrouter_variant: OpenRouterVariant {
 		default: OpenRouterVariant::Default,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Kimi wire format preference.
 	pub static AI_KIMI_API_FORMAT = ai_kimi_api_format: KimiApiFormat {
 		default: KimiApiFormat::Auto,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Model selector for tiny/title work.
 	pub static AI_TINY_SELECTOR = ai_tiny_selector: Str {
 		default: Str::new_static("@tiny"),
 		validate: validate_selector,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Model selector for memory inference.
 	pub static AI_MEMORY_SELECTOR = ai_memory_selector: Str {
 		default: Str::new_static("@tiny"),
 		validate: validate_selector,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Model selector for automatic-thinking classification.
 	pub static AI_AUTO_THINKING_SELECTOR = ai_auto_thinking_selector: Str {
 		default: Str::new_static("@tiny"),
 		validate: validate_selector,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Model selector for unexpected-stop classification.
 	pub static AI_UNEXPECTED_STOP_SELECTOR = ai_unexpected_stop_selector: Str {
 		default: Str::new_static("@tiny"),
 		validate: validate_selector,
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 
@@ -1343,8 +1316,6 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("model.tier_anthropic", "ai_tier_anthropic"),
 	("model.tier_google", "ai_tier_google"),
 	("model.tier_fireworks", "ai_tier_fireworks"),
-	("model.tier_subagent", "ai_tier_subagent"),
-	("model.tier_advisor", "ai_tier_advisor"),
 	("model.cache_retention", "ai_cache_retention"),
 	("model.openai_websockets", "ai_openai_websockets"),
 	("model.openrouter_variant", "ai_openrouter_variant"),
@@ -1471,8 +1442,6 @@ mod tests {
 			"model.tier_anthropic",
 			"model.tier_google",
 			"model.tier_fireworks",
-			"model.tier_subagent",
-			"model.tier_advisor",
 			"model.cache_retention",
 			"model.openai_websockets",
 			"model.openrouter_variant",
@@ -1497,8 +1466,6 @@ mod tests {
 			AI_TIER_ANTHROPIC.name(),
 			AI_TIER_GOOGLE.name(),
 			AI_TIER_FIREWORKS.name(),
-			AI_TIER_SUBAGENT.name(),
-			AI_TIER_ADVISOR.name(),
 			AI_CACHE_RETENTION.name(),
 			AI_OPENAI_WEBSOCKETS.name(),
 			AI_OPENROUTER_VARIANT.name(),

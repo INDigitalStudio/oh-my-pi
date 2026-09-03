@@ -98,6 +98,37 @@ pub fn config_dir(home: &Path) -> PathBuf {
 		.map_or_else(|| home.join(CONFIG_DIR_NAME), PathBuf::from)
 }
 
+/// Resolves the configuration root the selected profile reads and writes:
+/// [`config_dir`] itself, or `<config dir>/profiles/<profile>` once a
+/// profile was published via [`set_selected_profile`] (or `OMP_PROFILE`).
+///
+/// `config.cfg`, cfg scripts (`subagent.cfg`, `<agent>.cfg`, profiles run
+/// through `exec`), and the `agent/` asset tree all live under this root, so
+/// `--profile work` selects its own configuration, not only its own data.
+#[must_use]
+pub fn profile_config_dir(home: &Path) -> PathBuf {
+	let base = config_dir(home);
+	let profile = selected_profile().map(str::to_owned).or_else(|| {
+		env::var("OMP_PROFILE")
+			.ok()
+			.filter(|profile| !profile.is_empty())
+	});
+	match profile {
+		Some(profile) => base.join("profiles").join(profile),
+		None => base,
+	}
+}
+
+/// [`profile_config_dir`] rooted at the process home directory.
+///
+/// # Errors
+///
+/// Returns [`DataDirError::HomeUnset`] when no home directory is set.
+pub fn user_config_root() -> Result<PathBuf, DataDirError> {
+	let home = home_dir().ok_or(DataDirError::HomeUnset)?;
+	Ok(profile_config_dir(&home))
+}
+
 /// Failure to resolve the owner's private data directory.
 #[derive(Clone, Copy, Debug, Error)]
 pub enum DataDirError {

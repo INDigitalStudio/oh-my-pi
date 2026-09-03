@@ -20,6 +20,8 @@ pub mod resolve;
 pub mod runtime;
 pub mod selection;
 pub mod settings;
+/// Additional literal pi catalog-setting convars.
+pub mod pi_settings;
 pub mod snapshot;
 pub mod taxonomy;
 pub mod thinking;

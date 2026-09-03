@@ -578,12 +578,13 @@ fn merge_declared_pricing(defaults: &Pricing, declared: &[Price]) -> Pricing {
 		components.insert(price.unit, price.nanos_usd);
 	}
 	Pricing {
-		components: components
+		components:    components
 			.into_iter()
 			.map(|(unit, nanos_usd)| Price { unit, nanos_usd })
 			.collect::<Vec<_>>()
 			.into_boxed_slice(),
-		tiers:      defaults.tiers.clone(),
+		tiers:         defaults.tiers.clone(),
+		service_tiers: defaults.service_tiers.clone(),
 	}
 }
 
@@ -1153,7 +1154,8 @@ mod tests {
 				Price { unit: PriceUnit::MtokCacheWrite, nanos_usd: 4 },
 			]
 			.into_boxed_slice(),
-			tiers:      Box::new([]),
+			tiers:         Box::new([]),
+			service_tiers: Box::new([]),
 		};
 		let mut discovered = row("partial-pricing");
 		discovered.declared_pricing =

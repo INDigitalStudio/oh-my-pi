@@ -290,48 +290,12 @@ pub const AXES: &[AxisDef] = &[
 		values:        &[],
 		verbatim_keys: false,
 	},
-	// omp-only: retained because the compiled policy has a live consumer.
-	AxisDef {
-		key:           "flatten-root-unions",
-		resolved_key:  "flatten_root_unions",
-		set:           AxisSet::Wire,
-		shape:         AxisShape::Scalar,
-		records:       &[CompatRecord::OpenAi, CompatRecord::OpenAiResponses],
-		values:        &[],
-		verbatim_keys: false,
-	},
-	// omp-only: retained because the compiled policy has a live consumer.
-	AxisDef {
-		key:           "glyph-tokenization",
-		resolved_key:  "glyph_tokenization",
-		set:           AxisSet::Wire,
-		shape:         AxisShape::Scalar,
-		records:       &[
-			CompatRecord::OpenAi,
-			CompatRecord::OpenAiResponses,
-			CompatRecord::Anthropic,
-			CompatRecord::Bedrock,
-			CompatRecord::Google,
-		],
-		values:        &[],
-		verbatim_keys: false,
-	},
 	AxisDef {
 		key:           "harmony-leak-mitigation",
 		resolved_key:  "harmony_leak_mitigation",
 		set:           AxisSet::Wire,
 		shape:         AxisShape::Scalar,
 		records:       &[CompatRecord::OpenAiResponses],
-		values:        &[],
-		verbatim_keys: false,
-	},
-	// omp-only: retained because the compiled policy has a live consumer.
-	AxisDef {
-		key:           "image-encoding-format",
-		resolved_key:  "image_encoding_format",
-		set:           AxisSet::Wire,
-		shape:         AxisShape::Scalar,
-		records:       &[CompatRecord::OpenAi, CompatRecord::OpenAiResponses],
 		values:        &[],
 		verbatim_keys: false,
 	},
@@ -369,16 +333,6 @@ pub const AXES: &[AxisDef] = &[
 		shape:         AxisShape::Scalar,
 		records:       &[CompatRecord::OpenAi],
 		values:        &["openai", "anthropic"],
-		verbatim_keys: false,
-	},
-	// omp-only: retained because the compiled policy has a live consumer.
-	AxisDef {
-		key:           "leaked-thinking-healer",
-		resolved_key:  "leaked_thinking_healer",
-		set:           AxisSet::Wire,
-		shape:         AxisShape::Scalar,
-		records:       &[CompatRecord::OpenAi, CompatRecord::OpenAiResponses],
-		values:        &[],
 		verbatim_keys: false,
 	},
 	AxisDef {
@@ -665,6 +619,15 @@ pub const AXES: &[AxisDef] = &[
 	AxisDef {
 		key:           "requires-skip-thought-signature",
 		resolved_key:  "requires_skip_thought_signature",
+		set:           AxisSet::Wire,
+		shape:         AxisShape::Scalar,
+		records:       &[CompatRecord::Google],
+		values:        &[],
+		verbatim_keys: false,
+	},
+	AxisDef {
+		key:           "requires-skip-thought-signature-on-first-function-call",
+		resolved_key:  "requires_skip_thought_signature_on_first_function_call",
 		set:           AxisSet::Wire,
 		shape:         AxisShape::Scalar,
 		records:       &[CompatRecord::Google],
@@ -1086,16 +1049,6 @@ pub const AXES: &[AxisDef] = &[
 		values:        &[],
 		verbatim_keys: false,
 	},
-	// omp-only: retained because the compiled policy has a live consumer.
-	AxisDef {
-		key:           "thinking-close-max-retries",
-		resolved_key:  "thinking_close_max_retries",
-		set:           AxisSet::Wire,
-		shape:         AxisShape::Scalar,
-		records:       &[CompatRecord::OpenAiResponses],
-		values:        &[],
-		verbatim_keys: false,
-	},
 	AxisDef {
 		key:           "thinking-default-level",
 		resolved_key:  "defaultLevel",
@@ -1220,16 +1173,6 @@ pub const AXES: &[AxisDef] = &[
 		set:           AxisSet::Thinking,
 		shape:         AxisShape::Scalar,
 		records:       &[],
-		values:        &[],
-		verbatim_keys: false,
-	},
-	// omp-only: retained because the compiled policy has a live consumer.
-	AxisDef {
-		key:           "thinking-tool-choice-conflict",
-		resolved_key:  "thinking_tool_choice_conflict",
-		set:           AxisSet::Wire,
-		shape:         AxisShape::Scalar,
-		records:       &[CompatRecord::OpenAi, CompatRecord::OpenAiResponses],
 		values:        &[],
 		verbatim_keys: false,
 	},

@@ -13,5 +13,7 @@ pub mod github_cache;
 pub mod mcp_cache;
 /// Persistent secret-placeholder key storage.
 pub mod secret_key;
+/// Rebuildable historical usage index (`/stats`).
+pub mod stats_cache;
 /// Rebuildable diagnostic and AutoQA issue cache.
 pub mod telemetry_cache;

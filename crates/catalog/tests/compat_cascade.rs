@@ -11,23 +11,12 @@ use omp_catalog::{
 use omp_core::SemVer;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-const COMPAT_PROFILES: &str =
-	include_str!("../../../fixtures/llm-oracle/catalog-policy/compat-profiles.json");
-const THINKING_PROFILES: &str =
-	include_str!("../../../fixtures/llm-oracle/catalog-policy/thinking-profiles.json");
 const CENSUS_CASES: &str = include_str!("../../../fixtures/llm-oracle/quirk-census/cases.jsonl");
+const CATALOG_MODELS: &[u8] =
+	include_bytes!("../../../fixtures/llm-oracle/catalog/models.json.zst");
 const CATALOG_POSTCARD: &[u8] = include_bytes!("../data/catalog.postcard");
-
-#[derive(Deserialize)]
-struct ProfileDocument {
-	profiles: Vec<Profile>,
-}
-
-#[derive(Deserialize)]
-struct Profile {
-	shape: BTreeMap<String, Value>,
-}
 
 #[derive(Deserialize)]
 struct Case {
@@ -132,81 +121,110 @@ fn bundled_sources_match_the_compat_tree() {
 }
 
 #[test]
-fn axis_vocabulary_matches_the_oracles_and_reviewed_extensions() {
-	let wire: ProfileDocument =
-		serde_json::from_str(COMPAT_PROFILES).expect("compat profiles parse");
-	let thinking: ProfileDocument =
-		serde_json::from_str(THINKING_PROFILES).expect("thinking profiles parse");
-	let mut oracle_axes: Vec<String> = wire
-		.profiles
-		.iter()
-		.flat_map(|profile| profile.shape.keys())
-		.map(|key| {
-			key.strip_prefix("wire/")
-				.expect("wire/-prefixed key")
-				.to_owned()
-		})
-		.chain(thinking.profiles.iter().flat_map(|profile| {
-			profile.shape.keys().map(|key| {
-				let mut snake = String::with_capacity(key.len());
-				for character in key.chars() {
-					if character.is_ascii_uppercase() {
-						snake.push('_');
-						snake.push(character.to_ascii_lowercase());
-					} else {
-						snake.push(character);
-					}
-				}
-				snake
-			})
-		}))
-		.collect();
-	// These axes postdate the frozen oracle snapshot. They stay explicit until
-	// the next intentional snapshot refresh; compat KDL may use them without
-	// rewriting source digests in an unrelated port.
-	oracle_axes.extend([
-		"glyph_tokenization".to_owned(),
-		"image_encoding_format".to_owned(),
-		"leaked_thinking_healer".to_owned(),
-		"template_reasoning_effort".to_owned(),
-		"thinking_close_max_retries".to_owned(),
-		"thinking_tool_choice_conflict".to_owned(),
-	]);
-	oracle_axes.sort_unstable();
-	oracle_axes.dedup();
-	let mut known: Vec<String> = AXES
+fn checked_in_model_source_matches_current_pi_roster() {
+	let json = zstd::stream::decode_all(CATALOG_MODELS).expect("models fixture decompresses");
+	let providers: serde_json::Map<String, Value> =
+		serde_json::from_slice(&json).expect("models fixture parses");
+	let count = providers
+		.values()
+		.map(|models| models.as_object().expect("provider models are keyed").len())
+		.sum::<usize>();
+	assert_eq!(count, 4_763, "current pi models.json roster size");
+	assert_eq!(providers["cline-pass"].as_object().expect("ClinePass roster").len(), 18);
+	assert_eq!(providers["abliteration"].as_object().expect("Abliteration roster").len(), 3);
+}
+
+#[test]
+fn axis_vocabulary_is_literal_pi_parity() {
+	fn lower_camel(value: &str) -> String {
+		let mut output = String::with_capacity(value.len());
+		let mut uppercase = false;
+		for character in value.chars() {
+			if character == '_' {
+				uppercase = true;
+			} else if uppercase {
+				output.push(character.to_ascii_uppercase());
+				uppercase = false;
+			} else {
+				output.push(character);
+			}
+		}
+		output
+	}
+
+	let canonical = AXES
 		.iter()
 		.map(|axis| {
-			let mut snake = String::with_capacity(axis.resolved_key.len());
-			for character in axis.resolved_key.chars() {
-				if character.is_ascii_uppercase() {
-					snake.push('_');
-					snake.push(character.to_ascii_lowercase());
-				} else {
-					snake.push(character);
-				}
-			}
-			snake
+			let records = axis
+				.records
+				.iter()
+				.map(|record| {
+					record
+						.to_string()
+						.replace("open-ai-responses", "openai-responses")
+						.replace("open-ai", "openai")
+				})
+				.collect::<Vec<_>>()
+				.join(",");
+			format!(
+				"{}|{}|{}|{}|{}|{}|{}",
+				axis.key,
+				lower_camel(axis.resolved_key),
+				axis.set,
+				axis.shape,
+				records,
+				axis.values.join(","),
+				u8::from(axis.verbatim_keys),
+			)
 		})
-		.collect();
-	known.sort_unstable();
-	known.dedup();
-	for oracle_axis in oracle_axes {
-		let current = if oracle_axis == "template_reasoning_effort" {
-			"qwen_template_reasoning_effort"
-		} else {
-			oracle_axis.as_str()
-		};
-		assert!(
-			known.binary_search(&current.to_owned()).is_ok(),
-			"closed vocabulary is missing oracle axis {current}"
-		);
-	}
+		.collect::<Vec<_>>()
+		.join("\n");
+	assert_eq!(AXES.len(), 125, "pi defines exactly 125 compatibility axes");
+	// Pinned against pi `packages/catalog/src/compat/axes.ts` @ 7bfb41f243
+	// (adds `requires-skip-thought-signature-on-first-function-call`).
+	assert_eq!(
+		format!("{:x}", Sha256::digest(canonical)),
+		"2007f279a847e38f761ffefbc180da43f5139652e8cf548b1c088c13ea846e44",
+		"AXES must remain literal key/field/set/shape/records/values parity with pi axes.ts",
+	);
 }
 
 #[test]
 fn every_pi_rule_file_compiles_under_the_closed_vocabulary() {
 	CompatCascade::bundled().expect("every bundled class/provider rule uses the closed vocabulary");
+}
+
+#[test]
+fn cca_gemini_three_requires_only_the_first_call_signature_bypass() {
+	let cascade = CompatCascade::bundled().expect("bundled cascade parses");
+	for provider in ["google-antigravity", "google-gemini-cli"] {
+		for (model, expected) in [("gemini-3-pro", Some(&Value::Bool(true))), ("gemini-2.5-pro", None)]
+		{
+			let classification = classify(ClassificationInput {
+				phase: ClassificationPhase::CatalogCompiler,
+				provider,
+				model,
+				observed_at_ms: None,
+			});
+			let resolved = cascade
+				.resolve(&ResolveTarget {
+					provider,
+					class: classification.class.as_str(),
+					family: classification.family.as_ref().map(|family| family.as_str()),
+					revision: classification.revision,
+					model,
+					reasoning: true,
+				})
+				.unwrap_or_else(|error| panic!("{provider}/{model}: {error}"));
+			assert_eq!(
+				resolved
+					.wire
+					.get("requires_skip_thought_signature_on_first_function_call"),
+				expected,
+				"{provider}/{model}",
+			);
+		}
+	}
 }
 
 #[test]
