@@ -20,7 +20,14 @@ presentation adapter.
   headless path.
 - `registry` assembles catalog, credential, inference, and service
   authorities.
-- `discovery` retains credential-blind model configuration and role selection.
+- `discovery` retains credential-blind model configuration and role selection,
+  plus the prompt material the kernel journals as `prompt-facts`: `skills`
+  (`SKILL.md`, `skill://`), `rules` (context files such as `AGENTS.md` /
+  `CLAUDE.md` walked up from the project, and `.omp/rules` / `RULES.md` /
+  `.cursor/rules` / `.clinerules` rule documents served as `rule://`), and
+  `prompts` (Markdown prompt templates that become `/name` slash commands with
+  `$1` / `$ARGUMENTS` substitution). `--no-context-files`, `--no-rules`,
+  `--no-prompt-templates`, and `--prompt-template <path>` are their seams.
 
 `omp-driver` may construct `omp_envd::ProjectEnvironment` and supply the
 higher-layer bridges it needs, but the filesystem/process/document/tool host

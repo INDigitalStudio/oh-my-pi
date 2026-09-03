@@ -7,14 +7,18 @@ use std::{
 };
 
 use omp_agent::{
-	BackgroundToolCancellation, JobBoard, JobSettlement, RunControl, SessionTool, SessionToolCx,
-	SessionToolFuture, TurnInput, TurnStop,
+	BackgroundToolCancellation, DirectorError, DirectorRegistry, DirectorStack, ForceUntil,
+	JobBoard, JobSettlement, LifecycleHookError, LifecycleHooks, RunControl, SessionTool,
+	SessionToolCx, SessionToolFuture, TurnInput, TurnStop, directors::force_tool::ForceTool,
 };
 use omp_con::{CfgLoader, ConError, Ctx};
 use omp_core::{Str, Ulid};
 use omp_dom::{PropId, PropKey, Value};
 use omp_env::EnvClient;
-use omp_proto::env::v1::{CreateWorktree, DestroyWorktree, MergeMode, MergeWorktree};
+use omp_proto::{
+	env::v1::{CreateWorktree, DestroyWorktree, MergeMode, MergeWorktree},
+	toolhost::v1::HookEventId,
+};
 use omp_session::{
 	Session, SessionError,
 	components::jobs::{self, JobSpec},
@@ -27,18 +31,34 @@ use omp_tools::{
 		StartedChild, StructuredOutput, SubagentSpawner, TaskEffort, Update as TaskUpdate,
 		WorkspaceOutcome,
 	},
-	yield_tool::{Params as YieldParams, ResultEnvelope, YieldType},
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use super::settings::{
-	SV_TASK_RECURSION_DEPTH, TaskEffortCeiling, TaskIsolationMerge, TaskSettings, child_ctx,
+use super::{
+	settings::{
+		SV_TASK_RECURSION_DEPTH, TaskEffortCeiling, TaskIsolationMerge, TaskSettings, child_ctx,
+	},
+	yield_assembly,
 };
 use crate::headless::{
 	HeadlessError,
 	kernel::{KernelOptions, compose_kernel},
 };
+
+/// Standard prefix when a run ends without a yield.
+const WARNING_MISSING_YIELD: &str = "[subagent missing yield] the run ended without finalization";
+/// Reminder turns demanded from a schema-bound child that stops without a
+/// `yield` call before the run is failed (pi `MAX_YIELD_RETRIES`): two soft
+/// reminders, then one natively forced choice.
+const MAX_YIELD_RETRIES: u32 = 3;
+/// Developer reminder appended to a schema-bound child's turn when it stops
+/// idle without finalizing (pi `subagent-yield-reminder.md`).
+const YIELD_REMINDER: &str =
+	"Last turn had no yield call; the session is idle. Every turn MUST end with a tool call. First \
+	 applicable: resume work with the next intended tool if the assignment is incomplete; yield \
+	 success through a terminal `yield` with complete `result.data` if genuinely complete; yield \
+	 an error only for a real, nameable blocker. NEVER end this turn with text only.";
 
 /// Declaration-only spawner used to place `task@1` in the frozen registry.
 ///
@@ -81,6 +101,8 @@ pub struct DriverSubagentSpawner {
 	pub cfg:          Arc<dyn CfgLoader>,
 	/// Model selector used unless a driver policy resolves another route.
 	pub model:        Str,
+	/// Extension lifecycle gate (`subagent_spawn`); `None` runs ungated.
+	pub hooks:        Option<LifecycleHooks>,
 }
 
 impl SubagentSpawner for DriverSubagentSpawner {
@@ -95,6 +117,9 @@ impl SubagentSpawner for DriverSubagentSpawner {
 			.map_err(|source| TaskFault { message: Str::new(source.to_string()) })?;
 		let mut pending = Vec::with_capacity(request.tasks.len());
 		for child in request.tasks {
+			let child = admit_child(self.hooks.as_ref(), &self.parent_ctx, child, &self.model)
+				.await
+				.map_err(|source| TaskFault { message: Str::new(source.to_string()) })?;
 			let announced = child
 				.name
 				.clone()
@@ -143,22 +168,28 @@ impl SubagentSpawner for DriverSubagentSpawner {
 		}
 		let mut children = Vec::with_capacity(pending.len());
 		for (id, mut fallback) in pending {
-			let record = {
+			let (record, output) = {
 				let mut parent = self.parent.lock().await;
-				self
+				let record = self
 					.jobs
 					.wait(&mut parent, Some(std::slice::from_ref(&id)))
 					.await
+					.map_err(|source| TaskFault { message: Str::new(source.to_string()) })?;
+				let output = record
+					.as_ref()
+					.and_then(|record| record.output.as_deref())
+					.map(|output| omp_agent::resolve_output(&parent, output))
+					.transpose()
 					.map_err(|source| TaskFault { message: Str::new(source.to_string()) })?
+					.flatten();
+				(record, output)
 			};
 			let Some(record) = record else {
 				fallback.error = Some(Str::new_static("subagent job disappeared before settlement"));
 				children.push(fallback);
 				continue;
 			};
-			let result = record
-				.output
-				.as_deref()
+			let result = output
 				.and_then(|output| serde_json::from_str::<ChildResult>(output.get()).ok())
 				.unwrap_or_else(|| {
 					fallback.error = record.error.clone();
@@ -247,6 +278,15 @@ impl SessionTool for TaskSessionTool {
 			}
 			let mut jobs = Vec::with_capacity(request.tasks.len());
 			for child in request.tasks {
+				let child = match admit_child(cx.hooks, &self.parent_ctx, child, &self.model).await {
+					Ok(child) => child,
+					Err(source) => {
+						let fault = serde_json::value::to_raw_value(&TaskFault {
+							message: Str::new(source.to_string()),
+						})?;
+						return Ok(CallOutcome::Faulted(fault));
+					},
+				};
 				let cancel = cx.cancel.token().child_token();
 				let prepared = match prepare_child(cx.session, SpawnRequest {
 					data_dir: &self.data_dir,
@@ -313,6 +353,9 @@ pub enum SpawnError {
 	/// Child turn failed.
 	#[error("child turn failed")]
 	Kernel(#[from] omp_agent::KernelError),
+	/// Engaging the child's yield-enforcement Director failed.
+	#[error("child yield director engagement failed")]
+	Director(#[from] DirectorError),
 	/// Environment isolation or merge failed.
 	#[error("subagent workspace operation failed")]
 	Environment(#[from] omp_env::ClientError),
@@ -351,6 +394,193 @@ pub enum SpawnError {
 		/// Configured maximum depth.
 		maximum: i32,
 	},
+	/// A `subagent_spawn` hook refused the child.
+	#[error("subagent spawn denied by extension: {reason}")]
+	Denied {
+		/// Stable extension-supplied reason.
+		reason: Str,
+	},
+	/// The `subagent_spawn` gate itself failed (malformed transform, approval
+	/// at a lifecycle seam, payload encoding).
+	#[error("subagent spawn hook failed")]
+	Hook(#[source] LifecycleHookError),
+	/// A `subagent_spawn` transform returned a field outside the
+	/// `SubagentSpec` contract.
+	#[error("subagent spawn transform returned malformed field `{field}`")]
+	MalformedTransform {
+		/// Dotted field path.
+		field: &'static str,
+	},
+}
+
+/// Runs the `subagent_spawn` gate over one child request (Python
+/// `SubagentSpec`): a denial is a typed spawn failure, a transform replaces
+/// the request's spec-bearing fields, and an unsubscribed or absent gate
+/// returns the request unchanged.
+pub async fn admit_child(
+	hooks: Option<&LifecycleHooks>,
+	parent_ctx: &Ctx,
+	child: ChildRequest,
+	model: &str,
+) -> Result<ChildRequest, SpawnError> {
+	let Some(hooks) = hooks else {
+		return Ok(child);
+	};
+	if !hooks
+		.hook_gate()
+		.subscribed(HookEventId::HookEventSubagentSpawn)
+	{
+		return Ok(child);
+	}
+	let payload = subagent_spec(parent_ctx, &child, model);
+	match hooks
+		.gate(HookEventId::HookEventSubagentSpawn, payload.clone())
+		.await
+	{
+		Ok(effective) => child_from_spec(child, &payload, &effective),
+		Err(LifecycleHookError::Denied { reason, .. }) => Err(SpawnError::Denied { reason }),
+		Err(error) => Err(SpawnError::Hook(error)),
+	}
+}
+
+/// The Python `SubagentSpec` view of one child request.
+fn subagent_spec(parent_ctx: &Ctx, child: &ChildRequest, model: &str) -> serde_json::Value {
+	let settings = TaskSettings::from_con(parent_ctx);
+	let depth = SV_TASK_RECURSION_DEPTH.get(parent_ctx);
+	let worktree = child.isolated.unwrap_or(
+		settings.isolation.mode != super::settings::TaskIsolationMode::None,
+	);
+	let merge = if worktree {
+		<&'static str>::from(settings.isolation.merge)
+	} else {
+		"none"
+	};
+	serde_json::json!({
+		"task": child.task,
+		"name": child.name,
+		"agent": child.agent.as_deref().unwrap_or("task"),
+		"system_prompt": serde_json::Value::Null,
+		"model": model,
+		"on_model_unavailable": "fail",
+		"thinking": child.effort.map(effort_name),
+		"allowed_devices": serde_json::Value::Null,
+		"disallowed_devices": [],
+		"isolation": "clean",
+		"max_depth": i64::from(settings.max_recursion_depth).saturating_sub(i64::from(depth)).max(0),
+		"cwd": serde_json::Value::Null,
+		"worktree": worktree,
+		"merge": merge,
+		"env_vars": {},
+		"background": false,
+		"output_schema": child.output_schema,
+		"schema_mode": match child.schema_mode {
+			Some(SchemaMode::Strict) => "strict",
+			Some(SchemaMode::Permissive) | None => "permissive",
+		},
+		"deadline": serde_json::Value::Null,
+		"request_budget": serde_json::Value::Null,
+		"budget": serde_json::Value::Null,
+		"labels": {},
+	})
+}
+
+const fn effort_name(effort: TaskEffort) -> &'static str {
+	match effort {
+		TaskEffort::Lo => "lo",
+		TaskEffort::Med => "med",
+		TaskEffort::Hi => "hi",
+	}
+}
+
+/// Reads the spec-bearing fields a transform changed (relative to the
+/// `sent` spec) back into the child request; every field is validated,
+/// unknown ones are ignored, untouched ones keep the request's own value.
+fn child_from_spec(
+	mut child: ChildRequest,
+	sent: &serde_json::Value,
+	effective: &serde_json::Value,
+) -> Result<ChildRequest, SpawnError> {
+	let effective = serde_json::Value::Object(
+		effective
+			.as_object()
+			.map(|object| {
+				object
+					.iter()
+					.filter(|(name, value)| sent.get(name.as_str()) != Some(*value))
+					.map(|(name, value)| (name.clone(), value.clone()))
+					.collect()
+			})
+			.unwrap_or_default(),
+	);
+	let effective = &effective;
+	let field = |name: &'static str| effective.get(name).filter(|value| !value.is_null());
+	if let Some(task) = field("task") {
+		let task = task
+			.as_str()
+			.filter(|task| !task.trim().is_empty())
+			.ok_or(SpawnError::MalformedTransform { field: "task" })?;
+		child.task = Str::new(task);
+	}
+	match effective.get("name") {
+		None => {},
+		Some(serde_json::Value::Null) => child.name = None,
+		Some(name) => {
+			let name = name
+				.as_str()
+				.filter(|name| {
+					let mut chars = name.chars();
+					chars.next().is_some_and(|first| first.is_ascii_alphabetic())
+						&& name.len() <= 32
+						&& chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+				})
+				.ok_or(SpawnError::MalformedTransform { field: "name" })?;
+			child.name = Some(Str::new(name));
+		},
+	}
+	if let Some(agent) = field("agent") {
+		let agent = agent
+			.as_str()
+			.filter(|agent| !agent.trim().is_empty())
+			.ok_or(SpawnError::MalformedTransform { field: "agent" })?;
+		child.agent = Some(Str::new(agent));
+	}
+	match effective.get("thinking") {
+		None => {},
+		Some(serde_json::Value::Null) => child.effort = None,
+		Some(thinking) => {
+			child.effort = Some(match thinking.as_str() {
+				Some("lo" | "off") => TaskEffort::Lo,
+				Some("med") => TaskEffort::Med,
+				Some("hi") => TaskEffort::Hi,
+				_ => return Err(SpawnError::MalformedTransform { field: "thinking" }),
+			});
+		},
+	}
+	if let Some(worktree) = field("worktree") {
+		child.isolated = Some(
+			worktree
+				.as_bool()
+				.ok_or(SpawnError::MalformedTransform { field: "worktree" })?,
+		);
+	}
+	match effective.get("output_schema") {
+		None => {},
+		Some(serde_json::Value::Null) => child.output_schema = None,
+		Some(schema) => {
+			if !schema.is_object() {
+				return Err(SpawnError::MalformedTransform { field: "output_schema" });
+			}
+			child.output_schema = Some(schema.clone());
+		},
+	}
+	if let Some(mode) = field("schema_mode") {
+		child.schema_mode = Some(match mode.as_str() {
+			Some("strict") => SchemaMode::Strict,
+			Some("permissive") => SchemaMode::Permissive,
+			_ => return Err(SpawnError::MalformedTransform { field: "schema_mode" }),
+		});
+	}
+	Ok(child)
 }
 
 /// Host-owned inputs for one child run.
@@ -403,7 +633,13 @@ pub async fn spawn_child(
 		.ok_or_else(|| SpawnError::Workspace {
 			message: Str::new_static("subagent job disappeared before settlement"),
 		})?;
-	if let Some(output) = record.output {
+	if let Some(output) = record
+		.output
+		.as_deref()
+		.map(|output| omp_agent::resolve_output(parent, output))
+		.transpose()?
+		.flatten()
+	{
 		return serde_json::from_str(output.get())
 			.map_err(|source| SpawnError::Workspace { message: Str::new(source.to_string()) });
 	}
@@ -444,9 +680,7 @@ fn admit_batch(
 ) -> Result<(), SpawnError> {
 	let settings = TaskSettings::from_con(parent_ctx);
 	let depth = SV_TASK_RECURSION_DEPTH.get(parent_ctx);
-	if settings.max_recursion_depth >= 0
-		&& depth >= u32::try_from(settings.max_recursion_depth).unwrap_or(u32::MAX)
-	{
+	if settings.at_recursion_limit(depth) {
 		return Err(SpawnError::RecursionDepth {
 			depth,
 			maximum: i32::from(settings.max_recursion_depth),
@@ -484,9 +718,7 @@ fn prepare_child(
 ) -> Result<PreparedChild, SpawnError> {
 	let parent_settings = TaskSettings::from_con(request.parent_ctx);
 	let parent_depth = SV_TASK_RECURSION_DEPTH.get(request.parent_ctx);
-	if parent_settings.max_recursion_depth >= 0
-		&& parent_depth >= u32::try_from(parent_settings.max_recursion_depth).unwrap_or(u32::MAX)
-	{
+	if parent_settings.at_recursion_limit(parent_depth) {
 		return Err(SpawnError::RecursionDepth {
 			depth:   parent_depth,
 			maximum: i32::from(parent_settings.max_recursion_depth),
@@ -624,6 +856,7 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 			options,
 		)
 		.await?;
+		engage_yield_ladder(&prepared.child, &mut child_session)?;
 		let deadline = (prepared.settings.max_runtime_ms != 0).then(|| {
 			std::time::Instant::now() + Duration::from_millis(prepared.settings.max_runtime_ms)
 		});
@@ -689,12 +922,15 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 	})
 }
 
-struct IsolationRun {
-	id:   Str,
-	root: PathBuf,
+pub(crate) struct IsolationRun {
+	pub(crate) id:   Str,
+	pub(crate) root: PathBuf,
 }
 
-async fn create_isolation(env: &EnvClient, id: &Str) -> Result<IsolationRun, SpawnError> {
+pub(crate) async fn create_isolation(
+	env: &EnvClient,
+	id: &Str,
+) -> Result<IsolationRun, SpawnError> {
 	let result = env
 		.create_worktree(CreateWorktree {
 			name:      format!("subagent-{id}"),
@@ -716,7 +952,7 @@ async fn create_isolation(env: &EnvClient, id: &Str) -> Result<IsolationRun, Spa
 	Ok(IsolationRun { id: Str::new(worktree.id), root })
 }
 
-async fn finish_isolation(
+pub(crate) async fn finish_isolation(
 	env: &EnvClient,
 	isolation: IsolationRun,
 	settings: &TaskSettings,
@@ -756,7 +992,7 @@ async fn finish_isolation(
 	Ok(WorkspaceOutcome { worktree: isolation.id, patch, branch, applied, conflicts })
 }
 
-async fn discard_isolation(
+pub(crate) async fn discard_isolation(
 	env: &EnvClient,
 	isolation: IsolationRun,
 ) -> Result<WorkspaceOutcome, SpawnError> {
@@ -776,7 +1012,7 @@ async fn destroy_isolation(env: &EnvClient, id: &str) -> Result<(), SpawnError> 
 	Ok(())
 }
 
-fn configure_child_route(
+pub(crate) fn configure_child_route(
 	ctx: &Ctx,
 	settings: &TaskSettings,
 	agent: &str,
@@ -842,6 +1078,31 @@ fn clamp_effort(ctx: &Ctx, ceiling: TaskEffortCeiling) -> Result<(), SpawnError>
 	Ok(())
 }
 
+/// Engages pi's yield ladder on a schema-bound child before its first turn: a
+/// deferred `ForceTool("yield")` leaves the working requests unforced and,
+/// once the child stops idle without finalizing, reminds it
+/// [`MAX_YIELD_RETRIES`] times (the last rung natively forced) before the
+/// Director fails and the run is classified as a missing yield.
+fn engage_yield_ladder(request: &ChildRequest, session: &mut Session) -> Result<(), SpawnError> {
+	if request.output_schema.is_none() {
+		return Ok(());
+	}
+	let mut directors = DirectorStack::from_dom(session.dom(), &DirectorRegistry::standard());
+	directors.engage(
+		session,
+		Box::new(
+			ForceTool::new(
+				"yield",
+				ForceUntil::ToolCalled(Str::new_static("yield")),
+				Some(Str::new_static(YIELD_REMINDER)),
+				MAX_YIELD_RETRIES,
+			)
+			.deferred(),
+		),
+	)?;
+	Ok(())
+}
+
 fn structured_output(
 	request: &ChildRequest,
 	session: &Session,
@@ -867,7 +1128,12 @@ fn structured_output(
 			);
 		},
 	};
-	let (data, explicit_error) = terminal_yield(session, last_turn);
+	let (data, explicit_error) = yield_assembly::assemble(
+		&yield_assembly::settled_yields(session),
+		last_turn,
+		&yield_assembly::array_valued_labels(&schema),
+	)
+	.into_parts();
 	if let Some(error) = explicit_error {
 		let failure = Str::new(error);
 		return (
@@ -881,7 +1147,7 @@ fn structured_output(
 		);
 	}
 	let Some(data) = data else {
-		let failure = Str::new_static(super::yield_driver::WARNING_MISSING_YIELD);
+		let failure = Str::new_static(WARNING_MISSING_YIELD);
 		return (
 			Some(StructuredOutput {
 				mode,
@@ -929,64 +1195,20 @@ fn structured_output(
 	}
 }
 
-fn terminal_yield(
-	session: &Session,
-	last_turn: &str,
-) -> (Option<serde_json::Value>, Option<String>) {
-	let mut terminal = None;
-	for handle in session.dom().handles() {
-		let Some(node) = session.dom().get(handle) else {
-			continue;
-		};
-		if node.tag != omp_dom::Tag::Custom(Str::new_static("yield"))
-			|| node
-				.prop(&PropKey::from(PropId::Status))
-				.and_then(Value::as_str)
-				!= Some("ok")
-		{
-			continue;
-		}
-		let Some(input) = session.dom().children(handle).iter().find_map(|child| {
-			let node = session.dom().get(*child)?;
-			(node.tag == omp_dom::Tag::Known(omp_dom::KnownTag::Input)).then_some(node)
-		}) else {
-			continue;
-		};
-		let raw = input.content.as_deref().or_else(|| {
-			input
-				.prop(&PropKey::from(PropId::Text))
-				.and_then(Value::as_str)
-		});
-		let Some(raw) = raw else { continue };
-		let Ok(params) = serde_json::from_str::<YieldParams>(raw) else {
-			continue;
-		};
-		if matches!(params.kind, Some(YieldType::Sections(_))) {
-			continue;
-		}
-		terminal = Some(match params.result {
-			ResultEnvelope::Data { data } => (Some(data), None),
-			ResultEnvelope::Error { error } => (None, Some(error.to_string())),
-			ResultEnvelope::LastTurn {} if !last_turn.is_empty() => {
-				(Some(serde_json::Value::String(last_turn.to_owned())), None)
-			},
-			ResultEnvelope::LastTurn {} => {
-				(None, Some(super::yield_driver::WARNING_NULL_YIELD.to_owned()))
-			},
-		});
-	}
-	terminal.unwrap_or((None, None))
-}
-
+/// The child's explicit failure when no output schema is installed.
 fn terminal_yield_error(session: &Session) -> Option<Str> {
-	let (_, error) = terminal_yield(session, "");
+	let (_, error) =
+		yield_assembly::assemble(&yield_assembly::settled_yields(session), "", &[]).into_parts();
 	error.map(Str::new)
 }
 
-fn idle_park_delay(ttl_ms: u64) -> Option<Duration> {
+pub(crate) fn idle_park_delay(ttl_ms: u64) -> Option<Duration> {
 	(ttl_ms != 0).then(|| Duration::from_millis(ttl_ms))
 }
 
+/// Parks the registration after `ttl_ms` unless a later revival re-registered
+/// the same id with a different mailbox: the timer only evicts the run it was
+/// scheduled for.
 fn schedule_idle_park(
 	sessions: Arc<crate::sessions::SessionRegistry>,
 	id: crate::sessions::SessionId,
@@ -995,9 +1217,17 @@ fn schedule_idle_park(
 	let Some(delay) = idle_park_delay(ttl_ms) else {
 		return;
 	};
+	let Some(current) = sessions.lookup(&id) else {
+		return;
+	};
 	tokio::spawn(async move {
 		tokio::time::sleep(delay).await;
-		sessions.remove(&id);
+		if sessions
+			.lookup(&id)
+			.is_some_and(|live| live.up.same_channel(&current.up))
+		{
+			sessions.remove(&id);
+		}
 	});
 }
 
@@ -1041,7 +1271,7 @@ fn allocate_id(parent: &Session, requested: Str) -> Str {
 	unreachable!("u32 job-name suffix space exhausted")
 }
 
-fn child_session_path(sessions_dir: &Path, id: &Str) -> PathBuf {
+pub(crate) fn child_session_path(sessions_dir: &Path, id: &Str) -> PathBuf {
 	let safe = id
 		.as_str()
 		.chars()
@@ -1118,6 +1348,188 @@ mod tests {
 		));
 	}
 
+	struct SpawnGate {
+		hooks:     LifecycleHooks,
+		seen:      Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
+		responder: tokio::task::JoinHandle<()>,
+	}
+
+	impl Drop for SpawnGate {
+		fn drop(&mut self) {
+			self.responder.abort();
+		}
+	}
+
+	fn spawn_gate(
+		phase: omp_agent::HookPhase,
+		decide: impl Fn(&serde_json::Value) -> omp_agent::GateDecision + Send + 'static,
+	) -> SpawnGate {
+		let (gate, receiver) = omp_agent::HookGate::channel();
+		let gate = Arc::new(gate);
+		gate
+			.subscribe("test", [omp_agent::hooks::Subscription {
+				host: Str::new_static("test"),
+				source: omp_agent::SourceRef {
+					layer:        0,
+					publisher:    Str::new_static("test"),
+					extension_id: Str::new_static("spawn"),
+				},
+				id: 1,
+				event: HookEventId::HookEventSubagentSpawn,
+				phase,
+				order: 0,
+				on_failure: omp_agent::OnFailure::Deny,
+				when: omp_agent::When::default(),
+			}])
+			.expect("subscription");
+		let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+		let responder = {
+			let gate = Arc::clone(&gate);
+			let seen = Arc::clone(&seen);
+			tokio::spawn(async move {
+				while let Ok(dispatch) = receiver.recv_async().await {
+					let separator = dispatch
+						.payload
+						.iter()
+						.position(|byte| *byte == b'\n')
+						.map_or(0, |at| at + 1);
+					let payload: serde_json::Value =
+						serde_json::from_slice(&dispatch.payload[separator..]).expect("spec payload");
+					seen.lock().push(payload.clone());
+					gate
+						.answer(dispatch.dispatch_id, vec![(1, decide(&payload))])
+						.expect("answer");
+				}
+			})
+		};
+		SpawnGate { hooks: LifecycleHooks::new(gate), seen, responder }
+	}
+
+	fn plain_child() -> ChildRequest {
+		ChildRequest {
+			task:          Str::new_static("summarize the repo"),
+			name:          Some(Str::new_static("Summarizer")),
+			agent:         Some(Str::new_static("scout")),
+			effort:        Some(TaskEffort::Lo),
+			output_schema: None,
+			schema_mode:   None,
+			isolated:      None,
+		}
+	}
+
+	#[tokio::test]
+	async fn subagent_spawn_allow_keeps_the_request_and_exposes_the_spec() {
+		let gate = spawn_gate(omp_agent::HookPhase::Review, |_| omp_agent::GateDecision::Allow);
+		let ctx = Ctx::new();
+		let admitted = admit_child(Some(&gate.hooks), &ctx, plain_child(), "anthropic/claude")
+			.await
+			.expect("allowed spawn");
+		assert_eq!(admitted, plain_child());
+		let seen = gate.seen.lock().clone();
+		let spec = &seen[0];
+		assert_eq!(spec["task"], "summarize the repo");
+		assert_eq!(spec["name"], "Summarizer");
+		assert_eq!(spec["agent"], "scout");
+		assert_eq!(spec["thinking"], "lo");
+		assert_eq!(spec["model"], "anthropic/claude");
+		assert_eq!(spec["schema_mode"], "permissive");
+		for key in ["isolation", "worktree", "merge", "max_depth", "budget", "labels"] {
+			assert!(spec.get(key).is_some(), "SubagentSpec field {key} missing");
+		}
+		let ungated = admit_child(None, &ctx, plain_child(), "m").await.expect("no gate");
+		assert_eq!(ungated, plain_child());
+	}
+
+	#[tokio::test]
+	async fn subagent_spawn_deny_is_a_typed_spawn_failure() {
+		let gate = spawn_gate(omp_agent::HookPhase::Precheck, |_| {
+			omp_agent::GateDecision::Deny(Str::new_static("no scouts today"))
+		});
+		let ctx = Ctx::new();
+		let error = admit_child(Some(&gate.hooks), &ctx, plain_child(), "m")
+			.await
+			.expect_err("denied spawn");
+		assert!(matches!(&error, SpawnError::Denied { reason } if reason.as_str() == "no scouts today"));
+		assert_eq!(error.to_string(), "subagent spawn denied by extension: no scouts today");
+	}
+
+	#[tokio::test]
+	async fn subagent_spawn_transform_rewrites_the_request_and_rejects_malformed_fields() {
+		let gate = spawn_gate(omp_agent::HookPhase::Transform, |spec| {
+			let mut effective = spec.clone();
+			effective["task"] = "summarize only src/".into();
+			effective["name"] = "Scout2".into();
+			effective["agent"] = "task".into();
+			effective["thinking"] = "hi".into();
+			effective["worktree"] = true.into();
+			effective["output_schema"] = serde_json::json!({"type": "object"});
+			effective["schema_mode"] = "strict".into();
+			omp_agent::GateDecision::Modify(omp_agent::HookPatch {
+				target: None,
+				args:   Some(bytes::Bytes::from(serde_json::to_vec(&effective).expect("patch"))),
+			})
+		});
+		let ctx = Ctx::new();
+		let admitted = admit_child(Some(&gate.hooks), &ctx, plain_child(), "m")
+			.await
+			.expect("transformed spawn");
+		assert_eq!(admitted, ChildRequest {
+			task:          Str::new_static("summarize only src/"),
+			name:          Some(Str::new_static("Scout2")),
+			agent:         Some(Str::new_static("task")),
+			effort:        Some(TaskEffort::Hi),
+			output_schema: Some(serde_json::json!({"type": "object"})),
+			schema_mode:   Some(SchemaMode::Strict),
+			isolated:      Some(true),
+		});
+		drop(gate);
+
+		let gate = spawn_gate(omp_agent::HookPhase::Transform, |spec| {
+			let mut effective = spec.clone();
+			effective["name"] = "9lives".into();
+			omp_agent::GateDecision::Modify(omp_agent::HookPatch {
+				target: None,
+				args:   Some(bytes::Bytes::from(serde_json::to_vec(&effective).expect("patch"))),
+			})
+		});
+		let error = admit_child(Some(&gate.hooks), &ctx, plain_child(), "m")
+			.await
+			.expect_err("malformed name");
+		assert!(matches!(error, SpawnError::MalformedTransform { field: "name" }));
+	}
+
+	#[test]
+	fn schema_bound_child_engages_force_yield_director() {
+		let temp = tempfile::tempdir().expect("temporary directory");
+		let mut session =
+			Session::create(temp.path().join("child.oms"), omp_session::ComponentRegistry::standard())
+				.expect("child session");
+		engage_yield_ladder(&request_with_schema(SchemaMode::Strict), &mut session)
+			.expect("engage yield ladder");
+		let (_, node) = omp_agent::find_director(session.dom(), "force_tool")
+			.expect("force-tool director is active before the first turn");
+		assert_eq!(omp_agent::state_str(node, "tool").as_deref(), Some("yield"));
+		assert_eq!(omp_agent::state_str(node, "until").as_deref(), Some("yield"));
+		assert_eq!(omp_agent::state_bool(node, "deferred"), Some(true));
+		assert_eq!(omp_agent::state_int(node, "retries"), Some(i64::from(MAX_YIELD_RETRIES)));
+		assert_eq!(omp_agent::state_str(node, "reminder").as_deref(), Some(YIELD_REMINDER));
+		assert_eq!(
+			DirectorStack::from_dom(session.dom(), &DirectorRegistry::standard()).active_ids(),
+			vec!["force_tool"]
+		);
+	}
+
+	#[test]
+	fn unbound_child_engages_no_yield_director() {
+		let temp = tempfile::tempdir().expect("temporary directory");
+		let mut session =
+			Session::create(temp.path().join("child.oms"), omp_session::ComponentRegistry::standard())
+				.expect("child session");
+		let request = ChildRequest { output_schema: None, ..request_with_schema(SchemaMode::Strict) };
+		engage_yield_ladder(&request, &mut session).expect("no-op engagement");
+		assert!(omp_agent::find_director(session.dom(), "force_tool").is_none());
+	}
+
 	#[test]
 	fn strict_schema_turn_without_yield_is_a_failed_child() {
 		let temp = tempfile::tempdir().expect("temporary directory");
@@ -1128,6 +1540,62 @@ mod tests {
 			structured_output(&request_with_schema(SchemaMode::Strict), &session, "plain text");
 		assert_eq!(output.expect("schema verdict").status, OutputStatus::Invalid);
 		assert!(error.is_some());
+	}
+
+	fn settle_yield(session: &mut Session, call_id: &'static str, args: serde_json::Value) {
+		let args = serde_json::value::to_raw_value(&args).expect("yield args");
+		let call = session
+			.call("yield", 2, Str::new_static(call_id), None, Some(args), None)
+			.expect("yield call");
+		let outcome = serde_json::value::to_raw_value(&serde_json::json!({
+			"incremental": true,
+			"use_last_turn": false,
+			"validation": null,
+		}))
+		.expect("yield outcome");
+		session.settle(call, outcome).expect("yield settles");
+	}
+
+	#[test]
+	fn incremental_section_yields_assemble_into_the_terminal_result() {
+		let temp = tempfile::tempdir().expect("temporary directory");
+		let mut session =
+			Session::create(temp.path().join("child.oms"), omp_session::ComponentRegistry::standard())
+				.expect("child session");
+		session.begin_turn().expect("turn");
+		session.user("review", Vec::new()).expect("prompt");
+		settle_yield(
+			&mut session,
+			"y1",
+			serde_json::json!({"type": ["findings"], "result": {"data": {"title": "first"}}}),
+		);
+		settle_yield(
+			&mut session,
+			"y2",
+			serde_json::json!({"type": ["findings"], "result": {"data": {"title": "second"}}}),
+		);
+		settle_yield(&mut session, "y3", serde_json::json!({"type": "result", "result": {}}));
+		let request = ChildRequest {
+			output_schema: Some(serde_json::json!({
+				"type": "object",
+				"required": ["findings"],
+				"properties": {
+					"findings": {
+						"type": "array",
+						"items": {"type": "object", "required": ["title"]},
+					},
+				},
+			})),
+			..request_with_schema(SchemaMode::Strict)
+		};
+		let (output, error) = structured_output(&request, &session, "done");
+		assert_eq!(error, None);
+		let output = output.expect("schema verdict");
+		assert_eq!(output.status, OutputStatus::Valid);
+		assert_eq!(
+			output.data,
+			Some(serde_json::json!({"findings": [{"title": "first"}, {"title": "second"}]}))
+		);
 	}
 
 	#[test]

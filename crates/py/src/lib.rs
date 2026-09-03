@@ -33,9 +33,7 @@ pub mod interrupt;
 
 use std::{
 	env,
-	error::Error,
 	ffi::CString,
-	fmt::{self, Display},
 	mem::MaybeUninit,
 	os::unix::ffi::OsStrExt,
 	path::{Path, PathBuf},
@@ -89,25 +87,16 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// CPython-side boot failures (corrupt frozen data, allocator failure) do
 /// not surface here: the interpreter prints its diagnostic and exits the
 /// process, per embedding convention.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum InitError {
 	/// The engine was already initialized in this process.
+	#[error("python engine already initialized")]
 	AlreadyInitialized,
 	/// A configured search path contains an interior NUL byte.
+	#[error("search path contains NUL byte: {}", .0.display())]
 	InvalidPath(PathBuf),
 }
-
-impl Display for InitError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::AlreadyInitialized => f.write_str("python engine already initialized"),
-			Self::InvalidPath(p) => write!(f, "search path contains NUL byte: {}", p.display()),
-		}
-	}
-}
-
-impl Error for InitError {}
 
 /// Processing policy for the one host-authorized site-packages directory.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -419,5 +408,21 @@ fn init_python(site_packages: &CString) {
 			tracing::error!("embedded Python initialization created no thread state");
 			panic!("CPython initialization did not create a thread state");
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn init_error_reports_its_cause() {
+		let already: &dyn std::error::Error = &InitError::AlreadyInitialized;
+		assert_eq!(already.to_string(), "python engine already initialized");
+		assert!(already.source().is_none());
+		assert_eq!(
+			InitError::InvalidPath(PathBuf::from("/opt/site\u{0}bad")).to_string(),
+			"search path contains NUL byte: /opt/site\u{0}bad"
+		);
 	}
 }

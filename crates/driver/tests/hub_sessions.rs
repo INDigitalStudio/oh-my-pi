@@ -6,6 +6,7 @@ use futures::stream;
 use omp_agent::{Inference, Kernel, RunControl, StaticPrompt, TurnInput};
 use omp_catalog::{ProviderId, RouteId};
 use omp_core::Str;
+use omp_dom::{KnownTag, NodeSpec, Op, PropId, PropKey, Tag, Txn, Value};
 use omp_driver::{
 	sessions::{KernelHandle, SessionId, SessionRegistry},
 	subagent::hub::SessionHub,
@@ -87,6 +88,72 @@ async fn send_lands_in_child_steering_and_inbox_reads_it() {
 	assert!(
 		SessionHub::inbox(&mut child, true)
 			.expect("empty inbox")
+			.useless
+	);
+}
+
+/// `hub inbox` is the peer bus: it drains `hub=true` queue items only. User
+/// steering shares `<queues><steering>` but belongs to the kernel safe point.
+#[test]
+fn hub_inbox_leaves_user_steering_queued() {
+	let temp = tempfile::tempdir().expect("temporary directory");
+	let mut session =
+		Session::create(temp.path().join("s.oms"), ComponentRegistry::standard()).expect("session");
+	let steering = session
+		.dom()
+		.children(session.dom().queues())
+		.iter()
+		.copied()
+		.find(|handle| {
+			session
+				.dom()
+				.get(*handle)
+				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Steering))
+		})
+		.expect("steering queue");
+	let queued =
+		|node: NodeSpec| node.with_prop(PropId::Status, Value::Str(Str::new_static("queued")));
+	let cause = session.head().expect("journal head");
+	session
+		.patch(Txn {
+			cause,
+			label: None,
+			ops: vec![
+				Op::Ins {
+					parent: steering,
+					after:  None,
+					node:   queued(NodeSpec::new(KnownTag::User))
+						.with_prop(PropKey::Custom(Str::new_static("hub")), Value::Bool(true))
+						.with_content(Str::new_static("peer says hi")),
+				},
+				Op::Ins {
+					parent: steering,
+					after:  None,
+					node:   queued(NodeSpec::new(KnownTag::User))
+						.with_content(Str::new_static("user redirect")),
+				},
+			],
+		})
+		.expect("queue both items");
+
+	let peeked = SessionHub::inbox(&mut session, true).expect("peek");
+	assert!(peeked.text.as_str().contains("peer says hi"));
+	assert!(!peeked.text.as_str().contains("user redirect"));
+
+	let drained = SessionHub::inbox(&mut session, false).expect("drain");
+	assert!(drained.text.as_str().contains("peer says hi"));
+	assert!(!drained.text.as_str().contains("user redirect"));
+
+	let remaining = session
+		.dom()
+		.children(steering)
+		.iter()
+		.filter_map(|handle| session.dom().get(*handle)?.content.clone())
+		.collect::<Vec<_>>();
+	assert_eq!(remaining, vec![Str::new_static("user redirect")]);
+	assert!(
+		SessionHub::inbox(&mut session, true)
+			.expect("peer inbox is empty")
 			.useless
 	);
 }

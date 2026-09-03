@@ -176,6 +176,31 @@ mod tests {
 		assert_eq!(files.load("subagent.cfg").unwrap().as_str(), "ai_fastmode 0\nai_thinking low\n");
 	}
 
+	/// The subagent spawn path installs [`CfgFiles`] as its loader (kernel
+	/// `TaskSessionTool`), so `~/.o2/subagent.cfg` and `~/.o2/<agent>.cfg`
+	/// reach every child in ADR 0013 order — user script, project overlay,
+	/// then the agent class — with `config.cfg` never re-read over the seed.
+	#[test]
+	fn spawn_configs_run_user_then_project_subagent_and_agent_cfgs() {
+		let dir = tempfile::tempdir().unwrap();
+		let user = dir.path().join("o2");
+		let project = dir.path().join("proj/.omp");
+		fs::create_dir_all(&user).unwrap();
+		fs::create_dir_all(&project).unwrap();
+		fs::write(user.join("config.cfg"), "ai_fastmode 1\nai_thinking low\n").unwrap();
+		fs::write(user.join("subagent.cfg"), "ai_fastmode 0\nai_thinking medium\n").unwrap();
+		fs::write(project.join("subagent.cfg"), "ai_thinking high\n").unwrap();
+		fs::write(user.join("scout.cfg"), "ai_model @smol\n").unwrap();
+		let files = CfgFiles::with_roots(user, Some(project));
+		let child = omp_con::Ctx::new();
+		omp_con::AI_FASTMODE.set(&child, true).unwrap();
+		let outcome = child.exec_spawn_configs(&files, "scout");
+		assert_eq!(outcome.failed, 0);
+		assert!(!omp_con::AI_FASTMODE.get(&child), "user subagent.cfg ran");
+		assert_eq!(omp_con::AI_THINKING.get(&child).as_str(), "high", "project overlay ran last");
+		assert_eq!(omp_con::AI_MODEL.get(&child).as_str(), "@smol", "user <agent>.cfg ran");
+	}
+
 	#[test]
 	fn save_writes_the_user_file_atomically_and_creates_the_root() {
 		let dir = tempfile::tempdir().unwrap();

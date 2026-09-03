@@ -13,7 +13,7 @@ use omp_agent::{
 	ExternalDispatchEvent, ExternalDispatchRequest, ExternalDispatchStream, ExternalToolExecutor,
 	Kernel, RouteFacts, RuntimeFlags,
 };
-use omp_core::{SecretString, Str, Ulid};
+use omp_core::{SecretString, Str, Ulid, sf};
 use omp_dom::{Op, PropKey, Txn, Value};
 use omp_inference::{
 	CallMeta, ChatRequest, ChatStream, Client, ExecutionBudget, ProviderService, RequestId, Target,
@@ -36,7 +36,7 @@ use crate::registry::{
 };
 
 /// Stable prompt projection overrides supplied by one invocation.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct PromptOverrides {
 	/// Complete replacement for the customizable prompt bands.
 	pub custom_prompt:          Option<Str>,
@@ -56,6 +56,33 @@ pub struct PromptOverrides {
 	pub include_skills:         Option<bool>,
 	/// Whether all provider prompt bands are bypassed.
 	pub null_prompt:            bool,
+	/// Whether discovered context files (AGENTS.md and friends) are included
+	/// (`--no-context-files`).
+	pub include_context_files:  bool,
+	/// Whether discovered rules (`.omp/rules`, `RULES.md`, `.cursor/rules`, …)
+	/// are included (`--no-rules`).
+	pub include_rules:          bool,
+	/// Additional workspace roots the prompt names beside the project.
+	pub additional_roots:       Vec<PathBuf>,
+}
+
+impl Default for PromptOverrides {
+	fn default() -> Self {
+		Self {
+			custom_prompt:          None,
+			append_prompt:          None,
+			personality:            None,
+			include_model:          None,
+			include_workstation:    None,
+			include_workspace_tree: None,
+			render_mermaid:         None,
+			include_skills:         None,
+			null_prompt:            false,
+			include_context_files:  true,
+			include_rules:          true,
+			additional_roots:       Vec::new(),
+		}
+	}
 }
 
 /// Native extension-root composition for one invocation.
@@ -145,6 +172,12 @@ pub struct KernelOptions {
 	pub output_schema:      Option<serde_json::Value>,
 	/// Enforcement mode for the child-specific output schema.
 	pub schema_mode:        Option<SchemaMode>,
+	/// Deny PTY-backed shell sessions to every tool (`--no-pty`).
+	pub no_pty:             bool,
+	/// Invocation-scoped provider prompt-cache identity (`--prompt-cache-key`).
+	pub prompt_cache_key:   Option<Str>,
+	/// Invocation-scoped provider session identity (`--provider-session-id`).
+	pub provider_session:   Option<Str>,
 }
 
 /// Removes a no-session journal regardless of which presentation adapter or
@@ -180,15 +213,42 @@ pub struct ProductionInference {
 }
 
 impl ProductionInference {
+	/// The catalog model `ai_model` currently selects (role selectors such
+	/// as `@plan` resolve through the launch roles), else the launch model.
+	fn selected_model(&self) -> Str {
+		let selector = omp_con::AI_MODEL.get(&self.con);
+		if selector.is_empty() {
+			return Str::new(self.model.as_str());
+		}
+		if let Ok(model) = resolve_model_selector(self.catalog.as_ref(), selector.as_str()) {
+			return model;
+		}
+		let settings = omp_catalog::settings::ModelSettings::from_con(&self.con);
+		crate::discovery::roles::resolve_role_selector(
+			self.catalog.as_ref(),
+			&settings,
+			selector.as_str(),
+		)
+		.map_or_else(|_| Str::new(self.model.as_str()), |selected| Str::new(selected.model.as_str()))
+	}
+
+	/// Catalog facts for the model the next request targets (R2 #10: `/model`
+	/// switches must not leave compaction, vision, or tool lowering on the
+	/// launch model).
+	fn route_facts(&self) -> Option<RouteFacts> {
+		let model = self.selected_model();
+		let spec = self
+			.catalog
+			.model(omp_catalog::ModelKey::from_ref(model.as_str()))?;
+		Some(route_facts(self.catalog.as_ref(), spec))
+	}
+
 	/// Applies the control plane to the next call: `ai_model` re-targets the
 	/// client when it names a different catalog model (ADR 0012: the convar
 	/// is the live route), and `ai_thinking` sets the reasoning effort.
 	fn apply_convars(&mut self, request: &mut ChatRequest) {
-		let selector = omp_con::AI_MODEL.get(&self.con);
-		if !selector.is_empty()
-			&& let Ok(model) = resolve_model_selector(self.catalog.as_ref(), selector.as_str())
-			&& model.as_str() != self.model.as_str()
-		{
+		let model = self.selected_model();
+		if model.as_str() != self.model.as_str() {
 			let key = omp_catalog::ModelKey::from(model.as_str());
 			let mut meta = self.meta.clone();
 			meta.target = match &self.meta.target {
@@ -199,6 +259,12 @@ impl ProductionInference {
 			};
 			self.client.set_call_meta(meta);
 			self.model = key;
+		}
+		// pi `externalThinking`: provider reasoning stays off; the kernel
+		// advertises the hidden `think` tool instead.
+		if omp_inference::pi_settings::AI_EXTERNAL_THINKING.get(&self.con) {
+			request.reasoning = omp_inference::Setting::Unset;
+			return;
 		}
 		if matches!(request.reasoning, omp_inference::Setting::Unset) {
 			let thinking = omp_con::AI_THINKING.get(&self.con);
@@ -259,14 +325,158 @@ fn convar_reasoning(
 	})
 }
 
+/// Environment-routed tool execution: opens the invocation on the project
+/// environment, commits the arguments, and answers the environment's
+/// admission query by prompting the session's approval authority.
 #[derive(Clone)]
-struct EnvToolExecutor {
-	client: omp_env::EnvClient,
+pub struct EnvToolExecutor {
+	client:    omp_env::EnvClient,
+	approvals: omp_agent::ApprovalRoute,
+}
+
+impl EnvToolExecutor {
+	/// Executes environment tools for `client`; every admission query the
+	/// environment raises (an `--approval-mode` tier above the call's
+	/// policy) becomes one prompt on `approvals`.
+	#[must_use]
+	pub const fn new(client: omp_env::EnvClient, approvals: omp_agent::ApprovalRoute) -> Self {
+		Self { client, approvals }
+	}
+}
+
+/// The prompt an admission query becomes (pi `formatApprovalPrompt`): the
+/// exact command for `bash`, else the tool name and its committed arguments.
+fn admission_spec(
+	request: &ExternalDispatchRequest,
+	query: &omp_env::frame::AdmitInvocation,
+) -> omp_agent::ApprovalSpec {
+	let name = request.identity.name.as_str();
+	let (kind, subject) = match query.bash.as_ref() {
+		Some(bash) => ("exec", Str::new(bash.source.as_str())),
+		None => ("tool", Str::new(name)),
+	};
+	let args = request.args.get();
+	let body = match query.bash.as_ref() {
+		Some(bash) => sf!("$ {}", bash.source),
+		None => sf!("{name} {}", args.chars().take(512).collect::<String>()),
+	};
+	omp_agent::ApprovalSpec {
+		title:         sf!("Run {name}"),
+		body,
+		subject,
+		kind:          Str::new_static(kind),
+		scopes:        vec![Str::new_static("once"), Str::new_static("session")],
+		default:       Some(false),
+		route:         Str::new_static("user"),
+		approver:      None,
+		timeout_ms:    query.deadline_ms,
+		unreachable:   Str::new_static("deny"),
+		require_human: true,
+		pattern:       None,
+		evidence:      vec![sf!("tool `{name}` requires approval under the session approval mode")],
+	}
+}
+
+/// `--approval-mode` / `tools.approval.*` for native tool calls (pi
+/// `resolveApproval`): the tool's declared effect tier against the session
+/// approval mode, with per-tool overrides.
+pub struct SettingsAdmission {
+	settings: omp_envd::tool_settings::ToolSettings,
+}
+
+impl SettingsAdmission {
+	/// Resolves the policy from the effective control plane plus the
+	/// invocation's `--approval-mode` override.
+	#[must_use]
+	pub fn new(
+		ctx: &omp_con::Ctx,
+		approval_mode: Option<omp_envd::tool_settings::ApprovalMode>,
+	) -> Self {
+		Self {
+			settings: omp_envd::tool_settings::ToolSettings::from_con(ctx)
+				.with_approval_mode_override(approval_mode),
+		}
+	}
+}
+
+impl omp_agent::ToolAdmission for SettingsAdmission {
+	fn admit(
+		&self,
+		name: &str,
+		effects: &omp_tool::Effects,
+		args: &serde_json::value::RawValue,
+	) -> omp_agent::ToolAdmissionVerdict {
+		let resolved = self.settings.approval_for(name, name, effects);
+		match resolved.policy {
+			omp_envd::admission::ApprovalPolicy::Allow => omp_agent::ToolAdmissionVerdict::Allow,
+			omp_envd::admission::ApprovalPolicy::Deny => omp_agent::ToolAdmissionVerdict::Deny(sf!(
+				"tool `{name}` is denied by approval policy (tools.approval.{name})"
+			)),
+			omp_envd::admission::ApprovalPolicy::Prompt => {
+				let command = serde_json::from_str::<serde_json::Value>(args.get())
+					.ok()
+					.and_then(|value| {
+						value
+							.get("command")
+							.and_then(serde_json::Value::as_str)
+							.map(str::to_owned)
+					});
+				let (kind, subject, body) = match &command {
+					Some(command) => ("exec", Str::new(command.as_str()), sf!("$ {command}")),
+					None => (
+						"tool",
+						Str::new(name),
+						sf!("{name} {}", args.get().chars().take(512).collect::<String>()),
+					),
+				};
+				omp_agent::ToolAdmissionVerdict::Prompt(omp_agent::ApprovalSpec {
+					title:         sf!("Run {name}"),
+					body,
+					subject,
+					kind:          Str::new_static(kind),
+					scopes:        vec![Str::new_static("once"), Str::new_static("session")],
+					default:       Some(false),
+					route:         Str::new_static("user"),
+					approver:      None,
+					timeout_ms:    0,
+					unreachable:   Str::new_static("deny"),
+					require_human: true,
+					pattern:       None,
+					evidence:      vec![sf!(
+						"{} tier under approval mode {}",
+						<&'static str>::from(resolved.tier),
+						<&'static str>::from(self.settings.approval_mode)
+					)],
+				})
+			},
+		}
+	}
+}
+
+/// The structured denial the environment journals when the prompt refused
+/// the call.
+fn admission_denial(
+	call_id: &str,
+	name: &str,
+	decision: &omp_agent::ApprovalDecision,
+) -> omp_proto::policy::v1::PolicyDenied {
+	let by = <&'static str>::from(decision.source);
+	omp_proto::policy::v1::PolicyDenied {
+		reason:      decision.reason.as_deref().map_or_else(
+			|| format!("Tool call denied by {by}: {name}"),
+			|reason| format!("Tool call denied by {by}: {name} ({reason})"),
+		),
+		code:        String::from("approval_denied"),
+		decision_id: call_id.to_owned(),
+		rules:       vec![format!("tools.approval.{name}")],
+		props:       Default::default(),
+	}
 }
 
 impl ExternalToolExecutor for EnvToolExecutor {
 	fn invoke(&self, request: ExternalDispatchRequest) -> ExternalDispatchStream {
 		let client = self.client.clone();
+		let approvals = self.approvals.clone();
 		Box::pin(async_stream::stream! {
 			let opened = client.invoke(omp_env::frame::InvokeTool {
 				invocation_id: request.call_id.to_string(),
@@ -337,11 +547,32 @@ impl ExternalToolExecutor for EnvToolExecutor {
 				match next {
 					Ok(Some(omp_env::InvocationEvent::Accepted(_))) => {},
 					Ok(Some(omp_env::InvocationEvent::Admission(query))) => {
-						if let Err(source) = invocation.admit(omp_env::frame::Admission {
+						let spec = admission_spec(&request, &query);
+						let ticket = approvals
+							.request_cancellable(
+								Some(request.call_id.clone()),
+								vec![spec],
+								authorized_at_ms,
+								request.cancellation.clone(),
+							)
+							.await;
+						let decision = ticket.decision.unwrap_or_else(|| omp_agent::ApprovalDecision {
+							approved:   false,
+							scope:      omp_agent::ApprovalScope::Once,
+							source:     omp_agent::ApprovalSource::Unavailable,
+							decided_by: None,
+							reason:     Some(Str::new_static("approval prompt settled without a decision")),
+							audited:    false,
+						});
+						let admission = omp_env::frame::Admission {
 							invocation_id: query.invocation_id,
-							allow: true,
+							allow: decision.approved,
+							denied: (!decision.approved).then(|| {
+								admission_denial(request.call_id.as_str(), request.identity.name.as_str(), &decision)
+							}),
 							..Default::default()
-						}).await {
+						};
+						if let Err(source) = invocation.admit(admission).await {
 							tracing::warn!(%source, call_id = %request.call_id, "environment tool admission failed");
 							yield ExternalDispatchEvent::Aborted(Abort::Interrupted {
 								reason: Str::new_static("environment tool admission failed"),
@@ -549,6 +780,20 @@ impl omp_agent::Inference for ComposedInference {
 			Self::Gateway { inference, .. } => inference.install_retry_sink(sink),
 		}
 	}
+
+	fn route_facts(&self) -> Option<RouteFacts> {
+		match self {
+			Self::Production(inference) => inference.route_facts(),
+			Self::Gateway { .. } => None,
+		}
+	}
+
+	fn selected_model(&self) -> Option<Str> {
+		match self {
+			Self::Production(inference) => Some(inference.selected_model()),
+			Self::Gateway { .. } => None,
+		}
+	}
 }
 
 /// Concrete prompt projection returned by [`compose_kernel`].
@@ -601,8 +846,30 @@ pub async fn compose_kernel(
 		.sessions
 		.clone()
 		.unwrap_or_else(|| Arc::new(crate::sessions::SessionRegistry::new()));
+	let disabled_extensions = crate::discovery::CL_DISABLED_EXTENSIONS.get(&ctx);
+	let skills = Arc::new(crate::discovery::skills::ActiveSkills::discover(&ctx, &project_root)?);
+	let (context_files, rules) = discover_prompt_material(&project_root, &options.prompt)?;
+	let facts = {
+		let buckets = rules.prompt_facts(crate::discovery::rules::MAIN_AGENT);
+		crate::discovery::PromptFacts {
+			skills:             skills.prompt_facts(),
+			context_files:      context_files.prompt_facts(),
+			always_apply_rules: buckets.always_apply,
+			rules:              buckets.rulebook,
+			active_repository:  crate::discovery::active_repo::resolve(&project_root),
+		}
+	};
 	let bridges = if tools_enabled {
 		omp_envd::RegistryBridges {
+			command_credentials: Some(Arc::new(crate::bridges::CommandCredentials)),
+			telemetry_upload: Some(Arc::new(crate::bridges::TelemetryDelivery)),
+			url_resolvers: vec![skills.resolver(), rules.resolver()],
+			content: omp_envd::ActiveContentInputs {
+				authored_skills:     skills.names(),
+				managed_skills_root: Some(crate::discovery::skills::managed_skills_root(
+					&omp_core::dirs::user_config_root()?,
+				)),
+			},
 			dynamic_tools: vec![
 				omp_envd::DynamicTool::new(
 					omp_tools::task::tool(crate::subagent::spawn::TaskDeclarationSpawner),
@@ -656,6 +923,7 @@ pub async fn compose_kernel(
 			mode:              native_mode,
 			include_workspace: options.extensions.include_workspace,
 			setting_overrides: &options.extensions.setting_overrides,
+			disabled:          &disabled_extensions,
 		},
 	)?;
 	trusted_extensions.extend(
@@ -718,7 +986,13 @@ pub async fn compose_kernel(
 		.model(&model_key)
 		.ok_or_else(|| HeadlessError::UnknownModel { selector: model.clone() })?;
 	let route_facts = route_facts(catalog.as_ref(), model_spec);
-	let external = Arc::new(EnvToolExecutor { client: environment.client().clone() });
+	let tool_client = if options.no_pty {
+		environment
+			.client()
+			.with_invocation_grant(omp_env::InvocationGrant::unrestricted().deny_pty())
+	} else {
+		environment.client().clone()
+	};
 
 	let mut inference = if let Some(channel) = options.gateway {
 		ComposedInference::Gateway {
@@ -753,7 +1027,12 @@ pub async fn compose_kernel(
 			session: None,
 			response_hooks: Default::default(),
 		};
-		let client = Client::new(stack.registry.service(), planner, meta.clone());
+		let client = Client::new(stack.registry.service(), planner, meta.clone()).with_affinity(
+			omp_inference::CallAffinity {
+				prompt_cache:     options.prompt_cache_key.clone(),
+				provider_session: options.provider_session.clone(),
+			},
+		);
 		ComposedInference::Production(ProductionInference {
 			client,
 			meta,
@@ -789,7 +1068,7 @@ pub async fn compose_kernel(
 	};
 	let con_journal = Arc::new(con_journal::ConJournal::attach(Arc::clone(&ctx), session.dom()));
 	apply_model_override(&ctx, model.as_str(), options.model_override)?;
-	install_prompt_facts(&mut session, &project_root, model.as_str(), &options.prompt)?;
+	install_prompt_facts(&mut session, &project_root, model.as_str(), &options.prompt, &facts)?;
 	if !options.ephemeral {
 		remember_terminal_session(&sessions_dir, terminal.as_deref(), &journal_path)?;
 	}
@@ -844,14 +1123,26 @@ pub async fn compose_kernel(
 			})
 			.unwrap_or(true),
 	};
-	let mut kernel = Kernel::new(inference, registry, policy, prompt)
+	let kernel = Kernel::new(inference, registry, policy, prompt)
 		.with_director_registry(director_registry)
-		.with_external_executor(external)
 		.with_route_facts(route_facts)
 		.with_runtime_flags(runtime_flags)
 		.with_con_context(Arc::clone(&ctx))
 		.with_hook_gate(admission_gate)
 		.with_session_state_bridge(con_journal.clone());
+	// The session's one approval authority: environment policy (sandbox
+	// amendments, privileged mutations, dynamic devices) and the tool
+	// executor's admission queries all prompt through the kernel mailbox,
+	// where each prompt is journaled under `<queues><prompts>` and answered
+	// by the host's `Up::Approve`.
+	let approvals = kernel.approval_route();
+	kernel
+		.inference()
+		.environment()
+		.bind_approval_authority(Some(Arc::new(omp_agent::ApprovalBook::new())), Some(approvals.clone()));
+	let mut kernel = kernel
+		.with_external_executor(Arc::new(EnvToolExecutor::new(tool_client, approvals)))
+		.with_tool_admission(Arc::new(SettingsAdmission::new(&ctx, options.approval_mode)));
 	kernel.register_live_component(con_journal.live_component());
 	for component in live_python_components {
 		kernel.register_live_component(Box::new(component));
@@ -870,26 +1161,32 @@ pub async fn compose_kernel(
 		snapshot: Arc::new(RwLock::new(session.dom().snapshot())),
 	});
 	if tools_enabled {
-		let cfg_root = project_root.join(".omp");
+		// ADR 0013: `subagent.cfg` and `<agent>.cfg` resolve through the same
+		// user (`~/.o2`) and project cfg roots every other `exec` uses.
 		let cfg: Arc<dyn omp_con::CfgLoader> =
-			Arc::new(move |name: &str| fs::read_to_string(cfg_root.join(name)).ok().map(Str::new));
-		kernel = kernel
-			.with_session_tool(Arc::new(crate::subagent::spawn::TaskSessionTool::new(
-				data_dir.to_path_buf(),
-				project_root.clone(),
-				sessions_dir,
-				Arc::clone(&live_sessions),
-				Arc::clone(&ctx),
-				cfg,
-				hub_environment.clone(),
-				name.clone(),
-				model,
-			)))
-			.with_session_tool(Arc::new(crate::subagent::hub::HubSessionTool::new(
-				hub_environment,
-				project_root.clone(),
-				name,
-			)));
+			Arc::new(crate::cfg::CfgFiles::new(Some(&project_root))?);
+		// pi `atMaxDepth`: a child at the recursion ceiling never sees `task`,
+		// so it cannot plan a delegation the spawner would refuse.
+		if !crate::subagent::settings::task_withheld(&ctx) {
+			kernel = kernel.with_session_tool(Arc::new(
+				crate::subagent::spawn::TaskSessionTool::new(
+					data_dir.to_path_buf(),
+					project_root.clone(),
+					sessions_dir,
+					Arc::clone(&live_sessions),
+					Arc::clone(&ctx),
+					cfg,
+					hub_environment.clone(),
+					name.clone(),
+					model,
+				),
+			));
+		}
+		kernel = kernel.with_session_tool(Arc::new(crate::subagent::hub::HubSessionTool::new(
+			hub_environment,
+			project_root.clone(),
+			name,
+		)));
 	}
 	Ok((kernel, session, prompt))
 }
@@ -908,6 +1205,9 @@ pub struct SessionHome {
 	pub model:        Str,
 	/// Invocation prompt projection overrides.
 	pub prompt:       PromptOverrides,
+	/// Discovered prompt material (skills, context files, rules) projected
+	/// into every session's prompt facts.
+	pub facts:        crate::discovery::PromptFacts,
 	/// Process-local live-session routing authority.
 	pub live:         Arc<crate::sessions::SessionRegistry>,
 	/// The kernel's upward mailbox, shared by every session it drives.
@@ -934,7 +1234,31 @@ impl SessionHome {
 			.sessions
 			.clone()
 			.unwrap_or_else(|| Arc::new(crate::sessions::SessionRegistry::new()));
-		Ok(Self { sessions_dir, project_root, model, prompt: options.prompt.clone(), live, up })
+		Ok(Self {
+			sessions_dir,
+			project_root,
+			model,
+			prompt: options.prompt.clone(),
+			facts: crate::discovery::PromptFacts::default(),
+			live,
+			up,
+		})
+	}
+
+	/// Records the discovered prompt material so sessions created in-chat
+	/// carry the same prompt facts as the launch session.
+	#[must_use]
+	pub fn with_facts(mut self, facts: crate::discovery::PromptFacts) -> Self {
+		self.facts = facts;
+		self
+	}
+
+	/// Adopts the prompt material [`compose_kernel`] journaled into the launch
+	/// session, so `/new`, `/fork`, and `/resume` sessions carry the same
+	/// skills, context files, and rules without a second discovery pass.
+	#[must_use]
+	pub fn with_facts_of(self, session: &Session) -> Self {
+		self.with_facts(journaled_prompt_facts(session))
 	}
 
 	/// Path of a fresh journal in the session directory.
@@ -951,7 +1275,13 @@ impl SessionHome {
 			fs::create_dir_all(parent)?;
 		}
 		let mut session = Session::create(&path, ComponentRegistry::standard())?;
-		install_prompt_facts(&mut session, &self.project_root, self.model.as_str(), &self.prompt)?;
+		install_prompt_facts(
+			&mut session,
+			&self.project_root,
+			self.model.as_str(),
+			&self.prompt,
+			&self.facts,
+		)?;
 		self.register(&session);
 		Ok(session)
 	}
@@ -960,7 +1290,13 @@ impl SessionHome {
 	pub fn open(&self, path: &Path) -> Result<Session, HeadlessError> {
 		let path = resolve_session_path(&self.sessions_dir, path);
 		let mut session = Session::open(&path, ComponentRegistry::standard())?;
-		install_prompt_facts(&mut session, &self.project_root, self.model.as_str(), &self.prompt)?;
+		install_prompt_facts(
+			&mut session,
+			&self.project_root,
+			self.model.as_str(),
+			&self.prompt,
+			&self.facts,
+		)?;
 		self.register(&session);
 		Ok(session)
 	}
@@ -1040,6 +1376,29 @@ fn route_facts(
 			.and_then(|policy| policy.tool.named_choice)
 			.unwrap_or(false),
 		context_window:     model.limits.context_window.unwrap_or(0),
+		strict_schema:      model
+			.capabilities
+			.chat
+			.as_ref()
+			.and_then(|chat| chat.tools.constraints())
+			.is_some_and(|tools| {
+				tools
+					.features
+					.contains(omp_catalog::capability::ToolFeatureBits::STRICT_SCHEMA)
+			}),
+		grammar:            model
+			.capabilities
+			.chat
+			.as_ref()
+			.and_then(|chat| chat.grammar.constraints())
+			.copied()
+			.unwrap_or_default(),
+		maximum_tools:      model
+			.capabilities
+			.chat
+			.as_ref()
+			.and_then(|chat| chat.tools.constraints())
+			.and_then(|tools| tools.maximum_tools),
 		image_input:        model
 			.capabilities
 			.chat
@@ -1126,6 +1485,31 @@ fn terminal_marker(sessions_dir: &Path, terminal: &str) -> PathBuf {
 	sessions_dir.join(".continue").join(key.as_str())
 }
 
+/// The most recently modified `.oms` journal in `sessions_dir`, if any.
+fn newest_project_session(sessions_dir: &Path) -> Result<Option<PathBuf>, HeadlessError> {
+	let entries = match fs::read_dir(sessions_dir) {
+		Ok(entries) => entries,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(error.into()),
+	};
+	let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+	for entry in entries {
+		let entry = entry?;
+		let path = entry.path();
+		if path.extension().and_then(|extension| extension.to_str())
+			!= Some(omp_journal::FILE_EXTENSION)
+			|| !path.is_file()
+		{
+			continue;
+		}
+		let modified = entry.metadata()?.modified()?;
+		if newest.as_ref().is_none_or(|(when, _)| modified > *when) {
+			newest = Some((modified, path));
+		}
+	}
+	Ok(newest.map(|(_, path)| path))
+}
+
 fn remembered_terminal_session(
 	sessions_dir: &Path,
 	terminal: Option<&str>,
@@ -1209,8 +1593,15 @@ fn select_journal_path(
 		fs::copy(source, &destination)?;
 		return Ok(destination);
 	}
-	if continue_session && let Some(path) = remembered_terminal_session(sessions_dir, terminal)? {
-		return Ok(path);
+	if continue_session {
+		if let Some(path) = remembered_terminal_session(sessions_dir, terminal)? {
+			return Ok(path);
+		}
+		// pi `findMostRecentSession`: no breadcrumb for this terminal, so
+		// continue the project's newest journal before creating a fresh one.
+		if let Some(path) = newest_project_session(sessions_dir)? {
+			return Ok(path);
+		}
 	}
 	let name = format!("{}.oms", Ulid::generate());
 	Ok(if ephemeral {
@@ -1220,22 +1611,103 @@ fn select_journal_path(
 	})
 }
 
+/// The discovered prompt material [`install_prompt_facts`] journaled on
+/// `session`'s `<meta>`; empty when the session carries no facts.
+#[must_use]
+pub fn journaled_prompt_facts(session: &Session) -> crate::discovery::PromptFacts {
+	let dom = session.dom();
+	let mut facts = crate::discovery::PromptFacts::default();
+	let Some(Value::Json(raw)) = dom
+		.get(dom.meta())
+		.and_then(|node| node.prop(&PropKey::Custom(Str::new_static("prompt-facts"))))
+	else {
+		return facts;
+	};
+	let Ok(serde_json::Value::Object(mut values)) = serde_json::from_str::<serde_json::Value>(raw.get())
+	else {
+		return facts;
+	};
+	let mut take = |key: &str| match values.remove(key) {
+		Some(serde_json::Value::Array(rows)) => rows,
+		_ => Vec::new(),
+	};
+	facts.skills = take("skills");
+	facts.context_files = take("context_files");
+	facts.always_apply_rules = take("always_apply_rules");
+	facts.rules = take("rules");
+	facts.active_repository = values
+		.remove("active_repository")
+		.and_then(|value| serde_json::from_value(value).ok());
+	facts
+}
+
+/// Discovers context files and rules for `project_root` under the invocation
+/// prompt policy: `--no-context-files` / `--no-rules` yield empty sets so the
+/// flags are honest seams rather than post-hoc filters.
+fn discover_prompt_material(
+	project_root: &Path,
+	overrides: &PromptOverrides,
+) -> Result<
+	(crate::discovery::rules::ContextFiles, Arc<crate::discovery::rules::ActiveRules>),
+	HeadlessError,
+> {
+	use crate::discovery::rules::{ActiveRules, ContextFiles};
+	if !overrides.include_context_files && !overrides.include_rules {
+		return Ok((ContextFiles::default(), Arc::new(ActiveRules::default())));
+	}
+	let home = omp_core::dirs::home_dir().ok_or(omp_core::dirs::DataDirError::HomeUnset)?;
+	let config_root = omp_core::dirs::user_config_root()?;
+	let context_files = if overrides.include_context_files {
+		ContextFiles::discover(project_root, &home, &config_root)
+	} else {
+		ContextFiles::default()
+	};
+	let rules = if overrides.include_rules {
+		ActiveRules::discover(project_root, &home, &config_root)
+	} else {
+		ActiveRules::default()
+	};
+	for warning in context_files
+		.warnings
+		.iter()
+		.chain(&rules.warnings)
+	{
+		tracing::warn!(path = %warning.path.display(), "{}", warning.message);
+	}
+	Ok((context_files, Arc::new(rules)))
+}
+
 fn install_prompt_facts(
 	session: &mut Session,
 	project_root: &Path,
 	model: &str,
 	overrides: &PromptOverrides,
+	discovered: &crate::discovery::PromptFacts,
 ) -> Result<(), omp_session::SessionError> {
 	let home = std::env::var_os("HOME").map_or_else(|| project_root.to_path_buf(), PathBuf::from);
 	let mut facts = serde_json::json!({
 		"cwd": project_root.to_string_lossy(),
 		"home": home.to_string_lossy(),
 		"model": { "identifier": model, "codex_task_policy": false },
-		"context_files": [],
+		"context_files": discovered.context_files,
+		"context_files_enabled": overrides.include_context_files,
+		"always_apply_rules": discovered.always_apply_rules,
+		"rules": discovered.rules,
+		"additional_roots": overrides
+			.additional_roots
+			.iter()
+			.map(|root| root.to_string_lossy().into_owned())
+			.collect::<Vec<_>>(),
+		"skills": discovered.skills,
 		"date": jiff::Zoned::now().strftime("%Y-%m-%d").to_string(),
 		"null_prompt": overrides.null_prompt,
 	});
 	let object = facts.as_object_mut().expect("prompt facts are an object");
+	// Only a resolved repository is journaled: `active-repo.md` renders
+	// whenever the key is present, so a JSON null would misfire.
+	if let Some(repository) = &discovered.active_repository {
+		object.insert("active_repository".to_owned(), serde_json::to_value(repository)?);
+	}
 	for (name, value) in [
 		("custom_prompt", overrides.custom_prompt.as_ref()),
 		("append_prompt", overrides.append_prompt.as_ref()),
@@ -1462,7 +1934,7 @@ mod tests {
 	}
 
 	#[test]
-	fn continue_is_terminal_local_and_missing_breadcrumb_starts_fresh() {
+	fn continue_prefers_the_terminal_breadcrumb_then_the_newest_project_session() {
 		let scratch = tempfile::tempdir().expect("tempdir");
 		let sessions = scratch.path();
 		let first = sessions.join("first.oms");
@@ -1473,17 +1945,20 @@ mod tests {
 			.expect("continue");
 		assert_eq!(resumed, first);
 
-		let fresh = select_journal_path(sessions, None, None, true, false, Some("terminal-b"))
-			.expect("fresh fallback");
-		assert_ne!(fresh, first);
-		assert!(!fresh.exists());
-		assert_eq!(fresh.parent(), Some(sessions));
+		// pi SessionManager.continueRecent: a terminal without its own breadcrumb
+		// continues the newest session of the project, not a fresh one.
+		let other_terminal =
+			select_journal_path(sessions, None, None, true, false, Some("terminal-b"))
+				.expect("newest project session");
+		assert_eq!(other_terminal, first);
 
+		// A stale breadcrumb with no journals left falls back to a fresh journal.
 		std::fs::remove_file(&first).expect("remove stale journal");
 		let stale = select_journal_path(sessions, None, None, true, false, Some("terminal-a"))
 			.expect("stale fallback");
 		assert_ne!(stale, first);
 		assert!(!stale.exists());
+		assert_eq!(stale.parent(), Some(sessions));
 	}
 
 	#[test]
@@ -1527,7 +2002,13 @@ mod tests {
 			null_prompt: true,
 			..PromptOverrides::default()
 		};
-		install_prompt_facts(&mut session, scratch.path(), "provider/model", &overrides)
+		install_prompt_facts(
+			&mut session,
+			scratch.path(),
+			"provider/model",
+			&overrides,
+			&crate::discovery::PromptFacts::default(),
+		)
 			.expect("prompt facts");
 		let value = session
 			.dom()
@@ -1544,6 +2025,119 @@ mod tests {
 		assert_eq!(facts["append_prompt"], "append");
 		assert_eq!(facts["include_model"], false);
 		assert_eq!(facts["null_prompt"], true);
+	}
+
+	#[test]
+	fn discovered_material_round_trips_through_prompt_facts_and_session_home() {
+		let scratch = tempfile::tempdir().expect("tempdir");
+		let path = scratch.path().join("facts.oms");
+		let mut session =
+			omp_session::Session::create(path, omp_session::ComponentRegistry::standard())
+				.expect("session");
+		let discovered = crate::discovery::PromptFacts {
+			skills:             vec![serde_json::json!({ "name": "tla", "description": "TLA" })],
+			context_files:      vec![serde_json::json!({ "origin": "/p/AGENTS.md", "content": "ctx" })],
+			always_apply_rules: vec![serde_json::json!({ "name": "RULES", "content": "sticky" })],
+			rules:              vec![serde_json::json!({ "name": "style", "description": "d", "globs": ["*.rs"] })],
+			active_repository:  Some(crate::discovery::active_repo::ActiveRepository {
+				relative_root: std::path::PathBuf::from("omp"),
+			}),
+		};
+		install_prompt_facts(
+			&mut session,
+			scratch.path(),
+			"provider/model",
+			&PromptOverrides::default(),
+			&discovered,
+		)
+		.expect("prompt facts");
+		let props = omp_agent::prompt::template_props(session.dom());
+		for key in ["skills", "context_files", "always_apply_rules", "rules", "active_repository"] {
+			assert!(
+				props.get(key).is_some_and(omp_scribe::Value::is_truthy),
+				"{key} reaches the template props"
+			);
+		}
+		assert_eq!(super::journaled_prompt_facts(&session), discovered, "facts read back for /new");
+		use omp_proto::thread::v1::{item, part};
+		let rendered = omp_agent::prompt::CanonicalPromptSource
+			.system_items(session.dom())
+			.expect("system prompt")
+			.into_iter()
+			.filter_map(|item| match item.kind {
+				Some(item::Kind::Message(message)) => Some(message.parts),
+				_ => None,
+			})
+			.flatten()
+			.filter_map(|part| match part.kind {
+				Some(part::Kind::Text(text)) => Some(text),
+				_ => None,
+			})
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(
+			rendered.contains("Exactly one direct-child git repo detected: `omp`"),
+			"active-repo.md names the nested repository:\n{rendered}"
+		);
+	}
+
+	#[test]
+	fn cwd_inside_a_repository_journals_no_active_repository() {
+		let scratch = tempfile::tempdir().expect("tempdir");
+		let path = scratch.path().join("facts.oms");
+		let mut session =
+			omp_session::Session::create(path, omp_session::ComponentRegistry::standard())
+				.expect("session");
+		install_prompt_facts(
+			&mut session,
+			scratch.path(),
+			"provider/model",
+			&PromptOverrides::default(),
+			&crate::discovery::PromptFacts::default(),
+		)
+		.expect("prompt facts");
+		let props = omp_agent::prompt::template_props(session.dom());
+		assert!(
+			props.get("active_repository").is_none(),
+			"an unresolved repository never reaches the template (a null would render active-repo.md)"
+		);
+		assert_eq!(super::journaled_prompt_facts(&session).active_repository, None);
+	}
+
+	#[test]
+	fn no_rules_and_no_context_files_yield_empty_material() {
+		let scratch = tempfile::tempdir().expect("tempdir");
+		let project = scratch.path().join("proj");
+		std::fs::create_dir_all(project.join(".omp/rules")).expect("rules dir");
+		std::fs::create_dir_all(project.join(".git")).expect("repo root");
+		std::fs::write(project.join(".omp/rules/one.md"), "---\nalwaysApply: true\n---\nbody\n")
+			.expect("rule");
+		std::fs::write(project.join("AGENTS.md"), "context\n").expect("context file");
+
+		// The developer's own `<config root>` may hold user-level material;
+		// only the scratch project's files are asserted.
+		use crate::discovery::rules::Level;
+		let project_files = |files: &crate::discovery::rules::ContextFiles| {
+			files.files.iter().filter(|file| file.level == Level::Project).count()
+		};
+		let project_rules = |rules: &crate::discovery::rules::ActiveRules| {
+			rules.rules.iter().filter(|rule| rule.level == Level::Project).count()
+		};
+		let (files, rules) = super::discover_prompt_material(&project, &PromptOverrides::default())
+			.expect("discovery");
+		assert_eq!(project_files(&files), 1);
+		assert_eq!(project_rules(&rules), 1);
+
+		let no_rules = PromptOverrides { include_rules: false, ..PromptOverrides::default() };
+		let (files, rules) = super::discover_prompt_material(&project, &no_rules).expect("discovery");
+		assert_eq!(project_files(&files), 1, "--no-rules leaves context files alone");
+		assert!(rules.rules.is_empty(), "--no-rules suppresses rule discovery");
+
+		let no_context =
+			PromptOverrides { include_context_files: false, ..PromptOverrides::default() };
+		let (files, rules) = super::discover_prompt_material(&project, &no_context).expect("discovery");
+		assert!(files.files.is_empty(), "--no-context-files suppresses context files");
+		assert_eq!(project_rules(&rules), 1);
 	}
 
 	#[test]

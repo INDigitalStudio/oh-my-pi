@@ -50,6 +50,10 @@ pub struct NativeAdmissionOptions<'a> {
 	pub include_workspace: bool,
 	/// Typed setting overrides applied before environment attachment.
 	pub setting_overrides: &'a [CliSettingOverride],
+	/// Manifest ids never loaded (`cl_disabled_extensions`,
+	/// [`super::CL_DISABLED_EXTENSIONS`]); explicit roots are still honored
+	/// because the operator named them on this invocation.
+	pub disabled:          &'a [Str],
 }
 
 /// An admitted extension and the source root that produced it.
@@ -222,9 +226,16 @@ pub fn admit_native_extensions(
 	let mut seen = BTreeSet::new();
 	let mut admitted = Vec::new();
 	for (loaded, origin) in candidates {
-		if seen.insert(loaded.manifest.id.clone()) {
-			admitted.push(lower_manifest(loaded, origin, options.setting_overrides)?);
+		if !seen.insert(loaded.manifest.id.clone()) {
+			continue;
 		}
+		if !matches!(origin, RootOrigin::Explicit)
+			&& options.disabled.iter().any(|id| *id == loaded.manifest.id)
+		{
+			tracing::debug!(id = %loaded.manifest.id, "extension disabled by cl_disabled_extensions");
+			continue;
+		}
+		admitted.push(lower_manifest(loaded, origin, options.setting_overrides)?);
 	}
 	Ok(admitted)
 }
@@ -532,6 +543,7 @@ default = {default}
 			mode:              NativeLoadMode::ExplicitOnly,
 			include_workspace: true,
 			setting_overrides: &[],
+			disabled:          &[],
 		})
 		.expect("admission");
 		assert_eq!(admitted.len(), 1);
@@ -554,11 +566,40 @@ default = {default}
 			mode:              NativeLoadMode::Merge,
 			include_workspace: true,
 			setting_overrides: &[],
+			disabled:          &[],
 		})
 		.expect("admission");
 		assert_eq!(admitted.len(), 1);
 		assert_eq!(admitted[0].root.file_name().and_then(|name| name.to_str()), Some("explicit"));
 		assert_eq!(admitted[0].spec.settings["enabled"], serde_json::json!(false));
+	}
+
+	/// `cl_disabled_extensions` (pi `disabledExtensions`) is the control
+	/// plane's only enablement knob: a listed manifest id is never loaded from
+	/// an automatic root, while an explicitly requested root still is.
+	#[test]
+	fn disabled_extension_ids_are_not_admitted_from_automatic_roots() {
+		let tree = tempfile::tempdir().expect("tree");
+		let home = tree.path().join("home");
+		let project = tree.path().join("project");
+		let explicit = tree.path().join("explicit");
+		extension(&home.join(".o2/agent/extensions/off"), "test.off", false);
+		extension(&project.join(".omp/extensions/on"), "test.on", false);
+		extension(&explicit, "test.explicit", false);
+		let disabled = [Str::new_static("test.off"), Str::new_static("test.explicit")];
+		let admitted = admit_native_extensions(&project, &home, NativeAdmissionOptions {
+			explicit_roots:    &[explicit],
+			mode:              NativeLoadMode::Merge,
+			include_workspace: true,
+			setting_overrides: &[],
+			disabled:          &disabled,
+		})
+		.expect("admission");
+		let ids = admitted
+			.iter()
+			.map(|extension| extension.spec.key.extension().as_str().to_owned())
+			.collect::<Vec<_>>();
+		assert_eq!(ids, ["test.explicit", "test.on"]);
 	}
 
 	#[test]
@@ -572,6 +613,7 @@ default = {default}
 			mode:              NativeLoadMode::Merge,
 			include_workspace: false,
 			setting_overrides: &[],
+			disabled:          &[],
 		})
 		.expect("admission");
 		assert!(admitted.is_empty());
@@ -595,6 +637,7 @@ default = {default}
 			mode:              NativeLoadMode::Merge,
 			include_workspace: true,
 			setting_overrides: &[],
+			disabled:          &[],
 		})
 		.expect_err("escape rejected");
 		assert!(matches!(error, NativeExtensionError::UntrustedAutomaticRoot { .. }));
@@ -613,6 +656,7 @@ default = {default}
 			mode:              NativeLoadMode::ExplicitOnly,
 			include_workspace: false,
 			setting_overrides: &[override_value],
+			disabled:          &[],
 		})
 		.expect("admission");
 		let spec = &admitted[0].spec;
@@ -655,6 +699,7 @@ entry = "demo"
 			mode:              NativeLoadMode::ExplicitOnly,
 			include_workspace: false,
 			setting_overrides: &[],
+			disabled:          &[],
 		})
 		.expect("Python manifest admission");
 		assert_eq!(admitted.len(), 1);
@@ -670,6 +715,7 @@ entry = "demo"
 			mode:              NativeLoadMode::ExplicitOnly,
 			include_workspace: false,
 			setting_overrides: &[],
+			disabled:          &[],
 		})
 		.expect_err("missing root");
 		assert!(matches!(error, NativeExtensionError::MissingExplicitRoot { .. }));

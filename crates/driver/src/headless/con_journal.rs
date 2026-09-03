@@ -251,7 +251,7 @@ mod tests {
 		let ctx = Arc::new(Ctx::new());
 		let mut session = open(&path);
 		let journal = Arc::new(ConJournal::attach(Arc::clone(&ctx), session.dom()));
-		let mut component = journal.live_component();
+		let component = journal.live_component();
 		ctx.run("ai_fastmode 1").expect("session write");
 		let turn = session.begin_turn().expect("turn");
 		let entry = session.entry(turn).cloned().expect("turn entry");

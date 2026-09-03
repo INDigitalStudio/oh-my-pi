@@ -242,11 +242,9 @@ fn list(
 	Ok(Response { text: Str::new(serde_json::json!({ "sessions": rows }).to_string()), useless })
 }
 
-fn inbox(
-	session: &mut omp_session::Session,
-	peek: bool,
-) -> Result<Response, omp_agent::SessionToolError> {
-	let steering = session
+/// The `<queues><steering>` element.
+fn steering_queue(session: &omp_session::Session) -> Result<Handle, omp_agent::SessionToolError> {
+	session
 		.dom()
 		.children(session.dom().queues())
 		.iter()
@@ -259,34 +257,53 @@ fn inbox(
 		})
 		.ok_or_else(|| omp_agent::SessionToolError::Rejected {
 			message: Str::new_static("session steering queue is absent"),
-		})?;
-	let messages = session
+		})
+}
+
+/// Queued peer messages (`hub=true`), oldest first. User steering shares the
+/// queue but belongs to the kernel safe point, never to the hub inbox.
+fn peer_messages(session: &omp_session::Session, steering: Handle) -> Vec<(Handle, Str)> {
+	let hub = PropKey::Custom(Str::new_static("hub"));
+	session
 		.dom()
 		.children(steering)
 		.iter()
-		.filter_map(|handle| session.dom().get(*handle)?.content.clone())
+		.filter_map(|handle| {
+			let node = session.dom().get(*handle)?;
+			matches!(node.prop(&hub), Some(Value::Bool(true)))
+				.then(|| node.content.clone())
+				.flatten()
+				.map(|text| (*handle, text))
+		})
+		.collect()
+}
+
+fn inbox(
+	session: &mut omp_session::Session,
+	peek: bool,
+) -> Result<Response, omp_agent::SessionToolError> {
+	let steering = steering_queue(session)?;
+	let peers = peer_messages(session, steering);
+	let messages = peers
+		.iter()
+		.map(|(_, text)| text.as_str())
 		.collect::<Vec<_>>();
 	let useless = messages.is_empty();
+	let text = Str::new(serde_json::json!({ "messages": messages }).to_string());
 	if !peek && !useless {
 		let cause = session
 			.head()
 			.ok_or_else(|| omp_agent::SessionToolError::Rejected {
 				message: Str::new_static("session has no journal head"),
 			})?;
-		let ops = session
-			.dom()
-			.children(steering)
-			.iter()
-			.copied()
-			.map(Op::Rm)
-			.collect();
+		let ops = peers.iter().map(|(handle, _)| Op::Rm(*handle)).collect();
 		session
 			.patch(Txn { cause, label: Some(Str::new_static("hub.inbox")), ops })
 			.map_err(|_| omp_agent::SessionToolError::Rejected {
 				message: Str::new_static("failed to journal inbox drain"),
 			})?;
 	}
-	Ok(Response { text: Str::new(serde_json::json!({ "messages": messages }).to_string()), useless })
+	Ok(Response { text, useless })
 }
 
 fn roster(jobs: &JobBoard) -> Result<Response, omp_agent::SessionToolError> {
@@ -462,41 +479,10 @@ fn selected_settled_job(jobs: &JobBoard, ids: Option<&[Str]>) -> Option<omp_agen
 fn pop_inbox_message(
 	session: &mut omp_session::Session,
 ) -> Result<Option<Str>, omp_agent::SessionToolError> {
-	let steering = session
-		.dom()
-		.children(session.dom().queues())
-		.iter()
-		.copied()
-		.find(|handle| {
-			session
-				.dom()
-				.get(*handle)
-				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Steering))
-		})
-		.ok_or_else(|| omp_agent::SessionToolError::Rejected {
-			message: Str::new_static("session steering queue is absent"),
-		})?;
-	let Some(message) = session
-		.dom()
-		.children(steering)
-		.iter()
-		.find_map(|handle| session.dom().get(*handle)?.content.clone())
-	else {
+	let steering = steering_queue(session)?;
+	let Some((handle, message)) = peer_messages(session, steering).into_iter().next() else {
 		return Ok(None);
 	};
-	let handle = session
-		.dom()
-		.children(steering)
-		.iter()
-		.copied()
-		.find(|handle| {
-			session
-				.dom()
-				.get(*handle)
-				.and_then(|node| node.content.as_ref())
-				== Some(&message)
-		})
-		.expect("message came from a steering child");
 	let cause = session
 		.head()
 		.ok_or_else(|| omp_agent::SessionToolError::Rejected {

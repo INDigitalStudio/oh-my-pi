@@ -365,6 +365,21 @@ impl TaskSettings {
 			show_resolved_model_badge: CL_TASK_SHOW_RESOLVED_MODEL_BADGE.get(ctx),
 		}
 	}
+
+	/// Whether an agent at `depth` may not spawn children (pi `atMaxDepth`):
+	/// its `task` tool is withheld rather than advertised and refused.
+	#[must_use]
+	pub fn at_recursion_limit(&self, depth: u32) -> bool {
+		self.max_recursion_depth >= 0
+			&& depth >= u32::try_from(self.max_recursion_depth).unwrap_or(u32::MAX)
+	}
+}
+
+/// Whether the kernel composed for `ctx` sits at the configured recursion
+/// limit and must not receive `task@1`.
+#[must_use]
+pub fn task_withheld(ctx: &Ctx) -> bool {
+	TaskSettings::from_con(ctx).at_recursion_limit(SV_TASK_RECURSION_DEPTH.get(ctx))
 }
 
 fn span_millis(span: omp_con::Span) -> u64 {
@@ -414,4 +429,21 @@ pub fn child_ctx(
 		);
 	}
 	Ok(child)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn task_is_withheld_only_at_the_configured_recursion_ceiling() {
+		let ctx = Ctx::new();
+		SV_TASK_MAX_RECURSION_DEPTH.set(&ctx, 2).expect("ceiling");
+		SV_TASK_RECURSION_DEPTH.set(&ctx, 1).expect("depth");
+		assert!(!task_withheld(&ctx), "one level below the ceiling may still delegate");
+		SV_TASK_RECURSION_DEPTH.set(&ctx, 2).expect("depth");
+		assert!(task_withheld(&ctx), "a child at the ceiling never sees `task`");
+		SV_TASK_MAX_RECURSION_DEPTH.set(&ctx, -1).expect("unlimited");
+		assert!(!task_withheld(&ctx), "-1 is unlimited");
+	}
 }

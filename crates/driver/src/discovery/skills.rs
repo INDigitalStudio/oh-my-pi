@@ -1,558 +1,354 @@
-//! Deterministic, data-only skill discovery and admission.
+//! Skill discovery: `SKILL.md` declarations the runtime lists in the system
+//! prompt (`<skills>`) and serves as `skill://<name>`.
+//!
+//! Sources follow pi (`packages/coding-agent/src/extensibility/skills.ts`,
+//! `discovery/{builtin,agents,claude,codex}.ts`): native `.omp/skills`
+//! (project walk-up) and `<config root>/agent/skills`, then `.claude/skills`,
+//! `.agent[s]/skills`, `.codex/skills` at project and user level, then
+//! `sv_skills_custom_directories`, then the isolated managed-skills root dead
+//! last. Within a name, the first source in that order wins; a custom
+//! directory beats a default-path provider. Every knob is a convar
+//! (`sv_skills_*`, `cl_disabled_extensions`), never a second schema.
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	fs,
-	path::{Path, PathBuf},
+	path::{Component, Path, PathBuf},
 	sync::Arc,
 };
 
-use omp_core::Str;
-use omp_walker::{FollowLinks, WalkRequest};
-use serde::{Deserialize, Serialize};
-
-use super::{
-	containment::contained_existing,
-	manifest::{
-		CapabilityPayload, DiscoveredCapability, SkillFrontmatter, SkillPayload, SourceProvenance,
-		SourceScope,
+use omp_core::{CowBytes, Str};
+use omp_envd::{ContentResolver, pi_settings as envd_settings};
+use omp_tools::read::{
+	Fault,
+	resolver::{
+		LineOffsetCache, ResourceCompletion, ResourceEntry, ResourceList, Scheme, SchemeEntry,
+		fuzzy_score,
 	},
+	selector::ParsedSelector,
 };
-use crate::settings::{
-	FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
-};
+use serde::Deserialize;
 
-/// Provenance for a skill discovery root.
-#[derive(Clone, Debug)]
-pub enum SkillSourceKind {
-	/// Native, user, foreign-adapter, or managed content.
-	Native,
-	/// Signed static content owned by one admitted extension package.
-	Extension {
-		/// Stable extension identity.
-		extension_id:  Str,
-		/// Canonical package containment root.
-		package_root:  PathBuf,
-		/// Signed distribution-relative path or glob.
-		declared_path: Str,
-	},
-	/// Session-bound paths returned by an extension discovery hook.
-	ExtensionDiscovery {
-		/// Stable extension identity.
-		extension_id: Str,
-		/// Exact canonical path admitted from the hook result.
-		path:         PathBuf,
-	},
+use crate::pi_settings as driver_settings;
+
+/// Where a skill source sits in the precedence ladder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
+pub enum SkillLevel {
+	/// Project walk-up roots.
+	Project,
+	/// Home/config-root roots.
+	User,
 }
 
-/// One skill source scanned in caller-defined precedence order.
-#[derive(Clone, Debug)]
+/// One directory of `<name>/SKILL.md` declarations.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SkillSource {
-	/// Stable source/provider identity used by settings.
-	pub id:                  Str,
-	/// Direct `SKILL.md` directory or parent of named skill directories.
-	pub root:                PathBuf,
-	/// Source scope.
-	pub scope:               SourceScope,
-	/// Whether the root itself may be a skill.
-	pub include_root:        bool,
-	/// Whether a description is mandatory for this source.
-	pub require_description: bool,
-	/// Optional package containment root.
-	pub contain_root:        Option<PathBuf>,
-	/// Read-only foreign/package content marker.
-	pub read_only:           bool,
-	/// Native or extension-package provenance.
-	pub kind:                SkillSourceKind,
+	/// Provider identity (`native`, `claude`, `agents`, `codex`, `custom`,
+	/// `omp-managed`).
+	pub provider: Str,
+	/// Directory holding named skill directories.
+	pub root:     PathBuf,
+	/// Precedence level.
+	pub level:    SkillLevel,
 }
 
-omp_con::var! {
-	/// Enables skill discovery and invocation.
-	pub static SV_SKILLS_ENABLED = sv_skills_enabled: bool {
-		default: true,
-		flags: archive,
-	};
-	/// Source IDs excluded before skill names claim precedence.
-	pub static SV_SKILLS_DISABLED_SOURCES = sv_skills_disabled_sources: Vec<Str> {
-		default: Vec::new(),
-		flags: archive,
-	};
-	/// Optional skill-name inclusion globs.
-	pub static SV_SKILLS_INCLUDE = sv_skills_include: Vec<Str> {
-		default: Vec::new(),
-		flags: archive,
-	};
-	/// Skill-name exclusion globs.
-	pub static SV_SKILLS_IGNORE = sv_skills_ignore: Vec<Str> {
-		default: Vec::new(),
-		flags: archive,
-	};
-	/// Explicit skill names disabled before collision handling.
-	pub static SV_SKILLS_DISABLED = sv_skills_disabled: Vec<Str> {
-		default: Vec::new(),
-		flags: archive,
-	};
-	/// Enables repo-surface third-party skill families.
-	pub static SV_SKILLS_THIRD_PARTY_ENABLED = sv_skills_third_party_enabled: bool {
-		default: true,
-		flags: archive,
-	};
-	/// Additional native authored skill roots.
-	pub static SV_SKILLS_CUSTOM_DIRECTORIES = sv_skills_custom_directories: Vec<Str> {
-		default: Vec::new(),
-		flags: archive,
-	};
+/// One admitted skill.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Skill {
+	/// Unique name (frontmatter `name`, else the directory name).
+	pub name:        Str,
+	/// Frontmatter description shown in the system prompt.
+	pub description: Str,
+	/// Canonical `SKILL.md` path.
+	pub path:        PathBuf,
+	/// Canonical directory `skill://<name>/<path>` resolves under.
+	pub base_dir:    PathBuf,
+	/// Provider identity of the winning source.
+	pub provider:    Str,
+	/// Precedence level of the winning source.
+	pub level:       SkillLevel,
+	/// Loaded and readable but omitted from the `<skills>` listing
+	/// (frontmatter `hide` / `disable-model-invocation`).
+	pub hidden:      bool,
 }
 
-/// Settings projection applied before skill names claim precedence.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct SkillDiscoverySettings {
-	/// Master enablement.
-	pub enabled:             bool,
-	/// Explicitly disabled source IDs.
-	pub disabled_sources:    BTreeSet<Str>,
-	/// Inclusion globs over skill names; empty includes every name.
-	pub include:             Vec<Str>,
-	/// Exclusion globs over skill names.
-	pub ignore:              Vec<Str>,
-	/// Explicit disabled skill names.
-	pub disabled_skills:     BTreeSet<Str>,
-	/// Fallback gate for repo-surface third-party families without a dedicated
-	/// source toggle.
-	pub third_party_enabled: bool,
-	/// Additional authored skill directories.
-	pub custom_directories:  Vec<PathBuf>,
-}
-
-impl Default for SkillDiscoverySettings {
-	fn default() -> Self {
-		Self {
-			enabled:             true,
-			disabled_sources:    BTreeSet::new(),
-			include:             Vec::new(),
-			ignore:              Vec::new(),
-			disabled_skills:     BTreeSet::new(),
-			third_party_enabled: true,
-			custom_directories:  Vec::new(),
-		}
-	}
-}
-
-impl SkillDiscoverySettings {
-	/// Resolves skill discovery policy from the process console context.
-	#[must_use]
-	pub fn from_con(ctx: &omp_con::Ctx) -> Self {
-		Self {
-			enabled:             SV_SKILLS_ENABLED.get(ctx),
-			disabled_sources:    SV_SKILLS_DISABLED_SOURCES.get(ctx).into_iter().collect(),
-			include:             SV_SKILLS_INCLUDE.get(ctx),
-			ignore:              SV_SKILLS_IGNORE.get(ctx),
-			disabled_skills:     SV_SKILLS_DISABLED.get(ctx).into_iter().collect(),
-			third_party_enabled: SV_SKILLS_THIRD_PARTY_ENABLED.get(ctx),
-			custom_directories:  SV_SKILLS_CUSTOM_DIRECTORIES
-				.get(ctx)
-				.into_iter()
-				.map(|path| PathBuf::from(path.as_str()))
-				.collect(),
-		}
-	}
-}
-
-const SKILL_SCOPES: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
-
-impl SettingsDomain for SkillDiscoverySettings {
-	const DOMAIN: &'static str = "skills";
-	const FIELDS: &'static [FieldDescriptor] = &[
-		FieldDescriptor {
-			path:        "skills.enabled",
-			label:       "Skills",
-			description: "Enable skill discovery and invocation.",
-			kind:        SettingKind::Boolean,
-			scopes:      SKILL_SCOPES,
-			order:       10,
-			options:     None,
-			condition:   None,
-			secret:      false,
-		},
-		FieldDescriptor {
-			path:        "skills.disabled_sources",
-			label:       "Disabled skill sources",
-			description: "Source IDs excluded before skill names claim precedence.",
-			kind:        SettingKind::Array,
-			scopes:      SKILL_SCOPES,
-			order:       20,
-			options:     None,
-			condition:   None,
-			secret:      false,
-		},
-		FieldDescriptor {
-			path:        "skills.include",
-			label:       "Included skills",
-			description: "Optional skill-name inclusion globs.",
-			kind:        SettingKind::Array,
-			scopes:      SKILL_SCOPES,
-			order:       30,
-			options:     None,
-			condition:   None,
-			secret:      false,
-		},
-		FieldDescriptor {
-			path:        "skills.ignore",
-			label:       "Ignored skills",
-			description: "Skill-name exclusion globs.",
-			kind:        SettingKind::Array,
-			scopes:      SKILL_SCOPES,
-			order:       40,
-			options:     None,
-			condition:   None,
-			secret:      false,
-		},
-		FieldDescriptor {
-			path:        "skills.disabled_skills",
-			label:       "Disabled skills",
-			description: "Explicit skill names disabled before collision handling.",
-			kind:        SettingKind::Array,
-			scopes:      SKILL_SCOPES,
-			order:       50,
-			options:     None,
-			condition:   None,
-			secret:      false,
-		},
-		FieldDescriptor {
-			path:        "skills.third_party_enabled",
-			label:       "Third-party content skills",
-			description: "Enable repo-surface third-party skill families without a dedicated source \
-			              toggle.",
-			kind:        SettingKind::Boolean,
-			scopes:      SKILL_SCOPES,
-			order:       60,
-			options:     None,
-			condition:   None,
-			secret:      false,
-		},
-		FieldDescriptor {
-			path:        "skills.custom_directories",
-			label:       "Custom skill directories",
-			description: "Additional native authored skill roots.",
-			kind:        SettingKind::Array,
-			scopes:      SKILL_SCOPES,
-			order:       70,
-			options:     None,
-			condition:   None,
-			secret:      false,
-		},
-	];
-
-	fn validate(&self) -> Result<(), ValidationError> {
-		let valid = self.disabled_sources.iter().all(|value| !value.is_empty())
-			&& self.disabled_skills.iter().all(|value| !value.is_empty())
-			&& self
-				.custom_directories
-				.iter()
-				.all(|path| !path.as_os_str().is_empty());
-		if valid {
-			Ok(())
-		} else {
-			Err(ValidationError::DomainInvariant { domain: Self::DOMAIN })
-		}
-	}
-}
-
-/// Non-fatal skill discovery diagnostic.
+/// Non-fatal discovery diagnostic.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SkillWarning {
-	/// Source which was skipped or suppressed.
+	/// Source or declaration the warning is about.
 	pub path:    PathBuf,
 	/// Stable diagnostic text.
 	pub message: Str,
 }
 
-/// Stable skill provider output.
-#[derive(Clone, Debug, Default)]
-pub struct SkillDiscovery {
-	/// Winning declarations in case-insensitive name/path order.
-	pub declarations: Vec<DiscoveredCapability>,
-	/// Non-fatal malformed, duplicate, and collision diagnostics.
-	pub warnings:     Vec<SkillWarning>,
+/// Skill admission policy projected from the control plane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillPolicy {
+	/// `sv_skills_enabled`.
+	pub enabled:            bool,
+	/// `sv_skills_include` name globs; empty admits every name.
+	pub include:            Vec<Str>,
+	/// `sv_skills_ignore` name globs.
+	pub ignore:             Vec<Str>,
+	/// `skill:<name>` entries of `cl_disabled_extensions`.
+	pub disabled:           BTreeSet<Str>,
+	/// `sv_skills_custom_directories`.
+	pub custom_directories: Vec<PathBuf>,
+	/// `sv_skills_enable_pi_user`.
+	pub native_user:        bool,
+	/// `sv_skills_enable_pi_project`.
+	pub native_project:     bool,
+	/// `sv_skills_enable_claude_user`.
+	pub claude_user:        bool,
+	/// `sv_skills_enable_claude_project`.
+	pub claude_project:     bool,
+	/// `sv_skills_enable_agents_user`.
+	pub agents_user:        bool,
+	/// `sv_skills_enable_agents_project`.
+	pub agents_project:     bool,
+	/// `sv_skills_enable_codex_user`.
+	pub codex_user:         bool,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SkillHeader {
-	name:                     Option<String>,
-	description:              Option<String>,
-	license:                  Option<String>,
-	compatibility:            Option<String>,
-	#[serde(default)]
-	metadata:                 BTreeMap<Str, serde_json::Value>,
-	#[serde(default, rename = "allowed-tools", alias = "allowedTools")]
-	allowed_tools:            ToolList,
-	#[serde(default)]
-	globs:                    StringList,
-	#[serde(default)]
-	always_apply:             bool,
-	#[serde(default)]
-	enabled:                  Option<bool>,
-	#[serde(default, alias = "hide")]
-	hidden:                   bool,
-	#[serde(default, alias = "disable-model-invocation")]
-	disable_model_invocation: bool,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(untagged)]
-enum ToolList {
-	One(String),
-	Many(Vec<String>),
-	#[default]
-	None,
-}
-
-impl ToolList {
-	fn values(self) -> Vec<Str> {
-		match self {
-			Self::One(value) => value.split_whitespace().map(Str::from).collect(),
-			Self::Many(values) => values
-				.into_iter()
-				.map(|value| value.trim().to_owned())
-				.filter(|value| !value.is_empty())
-				.map(Str::from)
-				.collect(),
-			Self::None => Vec::new(),
+impl Default for SkillPolicy {
+	fn default() -> Self {
+		Self {
+			enabled:            true,
+			include:            Vec::new(),
+			ignore:             Vec::new(),
+			disabled:           BTreeSet::new(),
+			custom_directories: Vec::new(),
+			native_user:        true,
+			native_project:     true,
+			claude_user:        false,
+			claude_project:     true,
+			agents_user:        true,
+			agents_project:     true,
+			codex_user:         false,
 		}
 	}
 }
 
-#[derive(Default, Deserialize)]
-#[serde(untagged)]
-enum StringList {
-	One(String),
-	Many(Vec<String>),
-	#[default]
-	None,
-}
+/// `cl_disabled_extensions` prefix naming one skill.
+pub const SKILL_ID_PREFIX: &str = "skill:";
 
-impl StringList {
-	fn values(self) -> Vec<Str> {
-		match self {
-			Self::One(value) => value
-				.split(',')
-				.map(str::trim)
-				.filter(|s| !s.is_empty())
-				.map(Str::from)
+impl SkillPolicy {
+	/// Projects the policy from the process console context.
+	#[must_use]
+	pub fn from_con(ctx: &omp_con::Ctx) -> Self {
+		let home = omp_core::dirs::home_dir();
+		Self {
+			enabled:            envd_settings::SV_SKILLS_ENABLED.get(ctx),
+			include:            envd_settings::SV_SKILLS_INCLUDE.get(ctx),
+			ignore:             envd_settings::SV_SKILLS_IGNORE.get(ctx),
+			disabled:           super::CL_DISABLED_EXTENSIONS
+				.get(ctx)
+				.iter()
+				.filter_map(|id| id.strip_prefix(SKILL_ID_PREFIX))
+				.map(Str::new)
 				.collect(),
-			Self::Many(values) => values
-				.into_iter()
-				.map(|s| s.trim().to_owned())
-				.filter(|s| !s.is_empty())
-				.map(Str::from)
+			custom_directories: envd_settings::SV_SKILLS_CUSTOM_DIRECTORIES
+				.get(ctx)
+				.iter()
+				.map(|dir| expand_tilde(dir.as_str(), home.as_deref()))
 				.collect(),
-			Self::None => Vec::new(),
+			native_user:        driver_settings::SV_SKILLS_ENABLE_PI_USER.get(ctx),
+			native_project:     driver_settings::SV_SKILLS_ENABLE_PI_PROJECT.get(ctx),
+			claude_user:        driver_settings::SV_SKILLS_ENABLE_CLAUDE_USER.get(ctx),
+			claude_project:     driver_settings::SV_SKILLS_ENABLE_CLAUDE_PROJECT.get(ctx),
+			agents_user:        driver_settings::SV_SKILLS_ENABLE_AGENTS_USER.get(ctx),
+			agents_project:     driver_settings::SV_SKILLS_ENABLE_AGENTS_PROJECT.get(ctx),
+			codex_user:         driver_settings::SV_SKILLS_ENABLE_CODEX_USER.get(ctx),
 		}
 	}
+
+	fn admits_name(&self, name: &str) -> bool {
+		!self.disabled.contains(name)
+			&& !self
+				.ignore
+				.iter()
+				.any(|pattern| glob_matches(pattern, name))
+			&& (self.include.is_empty()
+				|| self
+					.include
+					.iter()
+					.any(|pattern| glob_matches(pattern, name)))
+	}
 }
 
-/// Scans direct and nested `SKILL.md` declarations from ordered sources,
-/// follows only contained symlinks, applies source/name gates before claiming
-/// names, and realpath-deduplicates declarations.
-#[tracing::instrument(
-	level = "debug",
-	skip_all,
-	name = "skill_discovery",
-	fields(source_count = sources.len(), enabled = settings.enabled)
-)]
-pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> SkillDiscovery {
-	if !settings.enabled {
-		return SkillDiscovery::default();
+/// The skills one session admitted, in name order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ActiveSkills {
+	/// Winning declarations, case-insensitively ordered by name.
+	pub skills:   Vec<Skill>,
+	/// Malformed, duplicate, and collision diagnostics.
+	pub warnings: Vec<SkillWarning>,
+}
+
+impl ActiveSkills {
+	/// Discovers skills for `project_root` under the process policy: the
+	/// production entry `compose_kernel` calls once per session.
+	///
+	/// # Errors
+	///
+	/// [`omp_core::dirs::DataDirError::HomeUnset`] when no home is set.
+	pub fn discover(
+		ctx: &omp_con::Ctx,
+		project_root: &Path,
+	) -> Result<Self, omp_core::dirs::DataDirError> {
+		let home = omp_core::dirs::home_dir().ok_or(omp_core::dirs::DataDirError::HomeUnset)?;
+		let config_root = omp_core::dirs::user_config_root()?;
+		let policy = SkillPolicy::from_con(ctx);
+		Ok(discover(&sources(project_root, &home, &config_root, &policy), &policy))
 	}
-	let mut output = SkillDiscovery::default();
-	let mut names = BTreeMap::<Str, PathBuf>::new();
-	let mut realpaths = BTreeSet::new();
-	let mut configured_sources = sources.to_vec();
-	configured_sources.extend(
-		settings
-			.custom_directories
+
+	/// The skill named `name`, when admitted.
+	#[must_use]
+	pub fn get(&self, name: &str) -> Option<&Skill> {
+		self.skills.iter().find(|skill| skill.name.as_str() == name)
+	}
+
+	/// Every admitted name (the authored roster managed skills may never
+	/// claim).
+	#[must_use]
+	pub fn names(&self) -> BTreeSet<Str> {
+		self.skills.iter().map(|skill| skill.name.clone()).collect()
+	}
+
+	/// `{name, description}` rows for the system prompt's `<skills>` list;
+	/// hidden skills stay reachable through `skill://` but are not listed.
+	#[must_use]
+	pub fn prompt_facts(&self) -> Vec<serde_json::Value> {
+		self
+			.skills
 			.iter()
-			.cloned()
-			.map(|root| SkillSource {
-				id: Str::from("custom"),
-				root,
-				scope: SourceScope::User,
-				include_root: true,
-				require_description: true,
-				contain_root: None,
-				read_only: false,
-				kind: SkillSourceKind::Native,
-			}),
+			.filter(|skill| !skill.hidden)
+			.map(|skill| {
+				serde_json::json!({ "name": skill.name.as_str(), "description": skill.description.as_str() })
+			})
+			.collect()
+	}
+
+	/// The `skill://` resolver over this snapshot, installed through
+	/// [`omp_envd::RegistryBridges::url_resolvers`].
+	#[must_use]
+	pub fn resolver(self: &Arc<Self>) -> Arc<dyn ContentResolver> {
+		Arc::new(SkillResolver { skills: Arc::clone(self), lines: LineOffsetCache::default() })
+	}
+}
+
+/// The isolated managed-skills root beneath the configuration root
+/// ([`omp_envd::managed_skills_domain`]); dead last in discovery.
+#[must_use]
+pub fn managed_skills_root(config_root: &Path) -> PathBuf {
+	config_root.join("agent/managed-skills")
+}
+
+/// Ordered skill sources for one project: precedence is the vector order.
+#[must_use]
+pub fn sources(
+	project_root: &Path,
+	home: &Path,
+	config_root: &Path,
+	policy: &SkillPolicy,
+) -> Vec<SkillSource> {
+	let ancestors = ancestors(project_root, home);
+	let mut out = Vec::new();
+	let mut push = |provider: &'static str, root: PathBuf, level: SkillLevel| {
+		out.push(SkillSource { provider: Str::new_static(provider), root, level });
+	};
+	if policy.native_project {
+		for dir in &ancestors {
+			push("native", dir.join(".omp/skills"), SkillLevel::Project);
+		}
+	}
+	if policy.native_user {
+		push("native", config_root.join("agent/skills"), SkillLevel::User);
+	}
+	if policy.claude_project {
+		for dir in &ancestors {
+			push("claude", dir.join(".claude/skills"), SkillLevel::Project);
+		}
+	}
+	if policy.claude_user {
+		push("claude", home.join(".claude/skills"), SkillLevel::User);
+	}
+	if policy.agents_project {
+		for dir in &ancestors {
+			push("agents", dir.join(".agent/skills"), SkillLevel::Project);
+			push("agents", dir.join(".agents/skills"), SkillLevel::Project);
+		}
+	}
+	if policy.agents_user {
+		push("agents", home.join(".agent/skills"), SkillLevel::User);
+		push("agents", home.join(".agents/skills"), SkillLevel::User);
+	}
+	if policy.codex_user {
+		push("codex", home.join(".codex/skills"), SkillLevel::User);
+	}
+	for dir in &policy.custom_directories {
+		push("custom", dir.clone(), SkillLevel::User);
+	}
+	push(
+		omp_envd::managed_skills_domain::PROVIDER_ID,
+		managed_skills_root(config_root),
+		SkillLevel::User,
 	);
-	for source in &configured_sources {
-		if settings.disabled_sources.contains(&source.id)
-			|| (!settings.third_party_enabled && source.id.starts_with("foreign-"))
-		{
+	out
+}
+
+/// Scans `sources` in precedence order, admits each declaration through
+/// `policy`, and resolves name collisions first-wins (a `custom` source
+/// displaces a default-path provider; symlinked duplicates of one file are
+/// dropped silently).
+#[must_use]
+pub fn discover(sources: &[SkillSource], policy: &SkillPolicy) -> ActiveSkills {
+	let mut out = ActiveSkills::default();
+	if !policy.enabled {
+		return out;
+	}
+	let mut by_name = BTreeMap::<Str, usize>::new();
+	let mut realpaths = BTreeSet::<PathBuf>::new();
+	for source in sources {
+		let managed = source.provider.as_str() == omp_envd::managed_skills_domain::PROVIDER_ID;
+		if managed && !managed_root_safe(&source.root) {
 			continue;
 		}
-		let managed_source = source.id.as_str() == omp_envd::managed_skills_domain::PROVIDER_ID;
-		for path in skill_files(source, &mut output.warnings) {
-			if managed_source && !managed_path_safe(&path) {
-				output.warnings.push(SkillWarning {
-					path,
-					message: Str::from("managed skill path is linked, oversized, or not a regular file"),
-				});
+		for path in skill_files(&source.root, &mut out.warnings) {
+			let Some(skill) = load_skill(source, &path, managed, &mut out.warnings) else {
+				continue;
+			};
+			if !policy.admits_name(&skill.name) {
 				continue;
 			}
-			let canonical =
-				match contained_existing(source.contain_root.as_deref().unwrap_or(&source.root), &path)
-				{
-					Ok(path) => path,
-					Err(_) => {
-						output.warnings.push(SkillWarning {
-							path,
-							message: Str::from("skill path escapes its source root"),
+			if !realpaths.insert(skill.path.clone()) {
+				continue;
+			}
+			match by_name.get(&skill.name) {
+				Some(&index) => {
+					let existing = &out.skills[index];
+					if source.provider.as_str() == "custom" && existing.provider.as_str() != "custom" {
+						out.skills[index] = skill;
+					} else {
+						out.warnings.push(SkillWarning {
+							path:    skill.path,
+							message: Str::new(format!(
+								"name collision: \"{}\" already loaded from {}, skipping this one",
+								skill.name,
+								existing.path.display()
+							)),
 						});
-						continue;
-					},
-				};
-			if !realpaths.insert(canonical.clone()) {
-				continue;
-			}
-			if !matches!(&source.kind, SkillSourceKind::Native)
-				&& fs::metadata(&canonical).is_ok_and(|metadata| metadata.len() > 64_000)
-			{
-				output.warnings.push(SkillWarning {
-					path:    canonical,
-					message: Str::from("extension skill exceeds the 64,000-byte UTF-8 limit"),
-				});
-				continue;
-			}
-			let (header, content) = match parse_skill(&canonical) {
-				Ok(value) => value,
-				Err(_) => {
-					output.warnings.push(SkillWarning {
-						path:    canonical,
-						message: Str::from("failed to parse SKILL.md frontmatter"),
-					});
-					continue;
+					}
 				},
-			};
-			if header.enabled == Some(false) {
-				continue;
+				None => {
+					by_name.insert(skill.name.clone(), out.skills.len());
+					out.skills.push(skill);
+				},
 			}
-			let fallback = canonical
-				.parent()
-				.and_then(Path::file_name)
-				.and_then(|name| name.to_str())
-				.unwrap_or("skill");
-			let name = header
-				.name
-				.as_deref()
-				.map(str::trim)
-				.filter(|name| !name.is_empty())
-				.unwrap_or(fallback);
-			if !safe_skill_name(name) {
-				output.warnings.push(SkillWarning {
-					path:    canonical,
-					message: Str::from("skill name is not a safe directory-style identifier"),
-				});
-				continue;
-			}
-			let managed = managed_source;
-			if managed && !omp_envd::managed_skills_domain::is_valid_name(name) {
-				output.warnings.push(SkillWarning {
-					path:    canonical,
-					message: Str::from("managed skill name is not exact kebab-case"),
-				});
-				continue;
-			}
-			let managed_description = managed.then(|| {
-				omp_envd::managed_skills_domain::sanitize_description(
-					header.description.as_deref().unwrap_or_default(),
-				)
-			});
-			if source.require_description
-				&& header
-					.description
-					.as_deref()
-					.map(str::trim)
-					.filter(|v| !v.is_empty())
-					.is_none()
-			{
-				continue;
-			}
-			if managed_description.as_ref().is_some_and(Str::is_empty) {
-				continue;
-			}
-			if settings.disabled_skills.contains(name)
-				|| settings
-					.ignore
-					.iter()
-					.any(|pattern| glob_matches(pattern.as_str(), name))
-				|| (!settings.include.is_empty()
-					&& !settings
-						.include
-						.iter()
-						.any(|pattern| glob_matches(pattern.as_str(), name)))
-			{
-				continue;
-			}
-			let key = Str::from(name);
-			if let Some(winner) = names.get(&key) {
-				output.warnings.push(SkillWarning {
-					path:    canonical,
-					message: Str::from(format!("skill name is already claimed by {}", winner.display())),
-				});
-				continue;
-			}
-			names.insert(key.clone(), canonical.clone());
-			let mut payload = SkillPayload {
-				name:         key.clone(),
-				path:         canonical.clone(),
-				content:      Str::from(content),
-				frontmatter:  Arc::new(SkillFrontmatter {
-					description:              header
-						.description
-						.map(|value| Str::from(value.trim().to_owned())),
-					license:                  header
-						.license
-						.map(|value| Str::from(value.trim().to_owned())),
-					compatibility:            header
-						.compatibility
-						.map(|value| Str::from(value.trim().to_owned())),
-					metadata:                 header.metadata,
-					allowed_tools:            header.allowed_tools.values(),
-					globs:                    header.globs.values(),
-					always_apply:             header.always_apply,
-					hidden:                   header.hidden,
-					disable_model_invocation: header.disable_model_invocation,
-				}),
-				contain_root: source.contain_root.clone(),
-			};
-			if let Some(description) = managed_description {
-				Arc::make_mut(&mut payload.frontmatter).description = Some(description);
-			}
-			let mut provenance = SourceProvenance::native(source.id.clone(), canonical, source.scope);
-			provenance.read_only = source.read_only;
-			if let SkillSourceKind::Extension { extension_id, .. }
-			| SkillSourceKind::ExtensionDiscovery { extension_id, .. } = &source.kind
-			{
-				provenance.installed_package_id = Some(extension_id.clone());
-			}
-			output.declarations.push(DiscoveredCapability::keyed(
-				key,
-				CapabilityPayload::Skills(payload),
-				provenance,
-			));
 		}
 	}
-	output.declarations.sort_by(|left, right| {
-		let left = match &left.payload {
-			CapabilityPayload::Skills(skill) => skill,
-			_ => unreachable!(),
-		};
-		let right = match &right.payload {
-			CapabilityPayload::Skills(skill) => skill,
-			_ => unreachable!(),
-		};
+	out.skills.sort_by(|left, right| {
 		left
 			.name
 			.as_str()
@@ -561,156 +357,176 @@ pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> S
 			.then_with(|| left.name.cmp(&right.name))
 			.then_with(|| left.path.cmp(&right.path))
 	});
-	output
+	out
 }
 
-/// Lowers signed static `skills` rows to contained, read-only discovery roots.
-pub fn extension_sources(
-	extension_id: &Str,
-	package_root: &Path,
-	rows: &[omp_ext::config::StaticDeclaration],
-) -> Vec<SkillSource> {
-	rows
-		.iter()
-		.filter(|row| row.kind == "skills")
-		.filter_map(|row| {
-			let declared_path = row.path.as_deref()?;
-			let relative = Path::new(declared_path);
-			if declared_path.contains('\\')
-				|| relative.is_absolute()
-				|| relative.components().any(|component| {
-					matches!(
-						component,
-						std::path::Component::ParentDir
-							| std::path::Component::RootDir
-							| std::path::Component::Prefix(_)
-					)
-				}) {
-				return None;
-			}
-			let wildcard = declared_path
-				.find(|character| matches!(character, '*' | '?'))
-				.unwrap_or(declared_path.len());
-			let prefix = Path::new(&declared_path[..wildcard]);
-			let exact_file = wildcard == declared_path.len()
-				&& prefix.file_name().is_some_and(|name| name == "SKILL.md");
-			let root = if exact_file || prefix.extension().is_some() {
-				prefix.parent().unwrap_or_else(|| Path::new(""))
-			} else {
-				prefix
-			};
-			let contain_root = row
-				.metadata
-				.get("contain_root")
-				.and_then(serde_json::Value::as_str)
-				.map(Path::new)
-				.filter(|path| {
-					!path.is_absolute()
-						&& !path.components().any(|component| {
-							matches!(
-								component,
-								std::path::Component::ParentDir
-									| std::path::Component::RootDir
-									| std::path::Component::Prefix(_)
-							)
-						})
-				})
-				.map_or_else(|| package_root.to_path_buf(), |path| package_root.join(path));
-			Some(SkillSource {
-				id:                  extension_id.clone(),
-				root:                package_root.join(root),
-				scope:               SourceScope::Package,
-				include_root:        exact_file,
-				require_description: true,
-				contain_root:        Some(contain_root),
-				read_only:           true,
-				kind:                SkillSourceKind::Extension {
-					extension_id:  extension_id.clone(),
-					package_root:  package_root.to_path_buf(),
-					declared_path: Str::new(declared_path),
-				},
-			})
-		})
-		.collect()
+/// Project walk-up roots from `project_root` to its repository root (the
+/// nearest ancestor holding `.git`), never crossing into or above the home
+/// directory, closest first.
+fn ancestors(project_root: &Path, home: &Path) -> Vec<PathBuf> {
+	let mut out = Vec::new();
+	let mut current = Some(project_root);
+	while let Some(dir) = current {
+		if dir == home {
+			break;
+		}
+		out.push(dir.to_path_buf());
+		if dir.join(".git").exists() {
+			break;
+		}
+		current = dir.parent();
+	}
+	out
 }
 
-/// Converts already-admitted hook paths into driver discovery sources.
-pub fn contributed_sources(
-	extension_id: &Str,
-	paths: impl IntoIterator<Item = (PathBuf, PathBuf)>,
-) -> Vec<SkillSource> {
-	paths
-		.into_iter()
-		.filter_map(|(path, contain_root)| {
-			let root = path.parent()?.to_path_buf();
-			Some(SkillSource {
-				id: extension_id.clone(),
-				root,
-				scope: SourceScope::Package,
-				include_root: true,
-				require_description: true,
-				contain_root: Some(contain_root),
-				read_only: true,
-				kind: SkillSourceKind::ExtensionDiscovery { extension_id: extension_id.clone(), path },
-			})
-		})
-		.collect()
-}
-
-fn skill_files(source: &SkillSource, warnings: &mut Vec<SkillWarning>) -> Vec<PathBuf> {
-	let mut files = Vec::new();
-	if source.include_root && source.root.join("SKILL.md").is_file() {
-		files.push(source.root.join("SKILL.md"));
-	}
-	let outcome = WalkRequest::new(&source.root)
-		.hidden(false)
-		.gitignore(true)
-		.skip_git(true)
-		.follow_links(FollowLinks::Always)
-		.depth(2, 2)
-		.limit(1024)
-		.collect_files();
-	match outcome {
-		Ok(entries) => files.extend(
-			entries
-				.into_iter()
-				.map(|entry| entry.absolute_path(&source.root))
-				.filter(|path| path.file_name().is_some_and(|name| name == "SKILL.md")),
-		),
-		Err(_) if source.root.exists() => warnings.push(SkillWarning {
-			path:    source.root.clone(),
-			message: Str::from("failed to read skills directory"),
-		}),
-		Err(_) => {},
-	}
-	if let SkillSourceKind::Extension { package_root, declared_path, .. } = &source.kind {
-		files.retain(|path| {
-			path
-				.strip_prefix(package_root)
-				.ok()
-				.and_then(Path::to_str)
-				.is_some_and(|relative| glob_matches(declared_path, relative))
-		});
-	}
-	if let SkillSourceKind::ExtensionDiscovery { path, .. } = &source.kind {
-		files.retain(|candidate| candidate == path);
-	}
+/// Direct `<child>/SKILL.md` declarations below `root`, sorted; hidden
+/// children are skipped like pi's scanner.
+fn skill_files(root: &Path, warnings: &mut Vec<SkillWarning>) -> Vec<PathBuf> {
+	let entries = match fs::read_dir(root) {
+		Ok(entries) => entries,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+		Err(error) => {
+			warnings.push(SkillWarning {
+				path:    root.to_path_buf(),
+				message: Str::new(format!("Failed to read skills directory: {error}")),
+			});
+			return Vec::new();
+		},
+	};
+	let mut files = entries
+		.filter_map(Result::ok)
+		.filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+		.map(|entry| entry.path().join("SKILL.md"))
+		.filter(|path| path.is_file())
+		.collect::<Vec<_>>();
 	files.sort();
 	files
 }
 
-fn parse_skill(path: &Path) -> Result<(SkillHeader, String), serde_yaml::Error> {
-	let source = fs::read_to_string(path).unwrap_or_default();
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillHeader {
+	name:                     Option<String>,
+	description:              Option<String>,
+	#[serde(default)]
+	enabled:                  Option<bool>,
+	#[serde(default, alias = "hidden")]
+	hide:                     bool,
+	#[serde(default, alias = "disable-model-invocation")]
+	disable_model_invocation: bool,
+}
+
+fn load_skill(
+	source: &SkillSource,
+	path: &Path,
+	managed: bool,
+	warnings: &mut Vec<SkillWarning>,
+) -> Option<Skill> {
+	let canonical = match fs::canonicalize(path) {
+		Ok(canonical) => canonical,
+		Err(error) => {
+			warnings.push(SkillWarning {
+				path:    path.to_path_buf(),
+				message: Str::new(format!("Failed to read skill file: {error}")),
+			});
+			return None;
+		},
+	};
+	if managed && !managed_file_safe(path) {
+		warnings.push(SkillWarning {
+			path:    path.to_path_buf(),
+			message: Str::new_static("managed skill path is linked, oversized, or not a regular file"),
+		});
+		return None;
+	}
+	let text = match fs::read_to_string(&canonical) {
+		Ok(text) => text,
+		Err(error) => {
+			warnings.push(SkillWarning {
+				path:    canonical,
+				message: Str::new(format!("Failed to read skill file: {error}")),
+			});
+			return None;
+		},
+	};
+	let header = match parse_frontmatter(&text) {
+		Ok(header) => header,
+		Err(error) => {
+			warnings.push(SkillWarning {
+				path:    canonical,
+				message: Str::new(format!("failed to parse SKILL.md frontmatter: {error}")),
+			});
+			return None;
+		},
+	};
+	if header.enabled == Some(false) {
+		return None;
+	}
+	let directory = canonical
+		.parent()
+		.and_then(Path::file_name)
+		.and_then(|name| name.to_str())
+		.unwrap_or("skill");
+	let name = header
+		.name
+		.as_deref()
+		.map(str::trim)
+		.filter(|name| !name.is_empty())
+		.unwrap_or(directory);
+	if !safe_skill_name(name) {
+		warnings.push(SkillWarning {
+			path:    canonical,
+			message: Str::new_static("skill name is not a safe directory-style identifier"),
+		});
+		return None;
+	}
+	if managed && !omp_envd::managed_skills_domain::is_valid_name(name) {
+		warnings.push(SkillWarning {
+			path:    canonical,
+			message: Str::new_static("managed skill name is not exact kebab-case"),
+		});
+		return None;
+	}
+	let description = header
+		.description
+		.as_deref()
+		.map(str::trim)
+		.unwrap_or_default();
+	let description = if managed {
+		omp_envd::managed_skills_domain::sanitize_description(description)
+	} else {
+		Str::new(description)
+	};
+	if description.is_empty() {
+		return None;
+	}
+	let base_dir = canonical
+		.parent()
+		.map(Path::to_path_buf)
+		.unwrap_or_else(|| source.root.clone());
+	Some(Skill {
+		name: Str::new(name),
+		description,
+		path: canonical,
+		base_dir,
+		provider: source.provider.clone(),
+		level: source.level,
+		hidden: header.hide || header.disable_model_invocation,
+	})
+}
+
+fn parse_frontmatter(source: &str) -> Result<SkillHeader, serde_yaml::Error> {
 	let Some(rest) = source.strip_prefix("---\n") else {
-		return Ok((SkillHeader::default(), source));
+		return Ok(SkillHeader::default());
 	};
-	let Some((header, body)) = rest.split_once("\n---\n") else {
-		return Ok((SkillHeader::default(), source));
+	let Some((header, _)) = rest.split_once("\n---") else {
+		return Ok(SkillHeader::default());
 	};
-	Ok((serde_yaml::from_str(header)?, body.trim().to_owned()))
+	serde_yaml::from_str(header)
 }
 
 /// Returns whether a skill name is a safe, URL-addressable identifier.
+#[must_use]
 pub fn safe_skill_name(name: &str) -> bool {
 	!name.is_empty()
 		&& name != "."
@@ -720,7 +536,12 @@ pub fn safe_skill_name(name: &str) -> bool {
 			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn managed_path_safe(path: &Path) -> bool {
+fn managed_root_safe(root: &Path) -> bool {
+	fs::symlink_metadata(root)
+		.is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+}
+
+fn managed_file_safe(path: &Path) -> bool {
 	let Ok(file) = fs::symlink_metadata(path) else {
 		return false;
 	};
@@ -733,26 +554,21 @@ fn managed_path_safe(path: &Path) -> bool {
 	!file.file_type().is_symlink()
 		&& file.is_file()
 		&& file.len() <= omp_envd::managed_skills_domain::MAX_SKILL_BYTES as u64
-		&& managed_link_count(&file) == 1
 		&& !directory.file_type().is_symlink()
 		&& directory.is_dir()
 }
 
-#[cfg(unix)]
-fn managed_link_count(metadata: &fs::Metadata) -> u64 {
-	use std::os::unix::fs::MetadataExt as _;
-	metadata.nlink()
+fn expand_tilde(path: &str, home: Option<&Path>) -> PathBuf {
+	match (path.strip_prefix("~/"), home) {
+		(Some(rest), Some(home)) => home.join(rest),
+		_ if path == "~" => home.map_or_else(|| PathBuf::from(path), Path::to_path_buf),
+		_ => PathBuf::from(path),
+	}
 }
 
-#[cfg(windows)]
-fn managed_link_count(metadata: &fs::Metadata) -> u64 {
-	use std::os::windows::fs::MetadataExt as _;
-	u64::from(metadata.number_of_links())
-}
-
-/// Small allocation-free wildcard matcher used for configuration globs.
-/// `*` spans any bytes and `?` spans one byte; repeated stars naturally cover
-/// `**` without introducing a second pattern dialect.
+/// Small allocation-free wildcard matcher for configuration globs: `*`
+/// spans any bytes and `?` one byte; repeated stars cover `**`.
+#[must_use]
 pub fn glob_matches(pattern: &str, candidate: &str) -> bool {
 	let pattern = pattern.as_bytes();
 	let candidate = candidate.as_bytes();
@@ -779,137 +595,454 @@ pub fn glob_matches(pattern: &str, candidate: &str) -> bool {
 	p == pattern.len()
 }
 
+/// `skill://<name>` reads `SKILL.md`; `skill://<name>/<path>` reads a file
+/// or lists a directory inside the skill's base directory, realpath-contained
+/// (pi `internal-urls/skill-protocol.ts`).
+struct SkillResolver {
+	skills: Arc<ActiveSkills>,
+	lines:  LineOffsetCache,
+}
+
+impl SkillResolver {
+	fn unknown(&self, name: &str) -> Fault {
+		let available = self
+			.skills
+			.skills
+			.iter()
+			.map(|skill| skill.name.as_str())
+			.collect::<Vec<_>>();
+		let available = if available.is_empty() {
+			"none".to_owned()
+		} else {
+			available.join(", ")
+		};
+		Fault::Source { message: Str::new(format!("Unknown skill: {name}\nAvailable: {available}")) }
+	}
+
+	/// Resolves `resource` to a contained filesystem target.
+	fn target(&self, resource: &str) -> Result<(&Skill, PathBuf), Fault> {
+		let (name, relative) = resource
+			.split_once('/')
+			.map_or((resource, ""), |(name, rest)| (name, rest.trim_start_matches('/')));
+		if name.is_empty() {
+			return Err(Fault::Invalid {
+				message: Str::new_static("skill:// URL requires a skill name: skill://<name>"),
+			});
+		}
+		let skill = self.skills.get(name).ok_or_else(|| self.unknown(name))?;
+		if relative.is_empty() {
+			return Ok((skill, skill.path.clone()));
+		}
+		let relative = Path::new(relative);
+		if relative.is_absolute()
+			|| relative.components().any(|component| {
+				matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+			}) {
+			return Err(Fault::Invalid {
+				message: Str::new_static("Path traversal (..) is not allowed in skill:// URLs"),
+			});
+		}
+		let joined = skill.base_dir.join(relative);
+		let resolved = fs::canonicalize(&joined).map_err(|_| Fault::Source {
+			message: Str::new(format!("File not found: {}", joined.display())),
+		})?;
+		if !resolved.starts_with(&skill.base_dir) {
+			return Err(Fault::Invalid {
+				message: Str::new(format!(
+					"skill:// path resolves outside the skill directory: skill://{resource}"
+				)),
+			});
+		}
+		Ok((skill, resolved))
+	}
+
+	fn index(&self) -> Vec<u8> {
+		let mut text = String::from("# Skills\n\n");
+		for skill in &self.skills.skills {
+			text.push_str("- skill://");
+			text.push_str(&skill.name);
+			text.push_str(": ");
+			text.push_str(&skill.description);
+			text.push('\n');
+		}
+		text.into_bytes()
+	}
+}
+
+#[async_trait::async_trait]
+impl ContentResolver for SkillResolver {
+	fn entry(&self) -> SchemeEntry {
+		SchemeEntry::new(Scheme::Skill, true, false, "admitted SKILL.md documents and their files")
+			.with_capabilities(true, true, true)
+			.with_whole_body(true)
+	}
+
+	async fn read(
+		&self,
+		resource: &str,
+		selector: &ParsedSelector,
+	) -> Result<CowBytes<'static>, Fault> {
+		if resource.is_empty() {
+			return Ok(CowBytes::from(self.index()));
+		}
+		let (_, target) = self.target(resource)?;
+		let bytes = if target.is_dir() {
+			let listing = self.list(resource, usize::MAX, usize::MAX).await?;
+			let mut text = String::new();
+			for entry in listing.entries {
+				text.push_str(&entry.uri);
+				text.push('\n');
+			}
+			CowBytes::from(text.into_bytes())
+		} else {
+			CowBytes::from(fs::read(&target).map_err(|error| Fault::Source {
+				message: Str::new(format!("File not found: {} ({error})", target.display())),
+			})?)
+		};
+		let ParsedSelector::Lines { ranges, .. } = selector else {
+			return Ok(bytes);
+		};
+		let mut output = Vec::new();
+		for range in ranges {
+			let piece = self
+				.lines
+				.slice(resource, &bytes, *range)
+				.map_err(|error| Fault::Invalid { message: Str::new(error.to_string()) })?;
+			output.extend_from_slice(&piece);
+		}
+		Ok(CowBytes::from(output))
+	}
+
+	async fn list(
+		&self,
+		resource: &str,
+		max_entries: usize,
+		max_bytes: usize,
+	) -> Result<ResourceList, Fault> {
+		if resource.is_empty() {
+			let mut entries = Vec::new();
+			let mut truncated = false;
+			for skill in &self.skills.skills {
+				if entries.len() == max_entries {
+					truncated = true;
+					break;
+				}
+				entries.push(ResourceEntry {
+					uri:       Str::new(format!("skill://{}", skill.name)),
+					name:      skill.name.clone(),
+					directory: true,
+					size:      0,
+				});
+			}
+			return Ok(ResourceList { entries, truncated });
+		}
+		let (skill, target) = self.target(resource)?;
+		let directory = if !resource.contains('/') {
+			skill.base_dir.clone()
+		} else if target.is_dir() {
+			target
+		} else {
+			return Err(Fault::Invalid {
+				message: Str::new(format!("skill://{resource} is a file and cannot be listed.")),
+			});
+		};
+		let prefix = resource.trim_end_matches('/');
+		let mut children = fs::read_dir(&directory)
+			.map_err(|error| Fault::Source {
+				message: Str::new(format!("Failed to list {}: {error}", directory.display())),
+			})?
+			.filter_map(Result::ok)
+			.map(|entry| {
+				let metadata = entry.metadata().ok();
+				let is_dir = metadata.as_ref().is_some_and(fs::Metadata::is_dir);
+				let size = metadata.map_or(0, |metadata| metadata.len());
+				(entry.file_name().to_string_lossy().into_owned(), is_dir, size)
+			})
+			.collect::<Vec<_>>();
+		children.sort();
+		let mut entries = Vec::new();
+		let mut bytes = 0usize;
+		let mut truncated = false;
+		for (name, is_dir, size) in children {
+			let suffix = if is_dir { "/" } else { "" };
+			let uri = format!("skill://{prefix}/{name}{suffix}");
+			if entries.len() == max_entries || bytes.saturating_add(uri.len()) > max_bytes {
+				truncated = true;
+				break;
+			}
+			bytes += uri.len();
+			entries.push(ResourceEntry {
+				uri: Str::new(uri),
+				name: Str::new(format!("{name}{suffix}")),
+				directory: is_dir,
+				size,
+			});
+		}
+		Ok(ResourceList { entries, truncated })
+	}
+
+	async fn path(&self, resource: &str) -> Result<Option<Str>, Fault> {
+		if resource.is_empty() {
+			return Ok(None);
+		}
+		let (skill, target) = self.target(resource)?;
+		let target = if resource.contains('/') {
+			target
+		} else {
+			skill.base_dir.clone()
+		};
+		Ok(Some(Str::new(format!("file://{}", target.display()))))
+	}
+
+	async fn complete(
+		&self,
+		query: &str,
+		max_results: usize,
+	) -> Result<Vec<ResourceCompletion>, Fault> {
+		let mut matches = self
+			.skills
+			.skills
+			.iter()
+			.filter_map(|skill| {
+				fuzzy_score(query, &skill.name).map(|score| ResourceCompletion {
+					value: Str::new(format!("skill://{}", skill.name)),
+					description: skill.description.clone(),
+					score,
+				})
+			})
+			.collect::<Vec<_>>();
+		matches.sort_by(|left, right| {
+			right
+				.score
+				.cmp(&left.score)
+				.then_with(|| left.value.cmp(&right.value))
+		});
+		matches.truncate(max_results);
+		Ok(matches)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::fs;
 
+	use omp_con::Value;
+
 	use super::*;
 
-	#[test]
-	fn pi_frontmatter_spelling_and_compatibility_fields_are_retained() {
-		let tree = tempfile::tempdir().unwrap();
-		let root = tree.path().join("frontmatter");
-		let skill = root.join("compat/SKILL.md");
-		fs::create_dir_all(skill.parent().unwrap()).unwrap();
-		fs::write(
-			&skill,
-			"---\nname: compat\ndescription: compatible\nlicense: Apache-2.0\ncompatibility: \
-			 Requires git\nmetadata:\n  author: pi\n  revision: 2\nallowed-tools: Read Grep \
-			 Bash\ndisable-model-invocation: true\n---\nbody",
-		)
-		.unwrap();
-		let result = discover(
-			&[SkillSource {
-				id: Str::new_static("test"),
-				root,
-				scope: SourceScope::Project,
-				include_root: false,
-				require_description: true,
-				contain_root: None,
-				read_only: false,
-				kind: SkillSourceKind::Native,
-			}],
-			&SkillDiscoverySettings::default(),
-		);
-		let CapabilityPayload::Skills(skill) = &result.declarations[0].payload else {
-			panic!("skill payload")
-		};
-		assert!(skill.frontmatter.disable_model_invocation);
-		assert_eq!(skill.frontmatter.license.as_deref(), Some("Apache-2.0"));
-		assert_eq!(skill.frontmatter.compatibility.as_deref(), Some("Requires git"));
-		assert_eq!(skill.frontmatter.allowed_tools, [
-			Str::new_static("Read"),
-			Str::new_static("Grep"),
-			Str::new_static("Bash")
-		]);
-		assert_eq!(skill.frontmatter.metadata["author"], "pi");
-		assert_eq!(skill.frontmatter.metadata["revision"], 2);
+	fn write_skill(root: &Path, dir: &str, frontmatter: &str, body: &str) -> PathBuf {
+		let path = root.join(dir).join("SKILL.md");
+		fs::create_dir_all(path.parent().unwrap()).unwrap();
+		fs::write(&path, format!("---\n{frontmatter}\n---\n{body}")).unwrap();
+		path
+	}
+
+	fn source(root: &Path, provider: &'static str, level: SkillLevel) -> SkillSource {
+		SkillSource { provider: Str::new_static(provider), root: root.to_path_buf(), level }
 	}
 
 	#[test]
-	fn scans_nested_skills_and_applies_gates_before_collision() {
+	fn skills_are_admitted_from_ordered_sources_with_first_wins_and_custom_override() {
 		let tree = tempfile::tempdir().unwrap();
-		let high = tree.path().join("high");
-		let low = tree.path().join("low");
-		fs::create_dir_all(high.join("alpha")).unwrap();
-		fs::create_dir_all(low.join("alpha")).unwrap();
-		fs::write(
-			high.join("alpha/SKILL.md"),
-			"---\nname: alpha\ndescription: hidden\nenabled: false\n---\nhigh",
-		)
-		.unwrap();
-		fs::write(low.join("alpha/SKILL.md"), "---\ndescription: usable\n---\nlow").unwrap();
+		let project = tree.path().join("project");
+		let user = tree.path().join("user");
+		let custom = tree.path().join("custom");
+		write_skill(&project, "review", "description: project review", "project body");
+		write_skill(&user, "review", "description: user review", "user body");
+		write_skill(&user, "debug", "name: Debug-It\ndescription: debug things", "debug body");
+		write_skill(&user, "nodesc", "name: nodesc", "no description");
+		write_skill(&user, "off", "description: disabled\nenabled: false", "off");
+		write_skill(&custom, "debug", "description: custom debug", "custom body");
 		let sources = [
-			SkillSource {
-				id:                  Str::from("high"),
-				root:                high,
-				scope:               SourceScope::Project,
-				include_root:        false,
-				require_description: true,
-				contain_root:        None,
-				read_only:           false,
-				kind:                SkillSourceKind::Native,
-			},
-			SkillSource {
-				id:                  Str::from("low"),
-				root:                low,
-				scope:               SourceScope::User,
-				include_root:        false,
-				require_description: true,
-				contain_root:        None,
-				read_only:           false,
-				kind:                SkillSourceKind::Native,
-			},
+			source(&project, "native", SkillLevel::Project),
+			source(&user, "native", SkillLevel::User),
+			source(&custom, "custom", SkillLevel::User),
 		];
-		let result = discover(&sources, &SkillDiscoverySettings::default());
-		assert_eq!(result.declarations.len(), 1);
-		let CapabilityPayload::Skills(skill) = &result.declarations[0].payload else {
-			panic!()
-		};
-		assert_eq!(skill.content, "low");
+		let active = discover(&sources, &SkillPolicy::default());
+		let names = active
+			.skills
+			.iter()
+			.map(|skill| (skill.name.as_str(), skill.description.as_str()))
+			.collect::<Vec<_>>();
+		assert_eq!(names, [
+			("debug", "custom debug"),
+			("Debug-It", "debug things"),
+			("review", "project review")
+		]);
+		assert_eq!(active.get("review").unwrap().level, SkillLevel::Project);
+		assert_eq!(active.warnings.len(), 1, "{:?}", active.warnings);
+		assert!(active.warnings[0].message.contains("name collision"));
 	}
 
 	#[test]
-	fn extension_contributors_use_existing_first_source_precedence() {
-		let tree = tempfile::tempdir().expect("tree");
-		let first_root = tree.path().join("first");
-		let second_root = tree.path().join("second");
-		let first = first_root.join("review/SKILL.md");
-		let second = second_root.join("review/SKILL.md");
-		fs::create_dir_all(first.parent().expect("first parent")).expect("first directory");
-		fs::create_dir_all(second.parent().expect("second parent")).expect("second directory");
-		fs::write(&first, "---\ndescription: first\n---\nfirst").expect("first skill");
-		fs::write(&second, "---\ndescription: second\n---\nsecond").expect("second skill");
-		let sources = [
-			contributed_sources(&Str::from("publisher.first"), [(first.clone(), first_root)]),
-			contributed_sources(&Str::from("publisher.second"), [(second, second_root)]),
-		]
-		.concat();
-		let result = discover(&sources, &SkillDiscoverySettings::default());
-		assert_eq!(result.declarations.len(), 1);
-		let CapabilityPayload::Skills(skill) = &result.declarations[0].payload else {
-			panic!("skill payload")
+	fn policy_filters_ignore_include_disabled_and_master_switch() {
+		let tree = tempfile::tempdir().unwrap();
+		let root = tree.path().join("skills");
+		for name in ["alpha", "beta", "gamma"] {
+			write_skill(&root, name, &format!("description: {name}"), name);
+		}
+		let sources = [source(&root, "native", SkillLevel::User)];
+		let names = |policy: &SkillPolicy| {
+			discover(&sources, policy)
+				.skills
+				.into_iter()
+				.map(|skill| skill.name)
+				.collect::<Vec<_>>()
 		};
-		assert_eq!(skill.content, "first");
-		assert_eq!(
-			result.declarations[0]
-				.source
-				.installed_package_id
-				.as_deref(),
-			Some("publisher.first")
+		let policy = SkillPolicy { ignore: vec![Str::new_static("be*")], ..SkillPolicy::default() };
+		assert_eq!(names(&policy), ["alpha", "gamma"]);
+		let policy =
+			SkillPolicy { include: vec![Str::new_static("g?mma")], ..SkillPolicy::default() };
+		assert_eq!(names(&policy), ["gamma"]);
+		let policy = SkillPolicy {
+			disabled: [Str::new_static("alpha")].into_iter().collect(),
+			..SkillPolicy::default()
+		};
+		assert_eq!(names(&policy), ["beta", "gamma"]);
+		let policy = SkillPolicy { enabled: false, ..SkillPolicy::default() };
+		assert!(names(&policy).is_empty());
+	}
+
+	#[test]
+	fn hidden_skills_are_readable_but_not_listed_in_prompt_facts() {
+		let tree = tempfile::tempdir().unwrap();
+		let root = tree.path().join("skills");
+		write_skill(&root, "shown", "description: shown", "s");
+		write_skill(&root, "hidden", "description: hidden\nhide: true", "h");
+		write_skill(&root, "manual", "description: manual\ndisable-model-invocation: true", "m");
+		let active = discover(&[source(&root, "native", SkillLevel::User)], &SkillPolicy::default());
+		assert_eq!(active.skills.len(), 3);
+		let facts = active.prompt_facts();
+		assert_eq!(facts.len(), 1);
+		assert_eq!(facts[0]["name"], "shown");
+		assert_eq!(facts[0]["description"], "shown");
+	}
+
+	#[test]
+	fn policy_projects_convars_including_disabled_skill_ids() {
+		let ctx = omp_con::Ctx::new();
+		ctx.set(
+			"cl_disabled_extensions",
+			Value::List(vec![
+				Value::Str(Str::new_static("skill:review")),
+				Value::Str(Str::new_static("acme.reviewer")),
+			]),
+			omp_con::Origin::Host,
+		)
+		.unwrap();
+		ctx.set(
+			"sv_skills_ignore",
+			Value::List(vec![Value::Str(Str::new_static("tmp-*"))]),
+			omp_con::Origin::Host,
+		)
+		.unwrap();
+		ctx.set("sv_skills_enable_claude_user", Value::Bool(true), omp_con::Origin::Host)
+			.unwrap();
+		let policy = SkillPolicy::from_con(&ctx);
+		assert_eq!(policy.disabled, [Str::new_static("review")].into_iter().collect());
+		assert_eq!(policy.ignore, [Str::new_static("tmp-*")]);
+		assert!(policy.claude_user);
+		assert!(!policy.codex_user);
+		assert!(policy.enabled);
+	}
+
+	#[test]
+	fn sources_follow_pi_precedence_and_walk_up_to_the_repo_root() {
+		let tree = tempfile::tempdir().unwrap();
+		let home = tree.path().join("home");
+		let repo = home.join("work/repo");
+		let nested = repo.join("crates/app");
+		fs::create_dir_all(repo.join(".git")).unwrap();
+		fs::create_dir_all(&nested).unwrap();
+		let config = home.join(".o2");
+		let policy = SkillPolicy {
+			custom_directories: vec![PathBuf::from("/opt/skills")],
+			..SkillPolicy::default()
+		};
+		let roots = sources(&nested, &home, &config, &policy)
+			.into_iter()
+			.map(|source| (source.provider, source.root, source.level))
+			.collect::<Vec<_>>();
+		let expect =
+			|provider: &str, root: PathBuf, level: SkillLevel| (Str::new(provider), root, level);
+		assert_eq!(roots, [
+			expect("native", nested.join(".omp/skills"), SkillLevel::Project),
+			expect("native", repo.join("crates/.omp/skills"), SkillLevel::Project),
+			expect("native", repo.join(".omp/skills"), SkillLevel::Project),
+			expect("native", config.join("agent/skills"), SkillLevel::User),
+			expect("claude", nested.join(".claude/skills"), SkillLevel::Project),
+			expect("claude", repo.join("crates/.claude/skills"), SkillLevel::Project),
+			expect("claude", repo.join(".claude/skills"), SkillLevel::Project),
+			expect("agents", nested.join(".agent/skills"), SkillLevel::Project),
+			expect("agents", nested.join(".agents/skills"), SkillLevel::Project),
+			expect("agents", repo.join("crates/.agent/skills"), SkillLevel::Project),
+			expect("agents", repo.join("crates/.agents/skills"), SkillLevel::Project),
+			expect("agents", repo.join(".agent/skills"), SkillLevel::Project),
+			expect("agents", repo.join(".agents/skills"), SkillLevel::Project),
+			expect("agents", home.join(".agent/skills"), SkillLevel::User),
+			expect("agents", home.join(".agents/skills"), SkillLevel::User),
+			expect("custom", PathBuf::from("/opt/skills"), SkillLevel::User),
+			expect("omp-managed", config.join("agent/managed-skills"), SkillLevel::User),
+		]);
+	}
+
+	#[tokio::test]
+	async fn skill_uri_reads_skill_md_and_contained_files_only() {
+		let tree = tempfile::tempdir().unwrap();
+		let root = tree.path().join("skills");
+		write_skill(&root, "review", "description: review code", "Review body");
+		fs::create_dir_all(root.join("review/refs")).unwrap();
+		fs::write(root.join("review/refs/checklist.md"), "- check\n").unwrap();
+		fs::write(tree.path().join("secret.txt"), "secret").unwrap();
+		#[cfg(unix)]
+		std::os::unix::fs::symlink(tree.path().join("secret.txt"), root.join("review/leak.txt"))
+			.unwrap();
+		let active =
+			Arc::new(discover(&[source(&root, "native", SkillLevel::User)], &SkillPolicy::default()));
+		let resolver = active.resolver();
+		assert_eq!(resolver.entry().scheme, Scheme::Skill);
+		let body = resolver
+			.read("review", &ParsedSelector::None)
+			.await
+			.unwrap();
+		assert!(std::str::from_utf8(&body).unwrap().ends_with("Review body"));
+		let nested = resolver
+			.read("review/refs/checklist.md", &ParsedSelector::None)
+			.await
+			.unwrap();
+		assert_eq!(&*nested, b"- check\n");
+		let index = resolver.read("", &ParsedSelector::None).await.unwrap();
+		assert!(
+			std::str::from_utf8(&index)
+				.unwrap()
+				.contains("skill://review: review code")
 		);
-		let frozen = crate::skills::SkillSnapshot::from_declarations(&result.declarations);
-		fs::write(&first, "---\ndescription: first\n---\nupdated").expect("updated skill");
-		assert_eq!(frozen.resolve_body("review"), Some("first"));
-		let reloaded = discover(&sources, &SkillDiscoverySettings::default());
-		let reloaded = crate::skills::SkillSnapshot::from_declarations(&reloaded.declarations);
-		assert_eq!(reloaded.resolve_body("review"), Some("updated"));
-	}
-
-	#[test]
-	fn wildcard_matching_is_deterministic() {
-		assert!(glob_matches("rust-*", "rust-review"));
-		assert!(glob_matches("*-review", "rust-review"));
-		assert!(!glob_matches("go-*", "rust-review"));
+		let missing = resolver
+			.read("nope", &ParsedSelector::None)
+			.await
+			.unwrap_err();
+		assert_eq!(missing.message().as_str(), "Unknown skill: nope\nAvailable: review");
+		let traversal = resolver
+			.read("review/../secret.txt", &ParsedSelector::None)
+			.await
+			.unwrap_err();
+		assert!(traversal.message().contains("traversal"));
+		#[cfg(unix)]
+		{
+			let leak = resolver
+				.read("review/leak.txt", &ParsedSelector::None)
+				.await
+				.unwrap_err();
+			assert!(leak.message().contains("outside the skill directory"), "{leak:?}");
+		}
+		let listing = resolver.list("review", 16, 4096).await.unwrap();
+		let names = listing
+			.entries
+			.iter()
+			.map(|entry| entry.name.as_str())
+			.collect::<Vec<_>>();
+		assert!(names.contains(&"SKILL.md") && names.contains(&"refs/"), "{names:?}");
+		let completions = resolver.complete("rev", 5).await.unwrap();
+		assert_eq!(completions[0].value.as_str(), "skill://review");
 	}
 }
