@@ -28,7 +28,8 @@ pub enum VisionMode {
 }
 
 /// Text standing in for an image the policy withholds.
-const OMITTED: &str = "[image omitted: the current vision policy does not send images to this model]";
+const OMITTED: &str =
+	"[image omitted: the current vision policy does not send images to this model]";
 
 /// The journaled `ai_vision` mode, `auto` when unset.
 #[must_use]
@@ -75,11 +76,7 @@ pub fn apply(dom: &Dom, route: &RouteFacts, messages: &mut [Message]) {
 		if !message.content.iter().any(carries_image) {
 			continue;
 		}
-		let content = message
-			.content
-			.iter()
-			.map(strip_part)
-			.collect::<Vec<_>>();
+		let content = message.content.iter().map(strip_part).collect::<Vec<_>>();
 		message.content = Arc::from(content);
 	}
 }
@@ -87,9 +84,9 @@ pub fn apply(dom: &Dom, route: &RouteFacts, messages: &mut [Message]) {
 fn carries_image(part: &ContentPart) -> bool {
 	match part {
 		ContentPart::Image(_) => true,
-		ContentPart::ToolResult { content, .. } => {
-			content.iter().any(|item| matches!(item, ToolResultContent::Image(_)))
-		},
+		ContentPart::ToolResult { content, .. } => content
+			.iter()
+			.any(|item| matches!(item, ToolResultContent::Image(_))),
 		_ => false,
 	}
 }
@@ -158,6 +155,8 @@ mod tests {
 		apply(&dom, &images, &mut messages);
 		assert!(matches!(messages[0].content[1], ContentPart::Image(_)));
 		apply(&dom, &no_images, &mut messages);
-		assert!(matches!(&messages[0].content[1], ContentPart::Text { text, .. } if text.contains("image omitted")));
+		assert!(
+			matches!(&messages[0].content[1], ContentPart::Text { text, .. } if text.contains("image omitted"))
+		);
 	}
 }

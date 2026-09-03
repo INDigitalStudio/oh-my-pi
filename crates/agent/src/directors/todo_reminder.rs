@@ -4,8 +4,8 @@ use omp_core::Str;
 use omp_dom::{Dom, Node};
 
 use crate::director::{
-	BindValue, Director, DirectorCx, DirectorEffect, StateUpdate, TurnView, Verdict, find_director,
-	state_bool, state_int,
+	BindValue, Director, DirectorCx, DirectorEffect, TurnView, Verdict, find_director, state_bool,
+	state_int,
 };
 
 /// Reminds the model about unfinished todo items without burning retries on
@@ -64,7 +64,10 @@ impl Director for TodoReminder {
 			.count("prompts prompt[kind=ask][status=pending]")
 			.unwrap_or(0)
 			> 0;
-		let pending_wake = dom.count("jobs job[status=pending]").unwrap_or(0) > 0;
+		// pi `#hasPendingAsyncWake`: a running detached job or subagent will
+		// wake this session with an async-result follow-up; stop-time passes
+		// defer to the settle reached once the work lands.
+		let pending_wake = crate::jobs::pending_wake(dom);
 		let open_force = find_director(dom, "force_tool").is_some();
 		if pending_ask || pending_wake || open_force || turn.had_tool_calls {
 			return DirectorEffect::new(Verdict::Pass);
@@ -76,18 +79,13 @@ impl Director for TodoReminder {
 		if self.attempts >= self.max_reminders {
 			return DirectorEffect::new(Verdict::Pass);
 		}
-		DirectorEffect {
-			verdict: Verdict::Continue {
-				reminder: Some(Str::new_static(
-					"Todo items remain incomplete. Continue working before yielding.",
-				)),
-			},
-			updates: vec![
-				StateUpdate::new("attempts", BindValue::Int(i64::from(self.attempts + 1))),
-				StateUpdate::new("awaiting_progress", BindValue::Bool(true)),
-			],
-			asides:  Vec::new(),
-		}
+		DirectorEffect::new(Verdict::Continue {
+			reminder: Some(Str::new_static(
+				"Todo items remain incomplete. Continue working before yielding.",
+			)),
+		})
+		.with_update("attempts", BindValue::Int(i64::from(self.attempts + 1)))
+		.with_update("awaiting_progress", BindValue::Bool(true))
 	}
 }
 

@@ -40,7 +40,12 @@ impl Harness {
 			session,
 			stack,
 			registry,
-			route: RouteFacts { forced_choice_free: true, context_window: 128_000, image_input: false },
+			route: RouteFacts {
+				forced_choice_free: true,
+				context_window: 128_000,
+				image_input: false,
+				..RouteFacts::default()
+			},
 			next_call: 0,
 		}
 	}
@@ -79,7 +84,10 @@ impl Harness {
 			let outcome = RawValue::from_string("{}".to_owned()).expect("raw result");
 			self.session.settle(id, outcome).expect("tool result");
 		}
-		self.session.receipt(omp_journal::data::TurnReceipt::tokens(0, tokens, 0)).expect("receipt");
+		self
+			.session
+			.receipt(omp_journal::data::TurnReceipt::tokens(0, tokens, 0))
+			.expect("receipt");
 		self.session.assistant_end("stop").expect("assistant end");
 		let view = TurnView {
 			turn,
@@ -120,7 +128,10 @@ impl Harness {
 			let outcome = RawValue::from_string("{}".to_owned()).expect("raw result");
 			self.session.settle(id, outcome).expect("tool result");
 		}
-		self.session.receipt(omp_journal::data::TurnReceipt::tokens(0, tokens, 0)).expect("receipt");
+		self
+			.session
+			.receipt(omp_journal::data::TurnReceipt::tokens(0, tokens, 0))
+			.expect("receipt");
 		self.session.assistant_end("stop").expect("assistant end");
 		let view = TurnView {
 			turn,
@@ -180,7 +191,9 @@ impl Harness {
 		self.insert(
 			jobs,
 			NodeSpec::new(KnownTag::Job)
-				.with_prop(PropId::Status, Value::Str(Str::new_static("pending"))),
+				.with_prop(PropId::Id, Value::Str(Str::new_static("job-1")))
+				.with_prop(PropId::Kind, Value::Str(Str::new_static("tool")))
+				.with_prop(PropId::Status, Value::Str(Str::new_static("running"))),
 		)
 	}
 
@@ -260,6 +273,9 @@ impl Harness {
 			BindValue::Int(value) => Value::Int(value),
 			BindValue::Str(value) => Value::Str(value),
 			BindValue::Float(value) => Value::Float(value),
+			BindValue::List(items) => {
+				Value::Json(serde_json::value::to_raw_value(&items).expect("list bind serializes"))
+			},
 		};
 		self.patch("test.director.state", vec![Op::Set {
 			h: handle,

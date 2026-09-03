@@ -1,25 +1,24 @@
 //! Agent Client Protocol adapter over the journal-first kernel and session.
 
-use std::{
-	env, fs,
-	path::{Path, PathBuf},
-	sync::Arc,
-};
+use std::{borrow::Cow, fs, path::Path, sync::Arc};
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_agent::{
 	ApprovalDecision, ApprovalScope, ApprovalSource, Inference, Kernel, RunControl, TurnInput, Up,
 };
-use omp_core::Str;
+use omp_core::{Str, base64};
 use omp_dom::Event;
-use omp_driver::{discovery::roles, headless::kernel::SessionHome};
-use omp_session::Session;
+use omp_driver::headless::kernel::SessionHome;
+use omp_session::{AttachmentInput, Session, SessionError};
 use serde_json::{Map, Value, json};
 use tokio::io::{
 	AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader, stdin, stdout,
 };
 
-use crate::cli::{AcpArgs, ChatArgs};
+use crate::{
+	chat_cmd::{Launch, LaunchEnv},
+	cli::{AcpArgs, ChatArgs},
+};
 
 /// Runs ACP using stdin for NDJSON requests and stdout for NDJSON responses.
 pub async fn run(args: AcpArgs) -> miette::Result<()> {
@@ -34,114 +33,16 @@ pub async fn run(args: AcpArgs) -> miette::Result<()> {
 }
 
 async fn run_inner(args: ChatArgs) -> miette::Result<()> {
-	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let project = fs::canonicalize(&args.project).into_diagnostic()?;
 	let ctx = Arc::new(crate::process_ctx(&project)?);
-	for overlay in &args.config {
-		let script = fs::read_to_string(overlay).into_diagnostic()?;
-		ctx.exec(&script, omp_con::Source::Config(Str::new(overlay.to_string_lossy())))
-			.into_diagnostic()?;
-	}
-	let home = env::var_os("HOME").map_or_else(|| project.clone(), PathBuf::from);
-	let model_settings =
-		omp_catalog::settings::ModelSettings::from_con(&ctx).resolve_path_scopes(&project, &home);
-	let catalog = if args.gateway.is_some() {
-		Arc::new(omp_catalog::snapshot::Catalog::embedded().clone())
-	} else {
-		omp_driver::registry::production_catalog(&data_dir).map_err(|source| miette!(source))?
-	};
-	let launch_roles = roles::resolve_launch_roles(
-		catalog.as_ref(),
-		&model_settings,
-		None,
-		args.smol.as_deref(),
-		args.slow.as_deref(),
-		args.plan.as_deref(),
-	)
-	.map_err(|source| miette!(source))?;
-	let model = args
-		.model
-		.clone()
-		.or_else(|| launch_roles.primary.map(|value| Str::from(value.as_str())))
-		.ok_or_else(|| miette!("ACP mode requires a configured default model role"))?;
-	let prompt_slots = crate::spec::resolve_prompt_slots(
-		&project,
-		&home,
-		args.prompt_settings.custom_prompt.as_deref(),
-		args.prompt_settings.append_prompt.as_deref(),
-	)?;
-	let prompt = omp_driver::headless::kernel::PromptOverrides {
-		custom_prompt: prompt_slots.system,
-		append_prompt: prompt_slots.append,
-		personality: args.prompt_settings.personality.clone(),
-		include_model: args.prompt_settings.include_model_in_prompt,
-		include_workstation: args.prompt_settings.include_workstation,
-		include_workspace_tree: args.prompt_settings.include_workspace_tree,
-		render_mermaid: args.prompt_settings.render_mermaid,
-		include_skills: args.prompt_settings.skills_enabled,
-		null_prompt: args.prompt_settings.null_prompt,
-	};
-	let approval_mode = args.effective_approval().map(Into::into);
-	let live_sessions = Arc::new(omp_driver::sessions::SessionRegistry::new());
-	let gateway = match args.gateway.as_ref() {
-		Some(endpoint) => Some(endpoint.connect().await.into_diagnostic()?),
-		None => None,
-	};
-	let options = omp_driver::headless::kernel::KernelOptions {
-		continue_session: args.continue_session,
-		session: args
-			.resume
-			.as_ref()
-			.map(|value| PathBuf::from(value.as_str())),
-		fork: args
-			.fork
-			.as_ref()
-			.map(|value| PathBuf::from(value.as_str())),
-		sessions_dir: args.session_dir.clone(),
-		ephemeral: args.no_session,
-		no_tools: args.no_tools,
-		tools: args.tools.as_ref().map(|tools| tools.0.clone()),
-		py_eval: args.py_eval,
-		spawn_idle_timeout: args.envd_idle_timeout,
-		api_key: args.api_key.clone(),
-		approval_mode,
-		model_override: args.model.is_some(),
-		prompt,
-		provider: args
-			.provider
-			.as_ref()
-			.map(|value| omp_catalog::ProviderId::from(value.as_str()))
-			.or_else(|| {
-				args.api_key.as_ref().and_then(|_| {
-					model
-						.split_once('/')
-						.map(|(provider, _)| omp_catalog::ProviderId::from(provider))
-				})
-			}),
-		gateway,
-		sessions: Some(Arc::clone(&live_sessions)),
-		session_name: None,
-		tool_registry: None,
-		..omp_driver::headless::kernel::KernelOptions::default()
-	};
-	let (kernel, mut session, _) = omp_driver::headless::kernel::compose_kernel(
-		&data_dir,
-		&project,
-		model.as_str(),
-		Arc::clone(&ctx),
-		options.clone(),
-	)
-	.await
-	.into_diagnostic()?;
-	crate::chat_cmd::apply_launch_thinking(&ctx, args.thinking).into_diagnostic()?;
-	if args.plan_mode || args.plan_yolo {
-		crate::chat_cmd::set_plan_mode(&mut session, true).into_diagnostic()?;
-	}
+	let env = LaunchEnv::production(&project, args.gateway.is_some())?;
+	let launch = Launch::prepare(args, ctx, env).await?;
+	let (kernel, session) = launch.compose().await?;
 	let home = SessionHome::new(
-		&data_dir,
-		&project,
-		&options,
-		model,
+		&launch.data_dir,
+		&launch.project,
+		&launch.options,
+		launch.model.clone(),
 		kernel.mailbox(),
 	)
 	.into_diagnostic()?;
@@ -163,7 +64,7 @@ enum InputEvent<C> {
 /// Serves ACP over caller-provided NDJSON transport halves.
 #[doc(hidden)]
 pub async fn serve_acp<C, R, W>(
-	kernel: Kernel<C>,
+	mut kernel: Kernel<C>,
 	mut session: Session,
 	home: SessionHome,
 	input: R,
@@ -189,6 +90,11 @@ where
 	let (_, events) = session.subscribe();
 	let mut forwarder = Some(forward_events(events, output_tx.clone(), session_id.clone()));
 	let mailbox = kernel.mailbox();
+	// pi `acp-permission-gate.ts`: every journaled approval prompt becomes
+	// one `session/request_permission` request; the client's selected
+	// option answers the prompt (`session/approve` remains for clients that
+	// answer by prompt id).
+	let permission_requests = request_permissions(kernel.subscribe(), output_tx.clone());
 	let mut controller = Some((kernel, session));
 	let mut active: Option<tokio::task::JoinHandle<TurnCompletion<C>>> = None;
 	let mut initialized = false;
@@ -232,6 +138,13 @@ where
 		};
 		let id = frame.get("id").cloned();
 		let Some(method) = frame.get("method").and_then(Value::as_str) else {
+			// A response to one of our `session/request_permission` requests.
+			if let Some((prompt_id, decision)) =
+				permission_requests.answer(id.as_ref(), frame.get("result"))
+			{
+				let _ = mailbox.send(Up::Approve { id: prompt_id, decision });
+				continue;
+			}
 			if let Some(id) = id {
 				output_tx
 					.send(error(id, -32600, "request has no method"))
@@ -273,7 +186,7 @@ where
 						"agentCapabilities": {
 							"loadSession": true,
 							"sessionCapabilities": {"resume": {}, "close": {}},
-							"promptCapabilities": {"image": false, "embeddedContext": false},
+							"promptCapabilities": {"image": true, "embeddedContext": true},
 						},
 					}))
 				}
@@ -311,7 +224,9 @@ where
 					Ok(selector) => selector,
 					Err(message) => {
 						if let Some(id) = id {
-							output_tx.send(error(id, -32602, message)).into_diagnostic()?;
+							output_tx
+								.send(error(id, -32602, message))
+								.into_diagnostic()?;
 						}
 						continue;
 					},
@@ -339,17 +254,26 @@ where
 				Ok(session_descriptor(session_id.as_str()))
 			},
 			"session/prompt" if active.is_some() => Err((-32001, "a turn is already running")),
-			"session/prompt" => match prompt_text(&params) {
-				Ok(text) => {
-					let (mut kernel, mut session) =
-						controller.take().expect("idle ACP controller owns its kernel and session");
+			"session/prompt" => match prompt_input(&params) {
+				Ok(prompt) => {
+					let (mut kernel, mut session) = controller
+						.take()
+						.expect("idle ACP controller owns its kernel and session");
+					let input = match prompt.into_turn_input(&session) {
+						Ok(input) => input,
+						Err(source) => {
+							controller = Some((kernel, session));
+							if let Some(id) = id {
+								output_tx
+									.send(error(id, -32000, &source.to_string()))
+									.into_diagnostic()?;
+							}
+							continue;
+						},
+					};
 					active = Some(tokio::spawn(async move {
 						let response = match kernel
-							.run_turn(
-								&mut session,
-								TurnInput { text, attachments: Vec::new() },
-								RunControl::default(),
-							)
+							.run_turn(&mut session, input, RunControl::default())
 							.await
 						{
 							Ok(outcome) => Ok(json!({
@@ -368,7 +292,9 @@ where
 				},
 				Err(message) => Err((-32602, message)),
 			},
-			"session/cancel" => {
+			// ACP names the notification `cancel`; `session/cancel` is the
+			// legacy spelling earlier omp clients used.
+			"cancel" | "session/cancel" => {
 				if active.is_some() {
 					let _ = mailbox.send(Up::Interrupt);
 				}
@@ -419,6 +345,84 @@ where
 	Ok(())
 }
 
+/// Outstanding `session/request_permission` requests keyed by JSON-RPC id.
+#[derive(Clone)]
+struct PermissionRequests {
+	pending: Arc<parking_lot::Mutex<std::collections::BTreeMap<u64, Str>>>,
+	_task:   Arc<tokio::task::JoinHandle<()>>,
+}
+
+impl PermissionRequests {
+	/// Maps a client response to the prompt it answers: pi's option ids
+	/// `allow_once`/`allow_always`/`reject_once`/`reject_always`; a
+	/// `cancelled` outcome or an unknown option fails closed.
+	fn answer(&self, id: Option<&Value>, result: Option<&Value>) -> Option<(Str, ApprovalDecision)> {
+		let id = id.and_then(Value::as_u64)?;
+		let prompt_id = self.pending.lock().remove(&id)?;
+		let outcome = result.and_then(|result| result.get("outcome"));
+		let option = outcome
+			.filter(|outcome| outcome.get("outcome").and_then(Value::as_str) == Some("selected"))
+			.and_then(|outcome| outcome.get("optionId"))
+			.and_then(Value::as_str);
+		let (approved, scope) = match option {
+			Some("allow_once") => (true, ApprovalScope::Once),
+			Some("allow_always") => (true, ApprovalScope::Session),
+			_ => (false, ApprovalScope::Once),
+		};
+		Some((prompt_id, ApprovalDecision {
+			approved,
+			scope,
+			source: ApprovalSource::External,
+			decided_by: None,
+			reason: (!approved).then(|| Str::new_static("rejected by ACP client")),
+			audited: false,
+		}))
+	}
+}
+
+fn request_permissions(
+	events: flume::Receiver<omp_agent::KernelEvent>,
+	output: flume::Sender<Value>,
+) -> PermissionRequests {
+	let pending = Arc::new(parking_lot::Mutex::new(std::collections::BTreeMap::new()));
+	let table = Arc::clone(&pending);
+	let task = tokio::spawn(async move {
+		let mut next_id = 1_u64;
+		while let Ok(event) = events.recv_async().await {
+			let omp_agent::KernelEvent::ApprovalRequested(ticket) = event else {
+				continue;
+			};
+			let id = next_id;
+			next_id += 1;
+			table.lock().insert(id, ticket.ticket_id.clone());
+			let first = ticket.reasons.first();
+			let request = json!({
+				"jsonrpc": "2.0",
+				"id": id,
+				"method": "session/request_permission",
+				"params": {
+					"toolCall": {
+						"toolCallId": ticket.invocation_id.as_deref().unwrap_or(ticket.ticket_id.as_str()),
+						"title": first.map_or("Approval required", |spec| spec.title.as_str()),
+						"status": "pending",
+						"rawInput": {"subject": first.map(|spec| spec.subject.as_str()), "body": first.map(|spec| spec.body.as_str())},
+					},
+					"options": [
+						{"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+						{"optionId": "allow_always", "name": "Always allow", "kind": "allow_always"},
+						{"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+						{"optionId": "reject_always", "name": "Always reject", "kind": "reject_always"},
+					],
+				},
+			});
+			if output.send(request).is_err() {
+				break;
+			}
+		}
+	});
+	PermissionRequests { pending, _task: Arc::new(task) }
+}
+
 fn forward_events(
 	events: flume::Receiver<Event>,
 	output: flume::Sender<Value>,
@@ -426,7 +430,10 @@ fn forward_events(
 ) -> tokio::task::JoinHandle<miette::Result<()>> {
 	tokio::spawn(async move {
 		while let Ok(event) = events.recv_async().await {
-			if output.send(acp_event_value(session_id.as_str(), event)?).is_err() {
+			if output
+				.send(acp_event_value(session_id.as_str(), event)?)
+				.is_err()
+			{
 				break;
 			}
 		}
@@ -460,8 +467,9 @@ async fn switch_session<C>(
 	session_id: &mut Str,
 ) -> miette::Result<()> {
 	let (snapshot, events) = next.subscribe();
-	let (kernel, mut previous) =
-		controller.take().expect("idle ACP controller owns its kernel and session");
+	let (kernel, mut previous) = controller
+		.take()
+		.expect("idle ACP controller owns its kernel and session");
 	let _ = previous.session_switch();
 	home.unregister(&previous);
 	drop(previous);
@@ -471,10 +479,7 @@ async fn switch_session<C>(
 	home.register(&next);
 	*session_id = session_identifier(&next);
 	output
-		.send(acp_event_value(
-			session_id.as_str(),
-			Event::Reset { snapshot },
-		)?)
+		.send(acp_event_value(session_id.as_str(), Event::Reset { snapshot })?)
 		.into_diagnostic()?;
 	*forwarder = Some(forward_events(events, output.clone(), session_id.clone()));
 	*controller = Some((kernel, next));
@@ -505,30 +510,103 @@ fn session_descriptor(session_id: &str) -> Value {
 	})
 }
 
-fn prompt_text(params: &Map<String, Value>) -> Result<Str, &'static str> {
-	if let Some(text) = params
+/// A `session/prompt` request reduced to the turn text and its image blocks
+/// (pi `acp-agent.ts` `#convertPromptBlocks`), each block decoded with the
+/// `mimeType` it declared.
+struct PromptInput {
+	text:   Str,
+	images: Vec<AttachmentInput>,
+}
+
+impl PromptInput {
+	/// Stores every image in the session's blob store and returns the turn
+	/// input whose attachments reference them — the seam the chat composer's
+	/// image chips also take.
+	fn into_turn_input(self, session: &Session) -> Result<TurnInput, SessionError> {
+		Ok(TurnInput { text: self.text, attachments: session.store_attachments(self.images)? })
+	}
+}
+
+/// Reduces the request's `prompt` to text plus images: a bare string, a
+/// `{text}` object, or the ACP content-block array (`text`, `image`,
+/// `resource`, `resource_link`, `audio`).
+fn prompt_input(params: &Map<String, Value>) -> Result<PromptInput, &'static str> {
+	let prompt = params
 		.get("prompt")
 		.or_else(|| params.get("message"))
-		.and_then(Value::as_str)
-	{
-		return Ok(Str::new(text));
+		.ok_or("session/prompt requires a prompt")?;
+	if let Some(text) = prompt.as_str() {
+		return Ok(PromptInput { text: Str::new(text), images: Vec::new() });
 	}
-	let Some(parts) = params.get("prompt").and_then(Value::as_array) else {
-		return Err("session/prompt requires a prompt");
-	};
-	let mut text = String::new();
-	for part in parts {
-		if part.get("type").and_then(Value::as_str) == Some("text")
-			&& let Some(value) = part.get("text").and_then(Value::as_str)
-		{
-			text.push_str(value);
+	if let Some(text) = prompt.get("text").and_then(Value::as_str) {
+		return Ok(PromptInput { text: Str::new(text), images: Vec::new() });
+	}
+	let blocks = prompt
+		.as_array()
+		.ok_or("session/prompt requires a prompt string or content blocks")?;
+	let mut texts: Vec<Cow<'_, str>> = Vec::with_capacity(blocks.len());
+	let mut images = Vec::new();
+	for block in blocks {
+		match block.get("type").and_then(Value::as_str) {
+			Some("text") => {
+				texts.push(Cow::Borrowed(
+					block.get("text").and_then(Value::as_str).unwrap_or_default(),
+				));
+			},
+			Some("image") => {
+				let data = block
+					.get("data")
+					.and_then(Value::as_str)
+					.ok_or("image content block requires base64 data")?;
+				let mime = block
+					.get("mimeType")
+					.and_then(Value::as_str)
+					.ok_or("image content block requires mimeType")?;
+				images.push(decode_image(data, mime)?);
+			},
+			Some("resource") => {
+				let resource = block.get("resource").ok_or("resource block requires a resource")?;
+				if let Some(text) = resource.get("text").and_then(Value::as_str) {
+					texts.push(Cow::Borrowed(text));
+				} else if let Some(mime) = resource
+					.get("mimeType")
+					.and_then(Value::as_str)
+					.filter(|mime| mime.starts_with("image/"))
+					&& let Some(blob) = resource.get("blob").and_then(Value::as_str)
+				{
+					images.push(decode_image(blob, mime)?);
+				} else {
+					let uri = resource.get("uri").and_then(Value::as_str).unwrap_or_default();
+					texts.push(Cow::Owned(format!("[embedded resource: {uri}]")));
+				}
+			},
+			Some("resource_link") => {
+				texts.push(Cow::Borrowed(
+					block
+						.get("title")
+						.or_else(|| block.get("name"))
+						.or_else(|| block.get("uri"))
+						.and_then(Value::as_str)
+						.unwrap_or_default(),
+				));
+			},
+			Some("audio") => texts.push(Cow::Borrowed("[audio omitted]")),
+			_ => return Err("unsupported prompt content block"),
 		}
 	}
-	if text.is_empty() {
-		Err("prompt contains no text")
-	} else {
-		Ok(Str::new(text))
+	let text = texts.join("\n\n");
+	let text = text.trim();
+	if text.is_empty() && images.is_empty() {
+		return Err("prompt contains no text");
 	}
+	Ok(PromptInput { text: Str::new(text), images })
+}
+
+fn decode_image(data: &str, mime: &str) -> Result<AttachmentInput, &'static str> {
+	base64::decode(data.as_bytes())
+		.into_vec()
+		.map(|bytes| AttachmentInput { mime: Str::new(mime), bytes: bytes.into() })
+		.map_err(|_| "image content block data is not valid base64")
 }
 
 fn approval(params: &Map<String, Value>) -> Result<(Str, ApprovalDecision), &'static str> {
@@ -587,4 +665,76 @@ fn success(id: Value, result: Value) -> Value {
 
 fn error(id: Value, code: i64, message: &str) -> Value {
 	json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn params(value: Value) -> Map<String, Value> {
+		value.as_object().expect("object params").clone()
+	}
+
+	#[test]
+	fn prompt_accepts_string_object_and_content_blocks() {
+		let plain = prompt_input(&params(json!({"prompt": "hi"}))).expect("string prompt");
+		assert_eq!(plain.text.as_str(), "hi");
+		assert!(plain.images.is_empty());
+
+		let object =
+			prompt_input(&params(json!({"prompt": {"text": "structured"}}))).expect("object prompt");
+		assert_eq!(object.text.as_str(), "structured");
+
+		let blocks = prompt_input(&params(json!({"prompt": [
+			{"type": "text", "text": "look"},
+			{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+			{"type": "resource", "resource": {"uri": "file:///a.txt", "text": "alpha"}},
+			{"type": "resource", "resource": {"uri": "file:///b.bin", "mimeType": "application/octet-stream", "blob": "AAAA"}},
+			{"type": "resource", "resource": {"uri": "file:///c.png", "mimeType": "image/png", "blob": "d29ybGQ="}},
+			{"type": "resource_link", "uri": "file:///d.md", "title": "Design"},
+			{"type": "audio", "data": "", "mimeType": "audio/wav"},
+		]})))
+		.expect("content blocks");
+		assert_eq!(
+			blocks.text.as_str(),
+			"look\n\nalpha\n\n[embedded resource: file:///b.bin]\n\nDesign\n\n[audio omitted]"
+		);
+		let images = blocks
+			.images
+			.iter()
+			.map(|image| (image.mime.as_str(), image.bytes.as_ref()))
+			.collect::<Vec<_>>();
+		assert_eq!(images, vec![("image/png", b"hello".as_slice()), ("image/png", b"world".as_slice())]);
+		assert_eq!(
+			prompt_input(&params(json!({"prompt": [{"type": "image", "data": "aGVsbG8="}]}))).err(),
+			Some("image content block requires mimeType")
+		);
+	}
+
+	#[test]
+	fn prompt_rejects_missing_and_malformed_content() {
+		assert_eq!(
+			prompt_input(&params(json!({}))).err(),
+			Some("session/prompt requires a prompt")
+		);
+		assert_eq!(
+			prompt_input(&params(json!({"prompt": [{"type": "text", "text": "  "}]}))).err(),
+			Some("prompt contains no text")
+		);
+		assert_eq!(
+			prompt_input(&params(json!({"prompt": [{"type": "image", "data": "%%%", "mimeType": "image/png"}]})))
+				.err(),
+			Some("image content block data is not valid base64")
+		);
+		assert_eq!(
+			prompt_input(&params(json!({"prompt": [{"type": "video"}]}))).err(),
+			Some("unsupported prompt content block")
+		);
+		let image_only = prompt_input(&params(json!({"prompt": [
+			{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+		]})))
+		.expect("an image-only prompt is a valid turn");
+		assert!(image_only.text.is_empty());
+		assert_eq!(image_only.images.len(), 1);
+	}
 }

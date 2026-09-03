@@ -94,16 +94,19 @@ fn test_force_tool_is_evaluated_from_engagement_state() {
 	let mut world = Harness::new();
 	world.engage(ForceTool::new("grep", ForceUntil::AnyToolCall, None, 1));
 	let mut req = request();
-	let facts = RouteFacts { forced_choice_free: true, context_window: 128_000, image_input: false };
+	let facts = RouteFacts {
+		forced_choice_free: true,
+		context_window: 128_000,
+		image_input: false,
+		..RouteFacts::default()
+	};
 	let cx = DirectorCx::new(world.session.dom().body(), &facts);
 	DirectorStack::from_dom(world.session.dom(), &world.registry).prepare_inference(
 		world.session.dom(),
 		&cx,
 		&mut req,
 	);
-	assert!(
-		matches!(&req.tool_choice, Setting::Require(ToolChoice::Named(name)) if name == "grep")
-	);
+	assert!(matches!(&req.tool_choice, Setting::Require(ToolChoice::Named(name)) if name == "grep"));
 }
 
 fn request() -> ChatRequest {

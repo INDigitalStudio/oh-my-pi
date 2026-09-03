@@ -57,7 +57,12 @@ async fn local_run_journals_one_tool_turn_without_inference() {
 		.collect::<Vec<_>>();
 	assert_eq!(children, [Tag::Custom(Str::new_static("echo"))], "only the tool element");
 	let element = dom.get(dom.children(turn)[0]).expect("tool element");
-	assert_eq!(element.prop(&PropKey::from(PropId::Status)).and_then(Value::as_str), Some("ok"));
+	assert_eq!(
+		element
+			.prop(&PropKey::from(PropId::Status))
+			.and_then(Value::as_str),
+		Some("ok")
+	);
 	assert!(
 		element
 			.prop(&PropKey::from(PropId::Id))
@@ -95,7 +100,10 @@ async fn local_run_journals_one_tool_turn_without_inference() {
 	assert_eq!(texts.len(), 1, "one user message for the run: {items:?}");
 	assert!(texts[0].starts_with("Ran `echo` with `{\"command\":\"echo hi\"}`\n"), "{}", texts[0]);
 	assert!(texts[0].contains("```\nhi"), "{}", texts[0]);
-	assert!(dom.get(turn).is_some_and(|node| node.tag == Tag::Known(KnownTag::Turn)));
+	assert!(
+		dom.get(turn)
+			.is_some_and(|node| node.tag == Tag::Known(KnownTag::Turn))
+	);
 }
 
 #[tokio::test]

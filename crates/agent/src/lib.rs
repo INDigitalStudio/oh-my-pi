@@ -2,13 +2,12 @@
 
 pub mod approvals;
 pub mod cancel;
+pub mod context;
 pub mod director;
 pub mod directors;
 pub mod dispatch;
 pub mod env;
 pub mod events;
-/// Image-input policy (`ai_vision`).
-pub mod vision;
 pub mod extensions;
 pub mod hooks;
 pub mod jobs;
@@ -18,6 +17,9 @@ pub mod loop_;
 pub mod prompt;
 pub mod registry;
 pub mod steering;
+pub mod vars;
+/// Image-input policy (`ai_vision`).
+pub mod vision;
 
 pub use approvals::*;
 pub use cancel::*;
@@ -33,3 +35,4 @@ pub use loop_::*;
 pub use prompt::*;
 pub use registry::*;
 pub use steering::*;
+pub use vars::*;

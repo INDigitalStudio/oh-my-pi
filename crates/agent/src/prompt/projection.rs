@@ -2,9 +2,10 @@
 
 use std::fmt::Write as _;
 
-use omp_core::Str;
+use omp_core::{Hash32, Str};
 use omp_dom::{Dom, PropKey, Value as DomValue};
-use omp_proto::thread::v1::Item;
+use omp_journal::blob::{BlobRef, BlobStore};
+use omp_proto::thread::v1::{Item, Part, item, part};
 use omp_scribe::{Props, Value};
 
 const PROMPT_FACTS: &str = "prompt-facts";
@@ -41,12 +42,58 @@ pub fn template_props(dom: &Dom) -> Props {
 	props
 }
 
-/// Projects canonical conversation items, resolving journaled attachment blob
-/// references at the projection boundary rather than retaining a process-local
-/// attachment index.
-#[must_use]
-pub fn project_thread_with_attachments(dom: &Dom) -> Vec<Item> {
-	omp_session::project_thread(dom)
+/// Projects canonical conversation items and resolves journaled blob parts
+/// against `blobs` at the projection boundary (no process-local attachment
+/// index): every user attachment (pi `ImageContent`) must be present, so a
+/// missing one fails the request; a tool-result blob absent from the
+/// session store stays a reference. Each blob is read once into a shared
+/// buffer the inference request then borrows.
+///
+/// # Errors
+/// A user attachment is missing or corrupt in `blobs`.
+pub fn project_thread_with_attachments(
+	dom: &Dom,
+	blobs: &BlobStore,
+) -> Result<Vec<Item>, omp_journal::blob::Error> {
+	let mut items = omp_session::project_thread(dom);
+	for item in &mut items {
+		match item.kind.as_mut() {
+			Some(item::Kind::Message(message)) => {
+				for part in &mut message.parts {
+					inline_blob(part, blobs, true)?;
+				}
+			},
+			Some(item::Kind::ToolResult(result)) => {
+				for part in &mut result.parts {
+					inline_blob(part, blobs, false)?;
+				}
+			},
+			_ => {},
+		}
+	}
+	Ok(items)
+}
+
+fn inline_blob(
+	part: &mut Part,
+	blobs: &BlobStore,
+	required: bool,
+) -> Result<(), omp_journal::blob::Error> {
+	let Some(part::Kind::Blob(blob)) = part.kind.as_mut() else {
+		return Ok(());
+	};
+	if !blob.inline.is_empty() {
+		return Ok(());
+	}
+	let Ok(hash) = <[u8; 32]>::try_from(blob.hash.as_ref()) else {
+		return Ok(());
+	};
+	let reference = BlobRef { hash: Hash32::new(hash), size: blob.size };
+	if !required && !blobs.has(&reference) {
+		return Ok(());
+	}
+	blob.inline = blobs.get(&reference)?;
+	Ok(())
 }
 
 fn default_props() -> Props {
@@ -65,6 +112,7 @@ fn default_props() -> Props {
 	props.set("workspace_trees", Vec::<Value>::new());
 	props.set("skills", Vec::<Value>::new());
 	props.set("rules", Vec::<Value>::new());
+	props.set("always_apply_rules", Vec::<Value>::new());
 	props.set("personality", include_str!("../../prompts/personality/default.md"));
 	props.set("render_mermaid", true);
 	props.set("include_workstation", true);

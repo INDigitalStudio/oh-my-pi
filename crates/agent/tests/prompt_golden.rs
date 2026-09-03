@@ -8,7 +8,6 @@ use omp_agent::prompt::{
 };
 use omp_core::{Hash32, Str};
 use omp_dom::{KnownTag, NodeSpec, Op, PropId, PropKey, Txn, Value as DomValue};
-use omp_journal::blob::BlobRef;
 use omp_proto::thread::v1::{Item, item, part};
 use omp_scribe::{Props, canon::canonicalize_prompt};
 use omp_session::{ComponentRegistry, Session};
@@ -159,9 +158,12 @@ fn full_facts(personality: &str, full: bool, codex: bool) -> Value {
 			{ "name": "react", "description": "React implementation guidance." },
 			{ "name": "tla", "description": "TLA specification guidance." }
 		],
+		"always_apply_rules": [
+			{ "name": "RULES@project", "content": "Never force-push shared branches." }
+		],
 		"rules": [
-			{ "name": "rust", "description": "Use typed errors." },
-			{ "name": "tests", "description": "Test observable behavior." }
+			{ "name": "rust", "description": "Use typed errors.", "globs": ["*.rs"] },
+			{ "name": "tests", "description": "Test observable behavior.", "globs": [] }
 		],
 		"personality": personality,
 		"render_mermaid": true,
@@ -370,9 +372,24 @@ fn todo_and_director_status_are_selected_from_component_elements() {
 fn attachment_blob_refs_are_resolved_only_at_thread_projection() {
 	let (_, mut session) = session_with_facts(serde_json::json!({}));
 	session.begin_turn().expect("turn");
-	let blob = BlobRef { hash: Hash32::sum(b"image"), size: 5 };
-	session.user("look", vec![blob]).expect("user message");
-	let items = omp_agent::project_thread_with_attachments(session.dom());
+	let attachment = session
+		.store_attachment("image/png", b"image")
+		.expect("attachment stores");
+	let blob = attachment.blob;
+	assert_eq!(blob.hash, Hash32::sum(b"image"));
+	session
+		.user("look", vec![attachment])
+		.expect("user message");
+	// The tree carries the reference only; bytes join at the projection.
+	let tree_only = omp_session::project_thread(session.dom());
+	assert!(tree_only.iter().all(|item| match item.kind.as_ref() {
+		Some(item::Kind::Message(message)) => message.parts.iter().all(|part| {
+			!matches!(part.kind.as_ref(), Some(part::Kind::Blob(blob)) if !blob.inline.is_empty())
+		}),
+		_ => true,
+	}));
+	let items = omp_agent::project_thread_with_attachments(session.dom(), session.blobs())
+		.expect("stored attachment resolves");
 	let projected = items
 		.iter()
 		.find_map(|item| match item.kind.as_ref() {
@@ -388,6 +405,8 @@ fn attachment_blob_refs_are_resolved_only_at_thread_projection() {
 		.expect("projected blob");
 	assert_eq!(projected.hash.as_ref(), blob.hash.as_bytes());
 	assert_eq!(projected.size, blob.size);
+	assert_eq!(projected.mime, "image/png");
+	assert_eq!(projected.inline.as_ref(), b"image");
 }
 
 #[test]

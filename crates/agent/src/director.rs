@@ -61,15 +61,26 @@ pub enum BindValue {
 	Str(Str),
 	/// Finite floating-point value.
 	Float(f64),
+	/// Homogeneous text list (a `sv_tools` roster).
+	List(Vec<Str>),
 }
 
 impl BindValue {
+	/// Builds a text-list bind from static names.
+	#[must_use]
+	pub fn list(items: &[&'static str]) -> Self {
+		Self::List(items.iter().map(|item| Str::new_static(item)).collect())
+	}
+
 	fn into_dom(self) -> Value {
 		match self {
 			Self::Bool(value) => Value::Bool(value),
 			Self::Int(value) => Value::Int(value),
 			Self::Str(value) => Value::Str(value),
 			Self::Float(value) => Value::Float(value),
+			Self::List(items) => {
+				serde_json::value::to_raw_value(&items).map_or(Value::Null, Value::Json)
+			},
 		}
 	}
 
@@ -79,7 +90,10 @@ impl BindValue {
 			Value::Int(value) => Some(Self::Int(*value)),
 			Value::Str(value) => Some(Self::Str(value.clone())),
 			Value::Float(value) => Some(Self::Float(*value)),
-			Value::Null | Value::Json(_) => None,
+			Value::Json(raw) => serde_json::from_str::<Vec<Str>>(raw.get())
+				.ok()
+				.map(Self::List),
+			Value::Null => None,
 		}
 	}
 }
@@ -93,6 +107,28 @@ pub struct RouteFacts {
 	pub context_window:     u64,
 	/// The route accepts image input (catalog input modalities).
 	pub image_input:        bool,
+	/// The route enforces per-tool strict JSON Schema (catalog
+	/// `ToolFeatureBits::STRICT_SCHEMA`); tools lower to strict declarations
+	/// only when affirmative.
+	pub strict_schema:      bool,
+	/// Grammar constraint languages the route accepts.
+	pub grammar:            omp_catalog::GrammarBits,
+	/// Maximum model-visible tool declarations, when the route bounds them.
+	pub maximum_tools:      Option<u16>,
+}
+
+impl RouteFacts {
+	/// Capabilities the tool registry needs to lower declarations for this
+	/// route.
+	#[must_use]
+	pub const fn lowering_caps(&self) -> omp_tool::LoweringCaps {
+		omp_tool::LoweringCaps {
+			strict_schema:  self.strict_schema,
+			grammar:        self.grammar,
+			maximum_tools:  self.maximum_tools,
+			maximum_strict: None,
+		}
+	}
 }
 
 /// The outcome of one Director inspecting a candidate yield.
@@ -217,18 +253,46 @@ impl StateUpdate {
 /// A Director verdict plus state changes committed in the same tick.
 pub struct DirectorEffect {
 	/// Candidate-yield disposition.
-	pub verdict: Verdict,
+	pub verdict:             Verdict,
 	/// Durable state updates.
-	pub updates: Vec<StateUpdate>,
+	pub updates:             Vec<StateUpdate>,
 	/// Developer asides committed even when this tick exits the Director.
-	pub asides:  Vec<Str>,
+	pub asides:              Vec<Str>,
+	/// Session-layer convar writes committed by the kernel after this tick
+	/// (a plan handoff re-targeting `ai_model`); journaled through the
+	/// console bridge like any other session write.
+	pub writes:              Vec<(Str, BindValue)>,
+	/// With [`Verdict::Done`]: after this Director exits, run another turn
+	/// instead of re-offering the candidate yield (pi's plan-yolo handoff
+	/// finalizes the plan and immediately starts implementing).
+	pub continue_after_exit: bool,
 }
 
 impl DirectorEffect {
 	/// Builds an effect with no state changes.
 	#[must_use]
 	pub const fn new(verdict: Verdict) -> Self {
-		Self { verdict, updates: Vec::new(), asides: Vec::new() }
+		Self {
+			verdict,
+			updates: Vec::new(),
+			asides: Vec::new(),
+			writes: Vec::new(),
+			continue_after_exit: false,
+		}
+	}
+
+	/// Adds one session-layer convar write.
+	#[must_use]
+	pub fn with_write(mut self, name: impl Into<Str>, value: BindValue) -> Self {
+		self.writes.push((name.into(), value));
+		self
+	}
+
+	/// Continues the loop after a [`Verdict::Done`] exit.
+	#[must_use]
+	pub const fn continuing_after_exit(mut self) -> Self {
+		self.continue_after_exit = true;
+		self
 	}
 
 	/// Adds one state update.
@@ -278,6 +342,12 @@ pub struct MutDirectorCx<'a> {
 	/// Observer notifications for progress that is not journaled (the
 	/// compaction speculation pulse); `None` in headless tests.
 	pub events:    Option<&'a crate::KernelEvents>,
+	/// Effective control plane (archive, session, and engagement layers);
+	/// `None` when the host composed no console.
+	pub con:       Option<&'a omp_con::Ctx>,
+	/// Extension lifecycle gates (`compaction`, `thread_projection`, …);
+	/// `None` when no extension host is attached.
+	pub hooks:     Option<&'a crate::LifecycleHooks>,
 }
 
 impl MutDirectorCx<'_> {
@@ -399,6 +469,15 @@ pub enum DirectorError {
 	/// Blob persistence failed.
 	#[error(transparent)]
 	Blob(#[from] BlobError),
+	/// A Director's session-layer convar write could not address `<meta><con>`.
+	#[error(transparent)]
+	ConWrite(#[from] omp_session::components::con::ConComponentError),
+	/// An extension lifecycle hook failed.
+	#[error(transparent)]
+	Hook(#[from] crate::LifecycleHookError),
+	/// Projecting hidden history into inference messages failed.
+	#[error(transparent)]
+	ThreadProjection(#[from] omp_inference::ThreadProjectionError),
 	/// The canonical `<directors>` component is absent.
 	#[error("session tree has no directors component")]
 	MissingDirectors,
@@ -705,17 +784,19 @@ impl DirectorStack {
 		while index > 0 {
 			index -= 1;
 			let handle = self.active[index].handle;
-			let DirectorEffect { verdict, updates, asides } = self.active[index].director.evaluate(
-				session.dom(),
-				&cx.for_director(
-					handle,
-					session
-						.dom()
-						.get(handle)
-						.expect("active Director handle must exist"),
-				),
-				turn,
-			);
+			let DirectorEffect { verdict, updates, asides, writes, continue_after_exit } =
+				self.active[index].director.evaluate(
+					session.dom(),
+					&cx.for_director(
+						handle,
+						session
+							.dom()
+							.get(handle)
+							.expect("active Director handle must exist"),
+					),
+					turn,
+				);
+			let write_ops = con_write_ops(session, &writes)?;
 			let effect_ops = |dom: &Dom, mut ops: Vec<Op>| {
 				ops.extend(
 					asides
@@ -723,6 +804,7 @@ impl DirectorStack {
 						.cloned()
 						.map(|text| developer_op(dom, turn.turn, text)),
 				);
+				ops.extend(write_ops.iter().cloned());
 				ops
 			};
 			match verdict {
@@ -764,6 +846,10 @@ impl DirectorStack {
 					ops.push(Op::Rm(handle));
 					patch(session, "director.done", ops)?;
 					self.promote(session)?;
+					if continue_after_exit {
+						*self = Self::from_dom(session.dom(), &self.registry);
+						return Ok(LoopDecision::Continue { reminder: None });
+					}
 				},
 				Verdict::Fail(reason) => {
 					let mut ops = effect_ops(session.dom(), update_ops(handle, updates));
@@ -877,7 +963,7 @@ impl ControlDraft {
 }
 
 /// Prepends one system-level instruction without changing other request fields.
-pub(crate) fn prepend_system(req: &mut ChatRequest, text: Str) {
+pub fn prepend_system(req: &mut ChatRequest, text: Str) {
 	let mut messages = Vec::with_capacity(req.messages.len() + 1);
 	messages.push(Message {
 		role:    Role::System,
@@ -899,7 +985,8 @@ pub fn state_value(node: &Node, key: &str) -> Option<BindValue> {
 pub fn state_str(node: &Node, key: &str) -> Option<Str> {
 	match state_value(node, key) {
 		Some(BindValue::Str(value)) => Some(value),
-		Some(BindValue::Bool(_) | BindValue::Int(_) | BindValue::Float(_)) | None => None,
+		Some(BindValue::Bool(_) | BindValue::Int(_) | BindValue::Float(_) | BindValue::List(_))
+		| None => None,
 	}
 }
 
@@ -908,7 +995,8 @@ pub fn state_str(node: &Node, key: &str) -> Option<Str> {
 pub fn state_int(node: &Node, key: &str) -> Option<i64> {
 	match state_value(node, key) {
 		Some(BindValue::Int(value)) => Some(value),
-		Some(BindValue::Bool(_) | BindValue::Str(_) | BindValue::Float(_)) | None => None,
+		Some(BindValue::Bool(_) | BindValue::Str(_) | BindValue::Float(_) | BindValue::List(_))
+		| None => None,
 	}
 }
 
@@ -917,7 +1005,8 @@ pub fn state_int(node: &Node, key: &str) -> Option<i64> {
 pub fn state_bool(node: &Node, key: &str) -> Option<bool> {
 	match state_value(node, key) {
 		Some(BindValue::Bool(value)) => Some(value),
-		Some(BindValue::Int(_) | BindValue::Str(_) | BindValue::Float(_)) | None => None,
+		Some(BindValue::Int(_) | BindValue::Str(_) | BindValue::Float(_) | BindValue::List(_))
+		| None => None,
 	}
 }
 
@@ -1011,6 +1100,9 @@ fn con_value(value: BindValue) -> omp_con::Value {
 		BindValue::Int(value) => omp_con::Value::Int(value),
 		BindValue::Str(value) => omp_con::Value::Str(value),
 		BindValue::Float(value) => omp_con::Value::Float(value),
+		BindValue::List(items) => {
+			omp_con::Value::List(items.into_iter().map(omp_con::Value::Str).collect())
+		},
 	}
 }
 
@@ -1047,6 +1139,24 @@ fn patch(session: &mut Session, label: &'static str, ops: Vec<Op>) -> Result<(),
 		ops,
 	})?;
 	Ok(())
+}
+
+/// `<meta><con>` operations journaling a Director's session-layer writes
+/// (origin `director`); the console bridge re-hydrates the live context
+/// from the tree, so the value is effective before the next request.
+fn con_write_ops(session: &Session, writes: &[(Str, BindValue)]) -> Result<Vec<Op>, DirectorError> {
+	let cause = session.head().ok_or(DirectorError::MissingDirectors)?;
+	let mut ops = Vec::new();
+	for (name, value) in writes {
+		let write = omp_session::components::con::ConWrite {
+			name:   name.clone(),
+			value:  Str::new(con_value(value.clone()).to_string()),
+			origin: Str::new_static("director"),
+		};
+		let txn = omp_session::components::con::con_write_txn(session.dom(), cause, &write)?;
+		ops.extend(txn.ops);
+	}
+	Ok(ops)
 }
 
 fn developer_op(dom: &Dom, turn: Handle, text: Str) -> Op {

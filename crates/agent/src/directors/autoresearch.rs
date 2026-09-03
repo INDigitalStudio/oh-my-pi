@@ -29,7 +29,7 @@ impl Autoresearch {
 			max_iterations,
 			armed: false,
 			binds: vec![(
-				Str::new_static("prompt_slot"),
+				Str::new_static("ai_prompt_mode"),
 				BindValue::Str(Str::new_static("autoresearch")),
 			)],
 		}

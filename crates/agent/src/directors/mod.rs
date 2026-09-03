@@ -11,6 +11,24 @@ pub mod vibe;
 
 use crate::director::DirectorRegistry;
 
+/// Mode prompts a Director engagement selects through its `ai_prompt_mode`
+/// bind; the kernel renders the selected one as a system item on every
+/// request while the bind is effective.
+pub const MODE_PROMPTS: &[(&str, &str)] = &[
+	("plan", include_str!("../../prompts/modes/plan.md")),
+	("vibe", include_str!("../../prompts/modes/vibe.md")),
+	("autoresearch", include_str!("../../prompts/modes/autoresearch.md")),
+];
+
+/// The prompt text for one `ai_prompt_mode` value.
+#[must_use]
+pub fn mode_prompt(mode: &str) -> Option<&'static str> {
+	MODE_PROMPTS
+		.iter()
+		.find(|(name, _)| *name == mode)
+		.map(|(_, text)| *text)
+}
+
 /// Registers every built-in Director constructor.
 pub fn register_standard(registry: &mut DirectorRegistry) {
 	registry.register("autoresearch", |node| Box::new(autoresearch::Autoresearch::from_node(node)));

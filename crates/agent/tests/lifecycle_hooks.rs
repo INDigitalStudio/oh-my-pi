@@ -86,14 +86,14 @@ fn capture_registry(seen: Arc<Mutex<Option<Value>>>) -> Arc<Registry> {
 	Arc::new(registry)
 }
 
-fn subscription(
-	id: u32,
-	event: HookEventId,
-	phase: HookPhase,
-) -> omp_agent::hooks::Subscription {
+fn subscription(id: u32, event: HookEventId, phase: HookPhase) -> omp_agent::hooks::Subscription {
 	omp_agent::hooks::Subscription {
 		host: sf!("test"),
-		source: SourceRef { layer: 0, publisher: sf!("test"), extension_id: sf!("lifecycle") },
+		source: SourceRef {
+			layer:        0,
+			publisher:    sf!("test"),
+			extension_id: sf!("lifecycle"),
+		},
 		id,
 		event,
 		phase,
@@ -122,11 +122,14 @@ async fn lifecycle_tool_call_transform_reaches_executor_and_observations_are_com
 		HookEventId::HookEventTurnEnd,
 		HookEventId::HookEventAgentEnd,
 	];
-	let mut subscriptions = vec![subscription(1, HookEventId::HookEventToolCall, HookPhase::Transform)];
+	let mut subscriptions =
+		vec![subscription(1, HookEventId::HookEventToolCall, HookPhase::Transform)];
 	subscriptions.extend(events.into_iter().enumerate().map(|(index, event)| {
 		subscription(u32::try_from(index).expect("small") + 2, event, HookPhase::Observe)
 	}));
-	gate.subscribe("test", subscriptions).expect("subscriptions");
+	gate
+		.subscribe("test", subscriptions)
+		.expect("subscriptions");
 	let responder = {
 		let gate = Arc::clone(&gate);
 		let observed = Arc::clone(&observed);
@@ -138,14 +141,17 @@ async fn lifecycle_tool_call_transform_reaches_executor_and_observations_are_com
 					let mut transformed = payload;
 					transformed["args"] = serde_json::json!({"value": 2});
 					transformed["target"]["args"] = serde_json::json!({"value": 2});
-					gate.answer(
-						dispatch.dispatch_id,
-						vec![(1, GateDecision::Modify(HookPatch {
-							target: None,
-							args: Some(Bytes::from(serde_json::to_vec(&transformed).expect("transform"))),
-						}))],
-					)
-					.expect("hook answer");
+					gate
+						.answer(dispatch.dispatch_id, vec![(
+							1,
+							GateDecision::Modify(HookPatch {
+								target: None,
+								args:   Some(Bytes::from(
+									serde_json::to_vec(&transformed).expect("transform"),
+								)),
+							}),
+						)])
+						.expect("hook answer");
 				}
 			}
 		})
@@ -183,7 +189,22 @@ async fn lifecycle_tool_call_transform_reaches_executor_and_observations_are_com
 		.find(|(event, _)| *event == HookEventId::HookEventToolCall)
 		.map(|(_, payload)| payload.clone())
 		.expect("tool-call payload");
-	for key in ["call_id", "invocation_id", "target", "kind", "args", "raw_args", "repaired", "turn_id", "session_id", "cwd", "origin", "batch", "deadline", "bash"] {
+	for key in [
+		"call_id",
+		"invocation_id",
+		"target",
+		"kind",
+		"args",
+		"raw_args",
+		"repaired",
+		"turn_id",
+		"session_id",
+		"cwd",
+		"origin",
+		"batch",
+		"deadline",
+		"bash",
+	] {
 		assert!(tool_call.get(key).is_some(), "missing strict ToolCall key {key}");
 	}
 	drop(kernel);
@@ -201,7 +222,8 @@ async fn lifecycle_tool_call_denial_skips_executor_and_journals_abort() {
 		let gate = Arc::clone(&gate);
 		tokio::spawn(async move {
 			let dispatch = receiver.recv_async().await.expect("tool call gate");
-			gate.answer(dispatch.dispatch_id, vec![(1, GateDecision::Deny(sf!("blocked")))])
+			gate
+				.answer(dispatch.dispatch_id, vec![(1, GateDecision::Deny(sf!("blocked")))])
 				.expect("deny");
 		})
 	};
@@ -230,7 +252,14 @@ async fn lifecycle_tool_call_denial_skips_executor_and_journals_abort() {
 		.expect("turn");
 	assert!(seen.lock().is_none(), "denied tool never executes");
 	let entries = journal_entries(&path);
-	let call = entries.iter().find(|entry| entry.kind.name.as_str() == kind::TOOL_CALL).expect("call");
-	assert!(entries.iter().any(|entry| entry.kind.name.as_str() == kind::TOOL_RESULT && entry.by == Some(call.id)));
+	let call = entries
+		.iter()
+		.find(|entry| entry.kind.name.as_str() == kind::TOOL_CALL)
+		.expect("call");
+	assert!(
+		entries
+			.iter()
+			.any(|entry| entry.kind.name.as_str() == kind::TOOL_RESULT && entry.by == Some(call.id))
+	);
 	responder.await.expect("responder");
 }

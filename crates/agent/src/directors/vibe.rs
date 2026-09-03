@@ -6,6 +6,24 @@ use omp_dom::Node;
 use crate::director::{BindValue, Director, Slot};
 
 const CLAIMS: &[Slot] = &[Slot::Mode, Slot::Loop];
+/// Tools the vibe coordinator may use: inspection, tracking, the vibe
+/// orchestration device, and peer coordination; never direct mutation.
+pub const VIBE_TOOLS: &[&str] = &[
+	"read",
+	"grep",
+	"glob",
+	"todo",
+	"think",
+	"ask",
+	"vibe",
+	"vibe_spawn",
+	"vibe_send",
+	"vibe_wait",
+	"vibe_kill",
+	"vibe_list",
+	"hub",
+	"yield",
+];
 
 /// Restricts the roster and defers delivery while coordinating vibe workers.
 pub struct Vibe {
@@ -50,9 +68,11 @@ impl Director for Vibe {
 	}
 }
 
+/// The engagement layer vibe mode installs: the mode prompt slot and the
+/// coordinator roster (ADR 0012/0015).
 fn vibe_binds() -> Vec<(Str, BindValue)> {
 	vec![
-		(Str::new_static("toolset"), BindValue::Str(Str::new_static("read,todo"))),
-		(Str::new_static("delivery_policy"), BindValue::Str(Str::new_static("defer-to-settle"))),
+		(Str::new_static("ai_prompt_mode"), BindValue::Str(Str::new_static("vibe"))),
+		(Str::new_static("sv_tools"), BindValue::list(VIBE_TOOLS)),
 	]
 }

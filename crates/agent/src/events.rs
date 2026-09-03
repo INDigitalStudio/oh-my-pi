@@ -63,12 +63,16 @@ pub enum KernelEvent {
 		/// Whether the outcome is model-facing error content.
 		is_error: bool,
 	},
+	/// A pending approval prompt was journaled under `<queues><prompts>`;
+	/// hosts that do not replay the DOM answer it with [`crate::Up::Approve`].
+	ApprovalRequested(crate::ApprovalTicket),
 	/// The compaction Director started producing a summary (pi
 	/// `compactionSpeculation`): hosts pulse the gauge's threshold tick until
 	/// [`KernelEvent::CompactionSettled`].
 	CompactionSpeculating {
-		/// Estimated context occupancy that triggered it, in percent of the
-		/// usable window.
+		/// Live context occupancy that triggered it (the newest receipt's
+		/// tokens, or the byte estimate before any receipt), in percent of
+		/// the context window.
 		percent: u8,
 	},
 	/// The summary settled: journaled as a `compaction@1` boundary
@@ -76,6 +80,22 @@ pub enum KernelEvent {
 	CompactionSettled {
 		/// Whether a boundary landed.
 		applied: bool,
+	},
+	/// Settled background jobs or subagents were injected into the turn as
+	/// an async-result follow-up (pi `async-result`).
+	JobsDelivered {
+		/// Durable job identities delivered, oldest first.
+		ids: Vec<Str>,
+	},
+	/// A provider workflow action was executed and answered on its live
+	/// session.
+	WorkflowActionAnswered {
+		/// Provider correlation identity.
+		invocation: Str,
+		/// Tool the provider asked for.
+		name:       Str,
+		/// Whether the answer carried an error outcome.
+		is_error:   bool,
 	},
 }
 

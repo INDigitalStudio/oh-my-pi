@@ -77,11 +77,15 @@ impl Tool for Frames {
 fn frames_registry(chunks: Vec<&'static [u8]>, pause: Duration) -> Arc<Registry> {
 	let mut registry = Registry::new();
 	registry
-		.register(Frames { spec: tool_spec("frames", 1), chunks, pause }, Presentation::Slot, Claims {
-			precedence: Precedence::CORE,
-			claimant:   Str::new_static("omp-agent/tests"),
-			replaces:   None,
-		})
+		.register(
+			Frames { spec: tool_spec("frames", 1), chunks, pause },
+			Presentation::Slot,
+			Claims {
+				precedence: Precedence::CORE,
+				claimant:   Str::new_static("omp-agent/tests"),
+				replaces:   None,
+			},
+		)
 		.expect("tool registers");
 	Arc::new(registry)
 }
@@ -192,7 +196,9 @@ async fn output_stream_is_readable_mid_call_and_dedupes_stale_frames() {
 		// `dispatch` borrows the session mutably; cancel to release it, then
 		// inspect what the stream held when the call was torn down.
 		cancellation.cancel_tool();
-		dispatch.await.expect("cancelled dispatch journals a terminal")
+		dispatch
+			.await
+			.expect("cancelled dispatch journals a terminal")
 	};
 	assert!(report.is_error);
 	// The close materialized the concatenation (each chunk once despite

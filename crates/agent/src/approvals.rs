@@ -50,7 +50,8 @@ pub struct ApprovalSpec {
 }
 
 /// Granted lifetime of an approval decision.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, strum::Display, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub enum ApprovalScope {
 	/// This operation only.
 	Once,
@@ -63,6 +64,7 @@ pub enum ApprovalScope {
 	/// Persisted policy.
 	Persist,
 	/// A forward-compatible host-defined scope.
+	#[strum(default)]
 	Custom(Str),
 }
 
@@ -71,28 +73,9 @@ impl ApprovalScope {
 	#[must_use]
 	pub fn as_str(&self) -> &str {
 		match self {
-			Self::Once => "once",
-			Self::Call => "call",
-			Self::Turn => "turn",
-			Self::Session => "session",
-			Self::Persist => "persist",
 			Self::Custom(value) => value.as_str(),
+			known => known.into(),
 		}
-	}
-}
-
-impl FromStr for ApprovalScope {
-	type Err = core::convert::Infallible;
-
-	fn from_str(value: &str) -> Result<Self, Self::Err> {
-		Ok(match value {
-			"once" => Self::Once,
-			"call" => Self::Call,
-			"turn" => Self::Turn,
-			"session" => Self::Session,
-			"persist" => Self::Persist,
-			other => Self::Custom(Str::new(other)),
-		})
 	}
 }
 
@@ -111,7 +94,7 @@ impl<'de> Deserialize<'de> for ApprovalScope {
 		D: Deserializer<'de>,
 	{
 		let value = Str::deserialize(deserializer)?;
-		Ok(Self::from_str(value.as_str()).expect("approval scope parsing is infallible"))
+		Self::from_str(value.as_str()).map_err(serde::de::Error::custom)
 	}
 }
 
@@ -478,11 +461,86 @@ pub struct ApprovalRoute {
 }
 
 struct RouteInner {
-	next_id:   AtomicU64,
-	tx:        flume::Sender<ApprovalRequest>,
-	pending:   Mutex<std::collections::BTreeMap<Str, PendingRequest>>,
-	#[allow(dead_code, reason = "hook dispatch is wired by the extension registrar")]
-	hook_gate: Option<Arc<crate::HookGate>>,
+	next_id: AtomicU64,
+	tx:      RouteSink,
+	pending: Mutex<std::collections::BTreeMap<Str, PendingRequest>>,
+	/// `tool_approval_requested` / `tool_approval_resolved` observers (pi
+	/// `wrapper.ts` emits both around every prompted approval).
+	hooks:   Option<crate::LifecycleHooks>,
+}
+
+impl RouteInner {
+	fn notify_requested(&self, ticket: &ApprovalTicket) {
+		let Some(hooks) = &self.hooks else {
+			return;
+		};
+		let requested_by = ticket
+			.reasons
+			.first()
+			.map_or("user", |spec| spec.route.as_str());
+		let _ = hooks.notify(
+			omp_proto::toolhost::v1::HookEventId::HookEventToolApprovalRequested,
+			serde_json::json!({
+				"call_id": ticket.invocation_id.as_deref().unwrap_or(""),
+				"ticket_id": ticket.ticket_id,
+				"target": approval_target(ticket),
+				"reasons": ticket.reasons.iter().map(|spec| spec.body.as_str()).collect::<Vec<_>>(),
+				"requested_by": requested_by,
+			}),
+		);
+	}
+
+	fn notify_resolved(&self, ticket: &ApprovalTicket, decision: &ApprovalDecision, waited: Duration) {
+		let Some(hooks) = &self.hooks else {
+			return;
+		};
+		let _ = hooks.notify(
+			omp_proto::toolhost::v1::HookEventId::HookEventToolApprovalResolved,
+			serde_json::json!({
+				"call_id": ticket.invocation_id.as_deref().unwrap_or(""),
+				"ticket_id": ticket.ticket_id,
+				"target": approval_target(ticket),
+				"approved": decision.approved,
+				"reason": decision.reason,
+				"resolved_by": <&'static str>::from(decision.source),
+				"waited": format!("{}ms", waited.as_millis()),
+			}),
+		);
+	}
+}
+
+/// The Python `CallTarget` of an approval prompt: the route only knows the
+/// subject (command, path, dynamic target) and its tier, which travel as a
+/// core target named by the subject.
+fn approval_target(ticket: &ApprovalTicket) -> serde_json::Value {
+	let first = ticket.reasons.first();
+	serde_json::json!({
+		"kind": "core",
+		"name": first.map_or("", |spec| spec.subject.as_str()),
+		"rev": "",
+		"args": {
+			"kind": first.map_or("", |spec| spec.kind.as_str()),
+			"subject": first.map_or("", |spec| spec.subject.as_str()),
+			"pattern": first.and_then(|spec| spec.pattern.as_deref()),
+		},
+	})
+}
+
+/// Where a route delivers the prompts it files: a standalone host inbox, or
+/// the kernel mailbox so the request is journaled and answered at the same
+/// safe points as every other control message.
+enum RouteSink {
+	Inbox(flume::Sender<ApprovalRequest>),
+	Kernel(flume::Sender<crate::Up>),
+}
+
+impl RouteSink {
+	fn deliver(&self, request: ApprovalRequest) -> Result<(), ()> {
+		match self {
+			Self::Inbox(tx) => tx.send(request).map_err(|_| ()),
+			Self::Kernel(tx) => tx.send(crate::Up::Approval(request)).map_err(|_| ()),
+		}
+	}
 }
 
 #[derive(Clone)]
@@ -508,6 +566,7 @@ pub struct ApprovalInbox {
 }
 
 /// One pending approval delivered to the host actor.
+#[derive(Clone, Debug)]
 pub struct ApprovalRequest {
 	/// Prompt awaiting a decision.
 	pub ticket: ApprovalTicket,
@@ -522,6 +581,160 @@ impl ApprovalRequest {
 			.try_send(decision)
 			.map_err(|error| error.into_inner())
 	}
+
+	/// Whether the requesting policy stopped waiting (cancelled, timed out,
+	/// or the invocation ended) so no answer can reach it any more.
+	#[must_use]
+	pub fn is_abandoned(&self) -> bool {
+		self.reply.is_disconnected()
+	}
+}
+
+/// Kernel-owned bridge between route prompts and the journaled `<prompt>`
+/// elements a host answers through [`crate::Up::Approve`].
+///
+/// The DOM is the authority: filing opens (or merges into) the durable
+/// prompt, a decision is journaled first and only then relayed to the waiting
+/// policy, and a session-scoped grant already in the tree answers a repeated
+/// subject without prompting again. Only the reply channels live here.
+#[derive(Clone)]
+pub struct ApprovalDesk {
+	book:    Arc<ApprovalBook>,
+	pending: Arc<Mutex<std::collections::BTreeMap<Str, Vec<ApprovalRequest>>>>,
+	events:  crate::events::KernelEvents,
+}
+
+impl ApprovalDesk {
+	/// Creates the desk publishing [`crate::KernelEvent::ApprovalRequested`]
+	/// on `events`.
+	#[must_use]
+	pub fn new(events: crate::events::KernelEvents) -> Self {
+		Self {
+			book: Arc::new(ApprovalBook::new()),
+			pending: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+			events,
+		}
+	}
+
+	/// Journals one route request as a pending prompt and keeps its reply
+	/// channel until [`Self::decide`]; a matching session-wide grant already
+	/// in the tree decides it immediately.
+	pub fn file(
+		&self,
+		session: &mut Session,
+		request: ApprovalRequest,
+	) -> Result<ApprovalTicket, ApprovalError> {
+		let ticket = self.book.open_for(
+			session,
+			request.ticket.invocation_id.clone(),
+			request.ticket.reasons.clone(),
+			request.ticket.created_at_ms,
+		)?;
+		if let Some(grant) = session_grant(session, &ticket) {
+			let ticket = self.book.decide(session, ticket.ticket_id.as_str(), grant.clone())?;
+			let _ = request.respond(grant);
+			return Ok(ticket);
+		}
+		self
+			.pending
+			.lock()
+			.entry(ticket.ticket_id.clone())
+			.or_default()
+			.push(request);
+		self
+			.events
+			.publish(crate::KernelEvent::ApprovalRequested(ticket.clone()));
+		Ok(ticket)
+	}
+
+	/// Journals one prompt raised by host admission policy for `call_id`
+	/// (no reply channel: the dispatcher observes the decision through the
+	/// mailbox); a matching session-wide grant decides it immediately.
+	pub fn file_spec(
+		&self,
+		session: &mut Session,
+		call_id: Str,
+		spec: ApprovalSpec,
+	) -> Result<ApprovalTicket, ApprovalError> {
+		let ticket = self.book.open_for(session, Some(call_id), vec![spec], epoch_millis())?;
+		if let Some(grant) = session_grant(session, &ticket) {
+			return self.book.decide(session, ticket.ticket_id.as_str(), grant);
+		}
+		self
+			.events
+			.publish(crate::KernelEvent::ApprovalRequested(ticket.clone()));
+		Ok(ticket)
+	}
+
+	/// Journals the first decision for `ticket_id` and relays it to every
+	/// policy waiting on that prompt.
+	pub fn decide(
+		&self,
+		session: &mut Session,
+		ticket_id: &str,
+		decision: ApprovalDecision,
+	) -> Result<ApprovalTicket, ApprovalError> {
+		let ticket = self.book.decide(session, ticket_id, decision.clone())?;
+		let waiting = self.pending.lock().remove(ticket_id).unwrap_or_default();
+		for request in waiting {
+			let _ = request.respond(decision.clone());
+		}
+		Ok(ticket)
+	}
+
+	/// Withdraws every journaled prompt whose requesting policy stopped
+	/// waiting (route timeout, cancelled or finished invocation).
+	pub fn sweep(&self, session: &mut Session) -> Result<(), ApprovalError> {
+		let abandoned = {
+			let mut pending = self.pending.lock();
+			let ids = pending
+				.iter()
+				.filter(|(_, requests)| requests.iter().all(ApprovalRequest::is_abandoned))
+				.map(|(id, _)| id.clone())
+				.collect::<Vec<_>>();
+			for id in &ids {
+				pending.remove(id);
+			}
+			ids
+		};
+		for id in abandoned {
+			self.book.withdraw(session, id.as_str())?;
+		}
+		Ok(())
+	}
+
+	/// Prompt ids currently waiting on a host answer.
+	#[must_use]
+	pub fn waiting(&self) -> Vec<Str> {
+		self.pending.lock().keys().cloned().collect()
+	}
+}
+
+/// A decided prompt in the tree whose session-wide (or persisted) approval
+/// covers every reason of `ticket`: same kind and subject.
+fn session_grant(session: &Session, ticket: &ApprovalTicket) -> Option<ApprovalDecision> {
+	let covered = |decided: &ApprovalTicket, spec: &ApprovalSpec| {
+		decided
+			.reasons
+			.iter()
+			.any(|granted| granted.kind == spec.kind && granted.subject == spec.subject)
+	};
+	tickets(session).find_map(|(_, decided)| {
+		let decision = decided.decision.as_ref()?;
+		let granted = decision.approved
+			&& matches!(decision.scope, ApprovalScope::Session | ApprovalScope::Persist)
+			&& decided.ticket_id != ticket.ticket_id
+			&& !ticket.reasons.is_empty()
+			&& ticket.reasons.iter().all(|spec| covered(&decided, spec));
+		granted.then(|| ApprovalDecision {
+			approved:   true,
+			scope:      decision.scope.clone(),
+			source:     ApprovalSource::Config,
+			decided_by: decision.decided_by.clone(),
+			reason:     Some(sf!("granted by {} for this session", decided.ticket_id)),
+			audited:    false,
+		})
+	})
 }
 
 impl ApprovalInbox {
@@ -548,13 +761,31 @@ impl ApprovalRoute {
 			Self {
 				inner: Arc::new(RouteInner {
 					next_id: AtomicU64::new(1),
-					tx,
+					tx:      RouteSink::Inbox(tx),
 					pending: Mutex::new(std::collections::BTreeMap::new()),
-					hook_gate,
+					hooks:   hook_gate.map(crate::LifecycleHooks::new),
 				}),
 			},
 			ApprovalInbox { rx },
 		)
+	}
+
+	/// Creates a route whose prompts land in the kernel mailbox as
+	/// [`crate::Up::Approval`], where the turn loop journals them and relays
+	/// the host's [`crate::Up::Approve`] back through the same request.
+	#[must_use]
+	pub fn to_kernel(
+		mailbox: flume::Sender<crate::Up>,
+		hook_gate: Option<Arc<crate::HookGate>>,
+	) -> Self {
+		Self {
+			inner: Arc::new(RouteInner {
+				next_id: AtomicU64::new(1),
+				tx:      RouteSink::Kernel(mailbox),
+				pending: Mutex::new(std::collections::BTreeMap::new()),
+				hooks:   hook_gate.map(crate::LifecycleHooks::new),
+			}),
+		}
 	}
 
 	/// Files, dispatches, and awaits one approval prompt.
@@ -565,12 +796,7 @@ impl ApprovalRoute {
 		created_at_ms: u64,
 	) -> ApprovalTicket {
 		self
-			.request_cancellable(
-				invocation_id,
-				reasons,
-				created_at_ms,
-				CancellationToken::new(),
-			)
+			.request_cancellable(invocation_id, reasons, created_at_ms, CancellationToken::new())
 			.await
 	}
 
@@ -603,25 +829,31 @@ impl ApprovalRoute {
 				ticket: ticket.clone(),
 				reply:  reply.clone(),
 			});
-		let _guard = PendingGuard { inner: Arc::clone(&self.inner), ticket_id: ticket_id.clone() };
+		let _guard =
+			PendingGuard { inner: Arc::clone(&self.inner), ticket_id: ticket_id.clone() };
 		let timeout_ms = ticket
 			.reasons
 			.iter()
 			.map(|reason| reason.timeout_ms)
 			.filter(|value| *value != 0)
 			.min();
+		let filed = std::time::Instant::now();
 		if self
 			.inner
 			.tx
-			.send(ApprovalRequest { ticket: ticket.clone(), reply })
+			.deliver(ApprovalRequest { ticket: ticket.clone(), reply })
 			.is_err()
 		{
 			let decision = unreachable_decision(&ticket, "approval host disconnected");
+			self
+				.inner
+				.notify_resolved(&ticket, &decision, filed.elapsed());
 			ticket.state = TicketState::Decided;
 			ticket.decision = Some(decision);
 			self.inner.pending.lock().remove(&ticket_id);
 			return ticket;
 		}
+		self.inner.notify_requested(&ticket);
 		let decision = match timeout_ms {
 			Some(timeout_ms) => {
 				tokio::select! {
@@ -649,6 +881,9 @@ impl ApprovalRoute {
 			},
 		};
 		self.inner.pending.lock().remove(&ticket_id);
+		self
+			.inner
+			.notify_resolved(&ticket, &decision, filed.elapsed());
 		ticket.state = TicketState::Decided;
 		ticket.decision = Some(decision);
 		ticket

@@ -44,13 +44,13 @@ pub struct Fault {
 }
 
 pub struct TestTool {
-	spec:   ToolSpec,
-	output: Str,
-	update: Option<Str>,
-	delay:  Duration,
+	spec:    ToolSpec,
+	output:  Str,
+	update:  Option<Str>,
+	delay:   Duration,
 	barrier: Option<Arc<tokio::sync::Barrier>>,
 	started: Option<Arc<AtomicUsize>>,
-	fault:  bool,
+	fault:   bool,
 }
 
 pub fn tool_spec(name: &str, revision: u16) -> ToolSpec {
@@ -73,13 +73,13 @@ pub fn spec_family(name: &str, family: &str, revision: u16, output: &str) -> Tes
 	let mut tool = tool_spec(name, revision);
 	tool.rev.family = Str::new(family);
 	TestTool {
-		spec:   tool,
-		output: Str::new(output),
-		update: None,
-		delay:  Duration::ZERO,
+		spec:    tool,
+		output:  Str::new(output),
+		update:  None,
+		delay:   Duration::ZERO,
 		barrier: None,
 		started: None,
-		fault:  false,
+		fault:   false,
 	}
 }
 

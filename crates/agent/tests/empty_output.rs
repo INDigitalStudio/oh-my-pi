@@ -106,6 +106,13 @@ async fn empty_output_continues_with_numbered_developer_nudge() {
 		})
 		.expect("second request contains recovery nudge");
 	assert!(retry.contains("Attempt #1/3"));
+	assert!(
+		requests[1]
+			.messages
+			.iter()
+			.all(|message| message.role != Role::Assistant || !message.content.is_empty()),
+		"the empty assistant turn is dropped from the retry request"
+	);
 	drop(requests);
 	let developers = contents(&session, "body turn developer");
 	assert_eq!(developers.len(), 1);

@@ -317,6 +317,30 @@ impl HookEvent for ProviderErrorEvent {
 	}
 }
 
+/// Hook payload emitted at the candidate-yield seam (`agent_settled`, pi
+/// `session_stop`): extensions answer `continue` to run another turn or
+/// `settle` (the fail-open default) to let the yield stand.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSettledEvent {
+	/// Revision-1 JSON `AgentSettledEvent` payload.
+	pub payload: Bytes,
+}
+
+impl HookEvent for AgentSettledEvent {
+	type Return = AgentSettled;
+
+	const ID: HookEventId = HookEventId::HookEventAgentSettled;
+	const REV: u32 = 1;
+
+	fn encode_into(&self, out: &mut BytesMut) {
+		out.extend_from_slice(&self.payload);
+	}
+
+	fn apply(&mut self, _: &HookPatch) -> Result<(), GateError> {
+		Ok(())
+	}
+}
+
 /// Domain result for `thread_projection`; validation is owned by `context`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextPatch(pub Bytes);
@@ -343,75 +367,6 @@ pub trait HookEvent {
 	fn encode_into(&self, out: &mut BytesMut);
 	/// Applies an accepted transform under the event's fixed composition table.
 	fn apply(&mut self, patch: &HookPatch) -> Result<(), GateError>;
-}
-/// Result of one JSON-encoded catalog gate.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum JsonGateOutcome {
-	/// No extension subscribed, so no payload was constructed.
-	Bypassed,
-	/// The composed effective payload.
-	Allow(JsonValue),
-	/// A hook denied the event.
-	Deny {
-		/// Stable denial reason.
-		reason: Str,
-		/// Whether the denial is fatal to the caller submission.
-		fatal:  bool,
-	},
-	/// An approval requirement was returned at a gate that does not own tickets.
-	Approval,
-}
-
-/// Emits one JSON observation while preserving the bitmap-only negative path.
-pub(crate) fn notify_json(
-	event: HookEventId,
-	gate: Option<&HookGate>,
-	build: impl FnOnce() -> JsonValue,
-) {
-	let Some(gate) = gate else {
-		return;
-	};
-	if !gate.subscribed(event) {
-		return;
-	}
-	let Ok(payload) = serde_json::to_vec(&build()) else {
-		return;
-	};
-	gate.notify_payload(event, 1, Bytes::from(payload));
-}
-
-/// Runs one JSON admission gate while preserving the bitmap-only negative path.
-pub(crate) async fn gate_json(
-	event: HookEventId,
-	gate: Option<&HookGate>,
-	build: impl FnOnce() -> JsonValue,
-) -> JsonGateOutcome {
-	let Some(gate) = gate else {
-		return JsonGateOutcome::Bypassed;
-	};
-	if !gate.subscribed(event) {
-		return JsonGateOutcome::Bypassed;
-	}
-	// Denials at admission gates abort the submission; every other gate fails open.
-	let fatal =
-		matches!(event, HookEventId::HookEventBeforeAgentStart | HookEventId::HookEventTurnStart);
-	let Ok(payload) = serde_json::to_vec(&build()) else {
-		return JsonGateOutcome::Deny { reason: sf!("hook payload serialization failed"), fatal };
-	};
-	match gate
-		.gate(event, GateEvent::new(Str::default(), Bytes::from(payload)))
-		.await
-	{
-		GateOutcome::Allow { event, .. } => match serde_json::from_slice(&event.effective_args) {
-			Ok(payload) => JsonGateOutcome::Allow(payload),
-			Err(_) => JsonGateOutcome::Deny {
-				reason: sf!("hook transform returned malformed payload"),
-				fatal,
-			},
-		},
-		GateOutcome::Deny { reason, .. } => JsonGateOutcome::Deny { reason, fatal },
-		GateOutcome::Approval { .. } => JsonGateOutcome::Approval,
-	}
 }
 
 impl HookEvent for GateEvent {
@@ -638,23 +593,31 @@ impl LifecycleHooks {
 				serde_json::from_slice(&effective.effective_args)
 					.map_err(|source| LifecycleHookError::MalformedTransform { event, source })
 			},
-			GateOutcome::Deny { reason, .. } => {
-				Err(LifecycleHookError::Denied { event, reason })
-			},
-			GateOutcome::Approval { .. } => {
-				Err(LifecycleHookError::ApprovalUnsupported { event })
-			},
+			GateOutcome::Deny { reason, .. } => Err(LifecycleHookError::Denied { event, reason }),
+			GateOutcome::Approval { .. } => Err(LifecycleHookError::ApprovalUnsupported { event }),
 		}
+	}
+
+	/// Asks subscribed extensions whether a candidate yield should settle or
+	/// continue (`agent_settled`); unsubscribed and failed replies settle.
+	pub async fn agent_settled(&self, payload: JsonValue) -> AgentSettled {
+		if !self.gate.subscribed(HookEventId::HookEventAgentSettled) {
+			return AgentSettled::Settle;
+		}
+		let Ok(encoded) = serde_json::to_vec(&payload) else {
+			return AgentSettled::Settle;
+		};
+		self
+			.gate
+			.gate_domain(&AgentSettledEvent { payload: Bytes::from(encoded) })
+			.await
+			.winner
 	}
 
 	/// Publishes a revision-1 JSON lifecycle observation.
 	///
 	/// A full observer queue remains lossy and is accounted by [`HookGate`].
-	pub fn notify(
-		&self,
-		event: HookEventId,
-		payload: JsonValue,
-	) -> Result<(), LifecycleHookError> {
+	pub fn notify(&self, event: HookEventId, payload: JsonValue) -> Result<(), LifecycleHookError> {
 		if !self.gate.subscribed(event) {
 			return Ok(());
 		}
@@ -1118,10 +1081,7 @@ pub(crate) const fn event_position(event: HookEventId) -> (usize, u64) {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::{
-		Arc,
-		atomic::{AtomicUsize, Ordering},
-	};
+	use std::sync::Arc;
 
 	use bytes::Bytes;
 	use omp_core::sf;
@@ -1129,8 +1089,8 @@ mod tests {
 
 	use super::{
 		AgentSettled, DomainReturn, GateDecision, GateError, GateEvent, GateOutcome, HookEvent,
-		HookGate, HookPatch, HookPhase, JsonGateOutcome, LifecycleHookError, LifecycleHooks,
-		OnFailure, ProviderFailover, SourceRef, Subscription, When, gate_json, notify_json,
+		HookGate, HookPatch, HookPhase, LifecycleHookError, LifecycleHooks, OnFailure,
+		ProviderFailover, SourceRef, Subscription, When,
 	};
 
 	#[tokio::test]
@@ -1159,10 +1119,7 @@ mod tests {
 		gate.subscribe("test", [precheck]).unwrap();
 		let gate = Arc::new(gate);
 		let hooks = LifecycleHooks::new(Arc::clone(&gate));
-		let work = hooks.gate(
-			HookEventId::HookEventTurnStart,
-			serde_json::json!({"turn_id": "t"}),
-		);
+		let work = hooks.gate(HookEventId::HookEventTurnStart, serde_json::json!({"turn_id": "t"}));
 		let driver = async {
 			let dispatch = receiver.recv_async().await.unwrap();
 			gate
@@ -1187,10 +1144,7 @@ mod tests {
 		gate.subscribe("test", [transform]).unwrap();
 		let gate = Arc::new(gate);
 		let hooks = LifecycleHooks::new(Arc::clone(&gate));
-		let work = hooks.gate(
-			HookEventId::HookEventTurnStart,
-			serde_json::json!({"turn_id": "t"}),
-		);
+		let work = hooks.gate(HookEventId::HookEventTurnStart, serde_json::json!({"turn_id": "t"}));
 		let driver = async {
 			let dispatch = receiver.recv_async().await.unwrap();
 			gate
@@ -1206,10 +1160,7 @@ mod tests {
 		let (outcome, ()) = tokio::join!(work, driver);
 		assert!(matches!(
 			outcome,
-			Err(LifecycleHookError::MalformedTransform {
-				event: HookEventId::HookEventTurnStart,
-				..
-			})
+			Err(LifecycleHookError::MalformedTransform { event: HookEventId::HookEventTurnStart, .. })
 		));
 	}
 
@@ -1271,85 +1222,6 @@ mod tests {
 		gate.subscribe("test", [tool, mcp]).unwrap();
 		assert!(gate.subscribed(HookEventId::HookEventToolCall));
 		assert!(gate.subscribed(HookEventId::HookEventMcpNotification));
-	}
-
-	#[test]
-	fn unsubscribed_json_observation_does_not_construct_payload() {
-		let (gate, _) = HookGate::channel();
-		let builds = AtomicUsize::new(0);
-		notify_json(HookEventId::HookEventAgentStart, Some(&gate), || {
-			builds.fetch_add(1, Ordering::Relaxed);
-			serde_json::json!({"submission_id": "s", "from_phase": "idle", "pending_items": 0})
-		});
-		assert_eq!(builds.load(Ordering::Relaxed), 0);
-	}
-
-	#[test]
-	fn agent_start_observation_is_delivered_with_json_envelope() {
-		let (gate, receiver) = HookGate::channel();
-		let mut observe = subscription(HookPhase::Observe, 11);
-		observe.event = HookEventId::HookEventAgentStart;
-		gate.subscribe("test", [observe]).unwrap();
-		notify_json(
-			HookEventId::HookEventAgentStart,
-			Some(&gate),
-			|| serde_json::json!({"submission_id": "s", "from_phase": "idle", "pending_items": 2}),
-		);
-		let dispatch = receiver.try_recv().expect("agent_start observation");
-		assert_eq!(dispatch.event, HookEventId::HookEventAgentStart);
-		assert_eq!(
-			serde_json::from_slice::<serde_json::Value>(&dispatch.payload).unwrap(),
-			serde_json::json!({"submission_id": "s", "from_phase": "idle", "pending_items": 2}),
-		);
-	}
-
-	#[tokio::test]
-	async fn turn_start_deny_stops_the_gate() {
-		let (gate, receiver) = HookGate::channel();
-		let mut precheck = subscription(HookPhase::Precheck, 12);
-		precheck.event = HookEventId::HookEventTurnStart;
-		gate.subscribe("test", [precheck]).unwrap();
-		let work = gate_json(
-			HookEventId::HookEventTurnStart,
-			Some(&gate),
-			|| serde_json::json!({"turn_id": "t"}),
-		);
-		let driver = async {
-			let dispatch = receiver.recv_async().await.unwrap();
-			gate
-				.answer(dispatch.dispatch_id, vec![(12, GateDecision::Deny(sf!("blocked")))])
-				.unwrap();
-		};
-		let (outcome, ()) = tokio::join!(work, driver);
-		assert!(matches!(outcome, JsonGateOutcome::Deny { fatal: true, .. }));
-	}
-
-	#[tokio::test]
-	async fn delegated_tool_result_transform_returns_composed_annotations() {
-		let (gate, receiver) = HookGate::delegated_channel();
-		gate.replace_union_mask(1_u128 << HookEventId::HookEventToolResult as u32);
-		let work = gate_json(
-			HookEventId::HookEventToolResult,
-			Some(&gate),
-			|| serde_json::json!({"call_id": "c", "annotate": []}),
-		);
-		let driver = async {
-			let dispatch = receiver.recv_async().await.unwrap();
-			let effective = Bytes::from_static(
-				br#"{"call_id":"c","annotate":[{"kind":"lint","data":{},"display":true}]}"#,
-			);
-			gate
-				.answer(dispatch.dispatch_id, vec![(
-					27,
-					GateDecision::Modify(HookPatch { target: None, args: Some(effective) }),
-				)])
-				.unwrap();
-		};
-		let (outcome, ()) = tokio::join!(work, driver);
-		let JsonGateOutcome::Allow(payload) = outcome else {
-			panic!("tool_result transform must allow");
-		};
-		assert_eq!(payload["annotate"].as_array().unwrap().len(), 1);
 	}
 
 	#[tokio::test]

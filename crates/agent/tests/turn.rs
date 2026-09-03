@@ -246,13 +246,13 @@ async fn tool_call_round_settles_in_the_dom_then_runs_second_inference() {
 async fn independent_calls_from_one_turn_execute_concurrently() {
 	let directory = tempfile::tempdir().expect("temporary directory");
 	let first = ToolCall {
-		id: ToolCallId::from("first"),
-		name: Str::new_static("first"),
+		id:        ToolCallId::from("first"),
+		name:      Str::new_static("first"),
 		arguments: OpaqueJson::new(serde_json::json!({})),
 	};
 	let second = ToolCall {
-		id: ToolCallId::from("second"),
-		name: Str::new_static("second"),
+		id:        ToolCallId::from("second"),
+		name:      Str::new_static("second"),
 		arguments: OpaqueJson::new(serde_json::json!({})),
 	};
 	let tool_round = vec![
@@ -266,10 +266,8 @@ async fn independent_calls_from_one_turn_execute_concurrently() {
 	let mut kernel = Kernel::new(
 		inference,
 		registry([
-			spec("first", 1, "one")
-				.concurrency_probe(Arc::clone(&started), Arc::clone(&barrier)),
-			spec("second", 1, "two")
-				.concurrency_probe(Arc::clone(&started), Arc::clone(&barrier)),
+			spec("first", 1, "one").concurrency_probe(Arc::clone(&started), Arc::clone(&barrier)),
+			spec("second", 1, "two").concurrency_probe(Arc::clone(&started), Arc::clone(&barrier)),
 		]),
 		policy(&directory.path().join("blobs")),
 		StaticPrompt(Str::new_static("test system")),
@@ -309,7 +307,10 @@ async fn steering_is_drained_after_tool_results_before_the_yield_decision() {
 	);
 	kernel
 		.mailbox()
-		.send(Up::Steer(Str::new_static("include the settled result")))
+		.send(Up::Steer {
+			text:        Str::new_static("include the settled result"),
+			attachments: Vec::new(),
+		})
 		.expect("steering queues");
 	let mut session = fresh_session(&journal_path);
 
@@ -333,7 +334,7 @@ async fn steering_is_drained_after_tool_results_before_the_yield_decision() {
 		message.role == Role::User
 			&& message.content.iter().any(|part| {
 				matches!(part,
-					ContentPart::Text { text, .. } if text == "include the settled result")
+					ContentPart::Text { text, .. } if text.contains("include the settled result"))
 			})
 	}));
 	drop(requests);
@@ -456,7 +457,11 @@ async fn request_budget_prevents_the_first_disallowed_provider_call() {
 	assert_eq!(outcome.stop, TurnStop::Completed);
 	assert!(requests.lock().is_empty());
 	assert_eq!(
-		session.dom().select("body turn notice").expect("selector").count(),
+		session
+			.dom()
+			.select("body turn notice")
+			.expect("selector")
+			.count(),
 		1
 	);
 }
@@ -508,4 +513,332 @@ async fn interrupt_returns_cancelled_without_journaling_a_false_completion() {
 			.iter()
 			.any(|entry| entry.kind.name.as_str() == kind::TURN_RECEIPT)
 	);
+}
+
+/// R2Kernel #1: a subagent/detached job settling while the parent idles is
+/// journaled from the turn loop and delivered to the model as pi's
+/// async-result follow-up, so the parent never has to `hub wait`.
+#[tokio::test]
+async fn settled_background_job_is_delivered_to_the_model_as_a_follow_up_turn() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("deliver.oms");
+	let (inference, requests) =
+		ScriptedInference::new([text_script("delegated; waiting"), text_script("child says hello")]);
+	let mut kernel = Kernel::new(
+		inference,
+		registry([spec("echo", 1, "tool settled")]),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	);
+	let mut session = fresh_session(&journal_path);
+	let before = session.head().expect("genesis head");
+	let txn = omp_session::components::jobs::insert(
+		session.dom(),
+		before,
+		omp_session::components::jobs::JobSpec {
+			id:      Str::new_static("child-1"),
+			kind:    Str::new_static("subagent"),
+			owner:   Str::new_static("Main"),
+			started: Str::new_static("1"),
+			agent:   Some(Str::new_static("task")),
+		},
+	)
+	.expect("jobs root");
+	session.patch(txn).expect("insert subagent");
+	let handle = session
+		.dom()
+		.select("jobs subagent[id=child-1]")
+		.expect("valid selector")
+		.into_iter()
+		.next()
+		.expect("subagent element");
+	let (done_tx, done_rx) = flume::bounded::<()>(1);
+	assert!(kernel.jobs().attach_task(
+		session.dom(),
+		handle,
+		tokio_util::sync::CancellationToken::new(),
+		tokio::spawn(async move {
+			let _ = done_rx.recv_async().await;
+			omp_agent::JobSettlement {
+				status: Str::new_static("completed"),
+				output: Some(
+					serde_json::value::to_raw_value(&serde_json::json!({"text": "hello from child"}))
+						.expect("raw"),
+				),
+				error:  None,
+			}
+		}),
+	));
+	// The child settles shortly after the parent reaches its candidate yield.
+	tokio::spawn(async move {
+		tokio::time::sleep(Duration::from_millis(60)).await;
+		let _ = done_tx.send(());
+	});
+	let outcome = kernel
+		.run_turn(&mut session, input("delegate"), RunControl::default())
+		.await
+		.expect("turn completes after delivery");
+	assert_eq!(outcome.stop, TurnStop::Completed);
+	let requests = requests.lock();
+	assert_eq!(requests.len(), 2, "the settlement re-woke the loop for one follow-up request");
+	assert!(requests[1].messages.iter().any(|message| {
+		message.role == Role::User
+			&& message.content.iter().any(|part| {
+				matches!(part, ContentPart::Text { text, .. }
+					if text.contains("Background job child-1 has completed") && text.contains("hello from child"))
+			})
+	}));
+	drop(requests);
+	let node = session.dom().get(handle).expect("subagent element");
+	assert_eq!(
+		node
+			.prop(&PropKey::from(PropId::Status))
+			.and_then(omp_dom::Value::as_str),
+		Some("completed"),
+		"the settlement was journaled from the turn loop"
+	);
+	assert!(
+		node
+			.prop(&PropKey::Custom(Str::new_static(omp_agent::DELIVERED)))
+			.is_some(),
+		"delivery is a journaled fact, so a resumed session never re-delivers"
+	);
+	assert!(
+		session
+			.dom()
+			.select("body turn user[async_result=true]")
+			.expect("selector")
+			.count()
+			== 1
+	);
+}
+
+/// R2 (Fx2Transcript): an interrupted tool tail is re-executable without a
+/// model round trip (pi `retry()` + `toolReplayStart`): the journal rewinds
+/// past the aborted result, the same call id runs again, and the live chain
+/// ends with exactly one `tool.result@1` for it.
+#[tokio::test]
+async fn retry_tool_tail_reruns_the_aborted_call_and_continues_the_turn() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("retry-tail.oms");
+	let mut kernel = Kernel::new(
+		PendingCallInference,
+		registry([spec("echo", 1, "tool settled")]),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	);
+	let cancellation = tokio_util::sync::CancellationToken::new();
+	let trigger = cancellation.clone();
+	tokio::spawn(async move {
+		tokio::time::sleep(Duration::from_millis(10)).await;
+		trigger.cancel();
+	});
+	let mut session = fresh_session(&journal_path);
+	let outcome = kernel
+		.run_turn(&mut session, input("use echo"), RunControl::new(cancellation, None))
+		.await
+		.expect("cancellation settles");
+	assert_eq!(outcome.stop, TurnStop::Cancelled);
+	let turn = *session
+		.dom()
+		.children(session.dom().body())
+		.last()
+		.expect("turn");
+	assert!(omp_agent::aborted_tool_tail(session.dom(), turn), "the tail is retryable");
+
+	let (inference, requests) = ScriptedInference::new([text_script("after retry")]);
+	let mut kernel = Kernel::new(
+		inference,
+		registry([spec("echo", 1, "tool settled")]),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	);
+	let outcome = kernel
+		.retry_tool_tail(&mut session, RunControl::default())
+		.await
+		.expect("retry succeeds");
+	assert_eq!(outcome.stop, TurnStop::Completed);
+	assert_eq!(outcome.assistant_text.as_str(), "after retry");
+	assert!(!omp_agent::aborted_tool_tail(session.dom(), turn));
+	assert_eq!(
+		prop_text(&session, "body turn echo", PropId::Status),
+		"ok",
+		"the replayed call settled normally"
+	);
+	assert_eq!(requests.lock().len(), 1, "no model round trip before the replay");
+	let entries = journal_entries(&journal_path);
+	let live = omp_journal::live_chain(&entries).collect::<Vec<_>>();
+	let results = live
+		.iter()
+		.filter(|entry| entry.kind.name.as_str() == kind::TOOL_RESULT)
+		.count();
+	assert_eq!(results, 1, "the live chain carries exactly one result for the call");
+	assert!(
+		live.len() < entries.len(),
+		"the aborted result and interrupt notice are abandoned, not deleted"
+	);
+	assert!(matches!(
+		kernel
+			.retry_tool_tail(&mut session, RunControl::default())
+			.await,
+		Err(omp_agent::KernelError::NothingToRetry)
+	));
+}
+
+/// A user image attachment reaches the provider as pi's `ImageContent`: the
+/// request carries the blob's bytes inline with the journaled MIME, read
+/// from the session's blob store at request build (no process-local
+/// attachment index), and the resumed session projects the same request.
+#[tokio::test]
+async fn user_image_attachment_reaches_the_request_with_its_bytes_and_mime() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("image.oms");
+	let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x04\0\0\0\x03";
+	let (inference, requests) = ScriptedInference::new([text_script("a tiny png")]);
+	let mut kernel = Kernel::new(
+		inference,
+		registry(std::iter::empty()),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	)
+	.with_route_facts(omp_agent::RouteFacts { image_input: true, ..Default::default() });
+	let mut session = fresh_session(&journal_path);
+	let attachment = session
+		.store_attachment("image/png", png)
+		.expect("attachment stores");
+
+	let outcome = kernel
+		.run_turn(
+			&mut session,
+			TurnInput {
+				text:        Str::new_static("what is this? [Image #1, 4x3]"),
+				attachments: vec![attachment.clone()],
+			},
+			RunControl::default(),
+		)
+		.await
+		.expect("turn completes");
+	assert_eq!(outcome.stop, TurnStop::Completed);
+
+	let images = |request: &ChatRequest| {
+		request
+			.messages
+			.iter()
+			.filter(|message| message.role == Role::User)
+			.flat_map(|message| message.content.iter())
+			.filter_map(|part| match part {
+				ContentPart::Image(omp_inference::MediaInput::Bytes { media_type, data }) => {
+					Some((media_type.clone(), data.clone()))
+				},
+				ContentPart::Image(other) => panic!("image must be inline bytes, got {other:?}"),
+				_ => None,
+			})
+			.collect::<Vec<_>>()
+	};
+	let live = {
+		let requests = requests.lock();
+		assert_eq!(requests.len(), 1);
+		images(&requests[0])
+	};
+	assert_eq!(live.len(), 1);
+	assert_eq!(live[0].0, "image/png");
+	assert_eq!(live[0].1.as_ref(), png);
+	let user_texts = requests.lock()[0]
+		.messages
+		.iter()
+		.filter(|message| message.role == Role::User)
+		.flat_map(|message| message.content.iter())
+		.filter_map(|part| match part {
+			ContentPart::Text { text, .. } => Some(text.clone()),
+			_ => None,
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(user_texts, ["what is this? [Image #1, 4x3]"]);
+
+	// The journal carries the MIME beside the reference, so a resumed
+	// session builds the identical media part.
+	let journal = std::fs::read_to_string(&journal_path).expect("journal reads");
+	assert!(
+		journal.contains(&format!(r#""h":"{}","n":{},"mime":"image/png""#, attachment.blob, png.len())),
+		"{journal}"
+	);
+	drop(session);
+	let restored = omp_session::Session::open(&journal_path, omp_session::ComponentRegistry::default())
+		.expect("session restores");
+	let (inference, requests) = ScriptedInference::new([text_script("still a png")]);
+	let mut kernel = Kernel::new(
+		inference,
+		registry(std::iter::empty()),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	)
+	.with_route_facts(omp_agent::RouteFacts { image_input: true, ..Default::default() });
+	let mut restored = restored;
+	kernel
+		.run_turn(&mut restored, input("and now?"), RunControl::default())
+		.await
+		.expect("resumed turn completes");
+	assert_eq!(images(&requests.lock()[0]), live);
+}
+
+/// A steering aside with an image (pi `steer(text, images)`) keeps its
+/// attachment through the queue and the safe point: the second request's
+/// steered user message carries the bytes and MIME, not a dangling marker.
+#[tokio::test]
+async fn steered_image_attachment_reaches_the_next_request() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("steer-image.oms");
+	let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x02\0\0\0\x02";
+	let (inference, requests) = ScriptedInference::new([
+		tool_script("echo-1", "echo", serde_json::json!({})),
+		text_script("steered answer"),
+	]);
+	let mut kernel = Kernel::new(
+		inference,
+		registry([spec("echo", 1, "tool settled")]),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	)
+	.with_route_facts(omp_agent::RouteFacts { image_input: true, ..Default::default() });
+	let mut session = fresh_session(&journal_path);
+	let attachment = session
+		.store_attachment("image/png", png)
+		.expect("attachment stores");
+	kernel
+		.mailbox()
+		.send(Up::Steer {
+			text:        Str::new_static("also look at [Image #1, 2x2]"),
+			attachments: vec![attachment],
+		})
+		.expect("steering queues");
+
+	let outcome = kernel
+		.run_turn(&mut session, input("use echo"), RunControl::default())
+		.await
+		.expect("steered turn completes");
+	assert_eq!(outcome.stop, TurnStop::Steered);
+
+	let requests = requests.lock();
+	assert_eq!(requests.len(), 2);
+	let steered = requests[1]
+		.messages
+		.iter()
+		.find(|message| {
+			message.role == Role::User
+				&& message.content.iter().any(|part| {
+					matches!(part, ContentPart::Text { text, .. } if text.contains("also look at"))
+				})
+		})
+		.expect("steered user message");
+	let image = steered
+		.content
+		.iter()
+		.find_map(|part| match part {
+			ContentPart::Image(omp_inference::MediaInput::Bytes { media_type, data }) => {
+				Some((media_type.as_str(), data.as_ref()))
+			},
+			_ => None,
+		})
+		.expect("steered message carries the image inline");
+	assert_eq!(image, ("image/png", png.as_slice()));
 }

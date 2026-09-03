@@ -22,14 +22,30 @@ pub struct Genesis {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnStart {}
 
+/// One user attachment in a `msg.user@1` payload.
+///
+/// The content-addressed bytes plus the media type pi's
+/// `ImageContent.mimeType` carries, so the projection can hand providers a
+/// typed media part without reopening the blob. Serialized flat beside the
+/// reference: `{"h","n","mime"}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+	/// Content-addressed bytes (digest + byte length).
+	#[serde(flatten)]
+	pub blob: BlobRef,
+	/// Declared media type (`image/png`, …).
+	pub mime: Str,
+}
+
 /// `msg.user@1` payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgUser {
 	/// User-authored text.
 	pub text:        Str,
-	/// Attached content-addressed blobs.
+	/// Attached media, positional: `[Image #N]` in `text` names
+	/// `attachments[N-1]`.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub attachments: Vec<BlobRef>,
+	pub attachments: Vec<Attachment>,
 }
 
 /// `msg.assistant.start@1` payload.
@@ -178,6 +194,11 @@ pub struct TurnReceipt {
 	/// Milliseconds from request start to completion.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub duration_ms:   Option<u64>,
+	/// Provider premium-request units billed for this request in millionths
+	/// (`1_000_000` = one premium request; GitHub Copilot `premium_interactions`,
+	/// fractional for discounted models); zero for every other route.
+	#[serde(default, skip_serializing_if = "is_zero")]
+	pub premium_requests_millionths: u64,
 }
 
 impl TurnReceipt {
@@ -192,6 +213,7 @@ impl TurnReceipt {
 			cache_write: 0,
 			ttft_ms: None,
 			duration_ms: None,
+			premium_requests_millionths: 0,
 		}
 	}
 }
@@ -236,5 +258,35 @@ impl Compaction {
 	#[must_use]
 	pub const fn new(summary: BlobRef, boundary: EntryId) -> Self {
 		Self { summary, boundary, method: None, tokens_before: None, tokens_after: None, warning: None }
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use omp_core::Hash32;
+
+	use super::*;
+
+	#[test]
+	fn user_attachment_serializes_flat_beside_its_blob_reference() {
+		let payload = MsgUser {
+			text:        Str::new_static("look [Image #1]"),
+			attachments: vec![Attachment {
+				blob: BlobRef { hash: Hash32::new([0xab; 32]), size: 5 },
+				mime: Str::new_static("image/png"),
+			}],
+		};
+		let json = serde_json::to_string(&payload).unwrap();
+		assert_eq!(
+			json,
+			concat!(
+				r#"{"text":"look [Image #1]","attachments":[{"h":""#,
+				"abababababababababababababababababababababababababababababababab",
+				r#"","n":5,"mime":"image/png"}]}"#
+			)
+		);
+		assert_eq!(serde_json::from_str::<MsgUser>(&json).unwrap(), payload);
+		let bare: MsgUser = serde_json::from_str(r#"{"text":"hi"}"#).unwrap();
+		assert!(bare.attachments.is_empty());
 	}
 }

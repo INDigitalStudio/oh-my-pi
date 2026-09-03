@@ -429,10 +429,7 @@ async fn dispatch_timed_out_call_remains_observable_as_an_adopted_job() {
 			Duration::from_millis(20),
 		),
 	)
-	.with_external_executor(Arc::new(StuckExternal {
-		honors_cancel: true,
-		started,
-	}));
+	.with_external_executor(Arc::new(StuckExternal { honors_cancel: true, started }));
 	let mut session = session(&directory.path().join("detached.oms"));
 	let (entry, args) = call(&mut session, &identity, "detached-1");
 	let report = tokio::time::timeout(

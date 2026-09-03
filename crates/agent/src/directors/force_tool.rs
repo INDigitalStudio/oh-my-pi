@@ -11,12 +11,16 @@ use crate::director::{
 
 /// Requires a named tool call before its parent may inspect the yield.
 pub struct ForceTool {
-	name:     Str,
-	until:    ForceUntil,
-	reminder: Option<Str>,
+	name:      Str,
+	until:     ForceUntil,
+	reminder:  Option<Str>,
 	retries:   u32,
 	attempts:  u32,
 	satisfied: bool,
+	/// The first request runs unforced; the ladder starts only after the
+	/// model stops idle once (pi's subagent yield reminder demands the call
+	/// after the run settles, never on the first step).
+	deferred:  bool,
 }
 
 impl ForceTool {
@@ -28,7 +32,23 @@ impl ForceTool {
 		reminder: Option<Str>,
 		retries: u32,
 	) -> Self {
-		Self { name: name.into(), until, reminder, retries, attempts: 0, satisfied: false }
+		Self {
+			name: name.into(),
+			until,
+			reminder,
+			retries,
+			attempts: 0,
+			satisfied: false,
+			deferred: false,
+		}
+	}
+
+	/// Leaves the first request unforced; forcing begins after the model
+	/// yields once without the call.
+	#[must_use]
+	pub const fn deferred(mut self) -> Self {
+		self.deferred = true;
+		self
 	}
 
 	/// Reconstructs a forced-call engagement from DOM properties.
@@ -47,7 +67,8 @@ impl ForceTool {
 			.and_then(|value| u32::try_from(value).ok())
 			.unwrap_or(0);
 		let satisfied = state_bool(node, "satisfied").unwrap_or(false);
-		Self { name, until, reminder, retries, attempts, satisfied }
+		let deferred = state_bool(node, "deferred").unwrap_or(false);
+		Self { name, until, reminder, retries, attempts, satisfied, deferred }
 	}
 
 	fn turn_satisfies(&self, dom: &Dom, turn: &TurnView) -> bool {
@@ -81,10 +102,14 @@ impl Director for ForceTool {
 			(Str::new_static("retries"), BindValue::Int(i64::from(self.retries))),
 			(Str::new_static("attempts"), BindValue::Int(i64::from(self.attempts))),
 			(Str::new_static("satisfied"), BindValue::Bool(self.satisfied)),
+			(Str::new_static("deferred"), BindValue::Bool(self.deferred)),
 		]
 	}
 
 	fn prepare_inference(&self, _cx: &DirectorCx<'_>, req: &mut ChatRequest) {
+		if self.deferred && self.attempts == 0 {
+			return;
+		}
 		// This is semantic intent only. Inference owns the soft/native/costly
 		// translation and receipts each rung (ADRs 0016 and 0019).
 		req.tool_choice = Setting::Require(ToolChoice::Named(self.name.clone()));
@@ -114,13 +139,7 @@ impl Director for ForceTool {
 		let reminder = self.reminder.clone().or_else(|| {
 			Some(Str::new(format!("Call {} now; do not answer without using it.", self.name)))
 		});
-		DirectorEffect {
-			verdict: Verdict::Continue { reminder },
-			updates: vec![StateUpdate::new(
-				"attempts",
-				BindValue::Int(i64::from(self.attempts.saturating_add(1))),
-			)],
-			asides:  Vec::new(),
-		}
+		DirectorEffect::new(Verdict::Continue { reminder })
+			.with_update("attempts", BindValue::Int(i64::from(self.attempts.saturating_add(1))))
 	}
 }

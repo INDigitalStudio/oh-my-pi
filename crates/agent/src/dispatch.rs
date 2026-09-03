@@ -14,11 +14,12 @@ use std::{
 	io::Write as _,
 	pin::Pin,
 	sync::Arc,
+	task::{Context, Poll},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use flume::Receiver;
-use futures::{Stream, StreamExt as _, future::select_all};
+use flume::{Receiver, r#async::RecvStream};
+use futures::{Stream, StreamExt as _};
 use omp_core::{FastHashMap, Str, sf};
 use omp_dom::{Handle, KnownTag, PropId, Sid, Tag};
 use omp_journal::{
@@ -27,6 +28,7 @@ use omp_journal::{
 };
 use omp_session::{Session, SessionError};
 use omp_tool::{
+	Effects,
 	Abort, ArtifactLifetime, BlobRef as ToolBlobRef, CallOutcome, CallOutcomeDetails, CapsBase,
 	ErasedEv, ErasedOutcome, ExpectedArtifact, IncomingParams, Interrupt, InvocationFeed, JobKind,
 	JobMetadata, JobOwner, JobRef, ModelClass, Part, PromptCaps, Registry, RegistryError, Rev,
@@ -35,7 +37,7 @@ use omp_tool::{
 use serde_json::value::RawValue;
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::{
 	CancelTree, JobBoard, KernelEvent, SessionAuthority, TurnCancellation, Up,
@@ -91,11 +93,15 @@ pub struct DispatchPolicy {
 }
 
 impl DispatchPolicy {
+	/// Standard inline output bound shared by tool terminals and job
+	/// settlements.
+	pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
 	/// Creates the standard 64 KiB / 512-byte / 30-second / 1-second policy.
 	#[must_use]
 	pub const fn new(spill: BlobStore) -> Self {
 		Self {
-			max_output_bytes: 64 * 1024,
+			max_output_bytes: Self::DEFAULT_MAX_OUTPUT_BYTES,
 			max_line_bytes: 512,
 			blocking_limit: Duration::from_secs(30),
 			interrupt_grace: Duration::from_secs(1),
@@ -224,10 +230,11 @@ pub type SessionToolFuture<'a> = Pin<
 /// steers. Steering received here is journaled on receipt.
 #[derive(Clone)]
 pub struct CallControl {
-	mailbox: Receiver<Up>,
-	turn:    TurnCancellation,
-	session: CancelTree,
-	run:     Option<crate::RunControl>,
+	mailbox:   Receiver<Up>,
+	turn:      TurnCancellation,
+	session:   CancelTree,
+	run:       Option<crate::RunControl>,
+	approvals: crate::ApprovalDesk,
 }
 
 /// What one handled mailbox message meant for the running batch.
@@ -242,6 +249,28 @@ pub enum Received {
 	Rewound(omp_session::LifecycleWork),
 	/// The turn or session was cancelled.
 	Cancelled,
+	/// A journaled approval prompt was decided; a call waiting on it
+	/// starts or settles denied.
+	Approved(crate::ApprovalTicket),
+}
+
+/// Host policy deciding whether a native call may start (pi
+/// `resolveApproval`: the tool's declared effect tier against the session
+/// approval mode and per-tool overrides).
+pub trait ToolAdmission: Send + Sync {
+	/// Decides one committed call before its unit starts.
+	fn admit(&self, name: &str, effects: &omp_tool::Effects, args: &RawValue) -> ToolAdmissionVerdict;
+}
+
+/// One admission answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolAdmissionVerdict {
+	/// Start the call.
+	Allow,
+	/// Never start; the call settles as a policy denial.
+	Deny(Str),
+	/// Journal this prompt and start only once it is approved.
+	Prompt(crate::ApprovalSpec),
 }
 
 impl CallControl {
@@ -250,8 +279,9 @@ impl CallControl {
 		turn: TurnCancellation,
 		session: CancelTree,
 		run: Option<crate::RunControl>,
+		approvals: crate::ApprovalDesk,
 	) -> Self {
-		Self { mailbox, turn, session, run }
+		Self { mailbox, turn, session, run, approvals }
 	}
 
 	/// Receives the next mailbox message; pending forever once the kernel is
@@ -288,12 +318,16 @@ impl CallControl {
 	/// interrupts routed to the cancellation tree.
 	pub fn handle(&self, session: &mut Session, message: Up) -> Result<Received, SessionError> {
 		match message {
-			Up::Steer(text) => {
-				steering::queue_steering(session, text)?;
+			Up::Steer { text, attachments } => {
+				steering::queue_steering(session, text, &attachments)?;
 				Ok(Received::Steering)
 			},
 			Up::Peer(text) => {
 				steering::queue_peer(session, text)?;
+				Ok(Received::None)
+			},
+			Up::Queue(text) => {
+				steering::queue_prompt(session, text)?;
 				Ok(Received::None)
 			},
 			Up::Unqueue(reply) => {
@@ -309,11 +343,29 @@ impl CallControl {
 				self.turn.cancel_turn();
 				Ok(Received::Cancelled)
 			},
-			Up::Env(event) => Ok(journal_env_event(session, event)?
-				.map_or(Received::None, Received::Rewound)),
-			Up::Approve { id, decision } => {
-				let _ = crate::ApprovalBook::new().decide(session, id.as_str(), decision);
+			Up::Env(event) => {
+				Ok(journal_env_event(session, event)?.map_or(Received::None, Received::Rewound))
+			},
+			Up::Approval(request) => {
+				if let Err(error) = self.approvals.file(session, request.clone()) {
+					tracing::warn!(%error, ticket = %request.ticket.ticket_id, "approval prompt could not be journaled");
+					let _ = request.respond(crate::ApprovalDecision {
+						approved:   false,
+						scope:      crate::ApprovalScope::Once,
+						source:     crate::ApprovalSource::Unavailable,
+						decided_by: None,
+						reason:     Some(Str::new_static("approval prompt could not be journaled")),
+						audited:    false,
+					});
+				}
 				Ok(Received::None)
+			},
+			Up::Approve { id, decision } => match self.approvals.decide(session, id.as_str(), decision) {
+				Ok(ticket) => Ok(Received::Approved(ticket)),
+				Err(error) => {
+					tracing::debug!(%error, ticket = %id, "approval decision targets no live prompt");
+					Ok(Received::None)
+				},
 			},
 			Up::Subscribe(reply) => {
 				let _ = reply.send(session.subscribe());
@@ -373,16 +425,18 @@ fn checkpoint_control(
 			label: Some(Str::new_static("checkpoint.open")),
 			ops: vec![omp_dom::Op::Ins {
 				parent: session.dom().meta(),
-				after: session.dom().children(session.dom().meta()).last().copied(),
-				node: omp_dom::NodeSpec::new(omp_dom::Tag::Custom(Str::new_static("rewind-checkpoint")))
-					.with_prop(
-						omp_dom::PropKey::Custom(Str::new_static("token")),
-						omp_dom::Value::Str(Str::new(token)),
-					)
-					.with_prop(
-						omp_dom::PropKey::Custom(Str::new_static("target")),
-						omp_dom::Value::Str(Str::new(cause.to_string())),
-					),
+				after:  session.dom().children(session.dom().meta()).last().copied(),
+				node:   omp_dom::NodeSpec::new(omp_dom::Tag::Custom(Str::new_static(
+					"rewind-checkpoint",
+				)))
+				.with_prop(
+					omp_dom::PropKey::Custom(Str::new_static("token")),
+					omp_dom::Value::Str(Str::new(token)),
+				)
+				.with_prop(
+					omp_dom::PropKey::Custom(Str::new_static("target")),
+					omp_dom::Value::Str(Str::new(cause.to_string())),
+				),
 			}],
 		})?;
 		return Ok(None);
@@ -424,6 +478,9 @@ pub struct SessionToolCx<'a> {
 	/// The kernel's mailbox and cancellation scopes, for tools that wait
 	/// (`hub wait`): steering and interrupts are observed while blocked.
 	pub control:   Option<&'a CallControl>,
+	/// Extension lifecycle gates (`subagent_spawn`); `None` without an
+	/// extension host.
+	pub hooks:     Option<&'a crate::LifecycleHooks>,
 }
 
 /// Failure before a session tool can produce its typed terminal outcome.
@@ -633,7 +690,7 @@ impl OutputStream {
 }
 
 /// The `<result>` element of a live call.
-fn result_handle(session: &Session, call: EntryId) -> Result<Handle, DispatchError> {
+pub(crate) fn result_handle(session: &Session, call: EntryId) -> Result<Handle, DispatchError> {
 	let element = session.call_handle(call)?;
 	let dom = session.dom();
 	dom.children(element)
@@ -657,6 +714,9 @@ pub struct DispatchReport {
 	pub lines_clamped: u64,
 	/// Job reference when execution detached.
 	pub detached:      Option<JobRef>,
+	/// Wall time from admission to settlement (zero for calls that never
+	/// started).
+	pub duration:      Duration,
 }
 
 /// Registry dispatch, projection, persistence, or journal failure.
@@ -705,6 +765,30 @@ pub enum DispatchError {
 		/// Stable provider call identity.
 		call_id: Str,
 	},
+	/// The approval prompt a call requires could not be journaled.
+	#[error("tool approval prompt could not be journaled")]
+	Approval {
+		/// Typed prompt failure.
+		#[source]
+		source: crate::ApprovalError,
+	},
+}
+
+/// Model-facing reason for a call the host refused (pi `Tool call denied
+/// by user`).
+fn denial_reason(ticket: &crate::ApprovalTicket) -> Str {
+	let by = ticket
+		.decision
+		.as_ref()
+		.map_or("policy", |decision| <&'static str>::from(decision.source));
+	match ticket
+		.decision
+		.as_ref()
+		.and_then(|decision| decision.reason.as_deref())
+	{
+		Some(reason) => sf!("tool call denied by {by}: {reason}"),
+		None => sf!("tool call denied by {by}"),
+	}
 }
 
 /// One event from an execution unit, native or external.
@@ -718,7 +802,7 @@ pub(crate) enum DispatchEvent {
 /// the same code the foreground path uses.
 #[derive(Clone)]
 pub(crate) struct Committer {
-	registry: Arc<Registry>,
+	registry:        Arc<Registry>,
 	policy:          DispatchPolicy,
 	events:          KernelEvents,
 	lifecycle_hooks: Option<crate::LifecycleHooks>,
@@ -732,14 +816,13 @@ pub struct Dispatcher {
 	session_tools: FastHashMap<Str, Arc<dyn SessionTool>>,
 	jobs:          Arc<JobBoard>,
 	authority:     Option<Arc<dyn SessionAuthority>>,
+	admission:     Option<Arc<dyn ToolAdmission>>,
 }
 
 /// Where a prepared call executes.
 enum Unit {
 	/// In-process registry tool fed live argument fragments.
-	Native {
-		feed: InvocationFeed,
-	},
+	Native { feed: InvocationFeed },
 	/// Worker/remote tool started at commit with complete arguments.
 	External {
 		executor: Arc<dyn ExternalToolExecutor>,
@@ -749,9 +832,7 @@ enum Unit {
 	/// Host-authority tool run inline against the session.
 	Session(Arc<dyn SessionTool>),
 	/// Runtime-only view used to settle an already-detached unit.
-	Detached {
-		feed: Option<InvocationFeed>,
-	},
+	Detached { feed: Option<InvocationFeed> },
 }
 
 /// Lifecycle of a prepared call within its batch.
@@ -759,6 +840,8 @@ enum Unit {
 enum Phase {
 	/// Committed and waiting for the scheduler.
 	Pending,
+	/// Journaled approval prompt open; starts once approved.
+	AwaitingApproval,
 	/// Executing.
 	Running,
 	/// Stop requested; the unit has until the grace expires.
@@ -774,8 +857,14 @@ pub struct PreparedCall {
 	call:         EntryId,
 	cancellation: ToolCancellation,
 	interrupt:    CancellationToken,
+	/// Armed once at admission and polled in place by [`Signals`]; the
+	/// `Notified` inside is `!Unpin` and the call lives in a movable `Vec`,
+	/// so it is pinned on the heap exactly once per running call.
+	interrupted:  Option<Pin<Box<WaitForCancellationFutureOwned>>>,
 	unit:         Unit,
 	events:       Receiver<DispatchEvent>,
+	/// Persistent async view of `events`, polled in place by [`Signals`].
+	stream:       RecvStream<'static, DispatchEvent>,
 	task:         Option<tokio::task::JoinHandle<Result<(), RegistryError>>>,
 	args:         Option<Box<RawValue>>,
 	options:      DispatchOptions,
@@ -785,6 +874,8 @@ pub struct PreparedCall {
 	grace_until:  Option<Instant>,
 	closed:       bool,
 	report:       Option<DispatchReport>,
+	/// Approval prompt this call waits on while `AwaitingApproval`.
+	ticket:       Option<Str>,
 }
 
 impl PreparedCall {
@@ -810,6 +901,12 @@ impl PreparedCall {
 	#[must_use]
 	pub const fn is_committed(&self) -> bool {
 		self.args.is_some()
+	}
+
+	/// Canonical committed arguments, once [`Self::commit`] ran.
+	#[must_use]
+	pub fn args(&self) -> Option<&RawValue> {
+		self.args.as_deref()
 	}
 
 	/// Feeds one streamed argument fragment to the executor as it arrives
@@ -845,9 +942,11 @@ impl PreparedCall {
 		}
 	}
 
-	/// Whether an executor task is still running.
+	/// Whether the call still occupies its scheduling slot: running,
+	/// stopping, or waiting on an approval prompt (ordering holds while the
+	/// host decides).
 	fn is_live(&self) -> bool {
-		matches!(self.phase, Phase::Running | Phase::Interrupting)
+		matches!(self.phase, Phase::Running | Phase::Interrupting | Phase::AwaitingApproval)
 	}
 }
 
@@ -855,6 +954,8 @@ impl Dispatcher {
 	/// Creates a dispatcher over one runtime registry and central policy.
 	#[must_use]
 	pub fn new(registry: Arc<Registry>, policy: DispatchPolicy) -> Self {
+		let jobs = Arc::new(JobBoard::new());
+		jobs.set_output_bound(policy.max_output_bytes);
 		Self {
 			committer: Committer {
 				registry,
@@ -864,9 +965,18 @@ impl Dispatcher {
 			},
 			external: None,
 			session_tools: FastHashMap::default(),
-			jobs: Arc::new(JobBoard::new()),
+			jobs,
 			authority: None,
+			admission: None,
 		}
+	}
+
+	/// Installs the host approval policy consulted before a native call
+	/// starts.
+	#[must_use]
+	pub fn with_tool_admission(mut self, admission: Arc<dyn ToolAdmission>) -> Self {
+		self.admission = Some(admission);
+		self
 	}
 
 	/// Injects the host adapter for worker- and remote-routed tools.
@@ -886,6 +996,7 @@ impl Dispatcher {
 	/// Uses the supplied runtime job index for session tools and rewind work.
 	#[must_use]
 	pub fn with_job_board(mut self, jobs: Arc<JobBoard>) -> Self {
+		jobs.set_output_bound(self.committer.policy.max_output_bytes);
 		self.jobs = jobs;
 		self
 	}
@@ -937,6 +1048,7 @@ impl Dispatcher {
 	) -> Result<PreparedCall, DispatchError> {
 		let interrupt = cancellation.interrupt_token();
 		let (event_tx, events) = flume::unbounded();
+		let stream = events.clone().into_stream();
 		let name = identity.name.clone();
 		if let Some(tool) = self.session_tools.get(&name).cloned() {
 			return Ok(PreparedCall {
@@ -945,8 +1057,10 @@ impl Dispatcher {
 				call,
 				cancellation,
 				interrupt,
+				interrupted: None,
 				unit: Unit::Session(tool),
 				events,
+				stream,
 				task: None,
 				args: None,
 				options: DispatchOptions::default(),
@@ -956,6 +1070,7 @@ impl Dispatcher {
 				grace_until: None,
 				closed: true,
 				report: None,
+				ticket: None,
 			});
 		}
 		let route = self.committer.registry.route(name.as_str())?;
@@ -988,8 +1103,10 @@ impl Dispatcher {
 			call,
 			cancellation,
 			interrupt,
+			interrupted: None,
 			unit,
 			events,
+			stream,
 			task,
 			args: None,
 			options: DispatchOptions::default(),
@@ -999,6 +1116,7 @@ impl Dispatcher {
 			grace_until: None,
 			closed: false,
 			report: None,
+			ticket: None,
 		})
 	}
 
@@ -1029,7 +1147,9 @@ impl Dispatcher {
 			task.abort();
 		}
 		let mut output = std::mem::take(call.output(&self.committer.policy));
-		self.committer.commit_abort(session, &call, abort, &mut output)
+		self
+			.committer
+			.commit_abort(session, &call, abort, &mut output)
 	}
 
 	/// Drives a batch of committed calls to their terminals, journaling every
@@ -1056,8 +1176,9 @@ impl Dispatcher {
 			if calls.iter().all(|call| call.phase == Phase::Settled) {
 				break;
 			}
-			if let Some(index) =
-				calls.iter().position(|call| call.closed && call.task.is_some())
+			if let Some(index) = calls
+				.iter()
+				.position(|call| call.closed && call.task.is_some())
 			{
 				let task = calls[index].task.take().expect("filtered on presence");
 				let joined = task.await;
@@ -1069,7 +1190,7 @@ impl Dispatcher {
 				}
 				let mut terminal = None;
 				while let Ok(event) = call.events.try_recv() {
-					if let Some(report) = self.committer.apply_event(session, call, event)? {
+					if let Some(report) = self.committer.apply_event(session, call, event).await? {
 						terminal = Some(report);
 						break;
 					}
@@ -1104,49 +1225,12 @@ impl Dispatcher {
 				(Some(a), Some(b)) => Some(a.min(b)),
 				(a, b) => a.or(b),
 			};
-			let live = calls
-				.iter()
-				.enumerate()
-				.filter(|(_, call)| call.is_live())
-				.map(|(index, _)| index)
-				.collect::<Vec<_>>();
-			let signal = {
-				let receivers: Vec<
-					Pin<Box<dyn Future<Output = (usize, Option<DispatchEvent>)> + Send + '_>>,
-				> = live
-					.iter()
-					.filter(|index| !calls[**index].closed)
-					.map(|index| {
-						let receiver = calls[*index].events.clone();
-						let index = *index;
-						Box::pin(async move { (index, receiver.recv_async().await.ok()) })
-							as Pin<
-								Box<
-									dyn Future<Output = (usize, Option<DispatchEvent>)> + Send + '_,
-								>,
-							>
-					})
-					.collect();
-				let interrupts: Vec<Pin<Box<dyn Future<Output = usize> + Send + '_>>> = live
-					.iter()
-					.filter(|index| calls[**index].phase == Phase::Running)
-					.map(|index| {
-						let token = calls[*index].interrupt.clone();
-						let index = *index;
-						Box::pin(async move {
-							token.cancelled().await;
-							index
-						}) as Pin<Box<dyn Future<Output = usize> + Send + '_>>
-					})
-					.collect();
-				tokio::select! {
-					biased;
-					() = control_expired(control) => Signal::RunExpired,
-					message = control_recv(control) => Signal::Mailbox(message),
-					index = select_first(interrupts) => Signal::Interrupt(index),
-					() = sleep_until(wake) => Signal::Wake,
-					(index, event) = select_first(receivers) => Signal::Event(index, event),
-				}
+			let signal = tokio::select! {
+				biased;
+				() = control_expired(control) => Signal::RunExpired,
+				message = control_recv(control) => Signal::Mailbox(message),
+				() = sleep_until(wake) => Signal::Wake,
+				signal = Signals { calls: &mut calls } => signal,
 			};
 			match signal {
 				Signal::RunExpired => {
@@ -1165,11 +1249,56 @@ impl Dispatcher {
 							}
 							self.jobs.apply_lifecycle(session, &work).await;
 						},
+						Received::Approved(ticket) => {
+							let approved =
+								ticket.decision.as_ref().is_some_and(|decision| decision.approved);
+							for call in calls.iter_mut().filter(|call| {
+								call.phase == Phase::AwaitingApproval
+									&& call.ticket.as_deref() == Some(ticket.ticket_id.as_str())
+							}) {
+								if approved {
+									// Re-admitted by the next `admit` pass; the ticket stays
+									// recorded so policy is not consulted twice.
+									call.phase = Phase::Pending;
+								} else {
+									let mut output = std::mem::take(call.output(&self.committer.policy));
+									let report = self.committer.commit_abort(
+										session,
+										call,
+										Abort::Skipped { reason: denial_reason(&ticket) },
+										&mut output,
+									)?;
+									call.phase = Phase::Settled;
+									call.report = Some(report);
+								}
+							}
+						},
 						Received::None | Received::Cancelled => {},
+					}
+					// A cancellation while a prompt is open withdraws the
+					// prompt and settles the call as interrupted.
+					for call in calls.iter_mut().filter(|call| {
+						call.phase == Phase::AwaitingApproval && call.interrupt.is_cancelled()
+					}) {
+						if let Some(ticket) = call.ticket.take() {
+							let _ = crate::ApprovalBook::new().withdraw(session, ticket.as_str());
+						}
+						let mut output = std::mem::take(call.output(&self.committer.policy));
+						let report = self.committer.commit_abort(
+							session,
+							call,
+							Abort::Interrupted {
+								reason: Str::new_static("tool execution cancelled while awaiting approval"),
+							},
+							&mut output,
+						)?;
+						call.phase = Phase::Settled;
+						call.report = Some(report);
 					}
 				},
 				Signal::Interrupt(index) => {
 					let call = &mut calls[index];
+					call.interrupted = None;
 					call.phase = Phase::Interrupting;
 					call.grace_until = Some(Instant::now() + policy.interrupt_grace);
 					if let Unit::Native { feed } = &call.unit {
@@ -1215,7 +1344,7 @@ impl Dispatcher {
 				},
 				Signal::Event(index, Some(event)) => {
 					let call = &mut calls[index];
-					if let Some(report) = self.committer.apply_event(session, call, event)? {
+					if let Some(report) = self.committer.apply_event(session, call, event).await? {
 						call.phase = Phase::Settled;
 						call.report = Some(report);
 						if let Some(task) = call.task.take() {
@@ -1230,7 +1359,13 @@ impl Dispatcher {
 		}
 		Ok(calls
 			.into_iter()
-			.map(|call| call.report.expect("settled calls carry a report"))
+			.map(|call| {
+				let mut report = call.report.expect("settled calls carry a report");
+				report.duration = call
+					.started
+					.map_or(Duration::ZERO, |started| started.elapsed());
+				report
+			})
 			.collect())
 	}
 
@@ -1275,12 +1410,82 @@ impl Dispatcher {
 				continue;
 			}
 			let args = call.args.clone().expect("drive requires committed calls");
+			// Host approval policy for native calls (worker/remote calls are
+			// admitted by their environment; session tools are host code).
+			if matches!(call.unit, Unit::Native { .. })
+				&& call.ticket.is_none()
+				&& let Some(admission) = &self.admission
+			{
+				let effects = self
+					.committer
+					.registry
+					.effects(call.identity.name.as_str())
+					.cloned()
+					.unwrap_or_else(|_| Effects::empty());
+				match admission.admit(call.identity.name.as_str(), &effects, &args) {
+					ToolAdmissionVerdict::Allow => {},
+					ToolAdmissionVerdict::Deny(reason) => {
+						let mut output = std::mem::take(call.output(&self.committer.policy));
+						let report = self.committer.commit_abort(
+							session,
+							call,
+							Abort::Skipped { reason },
+							&mut output,
+						)?;
+						call.phase = Phase::Settled;
+						call.report = Some(report);
+						continue;
+					},
+					ToolAdmissionVerdict::Prompt(spec) => {
+						let Some(control) = control else {
+							let mut output = std::mem::take(call.output(&self.committer.policy));
+							let report = self.committer.commit_abort(
+								session,
+								call,
+								Abort::Skipped {
+									reason: Str::new_static(
+										"tool requires approval but no host can answer the prompt",
+									),
+								},
+								&mut output,
+							)?;
+							call.phase = Phase::Settled;
+							call.report = Some(report);
+							continue;
+						};
+						let ticket = control
+							.approvals
+							.file_spec(session, call.call_id.clone(), spec)
+							.map_err(|source| DispatchError::Approval { source })?;
+						if ticket.state == crate::TicketState::Decided {
+							// A session-wide grant in the tree decided it at once.
+							if !ticket.decision.as_ref().is_some_and(|decision| decision.approved) {
+								let mut output = std::mem::take(call.output(&self.committer.policy));
+								let report = self.committer.commit_abort(
+									session,
+									call,
+									Abort::Skipped { reason: denial_reason(&ticket) },
+									&mut output,
+								)?;
+								call.phase = Phase::Settled;
+								call.report = Some(report);
+								continue;
+							}
+						} else {
+							call.ticket = Some(ticket.ticket_id);
+							call.phase = Phase::AwaitingApproval;
+							continue;
+						}
+					},
+				}
+			}
 			call.started = Some(Instant::now());
 			match &mut call.unit {
 				Unit::Native { feed } => {
 					feed
 						.args_committed(Str::new(args.get()))
 						.map_err(|_| DispatchError::InputClosed)?;
+					call.interrupted = Some(Box::pin(call.interrupt.clone().cancelled_owned()));
 					call.phase = Phase::Running;
 				},
 				Unit::External { executor, route, event_tx } => {
@@ -1303,12 +1508,15 @@ impl Dispatcher {
 						}
 						Ok(())
 					}));
+					call.interrupted = Some(Box::pin(call.interrupt.clone().cancelled_owned()));
 					call.phase = Phase::Running;
 				},
 				Unit::Session(tool) => {
 					let tool = Arc::clone(tool);
 					call.phase = Phase::Running;
-					let report = self.run_session_tool(session, call, &tool, args, control).await?;
+					let report = self
+						.run_session_tool(session, call, &tool, args, control)
+						.await?;
 					call.phase = Phase::Settled;
 					call.report = Some(report);
 				},
@@ -1341,6 +1549,7 @@ impl Dispatcher {
 					cancel: BackgroundToolCancellation::from_token(interrupt.clone()),
 					authority: self.authority.as_deref(),
 					control,
+					hooks: self.committer.lifecycle_hooks.as_ref(),
 				},
 				args,
 			);
@@ -1385,9 +1594,17 @@ impl Dispatcher {
 			CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. } => Vec::new(),
 		};
 		let outcome = serde_json::value::to_raw_value(&outcome)?;
+		let staged =
+			self
+				.committer
+				.stage_external(session, call, outcome, parts, is_error, &mut output)?;
+		let staged = self
+			.committer
+			.gate_result(session, call, staged, &mut output)
+			.await?;
 		self
 			.committer
-			.finish_external(session, call, outcome, parts, is_error, &mut output)
+			.commit_staged(session, call, staged, &mut output)
 	}
 
 	/// After a settlement, applies the steering-stop rule: when steering is
@@ -1423,9 +1640,9 @@ impl Dispatcher {
 				call,
 				Abort::Skipped {
 					reason: Str::new_static(
-						"pending steering message. Do not count this skipped result as completed \
-						 work or verification. After the queued message is handled on the next \
-						 step, retry the skipped tool if it is still needed",
+						"pending steering message. Do not count this skipped result as completed work \
+						 or verification. After the queued message is handled on the next step, retry \
+						 the skipped tool if it is still needed",
 					),
 				},
 				&mut output,
@@ -1451,22 +1668,22 @@ impl Dispatcher {
 		let output_sid = output.sid.take();
 		self
 			.committer
-			.commit_terminal(session, call, outcome, prompt, false, &mut output)?;
+			.commit_terminal(session, call, outcome, prompt, false, false, &mut output)?;
 		output.sid = output_sid;
 		let detached = crate::jobs::DetachedCall {
 			committer: self.committer.clone(),
-			identity:  call.identity.clone(),
-			call_id:   call.call_id.clone(),
-			call:      call.call,
-			options:   call.options,
-			events:    call.events.clone(),
-			task:      call.task.take(),
-			feed:      match &call.unit {
+			identity: call.identity.clone(),
+			call_id: call.call_id.clone(),
+			call: call.call,
+			options: call.options,
+			events: call.events.clone(),
+			task: call.task.take(),
+			feed: match &call.unit {
 				Unit::Native { feed } => Some(feed.clone()),
 				Unit::External { .. } | Unit::Session(_) | Unit::Detached { .. } => None,
 			},
 			output,
-			closed:    call.closed,
+			closed: call.closed,
 		};
 		self
 			.jobs
@@ -1477,6 +1694,7 @@ impl Dispatcher {
 			spilled:       None,
 			lines_clamped: 0,
 			detached:      Some(job),
+			duration:      Duration::ZERO,
 		});
 		Ok(())
 	}
@@ -1495,6 +1713,38 @@ enum Signal {
 	Interrupt(usize),
 	Wake,
 	Event(usize, Option<DispatchEvent>),
+}
+
+/// The batch's per-call wake sources, polled in place: a stop request on a
+/// running call (earliest in batch order wins) or the next event of any live
+/// call. Nothing is allocated per poll; each call's stream and armed interrupt
+/// future persist across loop iterations and register their wakers once.
+struct Signals<'a> {
+	calls: &'a mut [PreparedCall],
+}
+
+impl Future for Signals<'_> {
+	type Output = Signal;
+
+	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		for (index, call) in self.calls.iter_mut().enumerate() {
+			if call.phase == Phase::Running
+				&& let Some(interrupted) = call.interrupted.as_mut()
+				&& interrupted.as_mut().poll(cx).is_ready()
+			{
+				return Poll::Ready(Signal::Interrupt(index));
+			}
+		}
+		for (index, call) in self.calls.iter_mut().enumerate() {
+			if !call.is_live() || call.closed {
+				continue;
+			}
+			if let Poll::Ready(event) = Pin::new(&mut call.stream).poll_next(cx) {
+				return Poll::Ready(Signal::Event(index, event));
+			}
+		}
+		Poll::Pending
+	}
 }
 
 async fn control_expired(control: Option<&CallControl>) {
@@ -1518,13 +1768,6 @@ async fn sleep_until(at: Option<Instant>) {
 	}
 }
 
-async fn select_first<T>(futures: Vec<Pin<Box<dyn Future<Output = T> + Send + '_>>>) -> T {
-	if futures.is_empty() {
-		return std::future::pending().await;
-	}
-	select_all(futures).await.0
-}
-
 impl crate::jobs::DetachedCall {
 	pub(crate) fn poll(
 		&mut self,
@@ -1532,30 +1775,46 @@ impl crate::jobs::DetachedCall {
 	) -> Result<Option<DispatchReport>, DispatchError> {
 		let (_, empty_events) = flume::unbounded();
 		let stub = PreparedCall {
-			identity: self.identity.clone(),
-			call_id: self.call_id.clone(),
-			call: self.call,
-			cancellation: ToolCancellation::Background(
-				BackgroundToolCancellation::from_token(CancellationToken::new()),
-			),
-			interrupt: CancellationToken::new(),
-			unit: Unit::Detached { feed: self.feed.clone() },
-			events: empty_events,
-			task: None,
-			args: None,
-			options: self.options,
-			output: None,
-			phase: Phase::Running,
-			started: None,
-			grace_until: None,
-			closed: false,
-			report: None,
+			identity:     self.identity.clone(),
+			call_id:      self.call_id.clone(),
+			call:         self.call,
+			cancellation: ToolCancellation::Background(BackgroundToolCancellation::from_token(
+				CancellationToken::new(),
+			)),
+			interrupt:    CancellationToken::new(),
+			interrupted:  None,
+			unit:         Unit::Detached { feed: self.feed.clone() },
+			stream:       empty_events.clone().into_stream(),
+			events:       empty_events,
+			task:         None,
+			args:         None,
+			options:      self.options,
+			output:       None,
+			phase:        Phase::Running,
+			started:      None,
+			grace_until:  None,
+			closed:       false,
+			report:       None,
+			ticket:       None,
 		};
 		while let Ok(event) = self.events.try_recv() {
-			if let Some(report) =
-				self.committer.apply_event_with(session, &stub, event, &mut self.output)?
+			// A detached settlement lands from the job board's synchronous
+			// poll; its `tool_result` gate ran when the call detached, and the
+			// background terminal commits as-is.
+			if let Some(settled) =
+				self
+					.committer
+					.apply_event_with(session, &stub, event, &mut self.output)?
 			{
 				self.task.take();
+				let report = match settled {
+					Settled::Report(report) => report,
+					Settled::Staged(staged) => {
+						self
+							.committer
+							.commit_staged(session, &stub, staged, &mut self.output)?
+					},
+				};
 				return Ok(Some(report));
 			}
 		}
@@ -1574,17 +1833,111 @@ impl crate::jobs::DetachedCall {
 
 impl Committer {
 	/// Journals one execution-unit event; returns the report when it was the
-	/// terminal.
-	pub(crate) fn apply_event(
+	/// terminal. A completed terminal passes the `tool_result` extension gate
+	/// (annotate, spill, replace) before it is journaled.
+	pub(crate) async fn apply_event(
 		&self,
 		session: &mut Session,
 		call: &mut PreparedCall,
 		event: DispatchEvent,
 	) -> Result<Option<DispatchReport>, DispatchError> {
 		let mut output = std::mem::take(call.output(&self.policy));
-		let result = self.apply_event_with(session, call, event, &mut output);
+		let result = match self.apply_event_with(session, call, event, &mut output) {
+			Ok(Some(Settled::Report(report))) => Ok(Some(report)),
+			Ok(Some(Settled::Staged(staged))) => {
+				match self.gate_result(session, call, staged, &mut output).await {
+					Ok(staged) => self
+						.commit_staged(session, call, staged, &mut output)
+						.map(Some),
+					Err(error) => Err(error),
+				}
+			},
+			Ok(None) => Ok(None),
+			Err(error) => Err(error),
+		};
 		call.output = Some(output);
 		result
+	}
+
+	/// Runs the `tool_result` gate over a staged terminal (pi
+	/// `shared-events.ts` `tool_result`: hooks may annotate, force a spill,
+	/// or replace the payload/fault). The gate fails open: a denial or a
+	/// malformed transform keeps the tool's own terminal.
+	async fn gate_result(
+		&self,
+		session: &mut Session,
+		call: &PreparedCall,
+		mut staged: StagedTerminal,
+		output: &mut OutputStream,
+	) -> Result<StagedTerminal, DispatchError> {
+		let Some(hooks) = &self.lifecycle_hooks else {
+			return Ok(staged);
+		};
+		if !hooks
+			.hook_gate()
+			.subscribed(omp_proto::toolhost::v1::HookEventId::HookEventToolResult)
+		{
+			return Ok(staged);
+		}
+		let outcome: serde_json::Value = serde_json::from_str(staged.outcome.get())?;
+		let kind = outcome_kind(&outcome);
+		let payload = serde_json::json!({
+			"call_id": call.call_id,
+			"target": call_target(call),
+			"outcome": kind,
+			"payload": (kind == "ok").then(|| outcome.clone()),
+			"fault": (kind == "faulted").then(|| outcome.clone()),
+			"abort": (kind == "aborted").then(|| outcome.clone()),
+			"artifact": staged.spilled.as_ref().map(artifact_address),
+			"useless": false,
+			"annotate": [],
+			"spill": serde_json::Value::Null,
+		});
+		let transformed = match hooks
+			.gate(omp_proto::toolhost::v1::HookEventId::HookEventToolResult, payload.clone())
+			.await
+		{
+			Ok(value) => value,
+			Err(error) => {
+				tracing::warn!(?error, call_id = %call.call_id, "tool_result hook failed; keeping the tool terminal");
+				hooks.notify(omp_proto::toolhost::v1::HookEventId::HookEventToolResult, payload)?;
+				return Ok(staged);
+			},
+		};
+		// Observers see the effective outcome after every transform.
+		hooks
+			.notify(omp_proto::toolhost::v1::HookEventId::HookEventToolResult, transformed.clone())?;
+		if let Some(annotations) = transformed
+			.get("annotate")
+			.and_then(serde_json::Value::as_array)
+		{
+			for annotation in annotations {
+				let diag = serde_json::value::to_raw_value(&serde_json::json!({
+					"diag": {
+						"kind": annotation.get("kind").cloned().unwrap_or_else(|| "annotation".into()),
+						"severity": "info",
+						"data": annotation.get("data").cloned().unwrap_or(serde_json::Value::Null),
+						"display": annotation.get("display").and_then(serde_json::Value::as_bool).unwrap_or(true),
+					}
+				}))?;
+				self.commit_update(session, call, diag, output)?;
+			}
+		}
+		let replacement = match kind {
+			"ok" => transformed.get("payload"),
+			"faulted" => transformed.get("fault"),
+			"aborted" => transformed.get("abort"),
+			_ => None,
+		}
+		.filter(|value| !value.is_null() && **value != outcome);
+		if let Some(value) = replacement {
+			staged.outcome = serde_json::value::to_raw_value(value)?;
+		}
+		staged.force_spill = transformed
+			.get("spill")
+			.and_then(serde_json::Value::as_bool)
+			== Some(true);
+		Ok(staged)
 	}
 
 	fn apply_event_with(
@@ -1593,17 +1946,16 @@ impl Committer {
 		call: &PreparedCall,
 		event: DispatchEvent,
 		output: &mut OutputStream,
-	) -> Result<Option<DispatchReport>, DispatchError> {
+	) -> Result<Option<Settled>, DispatchError> {
 		match event {
 			DispatchEvent::Native(Ok(ErasedEv::Update(update))) => {
-				let update = RawValue::from_string(String::from_utf8(update.to_vec()).map_err(
-					|source| {
+				let update =
+					RawValue::from_string(String::from_utf8(update.to_vec()).map_err(|source| {
 						serde_json::Error::io(std::io::Error::new(
 							std::io::ErrorKind::InvalidData,
 							source,
 						))
-					},
-				)?)?;
+					})?)?;
 				self.commit_update(session, call, update, output)?;
 				Ok(None)
 			},
@@ -1617,10 +1969,12 @@ impl Committer {
 				Ok(None)
 			},
 			DispatchEvent::External(ExternalDispatchEvent::Done { outcome, parts, is_error }) => {
-				Ok(Some(self.finish_external(session, call, outcome, parts, is_error, output)?))
+				Ok(Some(Settled::Staged(
+					self.stage_external(session, call, outcome, parts, is_error, output)?,
+				)))
 			},
 			DispatchEvent::External(ExternalDispatchEvent::Aborted(abort)) => {
-				Ok(Some(self.commit_abort(session, call, abort, output)?))
+				Ok(Some(Settled::Report(self.commit_abort(session, call, abort, output)?)))
 			},
 		}
 	}
@@ -1655,7 +2009,7 @@ impl Committer {
 		call: &PreparedCall,
 		outcome: ErasedOutcome,
 		output: &mut OutputStream,
-	) -> Result<DispatchReport, DispatchError> {
+	) -> Result<Settled, DispatchError> {
 		match outcome {
 			ErasedOutcome::Detached(job) => {
 				let raw = detached_outcome(&job)?;
@@ -1665,14 +2019,16 @@ impl Committer {
 					raw,
 					vec![Part::Text { text: sf!("detached job {}", job.id) }],
 					false,
+					false,
 					output,
 				)?;
-				Ok(DispatchReport {
+				Ok(Settled::Report(DispatchReport {
 					is_error:      false,
 					spilled:       None,
 					lines_clamped: 0,
 					detached:      Some(job),
-				})
+					duration:      Duration::ZERO,
+				}))
 			},
 			ErasedOutcome::Done { verdict, useless } => {
 				let caps = PromptCaps::for_tool(
@@ -1695,19 +2051,22 @@ impl Committer {
 							source,
 						))
 					})?)?;
-				self.finish_external(
+				Ok(Settled::Staged(self.stage_external(
 					session,
 					call,
 					raw,
 					projected.parts.to_vec(),
 					projected.is_error,
 					output,
-				)
+				)?))
 			},
 		}
 	}
 
-	fn finish_external(
+	/// Bounds a completed terminal and journals its truncation diagnostic
+	/// without committing the outcome, so the `tool_result` gate can still
+	/// annotate or replace it.
+	fn stage_external(
 		&self,
 		session: &mut Session,
 		call: &PreparedCall,
@@ -1715,7 +2074,7 @@ impl Committer {
 		parts: Vec<Part>,
 		is_error: bool,
 		output: &mut OutputStream,
-	) -> Result<DispatchReport, DispatchError> {
+	) -> Result<StagedTerminal, DispatchError> {
 		let bounded = bound_parts(&parts, call.options, &self.policy)?;
 		let stream_spill = output.close(session)?;
 		let spilled = bounded.spilled.or(stream_spill);
@@ -1730,8 +2089,53 @@ impl Committer {
 			}))?;
 			self.commit_update(session, call, diag, output)?;
 		}
-		self.commit_terminal(session, call, outcome, bounded.parts, is_error, output)?;
-		Ok(DispatchReport { is_error, spilled, lines_clamped: bounded.lines_clamped, detached: None })
+		Ok(StagedTerminal {
+			outcome,
+			parts: bounded.parts,
+			is_error,
+			spilled,
+			lines_clamped: bounded.lines_clamped,
+			force_spill: false,
+		})
+	}
+
+	/// Journals a staged terminal.
+	fn commit_staged(
+		&self,
+		session: &mut Session,
+		call: &PreparedCall,
+		staged: StagedTerminal,
+		output: &mut OutputStream,
+	) -> Result<DispatchReport, DispatchError> {
+		self.commit_terminal(
+			session,
+			call,
+			staged.outcome,
+			staged.parts,
+			staged.is_error,
+			staged.force_spill,
+			output,
+		)?;
+		Ok(DispatchReport {
+			is_error:      staged.is_error,
+			spilled:       staged.spilled,
+			lines_clamped: staged.lines_clamped,
+			detached:      None,
+			duration:      Duration::ZERO,
+		})
+	}
+
+	fn finish_external(
+		&self,
+		session: &mut Session,
+		call: &PreparedCall,
+		outcome: Box<RawValue>,
+		parts: Vec<Part>,
+		is_error: bool,
+		output: &mut OutputStream,
+	) -> Result<DispatchReport, DispatchError> {
+		let staged = self.stage_external(session, call, outcome, parts, is_error, output)?;
+		self.commit_staged(session, call, staged, output)
 	}
 
 	pub(crate) fn commit_abort(
@@ -1796,22 +2200,26 @@ impl Committer {
 		outcome: Box<RawValue>,
 		parts: Vec<Part>,
 		is_error: bool,
+		force_spill: bool,
 		output: &mut OutputStream,
 	) -> Result<(), DispatchError> {
 		output.close(session)?;
 		// The raw outcome is published on the element and travels in every
 		// snapshot and patch: bound it under the same policy as the prompt
 		// projection so an actor never receives an unbounded payload (ADR
-		// 0009). `notrunc` keeps it inline by explicit caller choice.
-		let outcome = if call.options.notrunc || outcome.get().len() <= self.policy.max_output_bytes {
+		// 0009). `notrunc` keeps it inline by explicit caller choice; a
+		// `tool_result` hook may demand the spill regardless.
+		let inline = !force_spill
+			&& (call.options.notrunc || outcome.get().len() <= self.policy.max_output_bytes);
+		let outcome = if inline {
 			outcome
 		} else {
 			let artifact = self.policy.spill.put(outcome.get().as_bytes())?;
 			serde_json::value::to_raw_value(&CallOutcomeDetails::Spilled {
-				blob: ToolBlobRef {
-					hash: Str::new(artifact.to_hex()),
+				blob:     ToolBlobRef {
+					hash:       Str::new(artifact.to_hex()),
 					media_type: Str::new_static("application/json"),
-					byte_len: u64::try_from(outcome.get().len()).unwrap_or(u64::MAX),
+					byte_len:   u64::try_from(outcome.get().len()).unwrap_or(u64::MAX),
 				},
 				byte_len: u64::try_from(outcome.get().len()).unwrap_or(u64::MAX),
 			})?
@@ -1827,6 +2235,48 @@ impl Committer {
 			.publish(KernelEvent::ToolSettled { call_id: call.call_id.clone(), is_error });
 		Ok(())
 	}
+}
+
+/// A completed terminal bounded and diagnosed but not yet journaled.
+pub(crate) struct StagedTerminal {
+	outcome:       Box<RawValue>,
+	parts:         Vec<Part>,
+	is_error:      bool,
+	spilled:       Option<BlobRef>,
+	lines_clamped: u64,
+	force_spill:   bool,
+}
+
+/// What one execution-unit event settled into.
+pub(crate) enum Settled {
+	/// A harness-owned terminal (abort, detachment) already journaled.
+	Report(DispatchReport),
+	/// A tool-produced terminal awaiting the `tool_result` gate.
+	Staged(StagedTerminal),
+}
+
+/// The `CallOutcome` arm name of a serialized outcome.
+fn outcome_kind(outcome: &serde_json::Value) -> &'static str {
+	match outcome.get("kind").and_then(serde_json::Value::as_str) {
+		Some("faulted") => "faulted",
+		Some("args_rejected") => "args_rejected",
+		Some("aborted") => "aborted",
+		_ => "ok",
+	}
+}
+
+/// The `CallTarget` hook payload for one prepared call.
+pub(crate) fn call_target(call: &PreparedCall) -> serde_json::Value {
+	serde_json::json!({
+		"kind": "core",
+		"name": call.identity.name,
+		"rev": format!("{}@{}", call.identity.rev.family, call.identity.rev.n),
+		"args": call
+			.args
+			.as_deref()
+			.and_then(|args| serde_json::from_str::<serde_json::Value>(args.get()).ok())
+			.unwrap_or_else(|| serde_json::json!({})),
+	})
 }
 
 fn detached_outcome(job: &JobRef) -> Result<Box<RawValue>, serde_json::Error> {
@@ -1948,7 +2398,9 @@ fn clamp_lines(text: &str, maximum: usize) -> (String, u64) {
 	(output, clamped)
 }
 
-fn utf8_prefix(text: &str, maximum: usize) -> &str {
+/// The longest prefix of `text` within `maximum` bytes that ends on a char
+/// boundary.
+pub(crate) fn utf8_prefix(text: &str, maximum: usize) -> &str {
 	if text.len() <= maximum {
 		return text;
 	}
@@ -1974,24 +2426,18 @@ mod checkpoint_tests {
 				.expect("session");
 		session.begin_turn().expect("turn");
 		session.user("before", Vec::new()).expect("before");
-		journal_env_event(
-			&mut session,
-			crate::EnvEvent::CheckpointControl {
-				operation: Str::new_static("checkpoint"),
-				payload: Str::new_static(r#"{"token":"checkpoint-1"}"#),
-			},
-		)
+		journal_env_event(&mut session, crate::EnvEvent::CheckpointControl {
+			operation: Str::new_static("checkpoint"),
+			payload:   Str::new_static(r#"{"token":"checkpoint-1"}"#),
+		})
 		.expect("checkpoint");
 		session.user("after", Vec::new()).expect("after");
-		let work = journal_env_event(
-			&mut session,
-			crate::EnvEvent::CheckpointControl {
-				operation: Str::new_static("schedule_rewind"),
-				payload: Str::new_static(
-					r#"{"token":"checkpoint-1","report":"done","receipt":"rewind-1"}"#,
-				),
-			},
-		)
+		let work = journal_env_event(&mut session, crate::EnvEvent::CheckpointControl {
+			operation: Str::new_static("schedule_rewind"),
+			payload:   Str::new_static(
+				r#"{"token":"checkpoint-1","report":"done","receipt":"rewind-1"}"#,
+			),
+		})
 		.expect("schedule")
 		.expect("rewind work");
 		assert!(work.terminate.is_empty());

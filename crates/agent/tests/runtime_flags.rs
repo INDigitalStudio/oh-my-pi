@@ -13,15 +13,16 @@ use support::{
 	ScriptedInference, fresh_session, registry, spec, spec_family, text_script, tool_script,
 };
 
-const INLINE_EDIT: &str = "<SM:EDIT path=\"src/a.rs\">\n<SM:FIND>\nlet x = 1;\n</SM:FIND>\n<SM:PUT>\nlet x = 2;\n</SM:PUT>\n</SM:EDIT>";
+const INLINE_EDIT: &str = "<SM:EDIT path=\"src/a.rs\">\n<SM:FIND>\nlet x = \
+                           1;\n</SM:FIND>\n<SM:PUT>\nlet x = 2;\n</SM:PUT>\n</SM:EDIT>";
 
 fn flags(compaction: bool, goal: bool) -> RuntimeFlags {
 	RuntimeFlags {
-		automatic_compaction: compaction,
-		goal_enabled: goal,
-		autolearn_enabled: false,
+		automatic_compaction:     compaction,
+		goal_enabled:             goal,
+		autolearn_enabled:        false,
 		autolearn_min_tool_calls: 5,
-		recover_inline_edits: true,
+		recover_inline_edits:     true,
 	}
 }
 
@@ -46,7 +47,13 @@ async fn automatic_compaction_flag_controls_director_engagement() {
 			)
 			.await
 			.expect("turn");
-		assert_eq!(session.dom().count("directors director[family=compaction]").expect("selector"), expected);
+		assert_eq!(
+			session
+				.dom()
+				.count("directors director[family=compaction]")
+				.expect("selector"),
+			expected
+		);
 	}
 }
 
@@ -66,11 +73,11 @@ async fn autolearn_flag_and_minimum_schedule_exactly_one_learn_call() {
 		StaticPrompt(sf!("system")),
 	)
 	.with_runtime_flags(RuntimeFlags {
-		automatic_compaction: false,
-		goal_enabled: true,
-		autolearn_enabled: true,
+		automatic_compaction:     false,
+		goal_enabled:             true,
+		autolearn_enabled:        true,
 		autolearn_min_tool_calls: 1,
-		recover_inline_edits: true,
+		recover_inline_edits:     true,
 	});
 	let mut session = fresh_session(&temp.path().join("autolearn.oms"));
 	kernel
@@ -99,11 +106,11 @@ async fn disabled_autolearn_never_schedules_learn_after_the_same_tool_count() {
 		StaticPrompt(sf!("system")),
 	)
 	.with_runtime_flags(RuntimeFlags {
-		automatic_compaction: false,
-		goal_enabled: true,
-		autolearn_enabled: false,
+		automatic_compaction:     false,
+		goal_enabled:             true,
+		autolearn_enabled:        false,
 		autolearn_min_tool_calls: 1,
-		recover_inline_edits: true,
+		recover_inline_edits:     true,
 	});
 	let mut session = fresh_session(&temp.path().join("no-autolearn.oms"));
 	kernel
@@ -133,11 +140,11 @@ async fn inline_recovery(flags_enabled: bool, family: &str, text: &str) -> (usiz
 		StaticPrompt(sf!("system")),
 	)
 	.with_runtime_flags(RuntimeFlags {
-		automatic_compaction: false,
-		goal_enabled: true,
-		autolearn_enabled: false,
+		automatic_compaction:     false,
+		goal_enabled:             true,
+		autolearn_enabled:        false,
 		autolearn_min_tool_calls: 5,
-		recover_inline_edits: flags_enabled,
+		recover_inline_edits:     flags_enabled,
 	});
 	let mut session = fresh_session(&temp.path().join("inline.oms"));
 	kernel
@@ -208,6 +215,12 @@ async fn disabled_goal_is_removed_before_inference_while_enabled_goal_remains() 
 			)
 			.await
 			.expect("turn");
-		assert_eq!(session.dom().count("directors director[family=goal]").expect("selector"), expected);
+		assert_eq!(
+			session
+				.dom()
+				.count("directors director[family=goal]")
+				.expect("selector"),
+			expected
+		);
 	}
 }
