@@ -63,14 +63,19 @@ pub enum GcError {
 /// harmless. Blob references remain embedded in retained entries and are not
 /// rewritten.
 ///
+/// The journal's writer lock is held from the initial read through the
+/// rename, so a live session never keeps appending to an inode that was
+/// unlinked underneath it: a session that has the journal open makes pruning
+/// fail with [`JournalError::Locked`] instead.
+///
 /// # Errors
 ///
-/// Returns a typed error if the source journal is invalid, a retained frame
-/// cannot be encoded, or staging/sync/replacement fails.
+/// Returns a typed error if the source journal is invalid or locked, a
+/// retained frame cannot be encoded, or staging/sync/replacement fails.
 pub fn prune_abandoned(path: impl AsRef<Path>) -> Result<GcReport, GcError> {
 	let path = path.as_ref();
-	let bytes_before = fs::metadata(path)?.len();
 	let (journal, entries) = Journal::open(path)?;
+	let bytes_before = fs::metadata(path)?.len();
 	let retained: Vec<_> = live_chain(&entries).cloned().collect();
 	let entries_before = entries.len();
 	let entries_after = retained.len();
@@ -100,7 +105,9 @@ pub fn prune_abandoned(path: impl AsRef<Path>) -> Result<GcReport, GcError> {
 		staged.set_permissions(permissions)?;
 		staged.write_all(&encoded)?;
 		staged.sync_all()?;
-		drop(journal);
+		// Close the replaceable journal inode (required by Windows), but keep
+		// its stable sidecar lock through rename and parent-directory sync.
+		let _lock = journal.close_for_replace();
 		fs::rename(&staging, path)?;
 		if let Some(parent) = path
 			.parent()

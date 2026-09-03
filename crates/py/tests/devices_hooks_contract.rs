@@ -16,7 +16,57 @@ import omp
 from omp import hooks as hook_module
 from omp._registry import registry
 from omp.devices import _dispatch_device
-from omp.events import spec as event_spec
+from omp.events import EVENT_IDS, spec as event_spec
+
+assert not (hook_module._ROUTABLE_EVENT_NAMES & hook_module._REJECTED_EVENTS.keys())
+assert (
+    hook_module._ROUTABLE_EVENT_NAMES | hook_module._REJECTED_EVENTS.keys()
+) == set(hook_module._EVENT_NAMES)
+assert hook_module._ROUTABLE_EVENT_NAMES == set(EVENT_IDS)
+assert set(hook_module._REJECTED_EVENTS) == {
+    "search_parse",
+    "sandbox_profile",
+    "sandbox_violation",
+    "context_reset",
+}
+for unsupported in hook_module._REJECTED_EVENTS:
+    try:
+        omp.hook(unsupported)
+    except hook_module.UnsupportedEvent as error:
+        assert unsupported in str(error)
+    else:
+        raise AssertionError(f"unsupported event was silently accepted: {unsupported}")
+
+for event_name in ("session_branch", "session_rewind"):
+    try:
+        omp.hook(event_name, phase=omp.HookPhase.TRANSFORM)
+    except hook_module.HookContractError:
+        pass
+    else:
+        raise AssertionError(f"{event_name} accepted an unapplied transform")
+
+branch_payload = hook_module._value_from_wire(
+    event_spec("session_branch").payload,
+    {
+        "at_event": 8,
+        "keep_event": 5,
+        "reason": "rewind",
+        "summarize": True,
+    },
+)
+assert isinstance(branch_payload, omp.SessionBranchEvent)
+assert branch_payload.reason is omp.BranchReason.REWIND
+rewind_payload = hook_module._value_from_wire(
+    event_spec("session_rewind").payload,
+    {
+        "to_event": 5,
+        "restore_workspace": False,
+        "targets": [{"event_index": 8, "keep_event": 5, "text": "discard"}],
+        "dropped_items": 3,
+    },
+)
+assert isinstance(rewind_payload, omp.SessionRewindEvent)
+assert rewind_payload.targets == (omp.RewindTarget(8, 5, "discard"),)
 
 registry.configure_manifest(
     tools=(("dynamic", "integration", 1),),

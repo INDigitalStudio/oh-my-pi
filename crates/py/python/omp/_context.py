@@ -101,6 +101,20 @@ class Context:
             raise LookupError("no active omp invocation context") from error
         return cls.from_scope(scope)
 
+    async def convar(self, name: str) -> object:
+        """Read one live control-plane variable by canonical name."""
+
+        from . import convars
+
+        return await convars.get(name)
+
+    def observe_convar(self, name: str) -> AsyncIterator[object]:
+        """Observe the current value and committed changes to one convar."""
+
+        from . import convars
+
+        return convars.observe(name)
+
     @property
     def root(self) -> WorkspaceUri:
         """Return the primary workspace root."""

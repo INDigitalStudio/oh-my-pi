@@ -147,16 +147,7 @@ registry_module.configure_manifest(
         ),
         executable_declaration("compaction-hook", "hook", "compaction/domain"),
         executable_declaration(
-            "sandbox-profile-hook", "hook", "sandbox_profile/transform"
-        ),
-        executable_declaration(
-            "sandbox-violation-hook", "hook", "sandbox_violation/domain"
-        ),
-        executable_declaration(
             "provider-usage-hook", "hook", "provider_usage/domain"
-        ),
-        executable_declaration(
-            "search-parse-hook", "hook", "search_parse/domain"
         ),
         executable_declaration(
             "models-discover-hook", "hook", "models_discover/domain"
@@ -650,14 +641,14 @@ expect_raises(
     lambda: omp.hook("compaction", phase=omp.HookPhase.REVIEW),
 )
 
-@omp.hook("sandbox_profile", phase=omp.HookPhase.TRANSFORM)
-async def sandbox_profile_hook(event):
-    return None
-
-
-@omp.hook("sandbox_violation")
-async def sandbox_violation_hook(event):
-    return None
+expect_raises(
+    omp.UnsupportedEvent,
+    lambda: omp.hook("sandbox_profile", phase=omp.HookPhase.TRANSFORM),
+)
+expect_raises(
+    omp.UnsupportedEvent,
+    lambda: omp.hook("sandbox_violation"),
+)
 
 # Bash IR pure behavior.
 span_read = omp.Span(start=0, end=3, line=1, column=1)
@@ -1083,11 +1074,11 @@ assert provider_module.SearchPage((search_result,)).results == (search_result,)
 @omp.hook("provider_usage", provider="x")
 def usage_projection(query):
     return None
-@omp.hook("search_parse", provider="x")
-def parse_search(query, response):
-    return (search_result,)
+expect_raises(
+    omp.UnsupportedEvent,
+    lambda: omp.hook("search_parse", provider="x"),
+)
 assert usage_projection.__omp_hooks__[-1].phase == "domain"
-assert parse_search.__omp_hooks__[-1].phase == "domain"
 composed_hook = asyncio.run(
     omp.hooks.dispatch_hook("tool_call", {"call_id": "surface-call"})
 )

@@ -695,6 +695,7 @@ from . import prompts as prompts
 from . import sessions as sessions
 from . import telemetry as telemetry
 from . import context as context
+from . import convars as convars
 from . import policy as policy
 from . import limits as limits
 from . import mcp as mcp
@@ -1754,6 +1755,7 @@ __all__ += (
     "Violation",
     "ViolationKind",
     "context",
+    "convars",
     "limits",
     "policy",
 )

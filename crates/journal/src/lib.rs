@@ -35,10 +35,18 @@ use crate::{
 pub const FILE_EXTENSION: &str = "oms";
 
 /// The single writer for one session journal.
+///
+/// A live `Journal` holds an exclusive advisory lock on a stable sidecar for
+/// its whole lifetime, so two processes (or two owners in one process) can
+/// never append to divergent materializations of one `.oms`, and
+/// [`gc::prune_abandoned`] cannot replace a file another writer is
+/// appending to. Read-only consumers use [`Journal::scan`], which takes no
+/// lock and never truncates.
 #[derive(Debug)]
 pub struct Journal {
 	path:                 PathBuf,
 	file:                 File,
+	_lock:                WriterLock,
 	generator:            MonotonicUlid,
 	ids:                  FastHashSet<EntryId>,
 	entry_count:          usize,
@@ -62,6 +70,7 @@ impl Journal {
 		{
 			fs::create_dir_all(parent)?;
 		}
+		let lock = WriterLock::acquire(&path)?;
 		let file = OpenOptions::new()
 			.create_new(true)
 			.append(true)
@@ -70,6 +79,7 @@ impl Journal {
 		Ok(Self {
 			path,
 			file,
+			_lock: lock,
 			generator: MonotonicUlid::default(),
 			ids: FastHashSet::default(),
 			entry_count: 0,
@@ -88,25 +98,19 @@ impl Journal {
 	/// structure, or invalid branch links.
 	pub fn open(path: impl AsRef<Path>) -> Result<(Self, Vec<Entry>), JournalError> {
 		let path = path.as_ref().to_path_buf();
-		let bytes = fs::read(&path)?;
-		let mut scanner = Scanner::new(&bytes);
-		let mut entries = Vec::new();
-		while let Some(frame) = scanner.next() {
-			entries.push(
-				frame
-					.map_err(|source| JournalError::Frame { source })?
-					.entry,
-			);
-		}
-		let clean_len = scanner.offset();
-		let truncated = bytes.len().saturating_sub(clean_len);
-		validate_history(&entries)?;
-
+		// Lock the stable sidecar before opening the journal. Locking the
+		// journal inode itself is insufficient: GC replaces that inode, and
+		// an opener that raced the rename could otherwise lock and append to
+		// the unlinked predecessor.
+		let lock = WriterLock::acquire(&path)?;
 		let file = OpenOptions::new()
 			.append(true)
 			.read(true)
 			.write(true)
 			.open(&path)?;
+		let bytes = fs::read(&path)?;
+		let (entries, clean_len) = decode_committed(&bytes)?;
+		let truncated = bytes.len().saturating_sub(clean_len);
 		if truncated != 0 {
 			file.set_len(u64::try_from(clean_len).map_err(|_| JournalError::FileTooLarge)?)?;
 			file.sync_data()?;
@@ -122,6 +126,7 @@ impl Journal {
 			Self {
 				path,
 				file,
+				_lock: lock,
 				generator: MonotonicUlid::seeded(floor),
 				ids,
 				entry_count: entries.len(),
@@ -129,6 +134,22 @@ impl Journal {
 			},
 			entries,
 		))
+	}
+
+	/// Reads the committed entries of a journal without taking the writer
+	/// lock or truncating a torn tail.
+	///
+	/// This is the read-only path for session indexes, pickers, and
+	/// renderers of a journal that may be live in another process: it sees
+	/// the committed prefix exactly as a later [`Self::open`] would.
+	///
+	/// # Errors
+	///
+	/// Returns a typed error for I/O, malformed complete frames, invalid
+	/// journal structure, or invalid branch links.
+	pub fn scan(path: impl AsRef<Path>) -> Result<Vec<Entry>, JournalError> {
+		let bytes = fs::read(path)?;
+		decode_committed(&bytes).map(|(entries, _)| entries)
 	}
 
 	/// Appends and durably commits one entry.
@@ -168,6 +189,13 @@ impl Journal {
 	#[must_use]
 	pub const fn recovered_tail_bytes(&self) -> u64 {
 		self.recovered_tail_bytes
+	}
+
+	/// Closes the replaceable data inode while retaining the stable sidecar
+	/// lock. GC uses this immediately before its atomic rename.
+	pub(crate) fn close_for_replace(self) -> WriterLock {
+		let Self { _lock, .. } = self;
+		_lock
 	}
 }
 
@@ -236,9 +264,62 @@ pub enum JournalError {
 	/// The platform cannot represent the journal file length.
 	#[error("journal file length cannot be represented")]
 	FileTooLarge,
+	/// Another writer holds the journal's exclusive lock.
+	#[error("journal {} is locked by another writer", path.display())]
+	Locked {
+		/// Journal file path.
+		path: PathBuf,
+	},
 	/// No larger ULID can be generated.
 	#[error(transparent)]
 	Ulid(#[from] UlidGenerationError),
+}
+
+/// Decodes every complete frame, returning the entries and the byte offset of
+/// the last commit point.
+fn decode_committed(bytes: &[u8]) -> Result<(Vec<Entry>, usize), JournalError> {
+	let mut scanner = Scanner::new(bytes);
+	let mut entries = Vec::new();
+	while let Some(frame) = scanner.next() {
+		entries.push(
+			frame
+				.map_err(|source| JournalError::Frame { source })?
+				.entry,
+		);
+	}
+	let clean_len = scanner.offset();
+	validate_history(&entries)?;
+	Ok((entries, clean_len))
+}
+
+/// Stable sidecar lock shared by journal writers and atomic replacement.
+///
+/// The sidecar is deliberately never deleted: unlinking a lock file allows a
+/// contender to create and lock a new inode while an existing owner still
+/// holds the old one.
+#[derive(Debug)]
+pub(crate) struct WriterLock {
+	_file: File,
+}
+
+impl WriterLock {
+	/// Takes the journal's exclusive advisory lock without blocking.
+	fn acquire(path: &Path) -> Result<Self, JournalError> {
+		let mut name = path.file_name().unwrap_or_default().to_os_string();
+		name.push(".lock");
+		let file = OpenOptions::new()
+			.create(true)
+			.read(true)
+			.write(true)
+			.open(path.with_file_name(name))?;
+		match file.try_lock() {
+			Ok(()) => Ok(Self { _file: file }),
+			Err(fs::TryLockError::WouldBlock) => {
+				Err(JournalError::Locked { path: path.to_path_buf() })
+			},
+			Err(fs::TryLockError::Error(source)) => Err(JournalError::Io(source)),
+		}
+	}
 }
 
 fn validate_history(entries: &[Entry]) -> Result<(), JournalError> {

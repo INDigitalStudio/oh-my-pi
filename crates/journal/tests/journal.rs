@@ -1,6 +1,10 @@
 //! Laws for append, recovery, and branch selection.
 
-use std::fs;
+use std::{
+	env,
+	fs,
+	process::Command,
+};
 
 use omp_core::Str;
 use omp_journal::{
@@ -135,4 +139,76 @@ fn prior_walk_selects_live_chain_and_retains_abandoned() {
 			.collect::<Vec<_>>(),
 		[first.id, second.id]
 	);
+}
+
+/// Subprocess half of the cross-process writer exclusion test.
+#[test]
+#[ignore = "subprocess helper"]
+fn writer_lock_subprocess_helper() {
+	let path = env::var_os("OMP_JOURNAL_LOCK_TEST_PATH").expect("journal test path");
+	let error = Journal::open(path).expect_err("parent process owns the writer lock");
+	assert!(matches!(error, JournalError::Locked { .. }));
+}
+
+/// The writer lock is cross-process, not merely an in-process ownership
+/// convention.
+#[test]
+fn second_process_is_refused_while_the_writer_is_open() {
+	let directory = tempdir().expect("tempdir");
+	let path = directory.path().join("process-locked.oms");
+	let mut journal = Journal::create(&path).expect("create");
+	journal.append(genesis()).expect("genesis");
+	let status = Command::new(env::current_exe().expect("journal test executable"))
+		.args(["--ignored", "--exact", "writer_lock_subprocess_helper"])
+		.env("OMP_JOURNAL_LOCK_TEST_PATH", &path)
+		.status()
+		.expect("run lock contender");
+	assert!(status.success(), "subprocess must observe the held writer lock");
+}
+
+/// One `.oms` has one writer: a second opener (another process, or a second
+/// owner in this one) gets a typed refusal instead of a divergent
+/// materialization, and the lock lifts with the writer.
+#[test]
+fn second_writer_is_refused_while_the_first_is_open() {
+	let directory = tempdir().expect("tempdir");
+	let path = directory.path().join("locked.oms");
+	let mut journal = Journal::create(&path).expect("create");
+	journal.append(genesis()).expect("genesis");
+	let error = Journal::open(&path).expect_err("a live writer excludes a second one");
+	assert!(matches!(error, JournalError::Locked { path: locked } if locked == path));
+	drop(journal);
+	let (_, entries) = Journal::open(&path).expect("the lock lifts with the writer");
+	assert_eq!(entries.len(), 1);
+}
+
+/// `scan` is the read-only view of a possibly-live journal: no lock, no
+/// truncation, and exactly the committed prefix a later `open` would keep.
+#[test]
+fn scan_reads_the_committed_prefix_without_locking_or_truncating() {
+	let directory = tempdir().expect("tempdir");
+	let path = directory.path().join("scan.oms");
+	let mut journal = Journal::create(&path).expect("create");
+	let genesis = journal.append(genesis()).expect("genesis");
+	journal
+		.append(draft(TURN_START, genesis.id))
+		.expect("turn");
+	let scanned = Journal::scan(&path).expect("scan while the writer is live");
+	assert_eq!(scanned.len(), 2);
+	drop(journal);
+	let complete_len = fs::metadata(&path).expect("metadata").len();
+	let mut torn = fs::read(&path).expect("read");
+	torn.extend_from_slice(b"event: stream@1\nid: 01Torn");
+	fs::write(&path, &torn).expect("write torn tail");
+	let scanned = Journal::scan(&path).expect("scan tolerates a torn tail");
+	assert_eq!(scanned.len(), 2);
+	assert_eq!(
+		fs::metadata(&path).expect("metadata").len(),
+		torn.len() as u64,
+		"scan never rewrites the file"
+	);
+	let (opened, entries) = Journal::open(&path).expect("open recovers");
+	assert_eq!(entries.len(), 2);
+	assert_eq!(fs::metadata(&path).expect("metadata").len(), complete_len);
+	drop(opened);
 }

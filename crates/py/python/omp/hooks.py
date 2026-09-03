@@ -33,6 +33,10 @@ class UnknownEvent(OmpError, ValueError):
     """A hook declaration or catalog lookup named no frozen event."""
 
 
+class UnsupportedEvent(OmpError, ValueError):
+    """A known hook name has no typed production route in this build."""
+
+
 class HookContractError(OmpError, ValueError):
     """A hook declaration or decision violates the frozen hook contract."""
 
@@ -338,6 +342,17 @@ _EVENT_NAMES = (
     "mcp_notification", "provider_response", "session_renamed",
 )
 
+_REJECTED_EVENTS = types.MappingProxyType(
+    {
+        "search_parse": "no HookEventId or production search-parser emitter exists",
+        "sandbox_profile": "no HookEventId or production sandbox-profile emitter exists",
+        "sandbox_violation": "no HookEventId or production sandbox-violation emitter exists",
+        "context_reset": "no HookEventId or production context-reset emitter exists",
+    }
+)
+_ROUTABLE_EVENT_NAMES = frozenset(_EVENT_NAMES) - _REJECTED_EVENTS.keys()
+_TRANSFORM_UNSUPPORTED = frozenset({"session_branch", "session_rewind"})
+
 
 @dataclass(frozen=True, slots=True)
 class _HookDeclaration:
@@ -405,6 +420,8 @@ def hook(
 
     if event not in _EVENT_NAMES:
         raise UnknownEvent(f"unknown hook event {event!r}")
+    if reason := _REJECTED_EVENTS.get(event):
+        raise UnsupportedEvent(f"unsupported hook event {event!r}: {reason}")
     if registry.sealed:
         raise LateRegistration("hook declarations are sealed")
     if isinstance(phase, str):
@@ -414,6 +431,10 @@ def hook(
             raise HookContractError(f"unknown hook phase {phase!r}") from error
     if phase is not None and not isinstance(phase, HookPhase):
         raise TypeError("phase must be HookPhase or None")
+    if event in _TRANSFORM_UNSUPPORTED and phase is HookPhase.TRANSFORM:
+        raise HookContractError(
+            f"{event!r} does not support TRANSFORM until Core applies its mutable fields"
+        )
     if event in _DOMAIN_EVENTS:
         if phase is not None:
             raise HookContractError(f"domain event {event!r} does not accept phase")
@@ -1109,5 +1130,5 @@ __all__ = (
     "Deny", "DeviceCall", "HookContractError", "HookDecision", "HookPhase",
     "HostShuttingDown", "LatencyClass", "LateRegistration", "McpCall", "Modify", "OnFailure",
     "PhaseConflict", "PolicyScope", "ReentrancyError", "RequireApproval", "TargetKind",
-    "UNSET", "UnknownEvent", "Unreachable", "When", "dispatch_hook", "hook",
+    "UNSET", "UnknownEvent", "UnsupportedEvent", "Unreachable", "When", "dispatch_hook", "hook",
 )
