@@ -1229,17 +1229,27 @@ fn retry_after_hint(headers: &HeaderMap) -> Option<time::Duration> {
 			continue;
 		};
 		let seconds = if name == "retry-after-ms" {
-			value.trim().parse::<f64>().ok().map(|milliseconds| milliseconds / 1_000.0)
-		} else if let Some(milliseconds) = value.trim().strip_suffix("ms") {
-			milliseconds.trim().parse::<f64>().ok().map(|milliseconds| milliseconds / 1_000.0)
-		} else if let Some(seconds) = value.trim().strip_suffix('s') {
-			seconds.trim().parse::<f64>().ok()
-		} else {
 			value
 				.trim()
 				.parse::<f64>()
 				.ok()
-				.map(|value| if value >= 1_000_000_000.0 { (value - now).max(0.0) } else { value })
+				.map(|milliseconds| milliseconds / 1_000.0)
+		} else if let Some(milliseconds) = value.trim().strip_suffix("ms") {
+			milliseconds
+				.trim()
+				.parse::<f64>()
+				.ok()
+				.map(|milliseconds| milliseconds / 1_000.0)
+		} else if let Some(seconds) = value.trim().strip_suffix('s') {
+			seconds.trim().parse::<f64>().ok()
+		} else {
+			value.trim().parse::<f64>().ok().map(|value| {
+				if value >= 1_000_000_000.0 {
+					(value - now).max(0.0)
+				} else {
+					value
+				}
+			})
 		};
 		let Some(seconds) = seconds.filter(|seconds| seconds.is_finite() && *seconds >= 0.0) else {
 			continue;
@@ -1265,8 +1275,11 @@ fn classify_http_error_with_hint(
 			.as_deref()
 			.is_some_and(is_transient_generation_fault);
 	let (kind, action) = if account_exhausted {
-		let kind =
-			if status == 402 { ErrorKind::PaymentRequired } else { ErrorKind::RateLimited };
+		let kind = if status == 402 {
+			ErrorKind::PaymentRequired
+		} else {
+			ErrorKind::RateLimited
+		};
 		(kind, RetryAction::RotateAccount)
 	} else if let Some(kind) = classified_rejection {
 		(kind, RetryAction::Never)
@@ -1299,9 +1312,10 @@ fn classify_http_error_with_hint(
 		))
 }
 
-/// Pi `USAGE_LIMIT_PATTERN`, `CREDITS_EXHAUSTED_PATTERN`, `SPEND_LIMIT_PATTERN`,
-/// `ACCOUNT_RATE_LIMIT_PATTERN`, and `OPENROUTER_DAILY_FREE_LIMIT_PATTERN`:
-/// wording that names a persistent, account-local cap.
+/// Pi `USAGE_LIMIT_PATTERN`, `CREDITS_EXHAUSTED_PATTERN`,
+/// `SPEND_LIMIT_PATTERN`, `ACCOUNT_RATE_LIMIT_PATTERN`, and
+/// `OPENROUTER_DAILY_FREE_LIMIT_PATTERN`: wording that names a persistent,
+/// account-local cap.
 static USAGE_LIMIT_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
 	regex::Regex::new(concat!(
 		r"(?i)usage.?limit|usage_limit_reached|usage_not_included|limit_reached",
@@ -1628,6 +1642,7 @@ fn decode_stream(
 					},
 				};
 				for frame in frames {
+					capture_debug_frame(&attempt, &frame);
 					capture_http_frame(&capture, ordinal, &frame, &mut capture_remaining);
 					ordinal += 1;
 					let mut events = VecDeque::new();
@@ -1659,6 +1674,7 @@ fn decode_stream(
 				match framer.finish() {
 					Ok(frames) => {
 						for frame in frames {
+							capture_debug_frame(&attempt, &frame);
 							capture_http_frame(&capture, ordinal, &frame, &mut capture_remaining);
 							ordinal += 1;
 							let mut events = VecDeque::new();
@@ -1763,6 +1779,24 @@ fn capture_http_frame(
 ) {
 	let mut capture = capture.lock();
 	capture_frame(&mut capture.frames, ordinal, frame, remaining);
+}
+
+fn capture_debug_frame(attempt: &TransportAttempt, frame: &Frame) {
+	let Frame::Sse(event) = frame else {
+		return;
+	};
+	let mut payload = String::new();
+	if let Some(name) = &event.name {
+		payload.push_str("event: ");
+		payload.push_str(name);
+		payload.push('\n');
+	}
+	for line in String::from_utf8_lossy(&event.data).lines() {
+		payload.push_str("data: ");
+		payload.push_str(line);
+		payload.push('\n');
+	}
+	crate::transport::global_provider_capture().capture(attempt.session.as_deref(), "sse", &payload);
 }
 
 enum ResponseFramer {
@@ -2165,7 +2199,10 @@ mod tests {
 	#[test]
 	fn quota_exhaustion_rotates_accounts_before_status_retry() {
 		for (status, body) in [
-			(429, br#"{"error":{"code":"insufficient_quota","message":"quota exhausted"}}"#.as_slice()),
+			(
+				429,
+				br#"{"error":{"code":"insufficient_quota","message":"quota exhausted"}}"#.as_slice(),
+			),
 			(402, br#"{"error":{"code":"billing","message":"insufficient balance"}}"#.as_slice()),
 		] {
 			assert_eq!(

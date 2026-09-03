@@ -603,7 +603,7 @@ mod tests {
 	use omp_core::ExposeSecret as _;
 	use parking_lot::Mutex;
 
-	use super::{*, super::lease::AuthRejectionKind};
+	use super::{super::lease::AuthRejectionKind, *};
 	use crate::{
 		auth::AuthSpec,
 		id::{AccountId, PrincipalId},
@@ -948,10 +948,9 @@ mod tests {
 			panic!("environment rejection is synchronous");
 		};
 		assert_eq!(rejected.into_inner(), Ok(()));
-		let Either::Left(unknown) = broker.lease(CredentialNeed {
-			spec: AuthSpecId::new("missing"),
-			..need
-		}) else {
+		let Either::Left(unknown) =
+			broker.lease(CredentialNeed { spec: AuthSpecId::new("missing"), ..need })
+		else {
 			panic!("unknown spec is rejected inline");
 		};
 		assert_eq!(unknown.into_inner().map(|_| ()), Err(CredentialError::InvalidSource));

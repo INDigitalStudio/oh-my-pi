@@ -1436,10 +1436,8 @@ pub fn lower_chat(
 	// Pi baseline for `anthropic-messages` is `supportsOutputEffort: true`;
 	// only an explicit rule (Vertex rawPredict) turns the field off.
 	let supports_output_effort = policy.reasoning.supports_output_effort != Some(false);
-	let forced_tool_choice = matches!(
-		body.tool_choice,
-		Some(WireToolChoice::Any { .. } | WireToolChoice::Tool { .. })
-	);
+	let forced_tool_choice =
+		matches!(body.tool_choice, Some(WireToolChoice::Any { .. } | WireToolChoice::Tool { .. }));
 	body.thinking = (!forced_tool_choice)
 		.then(|| {
 			lower_thinking(
@@ -1931,10 +1929,8 @@ fn extend_claude_code_headers(headers: &mut Vec<RequestHeader>, context: &Encode
 		.as_deref()
 		.or_else(|| context.session.map(|session| session.conversation.as_str()))
 	{
-		headers.push(RequestHeader {
-			name:  "x-claude-code-session-id".into(),
-			value: session.into(),
-		});
+		headers
+			.push(RequestHeader { name: "x-claude-code-session-id".into(), value: session.into() });
 	}
 }
 
@@ -3322,8 +3318,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
-	forced_call: None,
-}
+			forced_call:       None,
+		}
 	}
 
 	/// `canonical_chat` forces a named tool; thinking tests need an open tool
@@ -3721,17 +3717,20 @@ mod tests {
 		assert!(unrequested.context_management.is_some());
 
 		let off = resolved_thinking_effort(ThinkingMode::Budget, ThinkingEffort::Off);
-		let switched_off = lower_with_policy(&request, &policy, Some(ThinkingMode::Budget), Some(&off));
+		let switched_off =
+			lower_with_policy(&request, &policy, Some(ThinkingMode::Budget), Some(&off));
 		assert!(matches!(
 			switched_off.thinking,
 			Some(Thinking::Enabled { budget_tokens: 1_024, .. })
 		));
 
-		let adaptive = lower_with_policy(&request, &policy, Some(ThinkingMode::AnthropicAdaptive), None);
+		let adaptive =
+			lower_with_policy(&request, &policy, Some(ThinkingMode::AnthropicAdaptive), None);
 		assert!(matches!(adaptive.thinking, Some(Thinking::Adaptive { .. })));
 
 		// Without the axis nothing changes: no selection means no block.
-		let baseline = lower_with_policy(&request, &WirePolicy::baseline(), Some(ThinkingMode::Budget), None);
+		let baseline =
+			lower_with_policy(&request, &WirePolicy::baseline(), Some(ThinkingMode::Budget), None);
 		assert!(baseline.thinking.is_none());
 	}
 
@@ -3956,10 +3955,8 @@ mod tests {
 	fn call_provider_session_names_the_claude_code_session_without_a_conversation() {
 		// Headless OAuth calls bind no provider conversation; the caller's
 		// session identity must still reach the Claude Code session header.
-		let affinity = CallAffinity {
-			prompt_cache:     None,
-			provider_session: Some(sf!("caller-session")),
-		};
+		let affinity =
+			CallAffinity { prompt_cache: None, provider_session: Some(sf!("caller-session")) };
 		let encoded =
 			encoded_anthropic_with_affinity(CredentialKind::Bearer, &["caller system"], &affinity);
 		let header = encoded

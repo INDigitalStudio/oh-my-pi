@@ -23,9 +23,8 @@ use crate::{
 	answer::{AuthEvent, AuthPrompt, AuthPromptKind},
 	auth::{
 		LoginDriver, OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler,
-		OAuthRefreshFuture,
-		OAuthCustomSpec, OAuthEntropy, OAuthError, OAuthHttpClient, OAuthRefreshSpec, OAuthTokenSet,
-		SystemEntropySource,
+		OAuthCustomSpec, OAuthEntropy, OAuthError, OAuthHttpClient, OAuthRefreshFuture,
+		OAuthRefreshSpec, OAuthTokenSet, SystemEntropySource,
 	},
 	call::AuthInput,
 };
@@ -204,7 +203,9 @@ impl OAuthCustomHandler for GitlabExternalRedirectHandler {
 					OAuthRefreshSpec::TokenEndpoint => {
 						(spec.client.token_url.as_str(), spec.client.token_params.as_slice())
 					},
-					OAuthRefreshSpec::Endpoint { url, parameters } => (url.as_str(), parameters.as_slice()),
+					OAuthRefreshSpec::Endpoint { url, parameters } => {
+						(url.as_str(), parameters.as_slice())
+					},
 				};
 				let redirect_uri = catalog_redirect_uri(spec)?;
 				let fields = [

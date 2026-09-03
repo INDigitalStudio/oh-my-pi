@@ -97,7 +97,8 @@ pub enum Dialect {
 }
 
 impl Dialect {
-	/// Resolves a tool-envelope dialect from catalog-selected stream recovery policy.
+	/// Resolves a tool-envelope dialect from catalog-selected stream recovery
+	/// policy.
 	pub const fn from_markup_pattern(pattern: StreamMarkupHealingPattern) -> Option<Self> {
 		match pattern {
 			StreamMarkupHealingPattern::Kimi => Some(Self::Kimi),

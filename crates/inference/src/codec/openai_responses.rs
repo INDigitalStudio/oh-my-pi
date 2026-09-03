@@ -2848,12 +2848,7 @@ impl OpenAiResponsesCodec {
 								reason: sf!(reason.reason_id()),
 							});
 						}
-						(
-							ResponsesToolKind::Function,
-							Some(projection.schema),
-							projection.strict,
-							None,
-						)
+						(ResponsesToolKind::Function, Some(projection.schema), projection.strict, None)
 					},
 					ToolInputConstraint::JsonSchema { .. } => {
 						(ResponsesToolKind::Custom, None, None, None)
@@ -4088,15 +4083,10 @@ fn canonical_responses_adjustments(
 		};
 		let feature = match field.as_str() {
 			"tools.strict" => FeatureId::new_static("chat.tool.strict"),
-			"response_format.strict" => {
-				FeatureId::new_static("chat.structured_output.strict")
-			},
+			"response_format.strict" => FeatureId::new_static("chat.structured_output.strict"),
 			_ => return Err(encoding_error("responses_strict_adjustment_field")),
 		};
-		canonical.push(Adjustment::Dropped {
-			feature,
-			reason: ReasonId(reason.clone()),
-		});
+		canonical.push(Adjustment::Dropped { feature, reason: ReasonId(reason.clone()) });
 	}
 	Ok(canonical)
 }
@@ -4186,9 +4176,9 @@ impl Codec for OpenAiResponsesCodec {
 			headers.push(header);
 		}
 		Ok(EncodedRequest {
-			operation:   OperationKind::Chat,
-			method:      RequestMethod::Post,
-			uri:         responses_uri(
+			operation: OperationKind::Chat,
+			method: RequestMethod::Post,
+			uri: responses_uri(
 				context
 					.target
 					.expect("chat encoding checked the wire target")
@@ -4196,10 +4186,10 @@ impl Codec for OpenAiResponsesCodec {
 					.base_url
 					.as_str(),
 			),
-			headers:     headers.into_boxed_slice(),
-			body:        BodySource::Bytes(body),
-			framing:     FramingProtocol::Sse,
-			bounds:      SizeBounds {
+			headers: headers.into_boxed_slice(),
+			body: BodySource::Bytes(body),
+			framing: FramingProtocol::Sse,
+			bounds: SizeBounds {
 				request_body: 64 * 1024 * 1024,
 				frame:        16 * 1024 * 1024,
 				response:     256 * 1024 * 1024,
@@ -4240,10 +4230,10 @@ mod tests {
 	use crate::{
 		answer::GenerationEvent,
 		call::{
-			Background, CallAffinity, ChatRequest, ContentPart, Dimensions, ImageFormat,
-			ImageQuality, ImageRequest, MediaInput, Message, NegotiationPolicy, OpaqueJson,
-			OperationCall, ProviderProof, ReasoningRequest, ReasoningVisibility, Role, Sampling,
-			Setting, StructuredOutput, ToolChoice, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
+			Background, CallAffinity, ChatRequest, ContentPart, Dimensions, ImageFormat, ImageQuality,
+			ImageRequest, MediaInput, Message, NegotiationPolicy, OpaqueJson, OperationCall,
+			ProviderProof, ReasoningRequest, ReasoningVisibility, Role, Sampling, Setting,
+			StructuredOutput, ToolChoice, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
 			ToolInputConstraint, ToolResultContent,
 		},
 		catalog::{ProviderId, RouteId},
@@ -4288,8 +4278,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
-	forced_call: None,
-}
+			forced_call:       None,
+		}
 	}
 
 	fn empty_chat_request() -> ChatRequest {
@@ -4302,7 +4292,7 @@ mod tests {
 		});
 		request.tools = Arc::from([]);
 		request
-}
+	}
 
 	fn request_with_tool_result(content: Vec<ToolResultContent>) -> ChatRequest {
 		let mut request = empty_chat_request();
@@ -4317,7 +4307,7 @@ mod tests {
 			name:    None,
 		}]);
 		request
-}
+	}
 
 	fn native_tool_output(
 		kind: ResponsesInputItemKind,
@@ -4347,8 +4337,7 @@ mod tests {
 					.iter()
 					.filter_map(|route| catalog.route(route))
 					.find(|route| {
-						route.provider.as_str() == "openai"
-							&& route.codec.as_str() == "openai-responses"
+						route.provider.as_str() == "openai" && route.codec.as_str() == "openai-responses"
 					})
 					.map(|route| (model, route.clone()))
 			})
@@ -4397,10 +4386,8 @@ mod tests {
 			.expect("embedded Responses wire policy");
 		// No provider conversation is bound: the invocation key must still
 		// reach the wire from the session-independent call affinity.
-		let affinity = CallAffinity {
-			prompt_cache:     Some(sf!("invocation-cache")),
-			provider_session: None,
-		};
+		let affinity =
+			CallAffinity { prompt_cache: Some(sf!("invocation-cache")), provider_session: None };
 		let request_id = RequestId::new("responses-cache-encoding");
 		let context = EncodeContext {
 			request_id: &request_id,
@@ -5147,7 +5134,7 @@ mod tests {
 					"type": "object",
 					"properties": {"query": {"type": "string"}}
 				})),
-				strict: true,
+				strict:     true,
 			})
 		});
 		assert_eq!(encoded.request.tools[0].strict, None);
@@ -5175,10 +5162,13 @@ mod tests {
 						{"type": "object", "properties": {"query": {"type": "string"}}}
 					]
 				})),
-				strict: true,
+				strict:     true,
 			})
 		});
-		let schema = encoded.request.tools[0].parameters.as_ref().expect("schema");
+		let schema = encoded.request.tools[0]
+			.parameters
+			.as_ref()
+			.expect("schema");
 		assert_eq!(encoded.request.tools[0].strict, Some(true));
 		assert!(schema.get("oneOf").is_none());
 		assert!(schema.get("anyOf").is_some());
@@ -5366,7 +5356,7 @@ mod tests {
 			preserve_signatures: true,
 		});
 		request
-}
+	}
 
 	/// Encodes `effort` against a gpt-5-shaped ladder (`minimal..high`, off
 	/// allowed, no `reasoning-disable-mode`) through the planner's resolution.
@@ -6057,8 +6047,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
-	forced_call: None,
-}
+			forced_call:       None,
+		}
 	}
 
 	fn read_call(id: &str, path: &str) -> ContentPart {

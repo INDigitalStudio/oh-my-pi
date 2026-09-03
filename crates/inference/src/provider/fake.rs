@@ -882,6 +882,7 @@ mod tests {
 			deadline: None,
 			budget: ExecutionBudget::default(),
 			session: None,
+			debug_session: None,
 			affinity: Default::default(),
 			response_hooks: Default::default(),
 			attribution: InferenceAttribution::core(),
@@ -908,8 +909,8 @@ mod tests {
 				top_logprobs:      None,
 				safety:            Arc::from([]),
 				negotiation:       NegotiationPolicy::default(),
-	forced_call: None,
-})),
+				forced_call:       None,
+			})),
 			OperationCall::CountTokens(Arc::new(CountTokensRequest {
 				messages: Arc::from([]),
 				tools:    Arc::from([]),

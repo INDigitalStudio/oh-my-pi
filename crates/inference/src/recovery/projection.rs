@@ -3,10 +3,7 @@
 use std::{collections::BTreeMap, io::Cursor};
 
 use bytes::{Bytes, BytesMut};
-use omp_catalog::{
-	id::WirePolicyId,
-	policy::WirePolicy,
-};
+use omp_catalog::{id::WirePolicyId, policy::WirePolicy};
 use omp_core::Str;
 use xutf::BufReadCharsExt as _;
 
@@ -104,16 +101,17 @@ pub struct DialectRecoveryConfig {
 
 impl DialectRecoveryConfig {
 	/// Builds recovery configuration solely from compiled catalog policy.
-	pub fn from_wire_policy(
-		wire_policy: WirePolicyId,
-		policy: &WirePolicy,
-		attempt: u32,
-	) -> Self {
+	pub fn from_wire_policy(wire_policy: WirePolicyId, policy: &WirePolicy, attempt: u32) -> Self {
 		let dialect = policy
 			.streaming
 			.markup_healing_pattern
 			.and_then(Dialect::from_markup_pattern)
-			.or_else(|| policy.reasoning.leaked_healer.and_then(Dialect::from_healer));
+			.or_else(|| {
+				policy
+					.reasoning
+					.leaked_healer
+					.and_then(Dialect::from_healer)
+			});
 		Self {
 			wire_policy,
 			dialect,
@@ -202,10 +200,7 @@ impl<'a> DialectRecoveryPipeline<'a> {
 			if native_selected && matches!(&event, DialectEvent::ToolEnvelope(_)) {
 				continue;
 			}
-			append_batch(
-				&mut output,
-				self.projector.push(ProjectionInput::Dialect(event)),
-			);
+			append_batch(&mut output, self.projector.push(ProjectionInput::Dialect(event)));
 			if output.failure.is_some() {
 				break;
 			}
@@ -799,10 +794,7 @@ mod tests {
 					.expect("configured recovery remains valid"),
 			);
 		}
-		append_batch(
-			&mut output,
-			pipeline.finish().expect("configured recovery finishes"),
-		);
+		append_batch(&mut output, pipeline.finish().expect("configured recovery finishes"));
 		let calls: Vec<_> = output
 			.events
 			.iter()
@@ -823,22 +815,20 @@ mod tests {
 	fn passthrough_and_recovered_blocks_share_one_collision_free_allocator() {
 		let definitions = [definition()];
 		let config = DialectRecoveryConfig {
-			wire_policy: WirePolicyId::new("hermes-wire"),
-			dialect: Some(Dialect::Hermes),
-			attempt: 0,
-			max_block_bytes: 1024,
+			wire_policy:          WirePolicyId::new("hermes-wire"),
+			dialect:              Some(Dialect::Hermes),
+			attempt:              0,
+			max_block_bytes:      1024,
 			max_diagnostic_bytes: 32,
-			tool_limits: ToolAssemblyLimits::default(),
+			tool_limits:          ToolAssemblyLimits::default(),
 		};
 		let mut pipeline = DialectRecoveryPipeline::new(&definitions, config);
-		let thinking = pipeline.push_passthrough(ChatEvent::BlockStarted {
+		let thinking = pipeline
+			.push_passthrough(ChatEvent::BlockStarted { index: 0, kind: BlockKind::Thinking });
+		assert!(matches!(thinking.events.as_slice(), [ChatEvent::BlockStarted {
 			index: 0,
-			kind: BlockKind::Thinking,
-		});
-		assert!(matches!(
-			thinking.events.as_slice(),
-			[ChatEvent::BlockStarted { index: 0, kind: BlockKind::Thinking }]
-		));
+			kind:  BlockKind::Thinking,
+		}]));
 		let pending = pipeline
 			.push_text(Bytes::from_static(
 				br#"<tool_call>{"name":"echo","arguments":{"text":"ok"}}</tool_call>"#,
@@ -850,14 +840,12 @@ mod tests {
 				.iter()
 				.all(|event| event.authorized_tool_call().is_none())
 		);
-		let artifact = pipeline.push_passthrough(ChatEvent::BlockStarted {
+		let artifact = pipeline
+			.push_passthrough(ChatEvent::BlockStarted { index: 1, kind: BlockKind::Artifact });
+		assert!(matches!(artifact.events.as_slice(), [ChatEvent::BlockStarted {
 			index: 1,
-			kind: BlockKind::Artifact,
-		});
-		assert!(matches!(
-			artifact.events.as_slice(),
-			[ChatEvent::BlockStarted { index: 1, kind: BlockKind::Artifact }]
-		));
+			kind:  BlockKind::Artifact,
+		}]));
 		let recovered = pipeline.finish().expect("dialect recovery finishes");
 		assert!(
 			recovered
@@ -871,12 +859,12 @@ mod tests {
 	fn configured_pipeline_keeps_native_channel_authoritative() {
 		let definitions = [definition()];
 		let config = DialectRecoveryConfig {
-			wire_policy: WirePolicyId::new("hermes-wire"),
-			dialect: Some(Dialect::Hermes),
-			attempt: 0,
-			max_block_bytes: 1024,
+			wire_policy:          WirePolicyId::new("hermes-wire"),
+			dialect:              Some(Dialect::Hermes),
+			attempt:              0,
+			max_block_bytes:      1024,
 			max_diagnostic_bytes: 32,
-			tool_limits: ToolAssemblyLimits::default(),
+			tool_limits:          ToolAssemblyLimits::default(),
 		};
 		let mut pipeline = DialectRecoveryPipeline::new(&definitions, config);
 		let leaked = pipeline
@@ -888,13 +876,13 @@ mod tests {
 		let native = [
 			ToolFragment::Start {
 				source_index: 7,
-				id: Some(ToolCallId::new("native")),
-				name: Bytes::from_static(b"echo"),
-				input_kind: ToolInputKind::Json,
+				id:           Some(ToolCallId::new("native")),
+				name:         Bytes::from_static(b"echo"),
+				input_kind:   ToolInputKind::Json,
 			},
 			ToolFragment::ArgumentsDelta {
 				source_index: 7,
-				bytes: Bytes::from_static(br#"{"text":"native"}"#),
+				bytes:        Bytes::from_static(br#"{"text":"native"}"#),
 			},
 			ToolFragment::End { source_index: 7 },
 		];
@@ -928,23 +916,23 @@ mod tests {
 	fn completed_invalid_native_call_is_a_terminal_projection_failure() {
 		let definitions = [definition()];
 		let config = DialectRecoveryConfig {
-			wire_policy: WirePolicyId::new("wire"),
-			dialect: None,
-			attempt: 0,
-			max_block_bytes: 1024,
+			wire_policy:          WirePolicyId::new("wire"),
+			dialect:              None,
+			attempt:              0,
+			max_block_bytes:      1024,
 			max_diagnostic_bytes: 32,
-			tool_limits: ToolAssemblyLimits::default(),
+			tool_limits:          ToolAssemblyLimits::default(),
 		};
 		let mut pipeline = DialectRecoveryPipeline::new(&definitions, config);
 		pipeline.push_native(ToolFragment::Start {
 			source_index: 3,
-			id: None,
-			name: Bytes::from_static(b"undeclared"),
-			input_kind: ToolInputKind::Json,
+			id:           None,
+			name:         Bytes::from_static(b"undeclared"),
+			input_kind:   ToolInputKind::Json,
 		});
 		pipeline.push_native(ToolFragment::ArgumentsDelta {
 			source_index: 3,
-			bytes: Bytes::from_static(b"{}"),
+			bytes:        Bytes::from_static(b"{}"),
 		});
 		let rejected = pipeline.push_native(ToolFragment::End { source_index: 3 });
 		assert_eq!(rejected.failure, Some(ProjectionFailure::ToolAssemblyRejected));
@@ -960,12 +948,12 @@ mod tests {
 	fn configured_dialect_pipeline_fails_at_its_envelope_bound() {
 		let definitions = [definition()];
 		let config = DialectRecoveryConfig {
-			wire_policy: WirePolicyId::new("bounded-wire"),
-			dialect: Some(Dialect::Hermes),
-			attempt: 0,
-			max_block_bytes: 24,
+			wire_policy:          WirePolicyId::new("bounded-wire"),
+			dialect:              Some(Dialect::Hermes),
+			attempt:              0,
+			max_block_bytes:      24,
 			max_diagnostic_bytes: 8,
-			tool_limits: ToolAssemblyLimits::default(),
+			tool_limits:          ToolAssemblyLimits::default(),
 		};
 		let mut pipeline = DialectRecoveryPipeline::new(&definitions, config);
 		let error = pipeline
@@ -973,10 +961,7 @@ mod tests {
 				b"<tool_call>{\"name\":\"echo\",\"arguments\":{\"text\":\"far too long\"}}",
 			))
 			.expect_err("an unterminated envelope must not grow beyond its bound");
-		assert_eq!(
-			error,
-			RecoveryError::LimitExceeded { stage: "tag-scanner", limit: 24 }
-		);
+		assert_eq!(error, RecoveryError::LimitExceeded { stage: "tag-scanner", limit: 24 });
 	}
 
 	#[test]

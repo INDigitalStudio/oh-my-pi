@@ -734,8 +734,10 @@ pub fn credential_ready<'a, T: Send + 'a>(value: T) -> CredentialFuture<'a, T> {
 /// Secret-isolating credential acquisition and rejection boundary.
 pub trait CredentialSource: Send + Sync {
 	/// Acquires one opaque credential generation.
-	fn lease(&self, need: CredentialNeed)
-	-> CredentialFuture<'_, Result<CredentialLease, CredentialError>>;
+	fn lease(
+		&self,
+		need: CredentialNeed,
+	) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>>;
 
 	/// Explicitly refreshes a renewable credential, then leases the resulting
 	/// generation once.

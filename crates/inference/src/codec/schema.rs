@@ -1,4 +1,5 @@
-//! Provider-dialect JSON Schema normalization for OpenAI-compatible strict modes.
+//! Provider-dialect JSON Schema normalization for OpenAI-compatible strict
+//! modes.
 
 use serde_json::{Map, Value};
 
@@ -32,17 +33,18 @@ impl StrictFallbackReason {
 /// Schema and strict flag after one route-selected dialect projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SchemaProjection {
-	pub(crate) schema: Value,
+	pub(crate) schema:   Value,
 	/// `None` means the route must not receive a `strict` field.
-	pub(crate) strict: Option<bool>,
+	pub(crate) strict:   Option<bool>,
 	pub(crate) fallback: Option<StrictFallbackReason>,
 }
 
-/// Normalizes a schema once for the selected provider dialect and strict capability.
+/// Normalizes a schema once for the selected provider dialect and strict
+/// capability.
 ///
-/// Unknown capability is deliberately unsupported (ADR 0017). A strict schema that
-/// cannot be represented without changing its accepted values is sent non-strict
-/// with a typed fallback reason (ADR 0021).
+/// Unknown capability is deliberately unsupported (ADR 0017). A strict schema
+/// that cannot be represented without changing its accepted values is sent
+/// non-strict with a typed fallback reason (ADR 0021).
 pub(crate) fn normalize_schema(
 	schema: &Value,
 	requested_strict: bool,
@@ -52,8 +54,8 @@ pub(crate) fn normalize_schema(
 	let dialect_schema = normalize_dialect(schema, dialect);
 	if strict_capability != Some(true) {
 		return SchemaProjection {
-			schema: dialect_schema,
-			strict: None,
+			schema:   dialect_schema,
+			strict:   None,
 			fallback: requested_strict.then_some(StrictFallbackReason::Unsupported),
 		};
 	}
@@ -63,8 +65,8 @@ pub(crate) fn normalize_schema(
 	match enforce_strict(&dialect_schema) {
 		Some(schema) => SchemaProjection { schema, strict: Some(true), fallback: None },
 		None => SchemaProjection {
-			schema: dialect_schema,
-			strict: Some(false),
+			schema:   dialect_schema,
+			strict:   Some(false),
 			fallback: Some(StrictFallbackReason::Unrepresentable),
 		},
 	}
@@ -90,9 +92,18 @@ fn normalize_responses_node(value: &Value) -> Value {
 			"properties" | "patternProperties" | "dependentSchemas" | "$defs" | "definitions" => {
 				normalize_schema_map(child)
 			},
-			"items" | "additionalItems" | "contains" | "contentSchema" | "propertyNames"
-			| "if" | "then" | "else" | "not" | "additionalProperties"
-			| "unevaluatedItems" | "unevaluatedProperties" => normalize_responses_node(child),
+			"items"
+			| "additionalItems"
+			| "contains"
+			| "contentSchema"
+			| "propertyNames"
+			| "if"
+			| "then"
+			| "else"
+			| "not"
+			| "additionalProperties"
+			| "unevaluatedItems"
+			| "unevaluatedProperties" => normalize_responses_node(child),
 			"anyOf" | "allOf" | "prefixItems" => normalize_schema_array(child),
 			_ => child.clone(),
 		};
@@ -203,8 +214,8 @@ fn has_unrepresentable_open_map(value: &Value) -> bool {
 			"properties" | "dependentSchemas" | "$defs" | "definitions" => child
 				.as_object()
 				.is_none_or(|schemas| schemas.values().any(has_unrepresentable_open_map)),
-			"items" | "additionalItems" | "contains" | "contentSchema" | "propertyNames"
-			| "if" | "then" | "else" | "not" => has_unrepresentable_open_map(child),
+			"items" | "additionalItems" | "contains" | "contentSchema" | "propertyNames" | "if"
+			| "then" | "else" | "not" => has_unrepresentable_open_map(child),
 			"anyOf" | "allOf" | "oneOf" | "prefixItems" => child
 				.as_array()
 				.is_none_or(|schemas| schemas.iter().any(has_unrepresentable_open_map)),
@@ -296,7 +307,9 @@ fn strict_node(value: &Value) -> Option<Value> {
 	}
 	if output.get("type").is_none()
 		&& output.get("$ref").is_none()
-		&& !["anyOf", "allOf", "oneOf"].iter().any(|key| output.get(*key).is_some_and(Value::is_array))
+		&& !["anyOf", "allOf", "oneOf"]
+			.iter()
+			.any(|key| output.get(*key).is_some_and(Value::is_array))
 	{
 		let inferred = output.get("enum").and_then(infer_primitive_enum_type);
 		if let Some(kind) = inferred {
@@ -330,7 +343,11 @@ fn seal_object(
 		};
 		strict_properties.insert(name, schema);
 	}
-	let required = strict_properties.keys().cloned().map(Value::String).collect();
+	let required = strict_properties
+		.keys()
+		.cloned()
+		.map(Value::String)
+		.collect();
 	object.insert("properties".into(), Value::Object(strict_properties));
 	object.insert("required".into(), Value::Array(required));
 	object.insert("additionalProperties".into(), Value::Bool(false));
@@ -386,7 +403,10 @@ fn infer_primitive_enum_type(value: &Value) -> Option<&'static str> {
 	let values = value.as_array()?;
 	let first = values.first()?;
 	let kind = primitive_type(first)?;
-	values.iter().all(|value| primitive_type(value) == Some(kind)).then_some(kind)
+	values
+		.iter()
+		.all(|value| primitive_type(value) == Some(kind))
+		.then_some(kind)
 }
 
 fn primitive_type(value: &Value) -> Option<&'static str> {
@@ -422,11 +442,12 @@ mod tests {
 		assert_eq!(projection.strict, Some(true));
 		assert_eq!(projection.schema["additionalProperties"], false);
 		assert_eq!(projection.schema["required"], serde_json::json!(["required", "optional"]));
-		assert!(projection.schema["properties"]["required"].get("pattern").is_none());
-		assert_eq!(
-			projection.schema["properties"]["optional"]["anyOf"][1]["type"],
-			"null"
+		assert!(
+			projection.schema["properties"]["required"]
+				.get("pattern")
+				.is_none()
 		);
+		assert_eq!(projection.schema["properties"]["optional"]["anyOf"][1]["type"], "null");
 		assert_eq!(projection.schema["properties"]["optional"]["description"], "maybe");
 	}
 

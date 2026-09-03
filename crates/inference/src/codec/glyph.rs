@@ -510,8 +510,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            sync::Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
-	forced_call: None,
-};
+			forced_call:       None,
+		};
 		let operation = OperationCall::Chat(sync::Arc::new(request));
 		let OperationCall::Chat(encoded) = encode_operation(&operation).expect("active codec") else {
 			unreachable!()

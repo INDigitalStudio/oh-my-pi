@@ -102,7 +102,7 @@ pub fn premium_requests_millionths(
 pub struct CopilotDynamics {
 	/// `X-Initiator`, `X-Interaction-Type`, and `Copilot-Vision-Request` when
 	/// images are present.
-	pub headers: Vec<RequestHeader>,
+	pub headers:                     Vec<RequestHeader>,
 	/// Premium requests billed to this attempt.
 	pub premium_requests_millionths: u64,
 }
@@ -113,7 +113,8 @@ pub fn dynamics(
 	configured: &[RequestHeader],
 	declared: Option<PremiumMultiplier>,
 ) -> CopilotDynamics {
-	let initiator = initiator_override(configured).unwrap_or_else(|| infer_initiator(&request.messages));
+	let initiator =
+		initiator_override(configured).unwrap_or_else(|| infer_initiator(&request.messages));
 	let tag: &'static str = initiator.into();
 	let mut headers = Vec::with_capacity(3);
 	headers.push(RequestHeader::new(INITIATOR_HEADER, tag));
@@ -121,7 +122,10 @@ pub fn dynamics(
 	if has_vision_input(&request.messages) {
 		headers.push(RequestHeader::new(VISION_HEADER, "true"));
 	}
-	CopilotDynamics { headers, premium_requests_millionths: premium_requests_millionths(initiator, declared) }
+	CopilotDynamics {
+		headers,
+		premium_requests_millionths: premium_requests_millionths(initiator, declared),
+	}
 }
 
 const _: () = assert!(Usage::PREMIUM_REQUEST_SCALE == PremiumMultiplier::SCALE);
@@ -223,18 +227,28 @@ mod tests {
 		assert_eq!(premium_requests_millionths(CopilotInitiator::User, None), 1_000_000);
 		// Free plan: a 0× model still burns one request.
 		assert_eq!(
-			premium_requests_millionths(CopilotInitiator::User, Some(PremiumMultiplier::from_millionths(0))),
+			premium_requests_millionths(
+				CopilotInitiator::User,
+				Some(PremiumMultiplier::from_millionths(0))
+			),
 			1_000_000
 		);
 		assert_eq!(
-			premium_requests_millionths(CopilotInitiator::User, Some(PremiumMultiplier::from_millionths(3_000_000))),
+			premium_requests_millionths(
+				CopilotInitiator::User,
+				Some(PremiumMultiplier::from_millionths(3_000_000))
+			),
 			3_000_000
 		);
 	}
 
 	#[test]
 	fn dynamics_tag_the_wire_and_honor_a_configured_initiator() {
-		let user_turn = dynamics(&chat(vec![text(Role::User, "hi")]), &[], Some(PremiumMultiplier::from_millionths(330_000)));
+		let user_turn = dynamics(
+			&chat(vec![text(Role::User, "hi")]),
+			&[],
+			Some(PremiumMultiplier::from_millionths(330_000)),
+		);
 		assert_eq!(user_turn.headers, vec![
 			RequestHeader::new("X-Initiator", "user"),
 			RequestHeader::new("X-Interaction-Type", "conversation-user"),
@@ -244,7 +258,10 @@ mod tests {
 		let configured = [RequestHeader::new("x-initiator", "Agent")];
 		let overridden = dynamics(&chat(vec![text(Role::User, "hi")]), &configured, None);
 		assert_eq!(overridden.headers[0], RequestHeader::new("X-Initiator", "agent"));
-		assert_eq!(overridden.headers[1], RequestHeader::new("X-Interaction-Type", "conversation-agent"));
+		assert_eq!(
+			overridden.headers[1],
+			RequestHeader::new("X-Interaction-Type", "conversation-agent")
+		);
 		assert_eq!(overridden.premium_requests_millionths, 0);
 
 		let bogus = [RequestHeader::new("X-Initiator", "robot")];

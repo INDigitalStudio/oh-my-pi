@@ -208,6 +208,7 @@ fn request(
 		response_hooks: Default::default(),
 		attempt: TransportAttempt {
 			request_id:          RequestId::new("request"),
+			session:             None,
 			provider:            ProviderId::new("provider"),
 			model:               Some(omp_catalog::ModelKey::new("model")),
 			api:                 sf!("test"),

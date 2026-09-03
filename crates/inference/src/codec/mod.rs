@@ -55,8 +55,8 @@ pub mod openai_embedding;
 pub mod openai_media;
 pub mod openai_realtime;
 pub mod openai_responses;
-pub(crate) mod schema;
 pub mod provider_hooks;
+pub(crate) mod schema;
 pub use provider_hooks::{
 	ModelsDiscoverHookPage, ModelsDiscoverHookRequest, ProviderHookCredential, ProviderHookError,
 	ProviderHookObserver, ProviderLoginHookRequest, ProviderRefreshHookRequest,
@@ -993,6 +993,8 @@ impl fmt::Debug for Cancellation {
 pub struct TransportAttempt {
 	/// Logical request identity.
 	pub request_id:          RequestId,
+	/// Durable conversation/session identity for private debug capture.
+	pub session:             Option<Str>,
 	/// Provider selected for this attempt.
 	pub provider:            ProviderId,
 	/// Normalized model selected for this attempt.

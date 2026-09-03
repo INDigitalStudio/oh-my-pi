@@ -125,12 +125,11 @@ impl RawProviderCapture {
 	pub fn capture(&self, session: Option<&str>, event: &str, payload: &str) -> CapturedFrame {
 		let bounded = trim_wire_text(payload, self.frame_bytes);
 		let mut state = self.inner.lock();
-		let payload = Str::new(
-			state
-				.redactor
-				.as_mut()
-				.map_or_else(|| "[REDACTED]".to_owned(), |redactor| redactor.redact(&bounded)),
-		);
+		let payload =
+			Str::new(state.redactor.as_mut().map_or_else(
+				|| "[REDACTED]".to_owned(),
+				|redactor| redact_payload(&bounded, redactor),
+			));
 		let frame = CapturedFrame {
 			sequence: state.next_sequence,
 			session: session.map(Str::new),
@@ -195,4 +194,77 @@ impl RawProviderCapture {
 
 fn subscriber_matches(filter: Option<&str>, frame: Option<&str>) -> bool {
 	filter.is_none() || filter == frame
+}
+
+fn redact_payload(payload: &str, redactor: &mut SecretRedactor) -> String {
+	let masked = redactor.redact(payload);
+	let mut output = String::with_capacity(masked.len());
+	for segment in masked.split_inclusive('\n') {
+		let (line, newline) = segment
+			.strip_suffix('\n')
+			.map_or((segment, ""), |line| (line, "\n"));
+		let Some(json) = line.strip_prefix("data: ") else {
+			output.push_str(line);
+			output.push_str(newline);
+			continue;
+		};
+		let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json) else {
+			output.push_str(line);
+			output.push_str(newline);
+			continue;
+		};
+		redact_json(&mut value);
+		output.push_str("data: ");
+		output
+			.push_str(&serde_json::to_string(&value).unwrap_or_else(|_| "\"[REDACTED]\"".to_owned()));
+		output.push_str(newline);
+	}
+	output
+}
+
+fn redact_json(value: &mut serde_json::Value) {
+	match value {
+		serde_json::Value::Array(values) => {
+			for value in values {
+				redact_json(value);
+			}
+		},
+		serde_json::Value::Object(object) => {
+			for (key, value) in object {
+				let key = key.to_ascii_lowercase();
+				if ["token", "secret", "password", "credential", "authorization", "cookie", "api_key"]
+					.iter()
+					.any(|sensitive| key.contains(sensitive))
+				{
+					*value = serde_json::Value::String("[REDACTED]".to_owned());
+				} else {
+					redact_json(value);
+				}
+			}
+		},
+		_ => {},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn capture_is_bounded_redacted_and_session_scoped() {
+		let capture = RawProviderCapture::new(2, 256, 1);
+		let alpha = capture.subscribe(Some("alpha"));
+		capture.capture(Some("alpha"), "sse", "data: {\"token\":\"sk-or-v1-secretsecretsecret\"}");
+		capture.capture(Some("beta"), "sse", "data: beta");
+		capture.capture(Some("alpha"), "sse", "data: latest");
+
+		let snapshot = capture.snapshot(Some("alpha"));
+		assert_eq!(snapshot.frames.len(), 1, "oldest alpha frame was evicted globally");
+		assert_eq!(snapshot.frames[0].payload, "data: latest");
+		assert_eq!(snapshot.summary.evicted, 1);
+
+		let delivered = alpha.try_recv().expect("matching session delivery");
+		assert!(!delivered.payload.contains("sk-or-v1-secretsecretsecret"));
+		assert!(alpha.try_recv().is_err(), "foreign session is never delivered");
+	}
 }

@@ -2,8 +2,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	fmt,
-	str,
+	fmt, str,
 	sync::Arc,
 	time,
 };
@@ -112,23 +111,23 @@ impl InlineToolDescriptorsMode {
 #[derive(Clone, Debug, Default)]
 pub struct GoogleRequestOptions {
 	/// Existing Google cached-content resource name.
-	pub cached_content:                  Option<Str>,
+	pub cached_content: Option<Str>,
 	/// Explicit safety policy. An empty list means no safetySettings field.
-	pub safety_settings:                 Vec<GoogleSafetySetting>,
+	pub safety_settings: Vec<GoogleSafetySetting>,
 	/// Explicit output modalities.
-	pub response_modalities:             Vec<Str>,
+	pub response_modalities: Vec<Str>,
 	/// Whether the Google Search hosted tool is enabled.
-	pub google_search:                   bool,
+	pub google_search: bool,
 	/// Whether the code-execution hosted tool is enabled.
-	pub code_execution:                  bool,
+	pub code_execution: bool,
 	/// Selected wire identity required whenever historical continuation proofs
 	/// are present.
-	pub proof_scope:                     Option<GoogleProofScope>,
+	pub proof_scope: Option<GoogleProofScope>,
 	/// Whether assistant reasoning without a continuation proof is omitted from
 	/// the wire request instead of sent as an unsigned thought part.
-	pub drop_unsigned_reasoning:         bool,
+	pub drop_unsigned_reasoning: bool,
 	/// Whether function calls and results carry their canonical call ID.
-	pub supports_function_part_id:       Option<bool>,
+	pub supports_function_part_id: Option<bool>,
 	/// Whether every unsigned historical function call carries Google's
 	/// validation bypass sentinel.
 	pub requires_skip_thought_signature: bool,
@@ -136,16 +135,16 @@ pub struct GoogleRequestOptions {
 	/// bypass sentinel when it is unsigned; later unsigned calls stay bare.
 	pub requires_skip_thought_signature_on_first_function_call: bool,
 	/// Whether tool-result media is nested in `functionResponse.parts`.
-	pub multimodal_function_response:    Option<bool>,
+	pub multimodal_function_response: Option<bool>,
 	/// Whether image inputs are replaced by the non-vision placeholder.
-	pub strip_image_input:               bool,
+	pub strip_image_input: bool,
 	/// Whether function declarations use CCA's legacy `parameters` key.
-	pub cca_legacy_parameters_schema:    Option<bool>,
+	pub cca_legacy_parameters_schema: Option<bool>,
 	/// Legacy typed remote-file substitutions keyed by `(message index, part
 	/// index)`.
-	pub remote_files:                    BTreeMap<(usize, usize), GoogleFileData>,
+	pub remote_files: BTreeMap<(usize, usize), GoogleFileData>,
 	/// Inline descriptor optimization mode.
-	pub inline_tool_descriptors:         InlineToolDescriptorsMode,
+	pub inline_tool_descriptors: InlineToolDescriptorsMode,
 }
 
 /// One explicit Google harm-policy entry.
@@ -1861,23 +1860,23 @@ impl GoogleUsageMetadata {
 	/// Projects Google counters into dimensioned canonical usage.
 	pub const fn canonical(self) -> Usage {
 		Usage {
-			input_tokens:       self
+			input_tokens: self
 				.prompt_token_count
 				.saturating_sub(self.cached_content_token_count),
-			output_tokens:      self
+			output_tokens: self
 				.candidates_token_count
 				.saturating_add(self.thoughts_token_count),
-			reasoning_tokens:   self.thoughts_token_count,
-			cache_read_tokens:  self.cached_content_token_count,
+			reasoning_tokens: self.thoughts_token_count,
+			cache_read_tokens: self.cached_content_token_count,
 			cache_write_tokens: 0,
 			cache_write_1h_tokens: 0,
-			images:             0,
-			audio_input_ms:     0,
-			audio_output_ms:    0,
-			video_ms:           0,
-			search_calls:       0,
+			images: 0,
+			audio_input_ms: 0,
+			audio_output_ms: 0,
+			video_ms: 0,
+			search_calls: 0,
 			premium_requests_millionths: 0,
-			source:             UsageSource::Provider,
+			source: UsageSource::Provider,
 		}
 	}
 }
@@ -2473,8 +2472,8 @@ fn encode_google_count_tokens(
 		top_logprobs:      None,
 		safety:            Arc::from([]),
 		negotiation:       Default::default(),
-	forced_call: None,
-};
+		forced_call:       None,
+	};
 	let projection = codec
 		.project(&chat, &GoogleRequestOptions {
 			proof_scope: Some(GoogleProofScope {
@@ -2860,7 +2859,9 @@ fn google_stream_uri(
 		},
 		GoogleEndpointKind::Vertex if api_key => {
 			let version = vertex_version_prefix(base);
-			format!("{base}{version}/publishers/google/models/{model}{GENERATIVE_LANGUAGE_STREAM_PATH}")
+			format!(
+				"{base}{version}/publishers/google/models/{model}{GENERATIVE_LANGUAGE_STREAM_PATH}"
+			)
 		},
 		GoogleEndpointKind::Vertex => {
 			let project = project.ok_or_else(|| {
@@ -3360,8 +3361,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       Default::default(),
-	forced_call: None,
-}
+			forced_call:       None,
+		}
 	}
 
 	fn tool_call_message() -> Message {
@@ -3527,7 +3528,13 @@ mod tests {
 		assert_eq!(parts.len(), 3);
 		assert!(parts.iter().all(|part| part.thought_signature.is_none()));
 		assert_eq!(parts[0].text.as_deref(), Some("plan"));
-		assert_eq!(parts[2].function_call.as_ref().map(|call| call.name.as_str()), Some("read"));
+		assert_eq!(
+			parts[2]
+				.function_call
+				.as_ref()
+				.map(|call| call.name.as_str()),
+			Some("read")
+		);
 		assert_eq!(projection.adjustments, [GoogleAdjustment::new_static(
 			FOREIGN_SIGNATURE_FEATURE,
 			FOREIGN_SIGNATURE_REASON
@@ -3544,9 +3551,9 @@ mod tests {
 			.find(|route| route.codec.as_str() == "google-genai")
 			.expect("Google GenerateContent route");
 		let target = WireTarget {
-			route: route.id.clone(),
-			codec: route.codec.clone(),
-			endpoint: route.endpoint.clone(),
+			route:      route.id.clone(),
+			codec:      route.codec.clone(),
+			endpoint:   route.endpoint.clone(),
 			wire_model: omp_catalog::WireModelId::new("gemini-2.5-flash"),
 		};
 		let request_id = RequestId::new("gemini-foreign-proof");
@@ -3561,13 +3568,10 @@ mod tests {
 		let encoded = GeminiCodec::generative_language(None)
 			.encode(&context, &OperationCall::Chat(Arc::new(request)))
 			.expect("foreign signatures omit on the live codec path");
-		assert_eq!(
-			encoded.adjustments,
-			[Adjustment::Dropped {
-				feature: FeatureId::new_static(FOREIGN_SIGNATURE_FEATURE),
-				reason: ReasonId::new_static(FOREIGN_SIGNATURE_REASON),
-			}],
-		);
+		assert_eq!(encoded.adjustments, [Adjustment::Dropped {
+			feature: FeatureId::new_static(FOREIGN_SIGNATURE_FEATURE),
+			reason:  ReasonId::new_static(FOREIGN_SIGNATURE_REASON),
+		}],);
 	}
 
 	#[test]
@@ -4282,8 +4286,8 @@ mod tests {
 					top_logprobs:      None,
 					safety:            Arc::from([]),
 					negotiation:       Default::default(),
-	forced_call: None,
-},
+					forced_call:       None,
+				},
 				&GoogleRequestOptions::default(),
 				Some(&policy),
 				Some(&selection),
@@ -5095,10 +5099,7 @@ mod tests {
 			..EncodeContext::default()
 		};
 		let chat = GeminiCodec::vertex(None)
-			.encode(
-				&api_key_context,
-				&OperationCall::Chat(Arc::new(empty_chat_request())),
-			)
+			.encode(&api_key_context, &OperationCall::Chat(Arc::new(empty_chat_request())))
 			.expect("API-key Vertex chat uses Express mode");
 		assert_eq!(
 			chat.uri.as_str(),
@@ -5109,7 +5110,7 @@ mod tests {
 				&api_key_context,
 				&OperationCall::CountTokens(Arc::new(CountTokensRequest {
 					messages: Arc::from([]),
-					tools: Arc::from([]),
+					tools:    Arc::from([]),
 					accuracy: crate::call::CountAccuracy::Exact,
 				})),
 			)
@@ -5134,10 +5135,7 @@ mod tests {
 			..EncodeContext::default()
 		};
 		let bearer = GeminiCodec::vertex(None)
-			.encode(
-				&bearer_context,
-				&OperationCall::Chat(Arc::new(empty_chat_request())),
-			)
+			.encode(&bearer_context, &OperationCall::Chat(Arc::new(empty_chat_request())))
 			.expect("ADC Vertex chat remains project scoped");
 		assert_eq!(
 			bearer.uri.as_str(),

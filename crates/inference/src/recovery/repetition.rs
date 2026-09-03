@@ -688,11 +688,11 @@ mod tests {
 		let limits = CrossTurnLimits { consecutive_limit: 2, ..CrossTurnLimits::default() };
 		let make = |arguments, result| TurnRecoveryObservation {
 			tool_exchanges:        vec![ToolExchangeObservation {
-				call_id: ToolCallId::new("ignored"),
-				name: sf!("search"),
+				call_id:   ToolCallId::new("ignored"),
+				name:      sf!("search"),
 				arguments: OpaqueJson::new(arguments),
-				result: OpaqueJson::new(result),
-				is_error: false,
+				result:    OpaqueJson::new(result),
+				is_error:  false,
 			}],
 			made_textual_progress: false,
 		};

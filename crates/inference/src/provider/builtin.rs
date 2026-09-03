@@ -1238,10 +1238,7 @@ fn forced_call_operation(
 			}
 		});
 	}
-	Some(OperationCall::Chat(Arc::new(apply_forced_call_decision(
-		request,
-		&decision,
-	))))
+	Some(OperationCall::Chat(Arc::new(apply_forced_call_decision(request, &decision))))
 }
 
 fn encode_wire_request(
@@ -1458,8 +1455,7 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 						&& execution.provider_error_code_seen(openai_chat::TEMPLATE_EFFORT_REJECTED_CODE),
 				),
 		};
-		let adjusted_operation =
-			forced_call_operation(&call.operation, plan, execution);
+		let adjusted_operation = forced_call_operation(&call.operation, plan, execution);
 		let operation = adjusted_operation.as_ref().unwrap_or(&call.operation);
 		if matches!(self.route.codec.as_str(), "google-genai" | "google-vertex")
 			&& let OperationCall::Chat(request) = operation
@@ -1532,10 +1528,12 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			encoded.operation, encoded.method, encoded.uri, header_names, encoded.bounds.request_body,
 		);
 		global_provider_capture().capture(
-			call
-				.session
-				.as_ref()
-				.map(|session| session.conversation.as_str()),
+			call.debug_session.as_deref().or_else(|| {
+				call
+					.session
+					.as_ref()
+					.map(|session| session.conversation.as_str())
+			}),
 			"request.pre_dispatch",
 			&capture_payload,
 		);
@@ -1593,6 +1591,12 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			response_hooks: call.response_hooks.clone(),
 			attempt: TransportAttempt {
 				request_id: call.id.clone(),
+				session: call.debug_session.clone().or_else(|| {
+					call
+						.session
+						.as_ref()
+						.map(|session| Str::new(session.conversation.as_str()))
+				}),
 				provider: plan.provider.clone(),
 				model: plan.model.clone(),
 				api: Str::new(plan.codec.as_str()),
@@ -2357,9 +2361,7 @@ mod tests {
 			ProviderResponseObservation, ProviderResponseObserver, RequestMethod, SizeBounds,
 			google_cca::AntigravityFingerprint,
 		},
-		id::{
-			AccountId, ConversationId, PrincipalId, ProjectId, RequestId, Revision, ToolCallId,
-		},
+		id::{AccountId, ConversationId, PrincipalId, ProjectId, RequestId, Revision, ToolCallId},
 		operation::discovery::CatalogDiscoveryProjectorError,
 		plan::{
 			CapabilityAvailability, ExecutionPlan, FallbackScope, ReplayPlan, RouteHealth,
@@ -2454,8 +2456,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
-	forced_call: None,
-}
+			forced_call:       None,
+		}
 	}
 
 	fn lease(provider: &ProviderId<str>, secret: &str) -> CredentialLease {
@@ -2609,10 +2611,10 @@ mod tests {
 		let policy = catalog
 			.wire_policy(&model.wire_policy)
 			.expect("CCA model wire policy");
-		let binding = codec_binding(route, &test_cca(), false, false, None, None)
-			.expect("CCA codec binding");
+		let binding =
+			codec_binding(route, &test_cca(), false, false, None, None).expect("CCA codec binding");
 		let request = ChatRequest {
-			messages: Arc::from([Message {
+			messages:          Arc::from([Message {
 				role:    Role::Assistant,
 				content: Arc::from([
 					ContentPart::ToolCall {
@@ -2630,20 +2632,20 @@ mod tests {
 				]),
 				name:    None,
 			}]),
-			tools: Arc::from([]),
-			hosted_tools: Arc::from([]),
-			tool_choice: Setting::Unset,
-			output: Setting::Unset,
-			reasoning: Setting::Unset,
-			verbosity: Setting::Unset,
-			cache_retention: Setting::Unset,
-			service_tier: Setting::Unset,
-			sampling: Sampling::default(),
+			tools:             Arc::from([]),
+			hosted_tools:      Arc::from([]),
+			tool_choice:       Setting::Unset,
+			output:            Setting::Unset,
+			reasoning:         Setting::Unset,
+			verbosity:         Setting::Unset,
+			cache_retention:   Setting::Unset,
+			service_tier:      Setting::Unset,
+			sampling:          Sampling::default(),
 			max_output_tokens: None,
-			top_logprobs: None,
-			safety: Arc::from([]),
-			negotiation: NegotiationPolicy::default(),
-			forced_call: None,
+			top_logprobs:      None,
+			safety:            Arc::from([]),
+			negotiation:       NegotiationPolicy::default(),
+			forced_call:       None,
 		};
 		let target = WireTarget {
 			route: route.id.clone(),
@@ -2677,10 +2679,7 @@ mod tests {
 		let parts = body["request"]["contents"][0]["parts"]
 			.as_array()
 			.expect("CCA projected parts");
-		assert_eq!(
-			parts[0]["thoughtSignature"],
-			"skip_thought_signature_validator",
-		);
+		assert_eq!(parts[0]["thoughtSignature"], "skip_thought_signature_validator",);
 		assert!(
 			parts[1].get("thoughtSignature").is_none(),
 			"the first-call-only catalog axis must not sign later unsigned calls",
@@ -2996,8 +2995,8 @@ mod tests {
 			.clone();
 		let provider = catalog.provider(&route.provider).expect("provider");
 		let cca = test_cca();
-		let binding = codec_binding(&route, &cca, false, false, None, None)
-			.expect("route codec binding");
+		let binding =
+			codec_binding(&route, &cca, false, false, None, None).expect("route codec binding");
 		let codec = discovery_codec(catalog, &route, &binding)
 			.expect("discovery codec")
 			.expect("route supports discovery");
@@ -3055,6 +3054,7 @@ mod tests {
 			deadline: None,
 			budget,
 			session: None,
+			debug_session: None,
 			affinity: Default::default(),
 			response_hooks: Default::default(),
 			attribution: InferenceAttribution::core(),
@@ -3411,8 +3411,8 @@ mod tests {
 		let mut route = route;
 		route.transport = TransportKind::Websocket;
 		let cca = test_cca();
-		let binding = codec_binding(&route, &cca, false, false, None, None)
-			.expect("route codec binding");
+		let binding =
+			codec_binding(&route, &cca, false, false, None, None).expect("route codec binding");
 		let codec = RouteCodecSet::for_route(
 			&route,
 			OperationBits::for_kind(OperationKind::Realtime),

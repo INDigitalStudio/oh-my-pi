@@ -297,10 +297,7 @@ pub fn forced_call_ladder(
 	let escalation = (non_compliant && escalations_left != 0 && native_supported)
 		.then(|| caps.native_penalty.clone())
 		.flatten()
-		.map(|penalty| Adjustment::Escalated {
-			feature: FeatureId(sf!("tool_choice")),
-			penalty,
-		});
+		.map(|penalty| Adjustment::Escalated { feature: FeatureId(sf!("tool_choice")), penalty });
 	ForcedCallDecision {
 		soft_prompt: true,
 		native_choice: native_supported && (caps.native_penalty.is_none() || escalation.is_some()),

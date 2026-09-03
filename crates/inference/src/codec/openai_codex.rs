@@ -1035,16 +1035,17 @@ impl Codec for OpenAiCodexCodec {
 		// Codec options pin an identity for hosts that own the session; a bare
 		// call still names its session through the call affinity, with the
 		// request id as the retry-stable turn.
-		let affinity_identity = context
-			.affinity
-			.provider_session
-			.clone()
-			.map(|session_id| CodexRequestIdentity {
-				session_id,
-				turn_id: Str::new(context.request_id.as_str()),
-				account_id: None,
-				originator: Some(Str::new(CODEX_ORIGINATOR)),
-			});
+		let affinity_identity =
+			context
+				.affinity
+				.provider_session
+				.clone()
+				.map(|session_id| CodexRequestIdentity {
+					session_id,
+					turn_id: Str::new(context.request_id.as_str()),
+					account_id: None,
+					originator: Some(Str::new(CODEX_ORIGINATOR)),
+				});
 		if let Some(identity) = self
 			.options
 			.identity

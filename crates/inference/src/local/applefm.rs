@@ -1581,8 +1581,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            [].into(),
 			negotiation:       NegotiationPolicy::default(),
-	forced_call: None,
-}
+			forced_call:       None,
+		}
 	}
 
 	fn prompt_of(messages: &[(Role, &str)]) -> Result<(Str, Option<Str>, bool), ErrorKind> {
@@ -1667,6 +1667,7 @@ mod tests {
 	fn attempt() -> TransportAttempt {
 		TransportAttempt {
 			request_id:          RequestId::new("apple-test"),
+			session:             None,
 			provider:            ProviderId::new("apple-intelligence"),
 			model:               Some(omp_catalog::ModelKey::new("apple-intelligence")),
 			api:                 sf!("applefm"),

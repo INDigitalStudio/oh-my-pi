@@ -2614,8 +2614,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       Default::default(),
-	forced_call: None,
-}
+			forced_call:       None,
+		}
 	}
 
 	fn encoded_run(model_id: &str, roots: Box<[CursorRootPrompt]>) -> wire::AgentRunRequest {

@@ -1984,7 +1984,7 @@ mod tests {
 			},
 		};
 		let coercions = [ArgumentCoercionSpec {
-			path: sf!("/count"),
+			path:      sf!("/count"),
 			coercions: Box::new([ArgumentCoercion::Integer]),
 		}];
 		let (events, _) =
@@ -2218,12 +2218,8 @@ mod tests {
 		coercions: &[ArgumentCoercionSpec],
 	) -> (Vec<ToolAssemblyEvent>, Vec<Str>) {
 		let definitions = [definition];
-		let mut assembler = ToolAssembler::with_coercions(
-			&definitions,
-			coercions,
-			ToolAssemblyLimits::default(),
-			1,
-		);
+		let mut assembler =
+			ToolAssembler::with_coercions(&definitions, coercions, ToolAssemblyLimits::default(), 1);
 		assembler.push(ToolFragment::Start {
 			input_kind:   ToolInputKind::Json,
 			source_index: 0,
@@ -2266,11 +2262,10 @@ mod tests {
 			},
 		};
 		let coercions = [ArgumentCoercionSpec {
-			path: sf!("/payload"),
+			path:      sf!("/payload"),
 			coercions: Box::new([ArgumentCoercion::String]),
 		}];
-		let (events, _) =
-			call_with_coercions(definition, &json!({"payload": {"a": 1}}), &coercions);
+		let (events, _) = call_with_coercions(definition, &json!({"payload": {"a": 1}}), &coercions);
 		assert_eq!(ready_arguments(&events), Some(json!({"payload": "{\"a\":1}"})));
 	}
 
@@ -2278,16 +2273,8 @@ mod tests {
 	fn type_changes_require_matching_declared_coercions() {
 		let limits = ToolAssemblyLimits::default();
 		for (schema, input, expected) in [
-			(
-				json!({"type": "string"}),
-				json!({"value": 1}),
-				json!({"value": 1}),
-			),
-			(
-				json!({"type": "array", "items": {"type": "string"}}),
-				json!("one"),
-				json!("one"),
-			),
+			(json!({"type": "string"}), json!({"value": 1}), json!({"value": 1})),
+			(json!({"type": "array", "items": {"type": "string"}}), json!("one"), json!("one")),
 		] {
 			let error = repair_schema_arguments(&schema, &input, true, limits, &[])
 				.expect_err("an undeclared type change must be rejected");
@@ -2297,29 +2284,18 @@ mod tests {
 		}
 
 		for (schema, input, expected) in [
-			(
-				json!({"type": "string"}),
-				json!({"value": 1}),
-				json!("{\"value\":1}"),
-			),
-			(
-				json!({"type": "array", "items": {"type": "string"}}),
-				json!("one"),
-				json!(["one"]),
-			),
+			(json!({"type": "string"}), json!({"value": 1}), json!("{\"value\":1}")),
+			(json!({"type": "array", "items": {"type": "string"}}), json!("one"), json!(["one"])),
 		] {
 			let coercion = if schema["type"] == "string" {
 				ArgumentCoercion::String
 			} else {
 				ArgumentCoercion::Singleton
 			};
-			let specs = [ArgumentCoercionSpec {
-				path: sf!("/"),
-				coercions: Box::new([coercion]),
-			}];
-			let (actual, repairs) =
-				repair_schema_arguments(&schema, &input, true, limits, &specs)
-					.expect("the declared coercion must repair to the schema");
+			let specs =
+				[ArgumentCoercionSpec { path: sf!("/"), coercions: Box::new([coercion]) }];
+			let (actual, repairs) = repair_schema_arguments(&schema, &input, true, limits, &specs)
+				.expect("the declared coercion must repair to the schema");
 			assert_eq!(actual, expected);
 			assert_eq!(repairs, 1);
 		}
@@ -2383,11 +2359,10 @@ mod tests {
 			},
 		};
 		let coercions = [ArgumentCoercionSpec {
-			path: sf!("/payload"),
+			path:      sf!("/payload"),
 			coercions: Box::new([ArgumentCoercion::Number]),
 		}];
-		let (events, _) =
-			call_with_coercions(definition, &json!({"payload": "300"}), &coercions);
+		let (events, _) = call_with_coercions(definition, &json!({"payload": "300"}), &coercions);
 		assert_eq!(ready_arguments(&events), Some(json!({"payload": 300})));
 	}
 
@@ -2482,7 +2457,7 @@ mod tests {
 			},
 		};
 		let coercions = [ArgumentCoercionSpec {
-			path: sf!("/payload"),
+			path:      sf!("/payload"),
 			coercions: Box::new([ArgumentCoercion::String]),
 		}];
 		let (events, _) = call_with_coercions(definition, &value, &coercions);

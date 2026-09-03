@@ -19,16 +19,17 @@ use super::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReasoningLimits {
 	/// Consecutive equivalent deltas that declare a direct repetition loop.
-	pub repeated_delta_limit: u32,
-	/// Substantial semantic segments required before similarity may declare a stall.
-	pub no_progress_limit:    u32,
+	pub repeated_delta_limit:  u32,
+	/// Substantial semantic segments required before similarity may declare a
+	/// stall.
+	pub no_progress_limit:     u32,
 	/// Consecutive low-novelty, anchor-free segments that declare a
 	/// progress-lexicon stall: reworded filler that recycles recent vocabulary
 	/// and names nothing new. Calibrated by pi against 536k real reasoning
 	/// blocks (longest legitimate run observed: 7).
 	pub low_novelty_run_limit: u32,
 	/// Maximum retained normalized bytes per delta.
-	pub max_delta_bytes:      usize,
+	pub max_delta_bytes:       usize,
 }
 
 impl Default for ReasoningLimits {
@@ -141,8 +142,7 @@ impl ReasoningStallGuard {
 				1
 			};
 			self.last = Some((fingerprint, Str::new(normalized)));
-			(self.repeated >= self.limits.repeated_delta_limit)
-				.then_some((fingerprint, self.repeated))
+			(self.repeated >= self.limits.repeated_delta_limit).then_some((fingerprint, self.repeated))
 		});
 		if let Some((fingerprint, repetitions)) = direct_signal {
 			return Some(self.signal(fingerprint, repetitions, observation.visibility));
@@ -238,7 +238,7 @@ impl ReasoningStallGuard {
 		visibility: OutputVisibility,
 	) -> LoopSignal {
 		LoopSignal {
-			evidence: LoopEvidence {
+			evidence:    LoopEvidence {
 				kind: LoopKind::ReasoningStall,
 				fingerprint,
 				repetitions,
@@ -331,10 +331,7 @@ fn trigram_shingles(normalized: &str) -> BTreeSet<u64> {
 	if words.len() < 3 {
 		return std::iter::once(iter_shingle_hash(&words)).collect();
 	}
-	words
-		.windows(3)
-		.map(iter_shingle_hash)
-		.collect()
+	words.windows(3).map(iter_shingle_hash).collect()
 }
 
 fn iter_shingle_hash(words: &[&str]) -> u64 {
@@ -351,7 +348,10 @@ fn semantic_similarity(left: &BTreeSet<u64>, right: &BTreeSet<u64>) -> bool {
 		return false;
 	}
 	let intersection = left.intersection(right).count();
-	let union = left.len().saturating_add(right.len()).saturating_sub(intersection);
+	let union = left
+		.len()
+		.saturating_add(right.len())
+		.saturating_sub(intersection);
 	intersection.saturating_mul(5) >= union.saturating_mul(4)
 }
 
@@ -456,18 +456,23 @@ mod tests {
 		};
 		let mut guard = ReasoningStallGuard::new(limits);
 		for paragraph in [
-			"First I will compare the parser boundary with the documented contract and identify which invariant is currently violated.",
-			"Next I will inspect the event projection order to determine whether committed output can overtake a recovered tool call.",
-			"Then I will trace ownership through the session journal and verify that replay observes the same canonical arguments.",
-			"Finally I will review resource limits and make sure incomplete buffers resolve deterministically when the stream finishes.",
-			"A separate pass will check receipt evidence so every applied recovery remains attributable to the selected wire policy.",
+			"First I will compare the parser boundary with the documented contract and identify \
+			 which invariant is currently violated.",
+			"Next I will inspect the event projection order to determine whether committed output \
+			 can overtake a recovered tool call.",
+			"Then I will trace ownership through the session journal and verify that replay observes \
+			 the same canonical arguments.",
+			"Finally I will review resource limits and make sure incomplete buffers resolve \
+			 deterministically when the stream finishes.",
+			"A separate pass will check receipt evidence so every applied recovery remains \
+			 attributable to the selected wire policy.",
 		] {
 			assert!(
 				guard
 					.observe(ReasoningObservation {
-						delta: &format!("{paragraph}\n\n"),
+						delta:             &format!("{paragraph}\n\n"),
 						semantic_progress: false,
-						visibility: OutputVisibility::Gated,
+						visibility:        OutputVisibility::Gated,
 					})
 					.is_none(),
 				"novel reasoning must not be treated as a stall"
@@ -486,11 +491,12 @@ mod tests {
 		let mut signal = None;
 		for suffix in ["carefully", "thoroughly", "diligently", "rigorously"] {
 			signal = guard.observe(ReasoningObservation {
-				delta: &format!(
-					"I am now checking the implementation to ensure the final result is safe complete correct and ready for delivery {suffix}.\n\n"
+				delta:             &format!(
+					"I am now checking the implementation to ensure the final result is safe complete \
+					 correct and ready for delivery {suffix}.\n\n"
 				),
 				semantic_progress: false,
-				visibility: OutputVisibility::Gated,
+				visibility:        OutputVisibility::Gated,
 			});
 		}
 		let signal = signal.expect("near-duplicate segments must terminate the stall");
@@ -508,17 +514,21 @@ mod tests {
 		};
 		let mut guard = ReasoningStallGuard::new(limits);
 		let paragraphs = [
-			"I am now carefully checking the implementation to ensure the final result is safe complete correct and ready for delivery with every detail verified.",
-			"I am now carefully checking the implementation to ensure the final result is safe complete correct and ready for delivery with all details verified.",
-			"I am now carefully checking the implementation to ensure the final result is safe complete correct and ready for delivery while every detail is verified.",
-			"I am now carefully checking the implementation to ensure the final result is safe complete correct and ready for delivery and each detail verified.",
+			"I am now carefully checking the implementation to ensure the final result is safe \
+			 complete correct and ready for delivery with every detail verified.",
+			"I am now carefully checking the implementation to ensure the final result is safe \
+			 complete correct and ready for delivery with all details verified.",
+			"I am now carefully checking the implementation to ensure the final result is safe \
+			 complete correct and ready for delivery while every detail is verified.",
+			"I am now carefully checking the implementation to ensure the final result is safe \
+			 complete correct and ready for delivery and each detail verified.",
 		];
 		let mut signal = None;
 		for paragraph in paragraphs {
 			signal = guard.observe(ReasoningObservation {
-				delta: &format!("{paragraph}\n\n"),
+				delta:             &format!("{paragraph}\n\n"),
 				semantic_progress: false,
-				visibility: OutputVisibility::Gated,
+				visibility:        OutputVisibility::Gated,
 			});
 		}
 		let signal = signal.expect("repetitive semantic segments must terminate the stall");
@@ -537,18 +547,22 @@ mod tests {
 		};
 		let mut guard = ReasoningStallGuard::new(limits);
 		let paragraphs = [
-			"I am now carefully checking the implementation to ensure the final result is safe complete correct and ready for delivery with every detail verified.",
-			"I am now carefully checking the implementation to ensure the final result is safe complete correct and ready for delivery with all details verified.",
-			"I am now carefully checking the implementation in src/codec/schema.rs to ensure the final result is safe complete correct and ready for delivery.",
-			"I am now carefully checking the implementation to ensure the final result is safe complete correct and ready for delivery and each detail verified.",
+			"I am now carefully checking the implementation to ensure the final result is safe \
+			 complete correct and ready for delivery with every detail verified.",
+			"I am now carefully checking the implementation to ensure the final result is safe \
+			 complete correct and ready for delivery with all details verified.",
+			"I am now carefully checking the implementation in src/codec/schema.rs to ensure the \
+			 final result is safe complete correct and ready for delivery.",
+			"I am now carefully checking the implementation to ensure the final result is safe \
+			 complete correct and ready for delivery and each detail verified.",
 		];
 		for paragraph in paragraphs {
 			assert!(
 				guard
 					.observe(ReasoningObservation {
-						delta: &format!("{paragraph}\n\n"),
+						delta:             &format!("{paragraph}\n\n"),
 						semantic_progress: false,
-						visibility: OutputVisibility::Gated,
+						visibility:        OutputVisibility::Gated,
 					})
 					.is_none(),
 				"a segment naming a fresh reference is real work, not a stall"

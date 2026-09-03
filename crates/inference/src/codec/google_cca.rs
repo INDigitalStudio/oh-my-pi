@@ -1443,8 +1443,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            sync::Arc::from([]),
 			negotiation:       Default::default(),
-	forced_call: None,
-};
+			forced_call:       None,
+		};
 		let projected = GeminiCodec::cloud_code_assist(None)
 			.project(&request, &GoogleRequestOptions {
 				supports_function_part_id: Some(true),
@@ -2112,8 +2112,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            sync::Arc::from([]),
 			negotiation:       Default::default(),
-	forced_call: None,
-};
+			forced_call:       None,
+		};
 		let scope = GoogleProofScope { provider, codec: codec_id };
 		let dropping = GeminiCodec::cloud_code_assist(None)
 			.project(&request, &GoogleRequestOptions {

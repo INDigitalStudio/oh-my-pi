@@ -4,12 +4,9 @@ use bytes::{Bytes, BytesMut};
 use omp_core::Str;
 use smallvec::SmallVec;
 
-use super::{
-	capture,
-	frame::{
-		DEFAULT_MAX_FRAME_BYTES, FramerState, FramingError, FramingProtocol, IncrementalFramer,
-		Utf8Field, validate_utf8,
-	},
+use super::frame::{
+	DEFAULT_MAX_FRAME_BYTES, FramerState, FramingError, FramingProtocol, IncrementalFramer,
+	Utf8Field, validate_utf8,
 };
 
 /// One assembled Server-Sent Event.
@@ -33,7 +30,6 @@ pub struct SseDecoder {
 	state:           FramerState,
 	done_sentinel:   bool,
 	pending_error:   Option<FramingError>,
-	capture:         bool,
 }
 
 impl Default for SseDecoder {
@@ -60,16 +56,12 @@ impl SseDecoder {
 			state:           FramerState::Open,
 			done_sentinel:   false,
 			pending_error:   None,
-			capture:         true,
 		}
 	}
 
-	/// Creates a decoder for already-captured bytes without capturing them
-	/// again into the process-global ring.
+	/// Creates a decoder for already-captured replay bytes.
 	pub(crate) fn for_replay() -> Self {
-		let mut decoder = Self::new();
-		decoder.capture = false;
-		decoder
+		Self::new()
 	}
 
 	/// Feeds a byte chunk and emits every newly completed event.
@@ -267,9 +259,6 @@ impl IncrementalFramer for SseDecoder {
 			return Ok(SmallVec::new());
 		}
 		self.state.ensure_open(FramingProtocol::Sse)?;
-		if self.capture {
-			capture::global_provider_capture().capture(None, "sse", &String::from_utf8_lossy(&chunk));
-		}
 		self.append(chunk);
 		let mut output = SmallVec::new();
 		while let Some(len) = self.next_event_len() {

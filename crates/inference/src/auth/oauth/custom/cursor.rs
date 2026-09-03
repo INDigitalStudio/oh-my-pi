@@ -23,9 +23,9 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::super::{
-	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthRefreshFuture, OAuthEntropy,
-	OAuthError, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthTokenSet,
-	SystemEntropySource, parse_http_url, provider_error,
+	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthEntropy,
+	OAuthError, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthRefreshFuture,
+	OAuthTokenSet, SystemEntropySource, parse_http_url, provider_error,
 };
 use crate::{
 	answer::AuthEvent,

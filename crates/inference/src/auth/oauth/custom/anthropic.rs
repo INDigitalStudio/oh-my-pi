@@ -16,9 +16,9 @@ use sha2::{Digest as _, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::super::{
-	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthRefreshFuture, OAuthError,
-	OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthTokenSet, callback_code,
-	parse_http_url, provider_error, receive_callback_input, start_callback_server,
+	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthError,
+	OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthRefreshFuture, OAuthTokenSet,
+	callback_code, parse_http_url, provider_error, receive_callback_input, start_callback_server,
 };
 use crate::{
 	answer::{AuthEvent, AuthPrompt, AuthPromptKind},
@@ -58,9 +58,7 @@ impl OAuthCustomHandler for AnthropicPkceHandler {
 		spec: &'a OAuthCustomSpec,
 		refresh_token: SecretString,
 	) -> OAuthRefreshFuture<'a> {
-		Either::Right(
-			async move { refresh(self.http.as_ref(), spec, refresh_token).await }.boxed(),
-		)
+		Either::Right(async move { refresh(self.http.as_ref(), spec, refresh_token).await }.boxed())
 	}
 }
 

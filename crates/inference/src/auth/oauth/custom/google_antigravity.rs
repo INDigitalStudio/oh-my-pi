@@ -19,9 +19,8 @@ use zeroize::Zeroizing;
 
 use super::super::{
 	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthEngine,
-	OAuthRefreshFuture,
-	OAuthError, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthPkceSpec, OAuthTokenSet,
-	PkceCompletion,
+	OAuthError, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthPkceSpec,
+	OAuthRefreshFuture, OAuthTokenSet, PkceCompletion,
 };
 use crate::{
 	auth::{login::LoginDriver, spec::OAuthCustomSpec},
@@ -122,8 +121,8 @@ pub(super) fn register(
 	clock: Arc<dyn OAuthClock>,
 ) -> Result<(), OAuthCustomDispatchError> {
 	dispatcher.register(Arc::new(GoogleAntigravityHandler {
-		http: Arc::clone(&http),
-		clock: Arc::clone(&clock),
+		http:    Arc::clone(&http),
+		clock:   Arc::clone(&clock),
 		profile: CloudCodeProfile::Antigravity,
 	}))?;
 	dispatcher.register(Arc::new(GoogleAntigravityHandler {
@@ -159,9 +158,9 @@ fn pkce_spec(spec: &OAuthCustomSpec) -> Result<OAuthPkceSpec, OAuthError> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Metadata {
-	ide_type: &'static str,
+	ide_type:    &'static str,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	platform: Option<&'static str>,
+	platform:    Option<&'static str>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	plugin_type: Option<&'static str>,
 }
@@ -169,8 +168,8 @@ struct Metadata {
 const ANTIGRAVITY_METADATA: Metadata =
 	Metadata { ide_type: "ANTIGRAVITY", platform: None, plugin_type: None };
 const GEMINI_CLI_METADATA: Metadata = Metadata {
-	ide_type: "IDE_UNSPECIFIED",
-	platform: Some("PLATFORM_UNSPECIFIED"),
+	ide_type:    "IDE_UNSPECIFIED",
+	platform:    Some("PLATFORM_UNSPECIFIED"),
 	plugin_type: Some("GEMINI"),
 };
 
@@ -323,10 +322,7 @@ async fn onboard_user(
 			Method::POST,
 			&format!("{}/v1internal:onboardUser", profile.endpoint()),
 			access_token,
-			Some(json_body(&OnboardRequest {
-				tier_id: FREE_TIER_ID,
-				metadata: profile.metadata(),
-			})?),
+			Some(json_body(&OnboardRequest { tier_id: FREE_TIER_ID, metadata: profile.metadata() })?),
 		)?,
 		deadline,
 	)
@@ -674,7 +670,7 @@ mod tests {
 			CloudCodeProfile::Antigravity,
 		)
 		.await
-			.expect("project discovery");
+		.expect("project discovery");
 		assert_eq!(project.as_str(), "project-123");
 		let requests = http.requests.lock();
 		assert_eq!(requests.len(), 2);
@@ -753,7 +749,7 @@ mod tests {
 			CloudCodeProfile::Antigravity,
 		)
 		.await
-			.expect("hydrated project");
+		.expect("hydrated project");
 		assert_eq!(project.as_str(), "project-123");
 		let requests = http.requests.lock();
 		assert_eq!(requests.len(), 3);
@@ -782,7 +778,7 @@ mod tests {
 			CloudCodeProfile::Antigravity,
 		)
 		.await
-			.expect_err("ineligible account");
+		.expect_err("ineligible account");
 		assert_eq!(error, OAuthError::ProvisioningIneligible);
 		assert_eq!(http.requests.lock().len(), 1);
 	}
@@ -814,7 +810,7 @@ mod tests {
 			CloudCodeProfile::Antigravity,
 		)
 		.await
-			.expect("provisioned project");
+		.expect("provisioned project");
 		assert_eq!(project.as_str(), "project-123");
 		assert_eq!(clock.now(), SystemTime::UNIX_EPOCH + ONBOARD_POLL_INTERVAL);
 		let requests = http.requests.lock();

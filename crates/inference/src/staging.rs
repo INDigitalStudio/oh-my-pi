@@ -2183,19 +2183,19 @@ impl<'a> GateCursor<'a> {
 
 	fn usage(&mut self) -> Result<Usage, GateSpoolError> {
 		Ok(Usage {
-			input_tokens:       self.u64()?,
-			output_tokens:      self.u64()?,
-			reasoning_tokens:   self.u64()?,
-			cache_read_tokens:  self.u64()?,
+			input_tokens: self.u64()?,
+			output_tokens: self.u64()?,
+			reasoning_tokens: self.u64()?,
+			cache_read_tokens: self.u64()?,
 			cache_write_tokens: self.u64()?,
 			cache_write_1h_tokens: self.u64()?,
-			audio_input_ms:     self.u64()?,
-			audio_output_ms:    self.u64()?,
-			video_ms:           self.u64()?,
+			audio_input_ms: self.u64()?,
+			audio_output_ms: self.u64()?,
+			video_ms: self.u64()?,
 			premium_requests_millionths: self.u64()?,
-			images:             self.u32()?,
-			search_calls:       self.u32()?,
-			source:             match self.u8()? {
+			images: self.u32()?,
+			search_calls: self.u32()?,
+			source: match self.u8()? {
 				0 => UsageSource::Unknown,
 				1 => UsageSource::Provider,
 				2 => UsageSource::Measured,

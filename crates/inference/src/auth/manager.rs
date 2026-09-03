@@ -24,10 +24,9 @@ use super::{
 	AuditedCredentialReveal, AuthRejection, AuthSpec, CredentialBroker, CredentialError,
 	CredentialFuture, CredentialLease, CredentialMetadata, CredentialNeed, CredentialOrigin,
 	CredentialSource, CredentialStore, CredentialWrite, KeyError, LeaseMeta, LoginChannelError,
-	OAuthClientSpec,
-	OAuthClock, OAuthCredentialImport, OAuthCredentialManagerError, OAuthCustomDispatchError,
-	OAuthCustomDispatcher, OAuthCustomSpec, OAuthEngine, OAuthError, OAuthHttpClient,
-	OAuthHttpRequest, OAuthHttpResponse, OAuthParameter, OAuthTransportError,
+	OAuthClientSpec, OAuthClock, OAuthCredentialImport, OAuthCredentialManagerError,
+	OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomSpec, OAuthEngine, OAuthError,
+	OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthParameter, OAuthTransportError,
 	PROVIDER_NAME_PARAMETER, ScopedCredentialGrant, ScopedCredentialToken, StoreError,
 	credential_ready, default_login_channels,
 };
@@ -1888,8 +1887,6 @@ mod tests {
 	use omp_catalog::{ProviderId, provider::AuthSpecKind, snapshot::Catalog};
 	use omp_core::{ExposeSecret as _, SecretString};
 	use parking_lot::Mutex;
-
-	use crate::auth::{CredentialFuture, credential_ready};
 	use tokio::time;
 
 	use super::{
@@ -1901,10 +1898,11 @@ mod tests {
 		account::{AccountPool, AccountRecord, RefreshCoordinator, RefreshPolicy},
 		answer::{AccountState, AccountSummary, AuthEvent, AuthResponse as AnswerAuthResponse},
 		auth::{
-			AlibabaTokenPlanLoginEngine, AuthRejection, CredentialError, CredentialLease,
-			CredentialNeed, CredentialSource, CredentialStore, HeadlessKeySource, KeyError, KeyId,
-			LeaseMeta, OAuthClock, OAuthCustomDispatcher, OAuthHttpClient, OAuthHttpRequest,
-			OAuthHttpResponse, OAuthTransportError, SecretLoginEngine, StoreError,
+			AlibabaTokenPlanLoginEngine, AuthRejection, CredentialError, CredentialFuture,
+			CredentialLease, CredentialNeed, CredentialSource, CredentialStore, HeadlessKeySource,
+			KeyError, KeyId, LeaseMeta, OAuthClock, OAuthCustomDispatcher, OAuthHttpClient,
+			OAuthHttpRequest, OAuthHttpResponse, OAuthTransportError, SecretLoginEngine, StoreError,
+			credential_ready,
 		},
 		call::{AccountRoutingContext, AuthInput, AuthMethod, LoginRequest},
 		error::{Error, ErrorKind},

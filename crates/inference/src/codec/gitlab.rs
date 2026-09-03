@@ -2237,8 +2237,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
-	forced_call: None,
-};
+			forced_call:       None,
+		};
 		let error =
 			match build_start_request(&request, &context, WorkflowSession::new("workflow", "session"))
 			{

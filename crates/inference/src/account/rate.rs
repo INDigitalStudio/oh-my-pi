@@ -338,7 +338,10 @@ fn parse_delay(
 	let seconds = parse_u64(raw, source)?;
 	let until = now
 		.checked_add(Duration::from_secs(seconds))
-		.ok_or(RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::OutOfRange })?;
+		.ok_or(RetryAfterParseError {
+			syntax: source,
+			kind:   RetryAfterParseErrorKind::OutOfRange,
+		})?;
 	Ok(ParsedRetryAfter { until, source })
 }
 
@@ -350,10 +353,16 @@ fn parse_epoch(
 	let value = parse_u64(raw, source)?;
 	let millis = value
 		.checked_mul(millis_per_unit)
-		.ok_or(RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::OutOfRange })?;
+		.ok_or(RetryAfterParseError {
+			syntax: source,
+			kind:   RetryAfterParseErrorKind::OutOfRange,
+		})?;
 	let until = UNIX_EPOCH
 		.checked_add(Duration::from_millis(millis))
-		.ok_or(RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::OutOfRange })?;
+		.ok_or(RetryAfterParseError {
+			syntax: source,
+			kind:   RetryAfterParseErrorKind::OutOfRange,
+		})?;
 	Ok(ParsedRetryAfter { until, source })
 }
 
@@ -363,10 +372,15 @@ fn parse_u64(raw: &str, source: RetryAfterSource) -> Result<u64, RetryAfterParse
 		return Err(RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::Empty });
 	}
 	if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-		return Err(RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::InvalidSyntax });
+		return Err(RetryAfterParseError {
+			syntax: source,
+			kind:   RetryAfterParseErrorKind::InvalidSyntax,
+		});
 	}
-	raw.parse()
-		.map_err(|_| RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::OutOfRange })
+	raw.parse().map_err(|_| RetryAfterParseError {
+		syntax: source,
+		kind:   RetryAfterParseErrorKind::OutOfRange,
+	})
 }
 
 fn parse_http_date(raw: &str) -> Result<SystemTime, RetryAfterParseError> {
@@ -382,7 +396,10 @@ fn parse_http_date(raw: &str) -> Result<SystemTime, RetryAfterParseError> {
 		|| bytes[22] != b':'
 		|| &bytes[25..] != b" GMT"
 	{
-		return Err(RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::InvalidSyntax });
+		return Err(RetryAfterParseError {
+			syntax: source,
+			kind:   RetryAfterParseErrorKind::InvalidSyntax,
+		});
 	}
 	let weekday = match &bytes[..3] {
 		b"Sun" => 0_i64,
@@ -393,7 +410,10 @@ fn parse_http_date(raw: &str) -> Result<SystemTime, RetryAfterParseError> {
 		b"Fri" => 5,
 		b"Sat" => 6,
 		_ => {
-			return Err(RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::InvalidDate });
+			return Err(RetryAfterParseError {
+				syntax: source,
+				kind:   RetryAfterParseErrorKind::InvalidDate,
+			});
 		},
 	};
 	let day = parse_digits(&bytes[5..7], source)? as u32;
@@ -411,7 +431,10 @@ fn parse_http_date(raw: &str) -> Result<SystemTime, RetryAfterParseError> {
 		b"Nov" => 11,
 		b"Dec" => 12,
 		_ => {
-			return Err(RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::InvalidDate });
+			return Err(RetryAfterParseError {
+				syntax: source,
+				kind:   RetryAfterParseErrorKind::InvalidDate,
+			});
 		},
 	};
 	let year = parse_digits(&bytes[12..16], source)? as i64;
@@ -426,11 +449,17 @@ fn parse_http_date(raw: &str) -> Result<SystemTime, RetryAfterParseError> {
 		_ => 0,
 	};
 	if year < 1970 || day == 0 || day > days_in_month || hour > 23 || minute > 59 || second > 59 {
-		return Err(RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::InvalidDate });
+		return Err(RetryAfterParseError {
+			syntax: source,
+			kind:   RetryAfterParseErrorKind::InvalidDate,
+		});
 	}
 	let days = days_from_civil(year, month, day);
 	if (days + 4).rem_euclid(7) != weekday {
-		return Err(RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::InvalidDate });
+		return Err(RetryAfterParseError {
+			syntax: source,
+			kind:   RetryAfterParseErrorKind::InvalidDate,
+		});
 	}
 	let seconds = days
 		.checked_mul(86_400)
@@ -438,7 +467,10 @@ fn parse_http_date(raw: &str) -> Result<SystemTime, RetryAfterParseError> {
 			value.checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))
 		})
 		.and_then(|value| u64::try_from(value).ok())
-		.ok_or(RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::OutOfRange })?;
+		.ok_or(RetryAfterParseError {
+			syntax: source,
+			kind:   RetryAfterParseErrorKind::OutOfRange,
+		})?;
 	UNIX_EPOCH
 		.checked_add(Duration::from_secs(seconds))
 		.ok_or(RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::OutOfRange })
@@ -446,7 +478,10 @@ fn parse_http_date(raw: &str) -> Result<SystemTime, RetryAfterParseError> {
 
 fn parse_digits(bytes: &[u8], source: RetryAfterSource) -> Result<u64, RetryAfterParseError> {
 	if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
-		return Err(RetryAfterParseError { syntax: source, kind: RetryAfterParseErrorKind::InvalidSyntax });
+		return Err(RetryAfterParseError {
+			syntax: source,
+			kind:   RetryAfterParseErrorKind::InvalidSyntax,
+		});
 	}
 	bytes
 		.iter()

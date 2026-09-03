@@ -74,8 +74,8 @@ pub use manager::{
 pub use oauth::{
 	DevicePending, OAuthClock, OAuthCredentialManagerError, OAuthCustomDispatchError,
 	OAuthCustomDispatcher, OAuthCustomHandler, OAuthEngine, OAuthEntropy, OAuthError,
-	OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthProviderCode, OAuthTokenSet,
-	OAuthRefreshFuture, OAuthTransportError, PkcePending, SystemEntropySource, SystemOAuthClock,
+	OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthProviderCode, OAuthRefreshFuture,
+	OAuthTokenSet, OAuthTransportError, PkcePending, SystemEntropySource, SystemOAuthClock,
 	SystemOAuthHttpClient,
 };
 pub use scope::{CredentialGrants, CredentialScope, CredentialScopeError};

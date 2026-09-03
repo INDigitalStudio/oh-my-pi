@@ -478,7 +478,9 @@ impl OpenAiChatCodec {
 	/// Encodes a chat request to exact JSON bytes for fixture and cassette
 	/// assertions.
 	pub fn encode_chat(&self, model: &str, request: &ChatRequest) -> Result<Bytes, Error> {
-		self.encode_chat_adjusted(model, request).map(|(body, _)| body)
+		self
+			.encode_chat_adjusted(model, request)
+			.map(|(body, _)| body)
 	}
 
 	fn encode_chat_adjusted(
@@ -512,8 +514,7 @@ impl OpenAiChatCodec {
 	) -> Result<(WireRequest, Vec<Adjustment>), Error> {
 		let mut adjustments = Vec::new();
 		let messages = lower_messages(&self.profile, &request.messages)?;
-		let (mut tools, withheld) =
-			lower_tools(&self.profile, &request.tools, &mut adjustments)?;
+		let (mut tools, withheld) = lower_tools(&self.profile, &request.tools, &mut adjustments)?;
 		tools.extend(lower_hosted_tools(&self.profile, &request.hosted_tools)?);
 		let mut tool_choice =
 			lower_tool_choice(&self.profile, &mut tools, &request.tool_choice, &withheld)?;
@@ -565,7 +566,8 @@ impl OpenAiChatCodec {
 		// Mirrors pi's `resolveOpenAIOutputTokenParam`: a caller limit is
 		// lowered to the route's output clamp; an absent limit stays absent.
 		let output_limit = request.max_output_tokens.map(|requested| {
-			self.profile
+			self
+				.profile
 				.output_token_ceiling
 				.map_or(requested, |ceiling| requested.min(ceiling))
 		});
@@ -586,64 +588,67 @@ impl OpenAiChatCodec {
 		if cache_requested && prompt_cache_key.is_none() && prompt_cache_options.is_none() {
 			return Err(capability_error());
 		}
-		Ok((WireRequest {
-			model: Str::new(model),
-			messages,
-			stream: true,
-			stream_options: self
-				.profile
-				.streaming_usage
-				.then_some(StreamOptions { include_usage: true }),
-			store: self.profile.disable_store.then_some(false),
-			temperature: self
-				.profile
-				.sampling
-				.then_some(sampling.temperature)
-				.flatten(),
-			top_p: self.profile.sampling.then_some(sampling.top_p).flatten(),
-			top_k: self.profile.sampling.then_some(sampling.top_k).flatten(),
-			min_p: self.profile.sampling.then_some(sampling.min_p).flatten(),
-			presence_penalty: self
-				.profile
-				.penalties
-				.then_some(sampling.presence_penalty)
-				.flatten(),
-			frequency_penalty: self
-				.profile
-				.penalties
-				.then_some(sampling.frequency_penalty)
-				.flatten(),
-			repetition_penalty: self
-				.profile
-				.penalties
-				.then_some(sampling.repetition_penalty)
-				.flatten(),
-			stop: (!sampling.stop.is_empty()).then(|| sampling.stop.to_vec()),
-			seed: sampling.seed,
-			max_tokens,
-			max_completion_tokens,
-			logprobs: request.top_logprobs.map(|_| true),
-			top_logprobs: request.top_logprobs,
-			max_output_tokens,
-			tools: (!tools.is_empty()).then_some(tools),
-			tool_choice,
-			response_format,
-			reasoning_effort: reasoning.effort,
-			reasoning: reasoning.openrouter,
-			thinking: reasoning.zai,
-			enable_thinking: reasoning.qwen,
-			preserve_thinking: (self.profile.qwen_preserve_thinking
-				&& self.profile.reasoning == ReasoningWireFormat::Qwen)
-				.then_some(true),
-			chat_template_kwargs: reasoning.chat_template,
-			venice_parameters: reasoning.venice,
-			service_tier,
-			prompt_cache_key,
-			prompt_cache_options,
-			provider,
-			provider_options,
-			tool_stream,
-		}, adjustments))
+		Ok((
+			WireRequest {
+				model: Str::new(model),
+				messages,
+				stream: true,
+				stream_options: self
+					.profile
+					.streaming_usage
+					.then_some(StreamOptions { include_usage: true }),
+				store: self.profile.disable_store.then_some(false),
+				temperature: self
+					.profile
+					.sampling
+					.then_some(sampling.temperature)
+					.flatten(),
+				top_p: self.profile.sampling.then_some(sampling.top_p).flatten(),
+				top_k: self.profile.sampling.then_some(sampling.top_k).flatten(),
+				min_p: self.profile.sampling.then_some(sampling.min_p).flatten(),
+				presence_penalty: self
+					.profile
+					.penalties
+					.then_some(sampling.presence_penalty)
+					.flatten(),
+				frequency_penalty: self
+					.profile
+					.penalties
+					.then_some(sampling.frequency_penalty)
+					.flatten(),
+				repetition_penalty: self
+					.profile
+					.penalties
+					.then_some(sampling.repetition_penalty)
+					.flatten(),
+				stop: (!sampling.stop.is_empty()).then(|| sampling.stop.to_vec()),
+				seed: sampling.seed,
+				max_tokens,
+				max_completion_tokens,
+				logprobs: request.top_logprobs.map(|_| true),
+				top_logprobs: request.top_logprobs,
+				max_output_tokens,
+				tools: (!tools.is_empty()).then_some(tools),
+				tool_choice,
+				response_format,
+				reasoning_effort: reasoning.effort,
+				reasoning: reasoning.openrouter,
+				thinking: reasoning.zai,
+				enable_thinking: reasoning.qwen,
+				preserve_thinking: (self.profile.qwen_preserve_thinking
+					&& self.profile.reasoning == ReasoningWireFormat::Qwen)
+					.then_some(true),
+				chat_template_kwargs: reasoning.chat_template,
+				venice_parameters: reasoning.venice,
+				service_tier,
+				prompt_cache_key,
+				prompt_cache_options,
+				provider,
+				provider_options,
+				tool_stream,
+			},
+			adjustments,
+		))
 	}
 }
 
@@ -1433,20 +1438,15 @@ fn lower_tools(
 			ToolStrictWire::All => true,
 			ToolStrictWire::Unsupported => declared_strict,
 		};
-		let strict_capability =
-			(profile.tool_strict != ToolStrictWire::Unsupported).then_some(true);
+		let strict_capability = (profile.tool_strict != ToolStrictWire::Unsupported).then_some(true);
 		let flattened = if profile.flatten_root_unions {
 			flatten_exclusive_required_root_union(parameters.as_value())
 		} else {
 			None
 		};
 		let schema = flattened.as_ref().unwrap_or_else(|| parameters.as_value());
-		let projection = normalize_schema(
-			schema,
-			requested_strict,
-			strict_capability,
-			SchemaDialect::OpenAiChat,
-		);
+		let projection =
+			normalize_schema(schema, requested_strict, strict_capability, SchemaDialect::OpenAiChat);
 		if let Some(reason) = projection.fallback {
 			adjustments.push(Adjustment::Dropped {
 				feature: FeatureId::new_static("chat.tool.strict"),
@@ -1668,7 +1668,7 @@ fn lower_output(
 			}
 			ResponseFormat::JsonSchema {
 				json_schema: JsonSchemaFormat {
-					name: name.clone(),
+					name:   name.clone(),
 					schema: projection.schema,
 					strict: projection.strict.unwrap_or(false),
 				},
@@ -2901,16 +2901,16 @@ mod tests {
 	use serde::Deserialize;
 
 	use super::{
-		ErrorCode, OpenAiChatAdapterOptions, OpenAiChatCodec, OpenAiChatDecoder,
-		OpenAiChatProfile, OpenAiOptions, ReasoningWireFormat, ToolIdWireProfile, WireError,
-		WireFinishReason, WireUsage, classify_error, flatten_exclusive_required_root_union,
+		ErrorCode, OpenAiChatAdapterOptions, OpenAiChatCodec, OpenAiChatDecoder, OpenAiChatProfile,
+		OpenAiOptions, ReasoningWireFormat, ToolIdWireProfile, WireError, WireFinishReason,
+		WireUsage, classify_error, flatten_exclusive_required_root_union,
 	};
 	use crate::{
 		body::BodySource,
 		call::{
 			CallAffinity, ChatRequest, ContentPart, MediaInput, Message, NegotiationPolicy,
-			OpaqueJson, OperationCall, ReasoningRequest, ReasoningVisibility, Role, Sampling,
-			Setting, ToolChoice, ToolDefinition, ToolInputConstraint, ToolResultContent,
+			OpaqueJson, OperationCall, ReasoningRequest, ReasoningVisibility, Role, Sampling, Setting,
+			ToolChoice, ToolDefinition, ToolInputConstraint, ToolResultContent,
 		},
 		catalog::ReasoningEffort,
 		codec::{Codec, Decoder, EncodeContext, RawEvent},
@@ -2937,8 +2937,8 @@ mod tests {
 			top_logprobs: None,
 			safety: Arc::from([]),
 			negotiation: NegotiationPolicy::default(),
-	forced_call: None,
-}
+			forced_call: None,
+		}
 	}
 
 	fn text_message(text: &str) -> Message {
@@ -3397,7 +3397,10 @@ mod tests {
 		assert_eq!(usage.len(), 2);
 		assert_eq!(usage[0].reasoning_tokens, 2);
 		assert_eq!(usage[1].output_tokens, 4);
-		assert_eq!(usage[1].reasoning_tokens, 2, "later chunk without details must not zero reasoning");
+		assert_eq!(
+			usage[1].reasoning_tokens, 2,
+			"later chunk without details must not zero reasoning"
+		);
 	}
 
 	#[test]
@@ -4012,7 +4015,7 @@ mod tests {
 			preserve_signatures: false,
 		});
 		request
-}
+	}
 
 	#[test]
 	fn text_only_history_replaces_images_while_ocr_preserves_them() {
@@ -4342,7 +4345,7 @@ mod tests {
 			]),
 			name:    None,
 		}]))
-}
+	}
 
 	#[test]
 	fn replay_reasoning_content_matches_pi_request_shape() {
@@ -4468,7 +4471,7 @@ mod tests {
 			}]),
 			name:    None,
 		}]))
-}
+	}
 
 	#[test]
 	fn uses_openai_tool_call_id_limit_matches_pi_request_shape() {
@@ -4525,7 +4528,7 @@ mod tests {
 		}]);
 		request.tool_choice = Setting::Require(ToolChoice::Named("lookup".into()));
 		request
-}
+	}
 
 	#[test]
 	fn supports_strict_mode_matches_pi_request_shape() {
@@ -4629,10 +4632,7 @@ mod tests {
 			.expect("fallback encodes");
 		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
 		assert_eq!(wire["tools"][0]["function"]["strict"], false);
-		assert_eq!(
-			wire["tools"][0]["function"]["parameters"]["additionalProperties"],
-			true
-		);
+		assert_eq!(wire["tools"][0]["function"]["parameters"]["additionalProperties"], true);
 		assert!(matches!(
 			adjustments.as_slice(),
 			[Adjustment::Dropped { reason, .. }]
@@ -4682,7 +4682,7 @@ mod tests {
 			},
 			text_message("continue"),
 		]))
-}
+	}
 
 	#[test]
 	fn requires_tool_result_name_matches_pi_request_shape() {
@@ -4884,7 +4884,7 @@ mod tests {
 		let mut request = request(Arc::from([text_message("hello")]));
 		request.max_output_tokens = Some(max_output_tokens);
 		request
-}
+	}
 
 	#[test]
 	fn call_cache_affinity_lowers_prompt_cache_key_without_a_bound_conversation() {
