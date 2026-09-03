@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the `inspect_image` status hint naming the previous model after cycling roles (Ctrl+P) between two models that share image-input capability ([#10729](https://github.com/can1357/oh-my-pi/issues/10729)).
+
 ## [18.1.7] - 2026-09-03
 
 ### Breaking Changes
