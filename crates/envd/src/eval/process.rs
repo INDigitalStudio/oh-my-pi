@@ -65,7 +65,6 @@ const MAX_BRIDGE_PROGRESS_BYTES: usize = 256 * 1024;
 const CHILD_TIMEOUT_EXIT: i32 = 124;
 const SECRET_MARKERS: &[&str] =
 	&["TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "PRIVATE_KEY", "CREDENTIAL"];
-const OUTPUT_SPILL_THRESHOLD: usize = 128 * 1024;
 const MAX_RUNTIME_CWD_BYTES: usize = 16 * 1024;
 const MAX_MANAGED_ENV_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_MANAGED_ENV_BYTES: usize = 2 * 1024 * 1024;
@@ -318,7 +317,7 @@ impl ProcessEvalExec {
 			"{}:cell-{number}",
 			String::from_utf8_lossy(owned.key.session.as_ref())
 		));
-		let (events_tx, events) = flume::unbounded();
+		let (events_tx, events) = flume::bounded(1);
 		let cancelled = CancellationToken::new();
 		let task_cancelled = cancelled.clone();
 		let executable = self.inner.executable.clone();
@@ -375,9 +374,9 @@ impl ProcessEvalExec {
 							if task_cancelled.is_cancelled()
 								&& let Some(completion) = retry_cancelled.take()
 							{
-								let _ = events_tx.send(Ok(RunEvent::Completed(completion)));
+								let _ = events_tx.send_async(Ok(RunEvent::Completed(completion))).await;
 							} else {
-								let _ = events_tx.send(Err(resource_fault("open_session", error)));
+								let _ = events_tx.send_async(Err(resource_fault("open_session", error))).await;
 							}
 							return;
 						},
@@ -392,7 +391,7 @@ impl ProcessEvalExec {
 					if disposable && let Some(mut child) = child_slot.take() {
 						child.terminate().await;
 					}
-					let _ = events_tx.send(Ok(RunEvent::Completed(completion)));
+					let _ = events_tx.send_async(Ok(RunEvent::Completed(completion))).await;
 					return;
 				}
 				let child = child_slot.as_mut().expect("eval child initialized above");
@@ -418,11 +417,11 @@ impl ProcessEvalExec {
 						retry_cancelled = Some(completion);
 						if task_cancelled.is_cancelled() {
 							owned.needs_reset.store(true, Ordering::Release);
-							let _ = events_tx.send(Ok(RunEvent::Completed(
+							let _ = events_tx.send_async(Ok(RunEvent::Completed(
 								retry_cancelled
 									.take()
 									.expect("dead-kernel cancellation recorded above"),
-							)));
+							))).await;
 							return;
 						}
 					},
@@ -495,73 +494,6 @@ impl BridgeProgressSink for ProgressChannel {
 			.events
 			.send(BridgeTaskEvent::Progress { request_id: self.request_id, event })
 			.map_err(|_| BridgeHostError::message("eval bridge progress receiver was dropped"))
-	}
-}
-
-struct OutputSpill {
-	host:        Option<BlobHost>,
-	buffered:    Vec<u8>,
-	stage:       Option<omp_journal::blob::BlobStage>,
-	total_lines: usize,
-	total_bytes: usize,
-}
-
-impl OutputSpill {
-	fn new(host: Option<BlobHost>) -> Self {
-		Self {
-			host,
-			buffered: Vec::with_capacity(OUTPUT_SPILL_THRESHOLD.min(64 * 1024)),
-			stage: None,
-			total_lines: 0,
-			total_bytes: 0,
-		}
-	}
-
-	fn push(&mut self, data: &[u8]) -> Result<(), ProcessError> {
-		self.total_bytes = self.total_bytes.saturating_add(data.len());
-		self.total_lines = self
-			.total_lines
-			.saturating_add(bytecount::count(data, b'\n'));
-		if let Some(stage) = self.stage.as_mut() {
-			stage
-				.write_all(data)
-				.map_err(|error| ProcessError::Spill(Str::from(error.to_string())))?;
-			return Ok(());
-		}
-		if self.buffered.len().saturating_add(data.len()) <= OUTPUT_SPILL_THRESHOLD {
-			self.buffered.extend_from_slice(data);
-			return Ok(());
-		}
-		let Some(host) = self.host.as_ref() else {
-			self.buffered.clear();
-			return Ok(());
-		};
-		let mut stage = host
-			.begin_spill()
-			.map_err(|error| ProcessError::Spill(Str::from(error.to_string())))?;
-		stage
-			.write_all(&self.buffered)
-			.and_then(|()| stage.write_all(data))
-			.map_err(|error| ProcessError::Spill(Str::from(error.to_string())))?;
-		self.buffered.clear();
-		self.stage = Some(stage);
-		Ok(())
-	}
-
-	async fn finish(self) -> Result<Option<BlobRef>, ProcessError> {
-		let Some(stage) = self.stage else {
-			return Ok(None);
-		};
-		let reference = task::spawn_blocking(move || stage.finish())
-			.await
-			.map_err(|error| ProcessError::Spill(Str::from(error.to_string())))?
-			.map_err(|error| ProcessError::Spill(Str::from(error.to_string())))?;
-		let hash = reference.hash.to_hex();
-		Ok(Some(BlobRef {
-			hash:       Str::from(hash.as_str()),
-			media_type: sf!("text/plain; charset=utf-8"),
-			byte_len:   reference.size,
-		}))
 	}
 }
 
@@ -755,8 +687,7 @@ impl EvalChild {
 			.map(|duration| u64::try_from(duration.as_nanos()))
 			.transpose()
 		else {
-			let _ = events
-				.send(Err(resource_fault("run", ProcessError::Duration(DurationError::Overflow))));
+			let _ = events.send_async(Err(resource_fault("run", ProcessError::Duration(DurationError::Overflow)))).await;
 			return RunCellDisposition::Drop;
 		};
 		if let Err(error) = write_frame(&mut self.stdin, &ParentFrame::Run {
@@ -770,14 +701,13 @@ impl EvalChild {
 		.await
 		{
 			needs_reset.store(true, Ordering::Release);
-			let _ = events.send(Err(session_lost(error)));
+			let _ = events.send_async(Err(session_lost(error))).await;
 			return RunCellDisposition::Drop;
 		}
 
 		let mut result = None;
 		let mut display_outputs = Vec::new();
 		let mut exception = None;
-		let mut spill = OutputSpill::new(blobs.clone());
 		let mut wire_sequence = 0_u64;
 		let (bridge_events_tx, bridge_events_rx) = flume::unbounded();
 		let mut bridge_tasks = JoinSet::new();
@@ -826,7 +756,7 @@ impl EvalChild {
 					needs_reset.store(true, Ordering::Release);
 					cancel_bridge_tasks(&mut bridge_tasks).await;
 					let _ =
-						events.send(Ok(RunEvent::Completed(cancelled_completion(elapsed_ms(started)))));
+						events.send_async(Ok(RunEvent::Completed(cancelled_completion(elapsed_ms(started))))).await;
 					return RunCellDisposition::Drop;
 				},
 				ParentLoopEvent::Timeout => {
@@ -835,7 +765,7 @@ impl EvalChild {
 					cancel_bridge_tasks(&mut bridge_tasks).await;
 					time::sleep(self.interrupt_grace).await;
 					let _ =
-						events.send(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started)))));
+						events.send_async(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started))))).await;
 					return RunCellDisposition::Drop;
 				},
 				ParentLoopEvent::Bridge(Some(BridgeTaskEvent::Progress { request_id, event })) => {
@@ -871,9 +801,9 @@ impl EvalChild {
 					{
 						needs_reset.store(true, Ordering::Release);
 						cancel_bridge_tasks(&mut bridge_tasks).await;
-						let _ = events.send(Err(Fault::SessionLost {
+						let _ = events.send_async(Err(Fault::SessionLost {
 							message: sf!("Python eval child exited during a host bridge response",),
-						}));
+						})).await;
 						return RunCellDisposition::Drop;
 					}
 					continue;
@@ -894,17 +824,17 @@ impl EvalChild {
 						== Some(CHILD_TIMEOUT_EXIT)
 					{
 						let _ =
-							events.send(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started)))));
+							events.send_async(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started))))).await;
 					} else {
-						let _ = events.send(Err(Fault::SessionLost {
+						let _ = events.send_async(Err(Fault::SessionLost {
 							message: sf!("Python eval child exited during the active cell"),
-						}));
+						})).await;
 					}
 					return RunCellDisposition::Drop;
 				},
 				Err(error) => {
 					needs_reset.store(true, Ordering::Release);
-					let _ = events.send(Err(session_lost(error)));
+					let _ = events.send_async(Err(session_lost(error))).await;
 					return RunCellDisposition::Drop;
 				},
 			};
@@ -912,19 +842,15 @@ impl EvalChild {
 				ChildFrame::Started { run_id: actual, cell_id: actual_cell }
 					if actual == run_id && actual_cell == cell_id =>
 				{
-					let _ = events.send(Ok(RunEvent::Started { cell_id: actual_cell }));
+					let _ = events.send_async(Ok(RunEvent::Started { cell_id: actual_cell })).await;
 				},
 				ChildFrame::Stdout { run_id: actual, mut update }
 				| ChildFrame::Stderr { run_id: actual, mut update }
 					if actual == run_id =>
 				{
-					if let Err(error) = spill.push(update.data.as_ref()) {
-						let _ = events.send(Err(resource_fault("spill_output", error)));
-						return RunCellDisposition::Drop;
-					}
 					update.sequence = wire_sequence;
 					wire_sequence = wire_sequence.saturating_add(1);
-					let _ = events.send(Ok(RunEvent::Output(update)));
+					let _ = events.send_async(Ok(RunEvent::Output(update))).await;
 				},
 				ChildFrame::Display { run_id: actual, output } if actual == run_id => {
 					upsert_display_output(
@@ -938,35 +864,11 @@ impl EvalChild {
 				ChildFrame::Error { run_id: actual, value } if actual == run_id => {
 					exception = Some(value);
 				},
-				ChildFrame::Done {
-					run_id: actual,
-					mut status,
-					truncated,
-					spilled_output,
-					total_lines,
-					total_bytes,
-				} if actual == run_id => {
+				ChildFrame::Done { run_id: actual, mut status } if actual == run_id => {
 					timeout.dispose();
 					cancel_bridge_tasks(&mut bridge_tasks).await;
 					status.exception = exception;
-					let spill_total_lines = spill.total_lines;
-					let spill_total_bytes = spill.total_bytes;
-					let spilled = match spill.finish().await {
-						Ok(value) => value,
-						Err(error) => {
-							let _ = events.send(Err(resource_fault("spill_output", error)));
-							return RunCellDisposition::Drop;
-						},
-					};
-					let completion = RunCompletion {
-						status,
-						result,
-						display_outputs,
-						truncated: truncated || spilled.is_some(),
-						spilled_output: spilled.or(spilled_output),
-						total_lines: total_lines.max(spill_total_lines),
-						total_bytes: total_bytes.max(spill_total_bytes),
-					};
+					let completion = RunCompletion { status, result, display_outputs };
 					if matches!(completion.status.outcome, CellOutcome::Cancelled) {
 						let kernel_alive = self.is_alive();
 						if should_retry_dead_kernel_cancellation(
@@ -977,14 +879,14 @@ impl EvalChild {
 						) {
 							return RunCellDisposition::RetryDeadCancellation(completion);
 						}
-						let _ = events.send(Ok(RunEvent::Completed(completion)));
+						let _ = events.send_async(Ok(RunEvent::Completed(completion))).await;
 						return if kernel_alive {
 							RunCellDisposition::Keep
 						} else {
 							RunCellDisposition::Drop
 						};
 					}
-					let _ = events.send(Ok(RunEvent::Completed(completion)));
+					let _ = events.send_async(Ok(RunEvent::Completed(completion))).await;
 					return RunCellDisposition::Keep;
 				},
 				ChildFrame::BridgeCall { run_id: actual, request_id, token, name, args }
@@ -1036,13 +938,13 @@ impl EvalChild {
 				},
 				ChildFrame::Fatal { message } => {
 					needs_reset.store(true, Ordering::Release);
-					let _ = events.send(Err(Fault::SessionLost { message }));
+					let _ = events.send_async(Err(Fault::SessionLost { message })).await;
 				},
 				_ => {
 					needs_reset.store(true, Ordering::Release);
-					let _ = events.send(Err(Fault::SessionLost {
+					let _ = events.send_async(Err(Fault::SessionLost {
 						message: sf!("Python eval child sent an invalid or out-of-order frame",),
-					}));
+					})).await;
 
 					return RunCellDisposition::Drop;
 				},
@@ -1181,12 +1083,8 @@ enum ChildFrame {
 		value:  PythonException,
 	},
 	Done {
-		run_id:         u64,
-		status:         CellStatus,
-		truncated:      bool,
-		spilled_output: Option<BlobRef>,
-		total_lines:    usize,
-		total_bytes:    usize,
+		run_id: u64,
+		status: CellStatus,
 	},
 	BridgeCall {
 		run_id:     u64,
@@ -1254,13 +1152,14 @@ impl ChildBridgeTransport for ChildBridgeHost {
 		self.pending.lock().insert(request_id, sender);
 		if self
 			.outgoing
-			.send(ChildFrame::BridgeCall {
+			.send_async(ChildFrame::BridgeCall {
 				run_id,
 				request_id,
 				token: self.token.clone(),
 				name: Str::from(name),
 				args,
 			})
+			.await
 			.is_err()
 		{
 			self.pending.lock().remove(&request_id);
@@ -1574,7 +1473,7 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 		};
 	validate_parent_identity(parent_pid)?;
 	start_parent_watchdog(parent_pid)?;
-	let (outgoing, outgoing_rx) = flume::unbounded();
+	let (outgoing, outgoing_rx) = flume::bounded(1);
 	let child_host = Arc::new(ChildBridgeHost {
 		token,
 		capabilities: BridgeCapabilities::from_allowed_names(capabilities),
@@ -1602,7 +1501,8 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 	let session = eval.open_session().await.map_err(ProcessError::Eval)?;
 	child_host
 		.outgoing
-		.send(ChildFrame::Ready)
+		.send_async(ChildFrame::Ready)
+		.await
 		.map_err(|_| ProcessError::Exited)?;
 	let active = Arc::new(AtomicBool::new(false));
 	loop {
@@ -1611,9 +1511,10 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 				if active.swap(true, Ordering::AcqRel) {
 					child_host
 						.outgoing
-						.send(ChildFrame::Fatal {
+						.send_async(ChildFrame::Fatal {
 							message: sf!("eval child received overlapping Run frames"),
 						})
+						.await
 						.map_err(|_| ProcessError::Exited)?;
 					continue;
 				}
@@ -1635,7 +1536,10 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 						child_host.active_run.store(0, Ordering::Release);
 						child_host
 							.outgoing
-							.send(ChildFrame::Fatal { message: Str::from(format!("{error:?}")) })
+							.send_async(ChildFrame::Fatal {
+								message: Str::from(format!("{error:?}")),
+							})
+							.await
 							.map_err(|_| ProcessError::Exited)?;
 						continue;
 					},
@@ -1649,60 +1553,44 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 						match run.next_event().await {
 							Ok(Some(RunEvent::Started { .. })) => {
 								let _ =
-									outgoing.send(ChildFrame::Started { run_id, cell_id: cell_id.clone() });
+									outgoing.send_async(ChildFrame::Started { run_id, cell_id: cell_id.clone() }).await;
 							},
 							Ok(Some(RunEvent::Output(update))) => {
 								let frame = match update.channel {
 									OutputChannel::Stdout => ChildFrame::Stdout { run_id, update },
 									OutputChannel::Stderr => ChildFrame::Stderr { run_id, update },
 								};
-								let _ = outgoing.send(frame);
+								let _ = outgoing.send_async(frame).await;
 							},
 							Ok(Some(RunEvent::Completed(completion))) => {
 								capture_barrier.drain().await;
 								run_route.active_run.store(0, Ordering::Release);
 								active_flag.store(false, Ordering::Release);
-								let RunCompletion {
-									mut status,
-									result,
-									display_outputs,
-									truncated,
-									spilled_output,
-									total_lines,
-									total_bytes,
-								} = completion;
+								let RunCompletion { mut status, result, display_outputs } = completion;
 								for output in display_outputs {
-									let _ = outgoing.send(ChildFrame::Display { run_id, output });
+									let _ = outgoing.send_async(ChildFrame::Display { run_id, output }).await;
 								}
 								if let Some(value) = result {
-									let _ = outgoing.send(ChildFrame::Result { run_id, value });
+									let _ = outgoing.send_async(ChildFrame::Result { run_id, value }).await;
 								}
 								if let Some(value) = status.exception.take() {
-									let _ = outgoing.send(ChildFrame::Error { run_id, value });
+									let _ = outgoing.send_async(ChildFrame::Error { run_id, value }).await;
 								}
-								let _ = outgoing.send(ChildFrame::Done {
-									run_id,
-									status,
-									truncated,
-									spilled_output,
-									total_lines,
-									total_bytes,
-								});
+								let _ = outgoing.send_async(ChildFrame::Done { run_id, status }).await;
 								break;
 							},
 							Ok(None) => {
 								run_route.active_run.store(0, Ordering::Release);
 								active_flag.store(false, Ordering::Release);
-								let _ = outgoing.send(ChildFrame::Fatal {
+								let _ = outgoing.send_async(ChildFrame::Fatal {
 									message: sf!("embedded eval stream ended without completion",),
-								});
+								}).await;
 								break;
 							},
 							Err(error) => {
 								run_route.active_run.store(0, Ordering::Release);
 								active_flag.store(false, Ordering::Release);
-								let _ = outgoing
-									.send(ChildFrame::Fatal { message: Str::from(format!("{error:?}")) });
+								let _ = outgoing.send_async(ChildFrame::Fatal { message: Str::from(format!("{error:?}")) }).await;
 								break;
 							},
 						}
@@ -1784,9 +1672,6 @@ pub enum ProcessError {
 	/// The child's embedded eval kernel rejected an operation.
 	#[error("eval child kernel failed: {0:?}")]
 	Eval(Fault),
-	/// Durable oversized-output staging failed.
-	#[error("eval child output spill failed: {0}")]
-	Spill(Str),
 	/// The child closed its protocol stream.
 	#[error("eval child exited")]
 	Exited,
@@ -2100,10 +1985,6 @@ const fn cancelled_completion(duration_ms: u64) -> RunCompletion {
 		},
 		result:          None,
 		display_outputs: Vec::new(),
-		truncated:       false,
-		spilled_output:  None,
-		total_lines:     0,
-		total_bytes:     0,
 	}
 }
 
@@ -2121,10 +2002,6 @@ const fn timeout_completion(duration_ms: u64) -> RunCompletion {
 		},
 		result:          None,
 		display_outputs: Vec::new(),
-		truncated:       false,
-		spilled_output:  None,
-		total_lines:     0,
-		total_bytes:     0,
 	}
 }
 
@@ -2232,6 +2109,70 @@ mod tests {
 		);
 		child.terminate().await;
 	}
+	#[tokio::test]
+	async fn external_process_streams_output_beyond_legacy_limits_byte_for_byte() {
+		use omp_tool::Registry;
+
+		let cwd = env::current_dir().expect("current directory");
+		let interpreter = discover_external_python(&cwd, None).expect("test host provides Python");
+		let host = Arc::new(SessionBridgeHost::new());
+		host
+			.bind_registry(Arc::new(Registry::new()))
+			.expect("bind empty bridge registry");
+		let session = Bytes::from_static(b"external-runner-large-output");
+		let mut child = EvalChild::spawn(
+			Path::new("unused-for-external-python"),
+			&interpreter,
+			&session,
+			&cwd,
+			Arc::clone(&host),
+			"1s".parse().expect("interrupt grace"),
+			None,
+		)
+		.await
+		.expect("launch selected interpreter");
+		let (events, received) = flume::unbounded();
+		let reset = AtomicBool::new(false);
+		let disposition = child
+			.run_cell(
+				Bytes::from_static(b"external-runner-large-output:cell-1"),
+				RunRequest {
+					code: sf!("import sys\nsys.stdout.write(('x' * 350 + '\\n') * 3001)"),
+					timeout: None,
+					reset: false,
+					runtime: runtime_snapshot(cwd),
+				},
+				CancellationToken::new(),
+				&events,
+				"owner",
+				&session,
+				host,
+				&reset,
+				None,
+				true,
+			)
+			.await;
+		assert!(matches!(disposition, RunCellDisposition::Keep));
+		let mut actual = Vec::new();
+		let mut completed = false;
+		for event in received.try_iter() {
+			match event.expect("successful run event") {
+				RunEvent::Output(update) if update.channel == OutputChannel::Stdout => {
+					actual.extend_from_slice(update.data.as_ref());
+				},
+				RunEvent::Completed(_) => completed = true,
+				RunEvent::Started { .. } | RunEvent::Output(_) => {},
+			}
+		}
+		let mut line = vec![b'x'; 350];
+		line.push(b'\n');
+		let expected = line.repeat(3_001);
+		assert!(expected.len() > 1024 * 1024);
+		assert_eq!(actual, expected);
+		assert!(completed);
+		child.terminate().await;
+	}
+
 	struct OverlapParent {
 		cwd:       PathBuf,
 		barrier:   tokio::sync::Barrier,

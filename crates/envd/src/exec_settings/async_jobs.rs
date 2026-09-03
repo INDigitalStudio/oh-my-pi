@@ -52,23 +52,23 @@ omp_con::var! {
 	/// Enable detached shell, task, and evaluation jobs.
 	pub static SV_ASYNC_ENABLED = sv_async_enabled: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Maximum running detached jobs; zero removes the capacity ceiling.
 	pub static SV_ASYNC_MAX_JOBS = sv_async_max_jobs: u32 {
 		default: 100,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Milliseconds to retain terminal job rows for observation.
 	pub static SV_ASYNC_RETENTION_MS = sv_async_retention_ms: i64 {
 		default: 300_000,
 		min: 0,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Maximum implicit wait, or the adaptive wait ladder.
 	pub static SV_ASYNC_POLL_WAIT_DURATION = sv_async_poll_wait_duration: PollWaitDuration {
 		default: PollWaitDuration::Smart,
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 

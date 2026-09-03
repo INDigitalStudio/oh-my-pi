@@ -207,6 +207,7 @@ impl CommitGenerator {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
+			forced_call:       None,
 		};
 		let meta = CallMeta {
 			id:             RequestId::from(format!("commit-{}", omp_core::Ulid::generate())),

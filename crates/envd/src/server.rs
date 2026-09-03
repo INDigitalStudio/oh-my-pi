@@ -328,10 +328,16 @@ pub enum EnvdError {
 	/// A native or worker tool declaration could not be registered.
 	#[error(transparent)]
 	Registry(#[from] RegistryError),
+	/// An admitted extension setting could not be installed as a convar.
+	#[error(transparent)]
+	ExtensionConvar(#[from] crate::exthost::ExtensionConvarError),
 	/// A worker advertised a declaration that cannot have a stable registry
 	/// identity.
 	#[error("invalid worker tool declaration: {0}")]
 	WorkerDeclaration(Str),
+	/// A worker advertised a malformed or incompatible protocol argument schema.
+	#[error("invalid worker tool declaration schema")]
+	WorkerProtocolSchema(#[from] omp_tool::ProtocolSchemaError),
 	/// The selected edit dialect was not a registered built-in revision.
 	#[error("invalid edit dialect: {0}")]
 	EditDialect(Str),
@@ -1761,6 +1767,18 @@ fn same_control_connection(
 		&& expected.capabilities == actual.capabilities
 }
 
+fn register_extension_convars(con: &Ctx, extensions: &[ExtHostSpec]) -> Result<(), EnvdError> {
+	for extension in extensions {
+		crate::exthost::register_extension_setting_convars(
+			con,
+			extension.key.extension().as_str(),
+			&extension.manifest.setting_schemas,
+			&extension.settings,
+		)?;
+	}
+	Ok(())
+}
+
 fn production_control_authorities(
 	state_dir: &Path,
 	session_id: &Str,
@@ -1769,6 +1787,7 @@ fn production_control_authorities(
 	extensions: &[ExtHostSpec],
 	journal_external: &ExternalJournalActor,
 	domain_control: Arc<DomainControlSlot>,
+	convars: Arc<dyn ControlAuthorityFactory>,
 ) -> ProductionControlBindings {
 	let resources = Arc::new(sync::OnceLock::new());
 	let manifests = Arc::new(
@@ -1864,7 +1883,8 @@ fn production_control_authorities(
 	let provider_owner = gated(DeclaredExternalDomain::Provider);
 	let services = gated(DeclaredExternalDomain::Services);
 	let auxiliary: Arc<dyn ControlAuthorityFactory> = Arc::new(CompositeControlFactory {
-		owners: vec![Arc::clone(&envd), parameters, workers, direct_filesystem].into_boxed_slice(),
+		owners: vec![Arc::clone(&envd), parameters, workers, direct_filesystem, convars]
+			.into_boxed_slice(),
 	});
 	let persistence = PersistenceControlAuthorities::new(sessions, persistent, credentials);
 	let policy = PolicyControlAuthorities::new(policy_owner, prompts);
@@ -2353,6 +2373,7 @@ impl EnvServer {
 		registry: Registry,
 		mut ext_host_config: ExtHostConfig,
 		con: &Ctx,
+		convars: Arc<dyn ControlAuthorityFactory>,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let workspace = WorkspaceHost::open(root)?;
@@ -2385,10 +2406,11 @@ impl EnvServer {
 			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
 				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
+		let blobs = BlobHost::open(state_dir.join("blobs"))?;
 		let exec = ExecHost::new()
 			.with_process_store(ProcessStore::new(state_dir.join("processes").join("meta.json")))?
-			.with_github_cache(Arc::clone(&github_cache));
-		let blobs = BlobHost::open(state_dir.join("blobs"))?;
+			.with_github_cache(Arc::clone(&github_cache))
+			.with_output_store(blobs.store().clone());
 		let telemetry = Arc::new(
 			TelemetryIndex::open(&state_dir.join("telemetry"), &state_dir.join("telemetry.sqlite3"))
 				.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
@@ -2402,6 +2424,7 @@ impl EnvServer {
 			local_root,
 		);
 		mcp.bind_manager(&mcp_manager);
+		register_extension_convars(con, &ext_host_config.extensions)?;
 		let journal_external = ExternalJournalActor::spawn(state_dir)?;
 		let control_bindings = production_control_authorities(
 			state_dir,
@@ -2411,6 +2434,7 @@ impl EnvServer {
 			&ext_host_config.extensions,
 			&journal_external,
 			ext_host_config.domain_control_factories(),
+			Arc::clone(&convars),
 		);
 		mcp_manager.bind_notification_sink(control_bindings.hooks.clone());
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
@@ -2468,6 +2492,7 @@ impl EnvServer {
 			session_id.as_str(),
 			Arc::clone(&github_cache),
 			&mcp,
+			Arc::clone(&mcp_manager),
 			&workspace,
 			memory_runtime.runtime(),
 			&telemetry,
@@ -2571,6 +2596,7 @@ impl EnvServer {
 		require_document_ownership: bool,
 		approval_mode: Option<super::tool_settings::ApprovalMode>,
 		con: &Ctx,
+		convars: Arc<dyn ControlAuthorityFactory>,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let workspace = WorkspaceHost::open(root)?;
@@ -2643,14 +2669,15 @@ impl EnvServer {
 			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
 				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
+		let blobs = BlobHost::open(state_dir.join("blobs"))?;
 		let exec = if doc_connections.is_some() {
 			ExecHost::new()
 				.with_process_store(ProcessStore::new(state_dir.join("processes").join("meta.json")))?
 		} else {
 			ExecHost::new()
 		}
-		.with_github_cache(Arc::clone(&github_cache));
-		let blobs = BlobHost::open(state_dir.join("blobs"))?;
+		.with_github_cache(Arc::clone(&github_cache))
+		.with_output_store(blobs.store().clone());
 		let telemetry = Arc::new(
 			TelemetryIndex::open(&state_dir.join("telemetry"), &state_dir.join("telemetry.sqlite3"))
 				.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
@@ -2664,6 +2691,7 @@ impl EnvServer {
 			local_root,
 		);
 		mcp.bind_manager(&mcp_manager);
+		register_extension_convars(con, &ext_host_config.extensions)?;
 		let journal_external = ExternalJournalActor::spawn(state_dir)?;
 		let control_bindings = production_control_authorities(
 			state_dir,
@@ -2673,6 +2701,7 @@ impl EnvServer {
 			&ext_host_config.extensions,
 			&journal_external,
 			ext_host_config.domain_control_factories(),
+			Arc::clone(&convars),
 		);
 		mcp_manager.bind_notification_sink(control_bindings.hooks.clone());
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
@@ -2733,6 +2762,7 @@ impl EnvServer {
 			session_id.as_str(),
 			Arc::clone(&github_cache),
 			&mcp,
+			Arc::clone(&mcp_manager),
 			&workspace,
 			memory_runtime.runtime(),
 			&telemetry,
@@ -2823,6 +2853,7 @@ impl EnvServer {
 		mut ext_host_config: ExtHostConfig,
 		approval_mode: Option<super::tool_settings::ApprovalMode>,
 		con: &Ctx,
+		convars: Arc<dyn ControlAuthorityFactory>,
 		bridges: RegistryBridges,
 		owner: EnvClient,
 	) -> Result<Self, EnvdError> {
@@ -2841,8 +2872,10 @@ impl EnvServer {
 			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
 				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
-		let exec = ExecHost::new().with_github_cache(Arc::clone(&github_cache));
 		let blobs = BlobHost::open(state_dir.join("blobs"))?;
+		let exec = ExecHost::new()
+			.with_github_cache(Arc::clone(&github_cache))
+			.with_output_store(blobs.store().clone());
 		let telemetry = Arc::new(
 			TelemetryIndex::open(&state_dir.join("telemetry"), &state_dir.join("telemetry.sqlite3"))
 				.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
@@ -2863,6 +2896,7 @@ impl EnvServer {
 			.await
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 
+		register_extension_convars(con, &ext_host_config.extensions)?;
 		let journal_external = ExternalJournalActor::spawn(state_dir)?;
 		let control_bindings = production_control_authorities(
 			state_dir,
@@ -2872,6 +2906,7 @@ impl EnvServer {
 			&ext_host_config.extensions,
 			&journal_external,
 			ext_host_config.domain_control_factories(),
+			Arc::clone(&convars),
 		);
 		mcp_manager.bind_notification_sink(control_bindings.hooks.clone());
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
@@ -3250,6 +3285,7 @@ impl EnvServer {
 		route: Option<ApprovalRoute>,
 	) {
 		self.approvals.bind(book, route.clone());
+		self.exec.bind_dynamic_approval_route(route.clone());
 		self.exec.bind_sandbox_approval_route(route);
 	}
 
@@ -7211,7 +7247,7 @@ impl EnvServer {
 			} else {
 				connection.owner.clone()
 			};
-			let (feed, params) = IncomingParams::owned_channel(owner);
+			let (feed, params) = IncomingParams::channel_for(Some(owner), Some(invocation_id.clone()));
 			let lifecycle = Arc::new(NativeLifecycle::default());
 			let name = Str::from(request.name);
 			let edit_repair = connection
@@ -11212,6 +11248,7 @@ pub async fn run_with_registry(
 		binding.prepare_endpoint()?;
 	}
 	let (doc_connections, doc_connection_rx) = watch::channel(0);
+	let convars = Arc::new(crate::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 	let server = Arc::new(
 		EnvServer::open_project(
 			&root,
@@ -11223,6 +11260,7 @@ pub async fn run_with_registry(
 			require_document_ownership,
 			None,
 			&con,
+			convars,
 			bridges,
 		)
 		.await?,
@@ -12245,6 +12283,9 @@ mod tests {
 	async fn extension_socket_is_owner_only_and_removed_on_shutdown() {
 		let root = tempfile::tempdir().expect("workspace");
 		let state = tempfile::tempdir().expect("state");
+		let con = Arc::new(Ctx::new());
+		let convars =
+			Arc::new(crate::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 		let server = Arc::new(
 			EnvServer::open_local(
 				root.path(),
@@ -12256,7 +12297,8 @@ mod tests {
 					sf!("test-session"),
 					1,
 				),
-				&Ctx::new(),
+				&con,
+				convars,
 				RegistryBridges::default(),
 			)
 			.await
@@ -12375,6 +12417,9 @@ mod tests {
 	async fn concurrent_extensions_cannot_reuse_each_others_endpoint() {
 		let root = tempfile::tempdir().expect("workspace");
 		let state = tempfile::tempdir().expect("state");
+		let con = Arc::new(Ctx::new());
+		let convars =
+			Arc::new(crate::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 		let server = Arc::new(
 			EnvServer::open_local(
 				root.path(),
@@ -12386,7 +12431,8 @@ mod tests {
 					sf!("test-session"),
 					1,
 				),
-				&Ctx::new(),
+				&con,
+				convars,
 				RegistryBridges::default(),
 			)
 			.await
@@ -13218,6 +13264,9 @@ mod tests {
 		let root = tempfile::tempdir().expect("workspace");
 		let state = tempfile::tempdir().expect("state");
 		fs::create_dir(root.path().join(".git")).expect("protected carve-out");
+		let con = Arc::new(Ctx::new());
+		let convars =
+			Arc::new(crate::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 		let server = Arc::new(
 			EnvServer::open_local(
 				root.path(),
@@ -13229,7 +13278,8 @@ mod tests {
 					sf!("test-session"),
 					1,
 				),
-				&Ctx::new(),
+				&con,
+				convars,
 				RegistryBridges::default(),
 			)
 			.await

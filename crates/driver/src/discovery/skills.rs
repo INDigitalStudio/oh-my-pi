@@ -70,37 +70,37 @@ omp_con::var! {
 	/// Enables skill discovery and invocation.
 	pub static SV_SKILLS_ENABLED = sv_skills_enabled: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Source IDs excluded before skill names claim precedence.
 	pub static SV_SKILLS_DISABLED_SOURCES = sv_skills_disabled_sources: Vec<Str> {
 		default: Vec::new(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Optional skill-name inclusion globs.
 	pub static SV_SKILLS_INCLUDE = sv_skills_include: Vec<Str> {
 		default: Vec::new(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Skill-name exclusion globs.
 	pub static SV_SKILLS_IGNORE = sv_skills_ignore: Vec<Str> {
 		default: Vec::new(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Explicit skill names disabled before collision handling.
 	pub static SV_SKILLS_DISABLED = sv_skills_disabled: Vec<Str> {
 		default: Vec::new(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Enables repo-surface third-party skill families.
 	pub static SV_SKILLS_THIRD_PARTY_ENABLED = sv_skills_third_party_enabled: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Additional native authored skill roots.
 	pub static SV_SKILLS_CUSTOM_DIRECTORIES = sv_skills_custom_directories: Vec<Str> {
 		default: Vec::new(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 

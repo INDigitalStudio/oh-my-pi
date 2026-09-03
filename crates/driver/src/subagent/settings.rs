@@ -139,46 +139,51 @@ omp_con::con_enum!(TaskIsolationMode);
 omp_con::con_enum!(TaskIsolationMerge);
 
 omp_con::var! {
+	/// Current child depth, seeded into descendants and advanced by the spawner.
+	pub static SV_TASK_RECURSION_DEPTH = sv_task_recursion_depth: u32 {
+		default: 0,
+		flags: session,
+	};
 	/// Maximum recursive subagent depth; -1 is unlimited.
 	pub static SV_TASK_MAX_RECURSION_DEPTH = sv_task_max_recursion_depth: i32 {
 		default: 2,
 		min: -1,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Maximum active subagent runs; 0 is unlimited.
 	pub static SV_TASK_MAX_CONCURRENCY = sv_task_max_concurrency: u32 {
 		default: 32,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Per-run wall-clock limit.
 	pub static SV_TASK_MAX_RUNTIME = sv_task_max_runtime: omp_con::Span {
 		default: omp_con::Span::Never,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Assistant-request budget before bounded wrap-up; 0 disables it.
 	pub static SV_TASK_SOFT_REQUEST_BUDGET = sv_task_soft_request_budget: u32 {
 		default: 200,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Emits one wrap-up notice after crossing the soft request budget.
 	pub static SV_TASK_SOFT_REQUEST_BUDGET_NOTICE = sv_task_soft_request_budget_notice: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Maximum caller-selectable reasoning effort for a child.
 	pub static SV_TASK_MAX_EFFORT = sv_task_max_effort: TaskEffortCeiling {
 		default: TaskEffortCeiling::Max,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Prompt pressure applied to task delegation.
 	pub static SV_TASK_EAGER = sv_task_eager: TaskEagerMode {
 		default: TaskEagerMode::Default,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Grants LSP capability to children.
 	pub static SV_TASK_ENABLE_LSP = sv_task_enable_lsp: bool {
 		default: false,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Idle interval before a child loop is parked.
 	pub static SV_TASK_AGENT_IDLE_TTL = sv_task_agent_idle_ttl: omp_con::Span {
@@ -186,52 +191,52 @@ omp_con::var! {
 			420,
 			omp_core::DurationUnit::Seconds,
 		)),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Agent definitions excluded from spawn resolution.
 	pub static SV_TASK_DISABLED_AGENTS = sv_task_disabled_agents: Vec<Str> {
 		default: Vec::new(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Definition-specific model-role overrides.
 	pub static SV_TASK_AGENT_MODEL_OVERRIDES = sv_task_agent_model_overrides: Kv {
 		default: Kv::default(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Definition-specific prewalk-role overrides.
 	pub static SV_TASK_AGENT_PREWALK = sv_task_agent_prewalk: Kv {
 		default: Kv::default(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Definition-specific advisor-role overrides.
 	pub static SV_TASK_AGENT_ADVISOR = sv_task_agent_advisor: Kv {
 		default: Kv::default(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Environment backend used for isolated child workspaces.
 	pub static SV_TASK_ISOLATION_MODE = sv_task_isolation_mode: TaskIsolationMode {
 		default: TaskIsolationMode::None,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Applies successful isolated workspace changes.
 	pub static SV_TASK_ISOLATION_APPLY = sv_task_isolation_apply: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Merge strategy for successful isolated workspace changes.
 	pub static SV_TASK_ISOLATION_MERGE = sv_task_isolation_merge: TaskIsolationMerge {
 		default: TaskIsolationMerge::Patch,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Shows the selected agent-definition badge in task output.
 	pub static CL_TASK_SHOW_AGENT_BADGE = cl_task_show_agent_badge: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Shows the serving model in task output.
 	pub static CL_TASK_SHOW_RESOLVED_MODEL_BADGE = cl_task_show_resolved_model_badge: bool {
 		default: false,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Default peer-message wait interval.
 	pub static SV_IRC_TIMEOUT = sv_irc_timeout: omp_con::Span {
@@ -239,17 +244,17 @@ omp_con::var! {
 			120,
 			omp_core::DurationUnit::Seconds,
 		)),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Relays peer-to-peer messages to the main transcript.
 	pub static CL_IRC_RELAY_TO_MAIN = cl_irc_relay_to_main: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Shows delivery-state badges beside relayed peer messages.
 	pub static CL_IRC_SHOW_BADGES = cl_irc_show_badges: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 
@@ -380,8 +385,12 @@ fn string_map(values: Kv) -> BTreeMap<Str, Str> {
 		.collect()
 }
 
-/// Creates a child console context from the parent's effective inherited
-/// values, then executes `config.cfg`, `subagent.cfg`, and `<agent>.cfg`.
+/// Creates a child console context in ADR 0013 order: the parent's live
+/// effective picture (every variable, engagement binds included), then
+/// `subagent.cfg`, then `<agent>.cfg`. `config.cfg` is deliberately not
+/// re-read: the parent already applied it, and re-running it would let a
+/// stale archived value override what the parent changed since startup.
+/// Whatever the spawner sets explicitly comes after this call.
 pub fn child_ctx(
 	parent: &Ctx,
 	loader: &dyn CfgLoader,
@@ -389,10 +398,14 @@ pub fn child_ctx(
 ) -> Result<Ctx, omp_con::ConError> {
 	let seed = parent.seed_child();
 	let child = Ctx::new();
-	for (name, value) in seed.iter() {
-		child.set_value(name.as_str(), value.clone(), omp_con::SetSource::Code)?;
+	let (dynamic_vars, values) = seed.into_parts();
+	for spec in dynamic_vars {
+		child.register_dynamic_var(spec)?;
 	}
-	let outcome = child.exec_configs(loader, Some(agent));
+	for (name, value) in values {
+		child.set_value(name.as_str(), value, omp_con::SetSource::Code)?;
+	}
+	let outcome = child.exec_spawn_configs(loader, agent);
 	if outcome.failed > 0 {
 		tracing::warn!(
 			agent,

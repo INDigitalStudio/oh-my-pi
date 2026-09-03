@@ -348,6 +348,13 @@ impl Resolve for UrlResolver {
 	}
 }
 
+/// Live policy for `local://`: readable, listable, pathable, and completable
+/// session scratch files; never minted by the model.
+pub(super) fn local_scheme_entry() -> SchemeEntry {
+	SchemeEntry::new(Scheme::Local, true, false, "session-local scratch files")
+		.with_capabilities(true, true, true)
+}
+
 /// Builds the production internal URL table and shared conflict registry.
 pub(super) fn production_url_resolvers(
 	conflicts: Arc<ConflictRegistry>,
@@ -455,8 +462,7 @@ pub(super) fn production_url_resolvers(
 		.expect("artifact URL resolver is unique");
 	builder
 		.register(
-			SchemeEntry::new(Scheme::Local, false, false, "session-local scratch files")
-				.with_capabilities(true, true, true),
+			local_scheme_entry(),
 			UrlResolver::Local(
 				local::LocalResolver::open(sessions_dir.clone())
 					.expect("canonical sessions directory can be created"),

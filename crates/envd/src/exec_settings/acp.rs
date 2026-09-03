@@ -34,7 +34,7 @@ omp_con::var! {
 	/// Choose whether eligible shell calls prefer a capable ACP terminal backend.
 	pub static SV_ACP_ROUTING = sv_acp_routing: AcpRouting {
 		default: AcpRouting::Auto,
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 

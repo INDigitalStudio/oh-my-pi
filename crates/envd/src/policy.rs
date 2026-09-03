@@ -38,6 +38,7 @@ pub const CAPABILITIES: &[&str] = &[
 	"invocation",
 	"env.exec",
 	"env.process",
+	"env.net",
 	"env.workspace.snapshot",
 	"env.worktree",
 	"env.blob",
@@ -123,12 +124,13 @@ impl Grants {
 				grants.extend(["env.doc.write", "env.fs.write", "env.blob"]);
 			}
 		}
-		if envelope
-			.exec
-			.as_ref()
-			.is_some_and(|exec| !exec.commands.is_empty())
-		{
-			grants.extend(["env.exec", "env.dap.read", "env.dap.execute", "env.blob"]);
+		if let Some(exec) = &envelope.exec {
+			if !exec.commands.is_empty() {
+				grants.extend(["env.exec", "env.dap.read", "env.dap.execute", "env.blob"]);
+			}
+			if exec.network {
+				grants.push("env.net");
+			}
 		}
 		if let Some(desktop) = &envelope.desktop {
 			if desktop.capture {
@@ -618,6 +620,10 @@ pub enum PolicyControlFailure {
 	/// A different durable decision already owns the ticket.
 	#[error("approval ticket already has a different decision")]
 	DecisionConflict,
+	/// The ticket carries a `require_human` reason and the decision did not
+	/// come from a human-facing route.
+	#[error("approval ticket requires a human decision")]
+	HumanRequired,
 	/// Durable audit failed before state could change.
 	#[error("policy audit append failed: {0}")]
 	Audit(Str),
@@ -635,6 +641,7 @@ impl PolicyControlFailure {
 			Self::UnknownHandle => "UnknownProfileHandle",
 			Self::UnknownTicket => "UnknownApprovalTicket",
 			Self::DecisionConflict => "ApprovalDecisionConflict",
+			Self::HumanRequired => "ApprovalHumanRequired",
 			Self::Audit(_) => "PolicyAuditFailed",
 		};
 		ControlProtocolError::new(code, Str::from(self.to_string()))
@@ -778,18 +785,9 @@ impl PolicyControlOwner {
 		}
 		let decision: Decision = serde_json::from_value(value)
 			.map_err(|error| PolicyControlFailure::Invalid(Str::from(error.to_string())))?;
-		let source = match decision.source.as_str() {
-			"user" => ApprovalSource::User,
-			"external" => ApprovalSource::External,
-			"forwarded" => ApprovalSource::Forwarded,
-			"config" => ApprovalSource::Config,
-			"extension" => ApprovalSource::Extension,
-			"timeout" => ApprovalSource::Timeout,
-			"unavailable" => ApprovalSource::Unavailable,
-			_ => {
-				return Err(PolicyControlFailure::Invalid(Str::new_static("unknown approval source")));
-			},
-		};
+		let source = ApprovalSource::from_str(decision.source.as_str()).map_err(|_| {
+			PolicyControlFailure::Invalid(Str::new_static("unknown approval source"))
+		})?;
 		let scope = match decision.scope {
 			PolicyScope::Once => Str::new_static("once"),
 			PolicyScope::Call => Str::new_static("call"),
@@ -816,6 +814,15 @@ impl PolicyControlOwner {
 			} else {
 				Err(PolicyControlFailure::DecisionConflict)
 			};
+		}
+		// One human-only reason makes the whole merged prompt human-only.
+		// Forwarding, configuration, extensions, and synthesized fallbacks
+		// remain non-human even when they arrive through an authenticated
+		// policy connection.
+		if !matches!(decision.source, ApprovalSource::User | ApprovalSource::External)
+			&& existing.reasons.iter().any(|reason| reason.require_human)
+		{
+			return Err(PolicyControlFailure::HumanRequired);
 		}
 		let mut durable = existing;
 		durable.state = TicketState::Decided;
@@ -1927,6 +1934,73 @@ mod tests {
 		assert_eq!(dap_command_capability("evaluate"), "env.dap.execute");
 		assert_eq!(dap_command_capability("continue"), "env.dap.execute");
 		assert_eq!(dap_command_capability("vendor_mutation"), "env.dap.execute");
+	}
+
+	/// HTTP DATA operations require `env.net`; the closed capability set must
+	/// accept the grant and network exec effects must derive it independently
+	/// of process execution.
+	#[test]
+	fn network_effects_derive_a_grantable_env_net_capability() {
+		assert!(Grants::supported(["env.net"]).contains("env.net"));
+		assert!(Grants::all().contains("env.net"));
+		for (commands, network, expected_net, expected_exec) in [
+			(Vec::new(), false, false, false),
+			(Vec::new(), true, true, false),
+			(vec![String::from("curl")], false, false, true),
+			(vec![String::from("curl")], true, true, true),
+		] {
+			let envelope = v1::EffectEnvelope {
+				exec: Some(v1::ExecEffects { commands, network, props: None }),
+				..v1::EffectEnvelope::default()
+			};
+			let grants = Grants::from_effect_envelope(&envelope);
+			assert_eq!(grants.contains("env.net"), expected_net);
+			assert_eq!(grants.contains("env.exec"), expected_exec);
+		}
+	}
+
+	/// Both the host manifest and the authorized effect envelope must grant
+	/// network access; either deny takes precedence.
+	#[test]
+	fn network_data_authority_requires_host_and_effect_grants() {
+		for (host_grant, effect_grant, expected) in [
+			(true, true, Ok(())),
+			(true, false, Err(PolicyError::Denied { capability: "env.net" })),
+			(false, true, Err(PolicyError::Denied { capability: "env.net" })),
+			(false, false, Err(PolicyError::Denied { capability: "env.net" })),
+		] {
+			let table = AuthorityTable::default();
+			let host = HostKey::new("project", "trusted", "fixture.extension");
+			let host_grants = host_grant.then_some("env.net");
+			table.register_host(host.clone(), Grants::supported(host_grants));
+			table.open(host.clone(), Str::new_static("call"));
+			let effect_grants = effect_grant.then_some("env.net");
+			table
+				.authorize(
+					&host,
+					"call",
+					Bytes::from_static(b"token"),
+					Grants::supported(effect_grants),
+					1,
+					7,
+					11,
+				)
+				.expect("authorization transition succeeds");
+			assert_eq!(
+				table.validate(
+					&host,
+					1,
+					DataAuthority {
+						invocation_id:      "call",
+						effect_token:       b"token",
+						host_generation:    7,
+						session_generation: 11,
+					},
+					"env.net",
+				),
+				expected,
+			);
+		}
 	}
 
 	#[test]

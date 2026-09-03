@@ -9,7 +9,7 @@ use std::{
 
 use omp_agent::{SessionAuthority, SessionEndpoint, Up};
 use omp_core::{FastHashMap, Str};
-use omp_dom::Snapshot;
+use omp_dom::{Dom, Op, PropId, Snapshot};
 use parking_lot::RwLock;
 
 omp_core::string_id!(
@@ -130,8 +130,10 @@ pub struct StoredSession {
 	pub created:    Str,
 	/// Journal file modification time in Unix milliseconds.
 	pub updated_ms: u64,
-	/// First line of the first user prompt, when the session has one.
+	/// Explicit live `<meta name>`, else the first live user prompt.
 	pub title:      Option<Str>,
+	/// User and assistant messages on the selected live branch.
+	pub messages:   u32,
 }
 
 impl StoredSession {
@@ -143,23 +145,83 @@ impl StoredSession {
 	}
 }
 
-/// First non-empty line of the earliest `msg.user@1` entry, control
-/// characters stripped.
-fn first_prompt_title(entries: &[omp_journal::Entry]) -> Option<Str> {
-	let user = omp_journal::Kind::known(omp_journal::KindName::MsgUser);
-	entries
+/// Selects exactly the journal prefix that materializes into the live DOM.
+fn live_chain(entries: &[omp_journal::Entry]) -> Vec<&omp_journal::Entry> {
+	let Some(mut index) = entries.len().checked_sub(1) else {
+		return Vec::new();
+	};
+	let by_id = entries
 		.iter()
-		.filter(|entry| entry.kind == user)
-		.find_map(|entry| {
-			let payload: omp_journal::data::MsgUser = serde_json::from_str(entry.data.as_str()).ok()?;
-			let line = payload.text.lines().next()?;
-			let clean = line
-				.chars()
-				.filter(|character| !character.is_control())
-				.collect::<String>();
-			let clean = clean.trim();
-			(!clean.is_empty()).then(|| Str::new(clean))
-		})
+		.enumerate()
+		.map(|(index, entry)| (entry.id, index))
+		.collect::<FastHashMap<_, _>>();
+	let mut reverse = Vec::new();
+	loop {
+		let entry = &entries[index];
+		reverse.push(entry);
+		if let Some(prior) = entry.prior {
+			let Some(parent) = by_id.get(&prior) else {
+				return Vec::new();
+			};
+			index = *parent;
+		} else if let Some(previous) = index.checked_sub(1) {
+			index = previous;
+		} else {
+			break;
+		}
+	}
+	reverse.reverse();
+	reverse
+}
+
+fn clean_title(text: &str) -> Option<Str> {
+	let line = text.lines().next()?;
+	let clean = line
+		.chars()
+		.filter(|character| !character.is_control())
+		.collect::<String>();
+	let clean = clean.trim();
+	(!clean.is_empty()).then(|| Str::new(clean))
+}
+
+/// Derives picker metadata from the selected branch's DOM vocabulary rather
+/// than raw file order. `<meta name>` wins over the first live user node.
+fn live_metadata(entries: &[omp_journal::Entry]) -> (Option<Str>, u32) {
+	let chain = live_chain(entries);
+	let user = omp_journal::Kind::known(omp_journal::KindName::MsgUser);
+	let assistant = omp_journal::Kind::known(omp_journal::KindName::MsgAssistantStart);
+	let patch = omp_journal::Kind::known(omp_journal::KindName::Patch);
+	let meta = Dom::new().meta();
+	let mut explicit = None;
+	let mut first_prompt = None;
+	let mut messages = 0_u32;
+	for entry in chain {
+		if entry.kind == user {
+			messages = messages.saturating_add(1);
+			if first_prompt.is_none()
+				&& let Ok(payload) =
+					serde_json::from_str::<omp_journal::data::MsgUser>(entry.data.as_str())
+			{
+				first_prompt = clean_title(payload.text.as_str());
+			}
+		} else if entry.kind == assistant {
+			messages = messages.saturating_add(1);
+		} else if entry.kind == patch
+			&& let Ok(payload) =
+				serde_json::from_str::<omp_journal::data::Patch>(entry.data.as_str())
+			&& let Ok(ops) = serde_json::from_str::<Vec<Op>>(payload.ops.get())
+		{
+			for op in ops {
+				if let Op::Set { h, prop, value } = op
+					&& h == meta
+					&& prop == PropId::Name.into()
+				{
+					explicit = value.as_str().and_then(clean_title);
+				}
+			}
+		}
+	}
+	(explicit.or(first_prompt), messages)
 }
 
 /// Disposable in-memory lookup rebuilt by scanning `.oms` genesis frames.
@@ -182,7 +244,7 @@ impl SessionIndex {
 		collect_journals(root.as_ref(), &mut paths)?;
 		let mut rows = FastHashMap::default();
 		for path in paths {
-			let (_, entries) = match omp_journal::Journal::open(&path) {
+			let entries = match omp_journal::Journal::scan(&path) {
 				Ok(opened) => opened,
 				Err(error) => {
 					tracing::warn!(journal = %path.display(), %error, "skipping invalid session journal");
@@ -210,7 +272,7 @@ impl SessionIndex {
 				.as_millis()
 				.try_into()
 				.unwrap_or(u64::MAX);
-			let title = first_prompt_title(&entries);
+			let (title, messages) = live_metadata(&entries);
 			rows.insert(Str::new(stem), StoredSession {
 				id: Str::new(stem),
 				path,
@@ -218,6 +280,7 @@ impl SessionIndex {
 				created: payload.created,
 				updated_ms,
 				title,
+				messages,
 			});
 		}
 		*self.by_id.write() = rows;
@@ -353,6 +416,52 @@ mod tests {
 		let all = index.recent(Some(&current), 8);
 		assert_eq!(all.iter().map(|row| row.path.clone()).collect::<Vec<_>>(), [middle, control, oldest]);
 		assert_eq!(all[2].display_name().as_str(), "Fix the parser");
+		assert_eq!(all[2].messages, 1);
 		assert!(index.recent(None, 8).iter().any(|row| row.path == current));
+	}
+
+	#[test]
+	fn metadata_uses_explicit_name_and_messages_from_the_live_branch() {
+		let scratch = tempfile::tempdir().expect("tempdir");
+		let path = scratch.path().join("branched.oms");
+		let mut session =
+			omp_session::Session::create(&path, omp_session::ComponentRegistry::standard())
+				.expect("session");
+		let cause = session.head().expect("genesis");
+		session
+			.patch(omp_dom::Txn {
+				cause,
+				label: Some(Str::new_static("rename")),
+				ops: vec![Op::Set {
+					h: session.dom().meta(),
+					prop: PropId::Name.into(),
+					value: omp_dom::Value::Str(Str::new_static("Live title")),
+				}],
+			})
+			.expect("live rename");
+		session.begin_turn().expect("live turn");
+		let live = session.user("live prompt", Vec::new()).expect("live prompt");
+		session.begin_turn().expect("abandoned turn");
+		session.user("abandoned prompt", Vec::new()).expect("abandoned prompt");
+		let cause = session.head().expect("abandoned head");
+		session
+			.patch(omp_dom::Txn {
+				cause,
+				label: Some(Str::new_static("rename")),
+				ops: vec![Op::Set {
+					h: session.dom().meta(),
+					prop: PropId::Name.into(),
+					value: omp_dom::Value::Str(Str::new_static("Abandoned title")),
+				}],
+			})
+			.expect("abandoned rename");
+		session.rewind(live).expect("rewind");
+		session.begin_turn().expect("commit branch selection");
+		drop(session);
+
+		let index = SessionIndex::open(scratch.path()).expect("index");
+		let stored = index.get("branched").expect("stored session");
+		assert_eq!(stored.title.as_deref(), Some("Live title"));
+		assert_eq!(stored.messages, 1, "abandoned messages do not count");
 	}
 }

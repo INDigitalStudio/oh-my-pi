@@ -1,6 +1,7 @@
 //! Python worker adapters for the engine Director and Component surfaces.
 
 use std::{
+	collections::BTreeMap,
 	str::FromStr as _,
 	sync::Arc,
 	time::{Duration, Instant},
@@ -11,8 +12,10 @@ use omp_agent::{
 	LiveComponent, LiveComponentError, MutDirectorCx, Prepared, Slot, StateUpdate, TurnView,
 	Verdict,
 };
+use omp_con::{Ctx, DynamicVarSpec, Origin, TypeSpec, Value as ConValue, VarFlags};
 use omp_core::{Str, sf};
 use omp_dom::{Node, Op, Txn};
+use omp_ext::config::{SettingSchema, SettingType, extension_setting_convar_name};
 use omp_journal::{Entry, Kind};
 use omp_session::{Component, Draft, SessionError};
 use serde_json::{Map, Value as JsonValue, json};
@@ -47,6 +50,125 @@ pub enum PyExtensionError {
 	/// Journaling the callback result failed.
 	#[error(transparent)]
 	Session(#[from] SessionError),
+}
+
+/// Failure while installing manifest settings into the shared control plane.
+#[derive(Debug, Error)]
+pub enum ExtensionConvarError {
+	/// A setting had neither a manifest default nor an admitted effective value.
+	#[error("extension {extension} setting {key} has no value to seed its convar")]
+	MissingValue {
+		/// Extension identity.
+		extension: Str,
+		/// Manifest setting key.
+		key:       Str,
+	},
+	/// A resolved value did not match its manifest-declared setting kind.
+	#[error("extension {extension} setting {key} does not match its declared type")]
+	InvalidValue {
+		/// Extension identity.
+		extension: Str,
+		/// Manifest setting key.
+		key:       Str,
+	},
+	/// The control plane rejected a dynamic declaration or effective value.
+	#[error("extension {extension} setting {key} could not be installed")]
+	Control {
+		/// Extension identity.
+		extension: Str,
+		/// Manifest setting key.
+		key:       Str,
+		/// Typed control-plane failure.
+		#[source]
+		source:    omp_con::ConError,
+	},
+}
+
+/// Registers every admitted extension setting as a dynamic control variable.
+///
+/// Names are owner-qualified as `ext::<extension>::<key>`. Registration uses
+/// the manifest default as the persistence baseline and commits a different
+/// admitted launch value to the session layer.
+pub fn register_extension_setting_convars(
+	ctx: &Ctx,
+	extension: &str,
+	settings: &BTreeMap<Str, SettingSchema>,
+	resolved: &serde_json::Map<String, JsonValue>,
+) -> Result<(), ExtensionConvarError> {
+	for (key, schema) in settings {
+		let effective = resolved.get(key.as_str());
+		let baseline = match schema.default.as_ref() {
+			Some(default) => serde_json::to_value(default)
+				.ok()
+				.as_ref()
+				.and_then(|value| convar_value(schema, value)),
+			None => effective.and_then(|value| convar_value(schema, value)),
+		}
+		.ok_or_else(|| ExtensionConvarError::MissingValue {
+			extension: Str::new(extension),
+			key:       key.clone(),
+		})?;
+		let name = extension_setting_convar_name(extension, key);
+		ctx
+			.register_dynamic_var(DynamicVarSpec {
+				name: name.clone(),
+				desc: schema
+					.description
+					.clone()
+					.unwrap_or_else(|| sf!("Setting {key} declared by extension {extension}")),
+				ty: convar_type(schema),
+				flags: VarFlags::ARCHIVE
+					.with(VarFlags::SESSION)
+					.with(VarFlags::REPLICATED),
+				default: baseline.clone(),
+			})
+			.map_err(|source| ExtensionConvarError::Control {
+				extension: Str::new(extension),
+				key:       key.clone(),
+				source,
+			})?;
+		if let Some(effective) = effective {
+			let effective =
+				convar_value(schema, effective).ok_or_else(|| ExtensionConvarError::InvalidValue {
+					extension: Str::new(extension),
+					key:       key.clone(),
+				})?;
+			if effective != baseline {
+				ctx
+					.set(name.as_str(), effective, Origin::Session)
+					.map_err(|source| ExtensionConvarError::Control {
+						extension: Str::new(extension),
+						key:       key.clone(),
+						source,
+					})?;
+			}
+		}
+	}
+	Ok(())
+}
+
+fn convar_type(schema: &SettingSchema) -> &'static TypeSpec {
+	match schema.kind {
+		SettingType::Boolean => TypeSpec::BOOL,
+		SettingType::Number => TypeSpec::FLOAT,
+		SettingType::String | SettingType::Enum => TypeSpec::STR,
+	}
+}
+
+fn convar_value(schema: &SettingSchema, value: &JsonValue) -> Option<ConValue> {
+	match schema.kind {
+		SettingType::Boolean => value.as_bool().map(ConValue::Bool),
+		SettingType::Number => value.as_f64().map(ConValue::Float),
+		SettingType::String => value.as_str().map(|value| ConValue::Str(Str::new(value))),
+		SettingType::Enum => {
+			let value = value.as_str()?;
+			schema
+				.values
+				.iter()
+				.any(|allowed| allowed == value)
+				.then(|| ConValue::Str(Str::new(value)))
+		},
+	}
 }
 
 #[derive(Clone)]
@@ -360,7 +482,7 @@ impl LiveComponent for PyComponent {
 		self.interested.iter().any(|candidate| candidate == kind)
 	}
 
-	fn reduce(&mut self, entry: &Entry, _: &omp_dom::Dom) -> Result<Vec<Op>, LiveComponentError> {
+	fn reduce(&self, entry: &Entry, _: &omp_dom::Dom) -> Result<Vec<Op>, LiveComponentError> {
 		self
 			.reduce_ops(entry)
 			.map_err(|_| LiveComponentError::Callback)
@@ -495,5 +617,77 @@ fn bind_value(value: &JsonValue) -> Option<BindValue> {
 			.or_else(|| value.as_f64().map(BindValue::Float)),
 		JsonValue::String(value) => Some(BindValue::Str(Str::new(value))),
 		_ => None,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use omp_con::{Ctx, Value as ConValue};
+	use omp_ext::config::{DeploymentManifest, resolve_extension_settings};
+
+	use super::{ExtensionConvarError, register_extension_setting_convars};
+
+	#[test]
+	fn manifest_settings_register_owner_qualified_dynamic_convars() {
+		let manifest = DeploymentManifest::parse(
+			r#"
+id = "demo"
+
+[settings.verbose]
+type = "boolean"
+default = false
+
+[settings.severity]
+type = "enum"
+values = ["warning", "error"]
+default = "warning"
+"#,
+		)
+		.expect("deployment manifest");
+		let mut resolved =
+			resolve_extension_settings(&manifest, &Default::default(), &[]).expect("defaults");
+		resolved.insert("verbose".into(), serde_json::json!(true));
+		let ctx = Ctx::new();
+		let writes = ctx.subscribe_session_writes();
+
+		register_extension_setting_convars(
+			&ctx,
+			manifest.id.as_str(),
+			&manifest.settings,
+			&resolved,
+		)
+		.expect("register dynamic convars");
+
+		assert_eq!(ctx.get("ext::demo::verbose"), Some(ConValue::Bool(true)));
+		assert_eq!(
+			ctx.get("ext::demo::severity"),
+			Some(ConValue::Str("warning".into())),
+		);
+		assert_eq!(
+			writes.try_recv().expect("effective override"),
+			("ext::demo::verbose".into(), ConValue::Bool(true)),
+		);
+	}
+
+	#[test]
+	fn setting_without_default_or_effective_value_is_rejected() {
+		let manifest = DeploymentManifest::parse(
+			r#"
+id = "demo"
+
+[settings.required]
+type = "string"
+"#,
+		)
+		.expect("deployment manifest");
+		assert!(matches!(
+			register_extension_setting_convars(
+				&Ctx::new(),
+				manifest.id.as_str(),
+				&manifest.settings,
+				&Default::default(),
+			),
+			Err(ExtensionConvarError::MissingValue { .. })
+		));
 	}
 }

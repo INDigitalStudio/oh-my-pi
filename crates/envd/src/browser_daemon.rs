@@ -1,19 +1,16 @@
 //! Supervised named-tab browser daemon over `omp-webview` automation.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc, thread, time::Duration};
+use std::{collections::HashMap, sync::Arc, thread, time::Duration};
 
 use async_trait::async_trait;
 use flume::Receiver;
 use omp_con::Ctx;
-use omp_core::{ArtifactUrl, Str, sf};
-use omp_tools::browser::{Action, BrowserHost, Fault, Params, Payload, RunOperation};
-use omp_webview::{
-	Engine, FrameConfig, SurfaceKind, WebView, WebViewBuilder, WindowConfig,
-	automation::{ExtractFormat, ObserveOptions, Selector},
-};
-use serde_json::{Value, json};
+use omp_core::{Str, sf};
+use omp_tools::browser::{Action, BrowserHost, Fault, Params, Payload};
+use omp_webview::{Engine, FrameConfig, SurfaceKind, WebView, WebViewBuilder, WindowConfig};
+use serde_json::json;
 
-use crate::blobs::{BlobError, BlobHost};
+use crate::blobs::BlobHost;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TIMEOUT: Duration = Duration::from_mins(5);
@@ -22,12 +19,12 @@ omp_con::var! {
 	/// Enable the browser tool for scripted web automation.
 	pub static SV_BROWSER_ENABLED = sv_browser_enabled: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Run browser automation offscreen instead of showing a browser window.
 	pub static SV_BROWSER_HEADLESS = sv_browser_headless: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 
@@ -151,10 +148,11 @@ fn run(receiver: Receiver<Request>, blobs: BlobHost, mut headless: bool) {
 
 fn execute(
 	tabs: &mut HashMap<Str, WebView>,
-	blobs: &BlobHost,
+	_blobs: &BlobHost,
 	headless: bool,
 	params: Params,
 ) -> Result<Payload, Fault> {
+	validate_supported(&params)?;
 	let name = params.name.clone().unwrap_or_else(|| sf!("main"));
 	match params.action {
 		Action::Open => open(tabs, name, headless, params),
@@ -173,7 +171,7 @@ fn execute(
 				artifacts: Vec::new(),
 			})
 		},
-		Action::Run => run_tab(tabs, blobs, name, params),
+		Action::Run => run_tab(tabs, name, params),
 	}
 }
 
@@ -193,14 +191,24 @@ fn open(
 	if let Some(url) = params.url.as_ref() {
 		builder = builder.url(url.clone());
 	}
-	let width = params.width.unwrap_or(1280).clamp(320, 4096);
-	let height = params.height.unwrap_or(800).clamp(240, 4096);
+	let width = params
+		.viewport
+		.map_or(1280, |viewport| viewport.width)
+		.clamp(320, 4096);
+	let height = params
+		.viewport
+		.map_or(800, |viewport| viewport.height)
+		.clamp(240, 4096);
 	let view = if headless {
 		builder
 			.build_frames(FrameConfig {
 				width,
 				height,
-				scale: params.scale.unwrap_or(1.0).clamp(0.5, 4.0),
+				scale: params
+					.viewport
+					.and_then(|viewport| viewport.scale)
+					.unwrap_or(1.0)
+					.clamp(0.5, 4.0),
 				..FrameConfig::default()
 			})
 			.map_err(webview_fault)?
@@ -229,7 +237,6 @@ fn open(
 
 fn run_tab(
 	tabs: &mut HashMap<Str, WebView>,
-	blobs: &BlobHost,
 	name: Str,
 	params: Params,
 ) -> Result<Payload, Fault> {
@@ -239,184 +246,46 @@ fn run_tab(
 	if let Some(url) = params.url.as_ref() {
 		tab.goto(url, timeout).map_err(webview_fault)?;
 	}
-	let operation = params
-		.operation
-		.or_else(|| params.code.as_ref().map(|_| RunOperation::Evaluate));
-	let operation = operation.ok_or_else(|| invalid("run requires `operation` or `code`"))?;
-	let mut artifacts = Vec::new();
-	let result = match operation {
-		RunOperation::Evaluate => tab
-			.evaluate(required(params.code.as_deref(), "code")?, timeout)
-			.map_err(webview_fault)?,
-		RunOperation::Observe => {
-			let observation = tab
-				.document()
-				.observe(ObserveOptions::default())
-				.map_err(webview_fault)?;
-			json!({
-				"url": observation.url,
-				"title": observation.title,
-				"text": observation.text,
-				"truncated": observation.truncated,
-				"elements": observation.elements.into_iter().map(|element| json!({
-					"id": element.id,
-					"ref": element.reference,
-					"role": element.role,
-					"name": element.name,
-					"value": element.value,
-					"bounds": element.bounds,
-					"visible": element.visible,
-				})).collect::<Vec<_>>(),
-			})
-		},
-		RunOperation::AriaSnapshot => Value::String(
-			tab.document()
-				.aria_snapshot(selector(params.selector.as_deref())?)
-				.map_err(webview_fault)?
-				.to_string(),
-		),
-		RunOperation::Screenshot => {
-			let screenshot = tab
-				.screenshot(selector(params.selector.as_deref())?, params.full_page, timeout)
-				.map_err(webview_fault)?;
-			let id = blobs.put(&screenshot.data).map_err(blob_fault)?;
-			let url = Str::new(ArtifactUrl::from_digest(id.hash).as_str());
-			artifacts.push(url.clone());
-			json!({ "artifact": url, "bytes": id.size, "clip": screenshot.clip })
-		},
-		RunOperation::ExtractText => Value::String(
-			tab.extract(ExtractFormat::Text)
-				.map_err(webview_fault)?
-				.to_string(),
-		),
-		RunOperation::ExtractHtml => Value::String(
-			tab.extract(ExtractFormat::Html)
-				.map_err(webview_fault)?
-				.to_string(),
-		),
-		RunOperation::Click => {
-			element(view, &params)?.click().map_err(webview_fault)?;
-			Value::Bool(true)
-		},
-		RunOperation::Type => {
-			element(view, &params)?
-				.type_text(required(params.value.as_deref(), "value")?)
-				.map_err(webview_fault)?;
-			Value::Bool(true)
-		},
-		RunOperation::Fill => {
-			element(view, &params)?
-				.fill(required(params.value.as_deref(), "value")?)
-				.map_err(webview_fault)?;
-			Value::Bool(true)
-		},
-		RunOperation::Select => {
-			element(view, &params)?
-				.select(
-					params
-						.values
-						.as_deref()
-						.ok_or_else(|| invalid("select requires `values`"))?,
-				)
-				.map_err(webview_fault)?;
-			Value::Bool(true)
-		},
-		RunOperation::Press => {
-			element(view, &params)?
-				.press(required(params.value.as_deref(), "value")?)
-				.map_err(webview_fault)?;
-			Value::Bool(true)
-		},
-		RunOperation::ScrollIntoView => {
-			element(view, &params)?
-				.scroll_into_view()
-				.map_err(webview_fault)?;
-			Value::Bool(true)
-		},
-		RunOperation::Drag => {
-			let source = element(view, &params)?;
-			let target = view
-				.automation()
-				.document()
-				.resolve(
-					Selector::parse(required(params.target.as_deref(), "target")?)
-						.map_err(webview_fault)?,
-				)
-				.map_err(webview_fault)?;
-			source.drag_to(&target).map_err(webview_fault)?;
-			Value::Bool(true)
-		},
-		RunOperation::Upload => {
-			let paths = params
-				.values
-				.as_deref()
-				.ok_or_else(|| invalid("upload requires `values`"))?;
-			let paths = paths
-				.iter()
-				.map(|path| PathBuf::from(path.as_str()))
-				.collect::<Vec<_>>();
-			tab.upload_files(
-				Selector::parse(required(params.selector.as_deref(), "selector")?)
-					.map_err(webview_fault)?,
-				&paths,
-				timeout,
-			)
-			.map_err(webview_fault)?;
-			Value::Bool(true)
-		},
-		RunOperation::WaitForSelector => {
-			tab.document()
-				.wait_for_selector(
-					Selector::parse(required(params.selector.as_deref(), "selector")?)
-						.map_err(webview_fault)?,
-					timeout,
-				)
-				.map_err(webview_fault)?;
-			Value::Bool(true)
-		},
-		RunOperation::WaitForUrl => Value::String(
-			tab.wait_for_url(required(params.value.as_deref(), "value")?, timeout)
-				.map_err(webview_fault)?
-				.to_string(),
-		),
-		RunOperation::WaitForResponse => Value::String(
-			tab.wait_for_response(required(params.value.as_deref(), "value")?, timeout)
-				.map_err(webview_fault)?
-				.to_string(),
-		),
-	};
+	let code = required(params.code.as_deref(), "run requires `code`")?;
+	let result = tab.evaluate(code, timeout).map_err(webview_fault)?;
 	Ok(Payload {
 		action: Action::Run,
 		name,
 		url: Some(view.url()),
 		title: Some(view.title()),
 		result: Some(result),
-		artifacts,
+		artifacts: Vec::new(),
 	})
 }
 
-fn element<'a>(
-	view: &'a WebView,
-	params: &Params,
-) -> Result<omp_webview::automation::ElementHandle<'a>, Fault> {
-	let selector =
-		Selector::parse(required(params.selector.as_deref(), "selector")?).map_err(webview_fault)?;
-	view
-		.automation()
-		.document()
-		.resolve(selector)
-		.map_err(webview_fault)
-}
-
-fn selector(value: Option<&str>) -> Result<Option<Selector>, Fault> {
-	value
-		.map(Selector::parse)
-		.transpose()
-		.map_err(webview_fault)
+fn validate_supported(params: &Params) -> Result<(), Fault> {
+	if params.dialogs.is_some() {
+		return Err(invalid("this browser backend does not support `dialogs`"));
+	}
+	if params.kill {
+		return Err(invalid("this browser backend does not spawn an external application"));
+	}
+	if let Some(app) = params.app.as_ref()
+		&& (app.path.is_some()
+			|| app.cdp_url.is_some()
+			|| app.relay == Some(true)
+			|| app.args.is_some()
+			|| app.target.is_some())
+	{
+		return Err(invalid(
+			"this browser backend does not support `app`; omit it to use the embedded browser",
+		));
+	}
+	Ok(())
 }
 
 fn timeout(params: &Params) -> Duration {
-	Duration::from_secs(params.timeout.unwrap_or(DEFAULT_TIMEOUT.as_secs())).min(MAX_TIMEOUT)
+	Duration::from_secs_f64(
+		params
+			.timeout
+			.unwrap_or(DEFAULT_TIMEOUT.as_secs_f64())
+			.clamp(0.001, MAX_TIMEOUT.as_secs_f64()),
+	)
 }
 
 fn required<'a>(value: Option<&'a str>, field: &'static str) -> Result<&'a str, Fault> {
@@ -437,8 +306,4 @@ fn daemon_closed() -> Fault {
 
 fn webview_fault(error: omp_webview::Error) -> Fault {
 	Fault { code: sf!("browser_automation_failed"), message: Str::new(error.to_string()) }
-}
-
-fn blob_fault(error: BlobError) -> Fault {
-	Fault { code: sf!("browser_artifact_failed"), message: Str::new(error.to_string()) }
 }

@@ -1,4 +1,4 @@
-//! Production bridge from `lsp@1` to the project document authority.
+//! Production bridge from `lsp@2` to the project document authority.
 
 use std::{
 	collections::HashMap,
@@ -227,6 +227,14 @@ fn reload_notification(binding: &pb::LspServerBinding) -> pb::LspNotificationReq
 	}
 }
 
+fn parse_request_payload(payload: Option<&str>) -> Result<Value, Fault> {
+	payload
+		.map(serde_json::from_str)
+		.transpose()
+		.map_err(|_| Fault::InvalidArguments)
+		.map(|value| value.unwrap_or_else(|| json!({})))
+}
+
 /// Environment-owned implementation of the revisioned LSP tool.
 #[derive(Clone)]
 pub struct DocumentLspControl {
@@ -323,7 +331,6 @@ impl DocumentLspControl {
 	async fn workspace_symbols(
 		&self,
 		query: &str,
-		server: Option<&str>,
 		cancel: &CancellationToken,
 	) -> Result<Payload, Fault> {
 		let roster = self
@@ -331,11 +338,7 @@ impl DocumentLspControl {
 			.lsp_status(pb::LspStatusRequest { reload: false, start: true }, cancel)
 			.await
 			.map_err(|_| Fault::Server)?;
-		let selected = roster
-			.servers
-			.into_iter()
-			.filter(|status| server.is_none_or(|server| status.name == server))
-			.collect::<Vec<_>>();
+		let selected = roster.servers;
 		if selected.is_empty() {
 			return Err(Fault::Unavailable);
 		}
@@ -385,6 +388,54 @@ impl DocumentLspControl {
 			outcomes.push(WorkspaceSymbolOutcome { server: Str::from(status.name), result });
 		}
 		aggregate_workspace_symbols(query, outcomes)
+	}
+
+	async fn workspace_request(
+		&self,
+		method: &str,
+		payload: Option<&str>,
+		cancel: &CancellationToken,
+	) -> Result<Payload, Fault> {
+		let params = parse_request_payload(payload)?;
+		let roster = self
+			.documents
+			.lsp_status(pb::LspStatusRequest { reload: false, start: true }, cancel)
+			.await
+			.map_err(|_| Fault::Server)?;
+		let server = roster
+			.servers
+			.into_iter()
+			.find(|server| !server.server_id.is_empty())
+			.ok_or(Fault::Unavailable)?;
+		let response = self
+			.documents
+			.lsp_request(
+				pb::LspRequest {
+					server_id:    server.server_id,
+					method:       method.into(),
+					params_json:  Bytes::from(
+						serde_json::to_vec(&params).map_err(|_| Fault::InvalidArguments)?,
+					),
+					document:     None,
+					revision:     None,
+					stale_policy: pb::LspStalePolicy::Fail as i32,
+				},
+				cancel,
+			)
+			.await
+			.map_err(|_| Fault::Server)?;
+		let data = match response.outcome {
+			Some(lsp_response::Outcome::ResultJson(bytes)) => {
+				serde_json::from_slice(&bytes).map_err(|_| Fault::Server)?
+			},
+			Some(lsp_response::Outcome::Error(_)) | None => return Err(Fault::Server),
+		};
+		Ok(Payload {
+			action:  Action::Request,
+			servers: vec![Str::from(server.name)],
+			output:  render::structured(&data, 200),
+			data,
+		})
 	}
 
 	async fn workspace_diagnostics(&self, cancel: &CancellationToken) -> Result<Payload, Fault> {
@@ -470,6 +521,30 @@ fn lsp_roster_payload(action: Action, roster: pb::LspStatusResponse, workspace: 
 	Payload { action, servers, output, data: json!({ "workspace": workspace, "servers": entries }) }
 }
 
+fn lsp_capabilities_payload(roster: pb::LspStatusResponse) -> Result<Payload, Fault> {
+	let mut servers = Vec::new();
+	let mut capabilities = Vec::new();
+	for server in roster.servers {
+		if server.server_id.is_empty() || server.capabilities_json.is_empty() {
+			continue;
+		}
+		let value: Value =
+			serde_json::from_slice(&server.capabilities_json).map_err(|_| Fault::Server)?;
+		servers.push(Str::from(server.name.as_str()));
+		capabilities.push(json!({"name": server.name, "capabilities": value}));
+	}
+	if servers.is_empty() {
+		return Err(Fault::Unavailable);
+	}
+	let data = Value::Array(capabilities);
+	Ok(Payload {
+		action: Action::Capabilities,
+		servers,
+		output: Str::from(serde_json::to_string_pretty(&data).map_err(|_| Fault::Server)?),
+		data,
+	})
+}
+
 fn lsp_stage_name(stage: i32) -> &'static str {
 	match pb::LspServerStage::try_from(stage) {
 		Ok(pb::LspServerStage::Available) => "available",
@@ -499,10 +574,29 @@ impl LspControl for DocumentLspControl {
 					return self
 						.workspace_symbols(
 							params.query.as_deref().ok_or(Fault::InvalidArguments)?,
-							params.server.as_deref(),
 							&cancel,
 						)
 						.await;
+				}
+				if params.action == Action::Request {
+					return self
+						.workspace_request(
+							params.query.as_deref().ok_or(Fault::InvalidArguments)?,
+							params.payload.as_deref(),
+							&cancel,
+						)
+						.await;
+				}
+				if params.action == Action::Capabilities {
+					let roster = self
+						.documents
+						.lsp_status(
+							pb::LspStatusRequest { reload: false, start: true },
+							&cancel,
+						)
+						.await
+						.map_err(|_| Fault::Server)?;
+					return lsp_capabilities_payload(roster);
 				}
 				if matches!(params.action, Action::Status | Action::Reload) {
 					let roster = self
@@ -528,7 +622,7 @@ impl LspControl for DocumentLspControl {
 				&& uri.to_file_path().is_ok_and(|path| path.is_dir())
 			{
 				let destination =
-					self.file_uri(params.query.as_deref().ok_or(Fault::InvalidArguments)?)?;
+					self.file_uri(params.new_name.as_deref().ok_or(Fault::InvalidArguments)?)?;
 				let data = json!({
 					"oldUri": uri.as_str(),
 					"newUri": destination.as_str(),
@@ -585,15 +679,7 @@ impl LspControl for DocumentLspControl {
 				.await
 				.map_err(|_| Fault::Server)?
 				.bindings;
-			let selected = bindings
-				.into_iter()
-				.filter(|binding| {
-					params
-						.server
-						.as_ref()
-						.is_none_or(|name| name.as_str() == binding.name)
-				})
-				.collect::<Vec<_>>();
+			let selected = bindings;
 			if selected.is_empty() {
 				return Err(Fault::Unavailable);
 			}
@@ -634,7 +720,7 @@ impl LspControl for DocumentLspControl {
 			}
 			if params.action == Action::RenameFile {
 				let destination =
-					self.file_uri(params.query.as_deref().ok_or(Fault::InvalidArguments)?)?;
+					self.file_uri(params.new_name.as_deref().ok_or(Fault::InvalidArguments)?)?;
 				let rename_params = json!({
 					"files": [{ "oldUri": uri.as_str(), "newUri": destination.as_str() }],
 				});
@@ -803,7 +889,7 @@ impl LspControl for DocumentLspControl {
 			};
 			let workspace_symbols = params.action == Action::Symbols && params.query.is_some();
 			let method = if params.action == Action::Request {
-				params.method.as_deref().ok_or(Fault::InvalidArguments)?
+				params.query.as_deref().ok_or(Fault::InvalidArguments)?
 			} else if params.action == Action::Reload {
 				"rust-analyzer/reloadWorkspace"
 			} else if workspace_symbols {
@@ -826,12 +912,20 @@ impl LspControl for DocumentLspControl {
 					},
 					_ => 0,
 				};
-				let mut request_params = actions::auto_parameters(
-					params.params.clone(),
-					Some(uri.as_str()),
-					params.line,
-					Some(character),
-				);
+				let supplied = params
+					.payload
+					.as_deref()
+					.map(|payload| parse_request_payload(Some(payload)))
+					.transpose()?;
+				let mut request_params = match (params.action, supplied) {
+					(Action::Request, Some(payload)) => payload,
+					(_, supplied) => actions::auto_parameters(
+						supplied,
+						Some(uri.as_str()),
+						params.line,
+						Some(character),
+					),
+				};
 				if params.action == Action::References {
 					request_params["context"] = json!({ "includeDeclaration": true });
 				}
@@ -1072,6 +1166,42 @@ impl LspControl for DocumentLspControl {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn workspace_capabilities_keep_exact_initialize_payloads() {
+		let payload = lsp_capabilities_payload(pb::LspStatusResponse {
+			servers: vec![pb::LspServerStatus {
+				name: "rust-analyzer".into(),
+				server_id: Bytes::from_static(b"server"),
+				capabilities_json: Bytes::from_static(br#"{"hoverProvider":true}"#),
+				..Default::default()
+			}],
+		})
+		.expect("capabilities");
+		assert_eq!(payload.action, Action::Capabilities);
+		assert_eq!(
+			payload.data,
+			json!([{"name": "rust-analyzer", "capabilities": {"hoverProvider": true}}])
+		);
+	}
+
+	#[test]
+	fn request_payload_is_real_json_or_an_empty_object() {
+		assert_eq!(parse_request_payload(None).expect("default payload"), json!({}));
+		assert_eq!(
+			parse_request_payload(Some(r#"{"context":{"triggerKind":1}}"#))
+				.expect("object payload"),
+			json!({"context": {"triggerKind": 1}})
+		);
+		assert_eq!(
+			parse_request_payload(Some(r#"["literal",1]"#)).expect("array payload"),
+			json!(["literal", 1])
+		);
+		assert!(matches!(
+			parse_request_payload(Some("{broken")),
+			Err(Fault::InvalidArguments)
+		));
+	}
 
 	#[test]
 	fn reload_notification_preserves_configured_and_empty_settings() {

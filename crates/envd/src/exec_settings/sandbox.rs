@@ -148,114 +148,114 @@ omp_con::var! {
 	/// Choose the filesystem sandbox posture for agent commands.
 	pub static SV_SANDBOX_MODE = sv_sandbox_mode: ExecSandboxMode {
 		default: ExecSandboxMode::Off,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Choose disabled, open, or scoped network access.
 	pub static SV_SANDBOX_NETWORK_MODE = sv_sandbox_network_mode: SandboxNetworkMode {
 		default: SandboxNetworkMode::Disabled,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Exact or leading wildcard domains allowed by scoped networking.
 	pub static SV_SANDBOX_ALLOW_DOMAINS = sv_sandbox_allow_domains: Vec<Str> {
 		default: Vec::new(),
 		validate: |_ctx, values| validate_domains(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Domains denied before scoped allow rules.
 	pub static SV_SANDBOX_DENY_DOMAINS = sv_sandbox_deny_domains: Vec<Str> {
 		default: Vec::new(),
 		validate: |_ctx, values| validate_domains(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// TCP ports allowed by scoped networking.
 	pub static SV_SANDBOX_ALLOW_PORTS = sv_sandbox_allow_ports: Vec<u16> {
 		default: vec![80, 443],
 		validate: |_ctx, values| validate_ports(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Allow scoped networking to loopback addresses.
 	pub static SV_SANDBOX_ALLOW_LOCALHOST = sv_sandbox_allow_localhost: bool {
 		default: false,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Existing absolute Unix-domain socket paths allowed independently of IP networking.
 	pub static SV_SANDBOX_ALLOW_UNIX_SOCKETS = sv_sandbox_allow_unix_sockets: Vec<Str> {
 		default: Vec::new(),
 		validate: |_ctx, values| validate_sockets(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Absolute paths that workspace-write mode may modify.
 	pub static SV_SANDBOX_WRITABLE_ROOTS = sv_sandbox_writable_roots: Vec<Str> {
 		default: Vec::new(),
 		validate: |_ctx, values| validate_absolute_paths(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Choose how workspace-write handles writes outside configured roots.
 	pub static SV_SANDBOX_UNSCOPED_WRITES = sv_sandbox_unscoped_writes: UnscopedWrites {
 		default: UnscopedWrites::Deny,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Environment variable name globs withheld from external commands.
 	pub static SV_SANDBOX_ENV_DENY = sv_sandbox_env_deny: Vec<Str> {
 		default: default_env_deny(),
 		validate: |_ctx, values| validate_env_patterns(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Choose the base environment inherited by child processes.
 	pub static SV_SANDBOX_ENV_INHERIT = sv_sandbox_env_inherit: EnvironmentInheritance {
 		default: EnvironmentInheritance::All,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Environment variable name globs retained before deny filtering.
 	pub static SV_SANDBOX_ENV_INCLUDE_ONLY = sv_sandbox_env_include_only: Vec<Str> {
 		default: Vec::new(),
 		validate: |_ctx, values| validate_env_patterns(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Explicit child environment values applied after filtering.
 	pub static SV_SANDBOX_ENV_SET = sv_sandbox_env_set: Kv {
 		default: Kv::new(),
 		validate: |_ctx, values| validate_string_map(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Do not grant workspace-write access to the platform temporary directory.
 	pub static SV_SANDBOX_EXCLUDE_TMPDIR = sv_sandbox_exclude_tmpdir: bool {
 		default: false,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Do not grant workspace-write access to `/tmp`.
 	pub static SV_SANDBOX_EXCLUDE_SLASH_TMP = sv_sandbox_exclude_slash_tmp: bool {
 		default: false,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Additional absolute paths made unreadable by the kernel sandbox.
 	pub static SV_SANDBOX_READ_DENY = sv_sandbox_read_deny: Vec<Str> {
 		default: Vec::new(),
 		validate: |_ctx, values| validate_absolute_paths(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Choose whether reads use host, workspace-only, or scoped roots.
 	pub static SV_SANDBOX_READ_MODE = sv_sandbox_read_mode: ReadMode {
 		default: ReadMode::Host,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Absolute paths readable in scoped mode.
 	pub static SV_SANDBOX_READABLE_ROOTS = sv_sandbox_readable_roots: Vec<Str> {
 		default: Vec::new(),
 		validate: |_ctx, values| validate_absolute_paths(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Glob patterns denied when supported by the selected sandbox backend.
 	pub static SV_SANDBOX_READ_DENY_GLOBS = sv_sandbox_read_deny_globs: Vec<Str> {
 		default: Vec::new(),
 		validate: |_ctx, values| validate_path_globs(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Additional absolute paths protected from writes.
 	pub static SV_SANDBOX_WRITE_DENY = sv_sandbox_write_deny: Vec<Str> {
 		default: Vec::new(),
 		validate: |_ctx, values| validate_absolute_paths(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 

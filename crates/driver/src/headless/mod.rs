@@ -1,8 +1,10 @@
 //! Journal-first non-interactive session assembly shared by app modes.
 
+pub mod ask;
 pub mod gateway;
 pub mod kernel;
 
+pub use ask::{AskReply, AskRoute};
 pub use kernel::{KernelOptions, compose_kernel};
 use omp_core::Str;
 
@@ -18,9 +20,24 @@ pub enum HeadlessError {
 	/// Frozen Python extension registrations were invalid.
 	#[error("Python extension registration failed")]
 	PythonExtension(#[from] omp_envd::exthost::PyExtensionError),
+	/// An invocation extension setting override was invalid.
+	#[error("extension setting override failed")]
+	ExtensionSetting(#[from] omp_ext::ExtensionError),
+	/// Native Python extension discovery or admission failed.
+	#[error("native extension admission failed")]
+	NativeExtension(#[from] crate::discovery::native::NativeExtensionError),
+	/// The user configuration root could not be resolved.
+	#[error("user configuration root could not be resolved")]
+	ConfigRoot(#[from] omp_core::dirs::DataDirError),
 	/// Catalog, inference, or credential composition failed.
 	#[error("production inference composition failed")]
 	Registry(#[from] crate::registry::RegistryError),
+	/// A child-specific yield schema could not be compiled.
+	#[error("child yield schema composition failed")]
+	YieldSchema(#[from] omp_tools::yield_tool::SchemaContractError),
+	/// A child-specific yield tool could not be installed.
+	#[error("child yield registry composition failed")]
+	YieldRegistry(#[from] omp_tool::RegistryError),
 	/// Journal-backed session creation or replay failed.
 	#[error("session journal operation failed")]
 	Session(#[from] omp_session::SessionError),

@@ -19,85 +19,95 @@ omp_con::var! {
 	pub static SV_TOOLS_ENABLED = sv_tools_enabled: Kv {
 		default: Kv::new(),
 		validate: |_ctx, values| validate_bool_map(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Global ceiling for tool execution deadlines.
 	pub static SV_TOOLS_MAX_TIMEOUT = sv_tools_max_timeout: Span {
 		default: Span::NEVER,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Pinned edit tool revision; empty selects the route default.
 	pub static SV_TOOLS_EDIT_DIALECT = sv_tools_edit_dialect: Str {
 		default: Str::default(),
-		flags: archive | inherit,
+		flags: archive,
+	};
+	/// Records committed edit transitions for parse-regression diagnosis.
+	pub static SV_TOOLS_EDIT_BLACKBOX_ENABLED = sv_tools_edit_blackbox_enabled: bool {
+		default: false,
+		flags: archive,
 	};
 	/// Optional JSONL destination for edit black-box diagnostics.
 	pub static SV_TOOLS_EDIT_BLACKBOX_PATH = sv_tools_edit_blackbox_path: Str {
 		default: Str::default(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Repair newly introduced syntax parse errors before commit.
 	pub static SV_TOOLS_EDIT_AUTO_REPAIR = sv_tools_edit_auto_repair: bool {
 		default: false,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Abort a turn as soon as streamed edit validation fails.
 	pub static SV_TOOLS_EDIT_STREAMING_ABORT = sv_tools_edit_streaming_abort: bool {
 		default: false,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Default effect tier approved without confirmation.
 	pub static SV_TOOLS_APPROVAL_MODE = sv_tools_approval_mode: ApprovalMode {
 		default: ApprovalMode::Yolo,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Per-tool allow, prompt, or deny overrides.
 	pub static SV_TOOLS_APPROVAL = sv_tools_approval: Kv {
 		default: Kv::new(),
 		validate: |_ctx, values| validate_approval_map(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Permit fuzzy edit anchor matching.
 	pub static SV_TOOLS_EDIT_FUZZY = sv_tools_edit_fuzzy: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Require a prior read before mutation.
 	pub static SV_TOOLS_EDIT_REQUIRE_SEEN = sv_tools_edit_require_seen: bool {
-		default: true,
-		flags: archive | inherit,
+		default: false,
+		flags: archive,
 	};
 	/// Refuse incidental generated-file edits.
 	pub static SV_TOOLS_EDIT_GUARD_GENERATED = sv_tools_edit_guard_generated: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Maximum bytes returned by one read call.
 	pub static SV_TOOLS_READ_MAX_BYTES = sv_tools_read_max_bytes: i64 {
 		default: 1024 * 1024,
 		min: 1,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Summarize supported oversized documents.
 	pub static SV_TOOLS_READ_SUMMARIZE = sv_tools_read_summarize: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Include line numbers in text reads.
 	pub static SV_TOOLS_READ_LINE_NUMBERS = sv_tools_read_line_numbers: bool {
-		default: true,
-		flags: archive | inherit,
+		default: false,
+		flags: archive,
 	};
-	/// Default context lines around grep matches.
-	pub static SV_TOOLS_GREP_CONTEXT_LINES = sv_tools_grep_context_lines: u16 {
+	/// Context lines before each grep match.
+	pub static SV_TOOLS_GREP_CONTEXT_BEFORE = sv_tools_grep_context_before: u16 {
 		default: 2,
-		flags: archive | inherit,
+		flags: archive,
+	};
+	/// Context lines after each grep match.
+	pub static SV_TOOLS_GREP_CONTEXT_AFTER = sv_tools_grep_context_after: u16 {
+		default: 2,
+		flags: archive,
 	};
 	/// Named eval interpreter command overrides.
 	pub static SV_TOOLS_EVAL_INTERPRETERS = sv_tools_eval_interpreters: Kv {
 		default: Kv::new(),
 		validate: |_ctx, values| validate_string_map(values),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Bytes retained inline before tool output spills.
 	pub static SV_TOOLS_OUTPUT_SPILL_BYTES = sv_tools_output_spill_bytes: i64 {
@@ -110,7 +120,7 @@ omp_con::var! {
 				Err(Str::new_static("spill threshold exceeds output ceiling"))
 			}
 		},
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Hard byte ceiling for one materialized tool output.
 	pub static SV_TOOLS_OUTPUT_MAX_BYTES = sv_tools_output_max_bytes: i64 {
@@ -123,24 +133,24 @@ omp_con::var! {
 				Err(Str::new_static("output ceiling is below spill threshold"))
 			}
 		},
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Include tool-intent decisions in diagnostic tracing.
 	pub static SV_TOOLS_INTENT_TRACING = sv_tools_intent_tracing: bool {
-		default: false,
-		flags: archive | inherit,
+		default: true,
+		flags: archive,
 	};
 	/// Maximum repeated equivalent calls before interruption.
 	pub static SV_TOOLS_LOOP_GUARD_LIMIT = sv_tools_loop_guard_limit: u32 {
 		default: 8,
 		min: 1,
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 
 /// Tool exposure, timeout, and approval policy resolved from the control
 /// context.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolSettings {
 	/// Explicit per-tool enablement overrides; absent names remain enabled.
@@ -149,7 +159,7 @@ pub struct ToolSettings {
 	/// Global ceiling for tool deadlines.
 	#[serde(skip_serializing_if = "Option::is_none", with = "optional_duration")]
 	pub max_timeout:          Option<Duration>,
-	/// Optional pinned edit revision (`rep.1` or `hl.1`) for this client.
+	/// Optional pinned edit revision (`rep.2`, `patch.2`, or `hl.1`) for this client.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub edit_dialect:         Option<Str>,
 	/// Optional JSONL destination for edit black-box diagnostics.
@@ -181,6 +191,8 @@ pub struct ToolSettings {
 	pub approval:             BTreeMap<Str, ApprovalPolicy>,
 	/// Permit fuzzy edit matching when exact anchors are unavailable.
 	pub edit_fuzzy:           bool,
+	/// Similarity threshold for accepted fuzzy edit anchors.
+	pub edit_fuzzy_threshold: f64,
 	/// Require files to have been read before mutation.
 	pub edit_require_seen:    bool,
 	/// Refuse generated-file edits unless explicitly requested.
@@ -191,8 +203,10 @@ pub struct ToolSettings {
 	pub read_summarize:       bool,
 	/// Include source line numbers in text reads.
 	pub read_line_numbers:    bool,
-	/// Default context lines around grep matches.
-	pub grep_context_lines:   u16,
+	/// Context lines before each grep match.
+	pub grep_context_before:  u16,
+	/// Context lines after each grep match.
+	pub grep_context_after:   u16,
 	/// Named eval interpreter command overrides.
 	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
 	pub eval_interpreters:    BTreeMap<Str, Str>,
@@ -209,32 +223,34 @@ pub struct ToolSettings {
 impl Default for ToolSettings {
 	fn default() -> Self {
 		Self {
-			enabled:              BTreeMap::new(),
+			enabled:              BTreeMap::from([(Str::new_static("ast_grep"), false)]),
 			max_timeout:          None,
 			edit_dialect:         None,
 			edit_blackbox_path:   None,
 			edit_auto_repair:     false,
 			edit_streaming_abort: false,
 			fetch_enabled:        true,
-			render_markdown:      true,
+			render_markdown:      false,
 			auto_resize_images:   true,
-			format_policy:        FormatPolicy::BestEffort,
+			format_policy:        FormatPolicy::Disabled,
 			diagnostics_on_write: true,
-			diagnostics_on_edit:  true,
+			diagnostics_on_edit:  false,
 			diagnostic_dedup:     true,
 			approval_mode:        ApprovalMode::Yolo,
 			approval:             BTreeMap::new(),
 			edit_fuzzy:           true,
-			edit_require_seen:    true,
+			edit_fuzzy_threshold: 0.95,
+			edit_require_seen:    false,
 			edit_guard_generated: true,
 			read_max_bytes:       1024 * 1024,
 			read_summarize:       true,
-			read_line_numbers:    true,
-			grep_context_lines:   2,
+			read_line_numbers:    false,
+			grep_context_before:  2,
+			grep_context_after:   2,
 			eval_interpreters:    BTreeMap::new(),
 			output_spill_bytes:   64 * 1024,
 			output_max_bytes:     16 * 1024 * 1024,
-			intent_tracing:       false,
+			intent_tracing:       true,
 			loop_guard_limit:     8,
 		}
 	}
@@ -245,31 +261,46 @@ impl ToolSettings {
 	/// context.
 	#[must_use]
 	pub fn from_con(ctx: &Ctx) -> Self {
-		let defaults = Self::default();
+		let lsp = omp_tools::settings::LspFileSettings::from_con(ctx);
+		let mut enabled = bool_map(SV_TOOLS_ENABLED.get(ctx));
+		if !omp_tools::pi_settings::SV_EVAL_PY.get(ctx) {
+			enabled.insert(Str::new_static("eval"), false);
+		}
+		if !omp_tools::pi_settings::SV_AST_GREP_ENABLED.get(ctx) {
+			enabled.insert(Str::new_static("ast_grep"), false);
+		}
 		Self {
-			enabled:              bool_map(SV_TOOLS_ENABLED.get(ctx)),
+			enabled,
 			max_timeout:          SV_TOOLS_MAX_TIMEOUT.get(ctx).as_finite(),
 			edit_dialect:         nonempty_str(SV_TOOLS_EDIT_DIALECT.get(ctx)),
-			edit_blackbox_path:   nonempty_str(SV_TOOLS_EDIT_BLACKBOX_PATH.get(ctx))
-				.map(|value| PathBuf::from(value.as_str())),
+			edit_blackbox_path:   SV_TOOLS_EDIT_BLACKBOX_ENABLED.get(ctx).then(|| {
+				nonempty_str(SV_TOOLS_EDIT_BLACKBOX_PATH.get(ctx))
+					.map_or_else(|| PathBuf::from("edit-blackbox.jsonl"), |value| PathBuf::from(value.as_str()))
+			}),
 			edit_auto_repair:     SV_TOOLS_EDIT_AUTO_REPAIR.get(ctx),
 			edit_streaming_abort: SV_TOOLS_EDIT_STREAMING_ABORT.get(ctx),
-			fetch_enabled:        defaults.fetch_enabled,
-			render_markdown:      defaults.render_markdown,
-			auto_resize_images:   defaults.auto_resize_images,
-			format_policy:        defaults.format_policy,
-			diagnostics_on_write: defaults.diagnostics_on_write,
-			diagnostics_on_edit:  defaults.diagnostics_on_edit,
-			diagnostic_dedup:     defaults.diagnostic_dedup,
+			fetch_enabled:        omp_tools::settings::SV_FETCH_ENABLED.get(ctx),
+			render_markdown:      omp_tools::settings::CL_READ_RENDER_MARKDOWN.get(ctx),
+			auto_resize_images:   omp_tools::settings::SV_IMAGES_AUTO_RESIZE.get(ctx),
+			format_policy:        if lsp.format_on_write {
+				FormatPolicy::BestEffort
+			} else {
+				FormatPolicy::Disabled
+			},
+			diagnostics_on_write: lsp.diagnostics_on_write,
+			diagnostics_on_edit:  lsp.diagnostics_on_edit,
+			diagnostic_dedup:     lsp.diagnostics_deduplicate,
 			approval_mode:        SV_TOOLS_APPROVAL_MODE.get(ctx),
 			approval:             approval_map(SV_TOOLS_APPROVAL.get(ctx)),
 			edit_fuzzy:           SV_TOOLS_EDIT_FUZZY.get(ctx),
+			edit_fuzzy_threshold: omp_tools::pi_settings::SV_EDIT_FUZZY_THRESHOLD.get(ctx),
 			edit_require_seen:    SV_TOOLS_EDIT_REQUIRE_SEEN.get(ctx),
 			edit_guard_generated: SV_TOOLS_EDIT_GUARD_GENERATED.get(ctx),
 			read_max_bytes:       SV_TOOLS_READ_MAX_BYTES.get(ctx) as u64,
 			read_summarize:       SV_TOOLS_READ_SUMMARIZE.get(ctx),
 			read_line_numbers:    SV_TOOLS_READ_LINE_NUMBERS.get(ctx),
-			grep_context_lines:   SV_TOOLS_GREP_CONTEXT_LINES.get(ctx),
+			grep_context_before:  SV_TOOLS_GREP_CONTEXT_BEFORE.get(ctx),
+			grep_context_after:   SV_TOOLS_GREP_CONTEXT_AFTER.get(ctx),
 			eval_interpreters:    string_map(SV_TOOLS_EVAL_INTERPRETERS.get(ctx)),
 			output_spill_bytes:   SV_TOOLS_OUTPUT_SPILL_BYTES.get(ctx) as u64,
 			output_max_bytes:     SV_TOOLS_OUTPUT_MAX_BYTES.get(ctx) as u64,
@@ -421,6 +452,35 @@ mod tests {
 		assert_eq!(ToolSettings::from_con(&ctx), ToolSettings {
 			approval_mode: ApprovalMode::Write,
 			approval: BTreeMap::from([(sf!("bash"), ApprovalPolicy::Deny)]),
+			..ToolSettings::default()
+		});
+	}
+
+	#[test]
+	fn read_and_lsp_policy_convars_reach_the_projection() {
+		let ctx = Ctx::new();
+		assert_eq!(ToolSettings::from_con(&ctx), ToolSettings::default());
+		ctx.run("sv_fetch_enabled false").expect("fetch policy");
+		ctx.run("cl_read_render_markdown true").expect("markdown policy");
+		ctx.run("sv_images_auto_resize false").expect("image policy");
+		ctx.run("sv_lsp_format_on_write true").expect("format policy");
+		ctx.run("sv_lsp_diagnostics_on_edit true").expect("diagnostics policy");
+		ctx.run("sv_lsp_diagnostics_deduplicate false").expect("dedup policy");
+		ctx.run("sv_eval_py false").expect("eval policy");
+		ctx.run("sv_ast_grep_enabled false").expect("ast-grep policy");
+		ctx.run("sv_edit_fuzzy_threshold 0.87").expect("fuzzy threshold");
+		assert_eq!(ToolSettings::from_con(&ctx), ToolSettings {
+			fetch_enabled: false,
+			render_markdown: true,
+			auto_resize_images: false,
+			format_policy: FormatPolicy::BestEffort,
+			diagnostics_on_edit: true,
+			diagnostic_dedup: false,
+			edit_fuzzy_threshold: 0.87,
+			enabled: BTreeMap::from([
+				(Str::new_static("eval"), false),
+				(Str::new_static("ast_grep"), false),
+			]),
 			..ToolSettings::default()
 		});
 	}

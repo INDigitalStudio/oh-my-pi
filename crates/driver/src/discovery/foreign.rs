@@ -22,12 +22,12 @@ omp_con::var! {
 	/// Enables read-only repository-surface foreign content imports.
 	pub static SV_FOREIGN_CONTENT_ENABLED = sv_foreign_content_enabled: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Allowed foreign repository content families.
 	pub static SV_FOREIGN_CONTENT_FAMILIES = sv_foreign_content_families: Vec<Str> {
 		default: Vec::new(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 

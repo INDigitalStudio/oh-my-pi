@@ -15,13 +15,11 @@ local = ["omp-inference/local"]
 local-all = [
 	"local-applefm",
 	"local-embedding",
-	"local-text",
 	"local-stt",
 	"local-tts",
 ]
 local-applefm = ["local", "omp-inference/local-applefm"]
 local-embedding = ["local", "omp-inference/local-embedding", "omp-memory/local-embedding"]
-local-text = ["local", "omp-inference/local-text"]
 local-stt = ["local", "omp-inference/local-stt"]
 local-tts = ["local", "omp-inference/local-tts"]
 

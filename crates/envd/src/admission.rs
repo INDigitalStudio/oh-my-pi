@@ -1,10 +1,17 @@
 //! Per-invocation admission gate between finalized arguments and authorization.
 
-use std::{io::Cursor, path::Path, time::Duration};
+use std::{
+	collections::BTreeMap,
+	io::Cursor,
+	path::Path,
+	sync::Arc,
+	time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use bytes::{Bytes, BytesMut};
 use flume::Receiver;
-use omp_core::Str;
+use omp_agent::{ApprovalRoute, ApprovalSpec, ApprovalSource as DecisionSource};
+use omp_core::{Str, sf};
 use omp_proto::{
 	env::v1::{Admission, AdmitInvocation},
 	policy::v1::{BashIr, EffectEnvelope, PolicyDenied},
@@ -14,10 +21,12 @@ use omp_shell_engine::{
 	parser::{Parser, ParserOptions},
 };
 use omp_tool::Effects;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{time, time::Instant};
+use tokio_util::sync::CancellationToken;
 
 /// Default approval posture applied before one invocation reaches interactive
 /// admission.
@@ -188,6 +197,136 @@ pub fn resolve_approval(
 		|policy| (policy, ApprovalSource::User, Some(tool_name.clone())),
 	);
 	ResolvedApproval { invocation_id, tool_name, tier, policy, source, policy_key }
+}
+
+/// Origin of a nested invocation admitted through the environment host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum DynamicInvocationSource {
+	/// A target selected by the in-process shell's `dyn` builtin.
+	ShellDyn,
+}
+
+/// Typed refusal from nested dynamic-target admission.
+#[derive(Debug, Error)]
+pub(crate) enum DynamicAdmissionError {
+	/// The resolved per-target policy denied the invocation.
+	#[error("dynamic target `{target}` is denied by approval policy")]
+	Denied {
+		/// Exact resolved dynamic target.
+		target: Str,
+	},
+	/// The target requires a prompt but no host approval route is installed.
+	#[error("dynamic target `{target}` requires an unavailable approval route")]
+	ApprovalUnavailable {
+		/// Exact resolved dynamic target.
+		target: Str,
+	},
+	/// Cancellation won while the target was awaiting approval.
+	#[error("dynamic target `{target}` admission was cancelled")]
+	Cancelled {
+		/// Exact resolved dynamic target.
+		target: Str,
+	},
+}
+
+/// Shared admission authority for targets resolved inside another tool.
+///
+/// Dynamic and native routes pass the resolved target's own [`Effects`] here;
+/// the containing tool's broader declaration never substitutes for the
+/// target-specific decision.
+#[derive(Clone)]
+pub(crate) struct DynamicAdmission {
+	mode:      ApprovalMode,
+	overrides: Arc<BTreeMap<Str, ApprovalPolicy>>,
+	route:     Arc<RwLock<Option<ApprovalRoute>>>,
+}
+
+impl DynamicAdmission {
+	/// Builds a cloneable nested admission authority from frozen tool policy.
+	pub(crate) fn new(
+		mode: ApprovalMode,
+		overrides: BTreeMap<Str, ApprovalPolicy>,
+		route: Option<ApprovalRoute>,
+	) -> Self {
+		Self { mode, overrides: Arc::new(overrides), route: Arc::new(RwLock::new(route)) }
+	}
+
+	/// Replaces the host route used by subsequent dynamic approval prompts.
+	pub(crate) fn bind_route(&self, route: Option<ApprovalRoute>) {
+		*self.route.write() = route;
+	}
+
+	/// Resolves and enforces one target's live effect declaration.
+	pub(crate) async fn admit(
+		&self,
+		invocation_id: Str,
+		target: Str,
+		effects: &Effects,
+		source: DynamicInvocationSource,
+		cancellation: CancellationToken,
+	) -> Result<ResolvedApproval, DynamicAdmissionError> {
+		if cancellation.is_cancelled() {
+			return Err(DynamicAdmissionError::Cancelled { target });
+		}
+		let resolved = resolve_approval(
+			invocation_id.clone(),
+			target.clone(),
+			effects,
+			self.mode,
+			self.overrides.get(&target).copied(),
+		);
+		match resolved.policy {
+			ApprovalPolicy::Allow => return Ok(resolved),
+			ApprovalPolicy::Deny => {
+				return Err(DynamicAdmissionError::Denied { target });
+			},
+			ApprovalPolicy::Prompt => {},
+		}
+		let Some(route) = self.route.read().clone() else {
+			return Err(DynamicAdmissionError::ApprovalUnavailable { target });
+		};
+		let tier: &'static str = resolved.tier.into();
+		let origin: &'static str = source.into();
+		let ticket = route
+			.request_cancellable(
+				Some(invocation_id),
+				vec![ApprovalSpec {
+					title: sf!("Approve dynamic target"),
+					body: sf!("Allow dynamic target `{target}`?"),
+					subject: target.clone(),
+					kind: Str::new_static(tier),
+					scopes: vec![sf!("once")],
+					default: None,
+					route: sf!("user"),
+					approver: None,
+					timeout_ms: 0,
+					unreachable: sf!("fail_closed"),
+					require_human: false,
+					pattern: None,
+					evidence: vec![sf!("invocation_source={origin}")],
+				}],
+				epoch_millis(),
+				cancellation.clone(),
+			)
+			.await;
+		let Some(decision) = ticket.decision else {
+			return Err(DynamicAdmissionError::ApprovalUnavailable { target });
+		};
+		if decision.approved {
+			return Ok(resolved);
+		}
+		if decision.source == DecisionSource::Unavailable && cancellation.is_cancelled() {
+			return Err(DynamicAdmissionError::Cancelled { target });
+		}
+		Err(DynamicAdmissionError::Denied { target })
+	}
+}
+
+fn epoch_millis() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// A finalized admission result, with policy transformation applied before the
@@ -630,9 +769,13 @@ fn approval_denial(invocation_id: &str, tool_name: &str) -> PolicyDenied {
 
 #[cfg(test)]
 mod tests {
-	use std::{path::Path, sync::Arc, time::Duration};
+	use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
 	use bytes::Bytes;
+	use omp_agent::{
+		ApprovalBook, ApprovalDecision, ApprovalRoute, ApprovalScope,
+		ApprovalSource as DecisionSource,
+	};
 	use omp_core::sf;
 	use omp_proto::{
 		env::v1::Admission,
@@ -642,11 +785,12 @@ mod tests {
 		DesktopEffects, DocEffects, Effects, ExecEffects as ToolExecEffects, InferenceEffects, Usd,
 	};
 	use tokio::time;
+	use tokio_util::sync::CancellationToken;
 
 	use super::{
 		AdmissionDecision, AdmissionGate, ApprovalMode, ApprovalPolicy, ApprovalSource, ApprovalTier,
-		apply_admission_patch, bash_ir, effects_narrow_or_refuse, github_mutation_targets,
-		resolve_approval,
+		DynamicAdmission, DynamicAdmissionError, DynamicInvocationSource, apply_admission_patch,
+		bash_ir, effects_narrow_or_refuse, github_mutation_targets, resolve_approval,
 	};
 
 	#[tokio::test]
@@ -824,6 +968,112 @@ mod tests {
 		);
 	}
 
+	#[tokio::test]
+	async fn dynamic_admission_uses_target_effects_and_deny_precedence() {
+		let network = Effects {
+			exec: Some(ToolExecEffects { commands: Arc::from([]), network: true }),
+			..Effects::empty()
+		};
+		for (mode, override_policy, expected) in [
+			(ApprovalMode::Yolo, None, "allow"),
+			(ApprovalMode::Write, None, "prompt_unavailable"),
+			(ApprovalMode::Yolo, Some(ApprovalPolicy::Deny), "deny"),
+			(ApprovalMode::AlwaysAsk, Some(ApprovalPolicy::Allow), "allow"),
+		] {
+			let overrides = override_policy
+				.map(|policy| BTreeMap::from([(sf!("github"), policy)]))
+				.unwrap_or_default();
+			let admission = DynamicAdmission::new(mode, overrides, None);
+			let result = admission
+				.admit(
+					sf!("dyn-1"),
+					sf!("github"),
+					&network,
+					DynamicInvocationSource::ShellDyn,
+					CancellationToken::new(),
+				)
+				.await;
+			match expected {
+				"allow" => {
+					let resolved = result.expect("target policy allows");
+					assert_eq!(resolved.tier, ApprovalTier::Exec);
+				},
+				"prompt_unavailable" => assert!(matches!(
+					result,
+					Err(DynamicAdmissionError::ApprovalUnavailable { .. })
+				)),
+				"deny" => assert!(matches!(result, Err(DynamicAdmissionError::Denied { .. }))),
+				_ => unreachable!("table contains only known outcomes"),
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn dynamic_admission_prompts_with_source_and_is_cancellable() {
+		let network = Effects {
+			exec: Some(ToolExecEffects { commands: Arc::from([]), network: true }),
+			..Effects::empty()
+		};
+		let (route, inbox) = ApprovalRoute::new(Arc::new(ApprovalBook::new()), None);
+		let admission = DynamicAdmission::new(ApprovalMode::Write, BTreeMap::new(), None);
+		admission.bind_route(Some(route.clone()));
+		let pending_admission = admission.clone();
+		let pending_network = network.clone();
+		let pending = tokio::spawn(async move {
+			pending_admission
+				.admit(
+					sf!("dyn-approval"),
+					sf!("github"),
+					&pending_network,
+					DynamicInvocationSource::ShellDyn,
+					CancellationToken::new(),
+				)
+				.await
+		});
+		let request = inbox.recv().await.expect("dynamic approval prompt dispatched");
+		assert_eq!(request.ticket.invocation_id.as_deref(), Some("dyn-approval"));
+		assert_eq!(request.ticket.reasons[0].subject, "github");
+		assert_eq!(request.ticket.reasons[0].kind, "exec");
+		assert_eq!(request.ticket.reasons[0].evidence.as_slice(), ["invocation_source=shell_dyn"]);
+		request
+			.respond(ApprovalDecision {
+				approved:   true,
+				scope:      ApprovalScope::Once,
+				source:     DecisionSource::User,
+				decided_by: None,
+				reason:     None,
+				audited:    false,
+			})
+			.expect("approval response accepted");
+		pending
+			.await
+			.expect("dynamic admission task")
+			.expect("human approved target");
+
+		let cancellation = CancellationToken::new();
+		let cancel_admission = admission.clone();
+		let cancel_network = network.clone();
+		let cancel_token = cancellation.clone();
+		let cancelled = tokio::spawn(async move {
+			cancel_admission
+				.admit(
+					sf!("dyn-cancelled"),
+					sf!("github"),
+					&cancel_network,
+					DynamicInvocationSource::ShellDyn,
+					cancel_token,
+				)
+				.await
+		});
+		let _request = inbox.recv().await.expect("cancellable prompt dispatched");
+		cancellation.cancel();
+		assert!(matches!(
+			cancelled.await.expect("cancelled admission task"),
+			Err(DynamicAdmissionError::Cancelled { .. })
+		));
+		assert!(route.pending().is_empty(), "cancelled prompt is withdrawn");
+	}
+
 	#[test]
 	fn derives_only_static_mutating_github_targets() {
 		let bash = bash_ir(
@@ -840,6 +1090,39 @@ mod tests {
 		assert_eq!(targets[0].repo.as_deref(), Some("Owner/Repo"));
 		assert_eq!(targets[0].kind, "issue");
 		assert_eq!(targets[0].number, Some(42));
+	}
+
+	#[test]
+	fn network_effect_narrowing_preserves_denies() {
+		for (maximum_network, requested_network, expected_network) in [
+			(false, false, Some(false)),
+			(false, true, None),
+			(true, false, Some(false)),
+			(true, true, Some(true)),
+		] {
+			let maximum = Effects {
+				exec: Some(ToolExecEffects {
+					commands: Arc::from([sf!("curl")]),
+					network: maximum_network,
+				}),
+				..Effects::empty()
+			};
+			let requested = EffectEnvelope {
+				exec: Some(ExecEffects {
+					commands: vec![String::from("curl")],
+					network:  requested_network,
+					props:    None,
+				}),
+				..EffectEnvelope::default()
+			};
+			let narrowed = effects_narrow_or_refuse(Some(&requested), &maximum);
+			assert_eq!(
+				narrowed
+					.and_then(|effects| effects.exec)
+					.map(|effects| effects.network),
+				expected_network,
+			);
+		}
 	}
 
 	#[test]

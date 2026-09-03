@@ -14,7 +14,7 @@ client and framing boundary; it does not contain an alternate host.
   connections, and the `EnvServer`/`EnvdError` server boundary.
 - `workspace`, `docs`, `document_cache`, `search_backend`, and `tool_search`
   provide workspace, search, and document operations.
-- `exec`, `process_store`, `process_log`, `shell_profile`, and `direnv` manage
+- `exec`, `process_store`, `process_log`, and `direnv` manage
   commands, named processes, logs, and shell environment setup.
 - `tools` and the `tool_*` modules implement daemon-backed tool operations.
 - `exthost` owns extension manifests, lifecycle, CONTROL routing, quotas,

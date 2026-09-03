@@ -166,6 +166,7 @@ pub(crate) async fn run(
 		worker_config(&state_dir, args.py_eval, &[], &[], interrupt_grace)?;
 	let (env_connections, env_connection_rx) = watch::channel(0);
 	let (doc_connections, doc_connection_rx) = watch::channel(0);
+	let convars = Arc::new(crate::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 	let server = Arc::new(
 		EnvServer::open_project(
 			&root,
@@ -177,6 +178,7 @@ pub(crate) async fn run(
 			require_document_ownership,
 			None,
 			&con,
+			convars,
 			bridges,
 		)
 		.await?,

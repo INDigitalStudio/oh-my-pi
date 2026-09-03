@@ -24,17 +24,17 @@ omp_con::var! {
 	/// Discovery providers disabled across every capability.
 	pub static SV_DISCOVERY_DISABLED_PROVIDERS = sv_discovery_disabled_providers: Vec<Str> {
 		default: Vec::new(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Individual discovery sources disabled without disabling their provider.
 	pub static SV_DISCOVERY_DISABLED_SOURCES = sv_discovery_disabled_sources: Vec<Str> {
 		default: Vec::new(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Explicit user claims over bundled capability names.
 	pub static SV_DISCOVERY_BUILTIN_SHADOWS = sv_discovery_builtin_shadows: Vec<Kv> {
 		default: Vec::new(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 

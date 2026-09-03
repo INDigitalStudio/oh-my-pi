@@ -12,7 +12,7 @@ use bytes::BytesMut;
 use futures::StreamExt as _;
 use http::{
 	HeaderMap, HeaderValue,
-	header::{ACCEPT, USER_AGENT},
+	header::{ACCEPT, LOCATION, USER_AGENT},
 };
 use omp_core::{Str, sf};
 use omp_inference::auth::HeaderPlacement;
@@ -26,6 +26,8 @@ use tokio_util::sync::CancellationToken;
 use super::github_url::{self, GithubCredentialBridge, GithubRepo};
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
+const RUN_WATCH_TAIL_DEFAULT: usize = 15;
+const RUN_WATCH_TAIL_MAX: usize = 200;
 
 /// Combined-credential GitHub owner.
 pub(crate) struct GithubService {
@@ -66,25 +68,7 @@ impl GithubService {
 		body: Option<&Value>,
 		cancellation: &CancellationToken,
 	) -> Result<ApiResponse, Fault> {
-		let mut headers = HeaderMap::new();
-		headers.insert(USER_AGENT, HeaderValue::from_static("omp-github-device"));
-		headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github+json"));
-		headers.insert("x-github-api-version", HeaderValue::from_static("2022-11-28"));
-		if let Some(lease) = tokio::select! {
-			result = self.credentials.lease() => result,
-			() = cancellation.cancelled() => return Err(cancelled_fault()),
-		}
-		.map_err(|error| Fault {
-			code:    sf!("github_credentials_failed"),
-			message: Str::new(error.message().clone()),
-		})? {
-			lease
-				.apply_header(&HeaderPlacement::bearer(), &mut headers)
-				.map_err(|_| Fault {
-					code:    sf!("github_credentials_failed"),
-					message: sf!("GitHub credential projection failed"),
-				})?;
-		}
+		let headers = self.api_headers(cancellation).await?;
 		let url = github_url::api_url_for_host(host, path);
 		let request = match method {
 			Method::Get => self.client.get(url),
@@ -110,18 +94,7 @@ impl GithubService {
 			.get("x-ratelimit-reset")
 			.and_then(|value| value.to_str().ok())
 			.and_then(|value| value.parse().ok());
-		let mut bytes = BytesMut::new();
-		let mut stream = response.bytes_stream();
-		while let Some(chunk) = tokio::select! {
-			chunk = stream.next() => chunk,
-			() = cancellation.cancelled() => return Err(cancelled_fault()),
-		} {
-			let chunk = chunk.map_err(http_fault)?;
-			if bytes.len().saturating_add(chunk.len()) > MAX_BODY {
-				return Err(fault("github_response_too_large", "GitHub response exceeds 16 MiB"));
-			}
-			bytes.extend_from_slice(&chunk);
-		}
+		let bytes = read_body(response, cancellation).await?;
 		if !(200..300).contains(&status) {
 			let message = serde_json::from_slice::<Value>(&bytes)
 				.ok()
@@ -141,6 +114,73 @@ impl GithubService {
 				.map_err(|_| fault("github_invalid_response", "GitHub returned malformed JSON"))?
 		};
 		Ok(ApiResponse { value, remaining, reset })
+	}
+
+	/// Builds the authenticated GitHub API header set for one request.
+	async fn api_headers(&self, cancellation: &CancellationToken) -> Result<HeaderMap, Fault> {
+		let mut headers = HeaderMap::new();
+		headers.insert(USER_AGENT, HeaderValue::from_static("omp-github-device"));
+		headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github+json"));
+		headers.insert("x-github-api-version", HeaderValue::from_static("2022-11-28"));
+		if let Some(lease) = tokio::select! {
+			result = self.credentials.lease() => result,
+			() = cancellation.cancelled() => return Err(cancelled_fault()),
+		}
+		.map_err(|error| Fault {
+			code:    sf!("github_credentials_failed"),
+			message: Str::new(error.message().clone()),
+		})? {
+			lease
+				.apply_header(&HeaderPlacement::bearer(), &mut headers)
+				.map_err(|_| Fault {
+					code:    sf!("github_credentials_failed"),
+					message: sf!("GitHub credential projection failed"),
+				})?;
+		}
+		Ok(headers)
+	}
+
+	/// Downloads one Actions job log as text.
+	///
+	/// GitHub answers the logs endpoint with a redirect to short-lived blob
+	/// storage; the redirect is followed once without credentials. Missing or
+	/// expired logs resolve to `None` rather than failing the watch.
+	async fn job_log(
+		&self,
+		repo: &GithubRepo,
+		job_id: u64,
+		cancellation: &CancellationToken,
+	) -> Result<Option<String>, Fault> {
+		let headers = self.api_headers(cancellation).await?;
+		let url = github_url::api_url_for_host(
+			repo.host(),
+			&format!("/repos/{}/actions/jobs/{job_id}/logs", repo.slug()),
+		);
+		let response = tokio::select! {
+			result = self.client.get(url).headers(headers).send() => result.map_err(http_fault)?,
+			() = cancellation.cancelled() => return Err(cancelled_fault()),
+		};
+		let response = if response.status().is_redirection() {
+			let Some(location) = response
+				.headers()
+				.get(LOCATION)
+				.and_then(|value| value.to_str().ok())
+				.map(str::to_owned)
+			else {
+				return Ok(None);
+			};
+			tokio::select! {
+				result = self.client.get(location).send() => result.map_err(http_fault)?,
+				() = cancellation.cancelled() => return Err(cancelled_fault()),
+			}
+		} else {
+			response
+		};
+		if !response.status().is_success() {
+			return Ok(None);
+		}
+		let bytes = read_body(response, cancellation).await?;
+		Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 	}
 
 	fn repo(&self, requested: Option<&str>) -> Result<GithubRepo, Fault> {
@@ -192,25 +232,7 @@ impl GithubHost for GithubService {
 				response.value = decode_file_response(&response.value, repo.identity(), path)?;
 				response
 			},
-			Operation::PrCreate => {
-				let repo = self.repo(params.repo.as_deref())?;
-				let body = json!({
-					"title": required(params.title.as_deref(), "pr_create requires `title`")?,
-					"body": params.body.as_deref().unwrap_or(""),
-					"head": required(params.head.as_deref(), "pr_create requires `head`")?,
-					"base": params.base.as_deref().unwrap_or("main"),
-					"draft": params.draft,
-				});
-				self
-					.request(
-						repo.host(),
-						Method::Post,
-						&format!("/repos/{}/pulls", repo.slug()),
-						Some(&body),
-						&cancellation,
-					)
-					.await?
-			},
+			Operation::PrCreate => self.create_pr(&params, &cancellation).await?,
 			Operation::PrCheckout => self.checkout(&params, &cancellation).await?,
 			Operation::PrPush => self.push(&params, &cancellation).await?,
 			Operation::SearchIssues
@@ -230,6 +252,96 @@ impl GithubHost for GithubService {
 }
 
 impl GithubService {
+	async fn create_pr(
+		&self,
+		params: &Params,
+		cancellation: &CancellationToken,
+	) -> Result<ApiResponse, Fault> {
+		let repo = self.repo(params.repo.as_deref())?;
+		let head = required(params.head.as_deref(), "pr_create requires `head`")?;
+		let base = params.base.as_deref().unwrap_or("main");
+		let (title, body) = if params.fill {
+			if params.title.is_some() || params.body.is_some() {
+				return Err(fault(
+					"github_invalid_request",
+					"fill is mutually exclusive with title and body",
+				));
+			}
+			let compare = self
+				.request(
+					repo.host(),
+					Method::Get,
+					&compare_endpoint(repo.slug(), base, head),
+					None,
+					cancellation,
+				)
+				.await?;
+			let messages = compare
+				.value
+				.get("commits")
+				.and_then(Value::as_array)
+				.ok_or_else(|| {
+					fault("github_invalid_response", "GitHub compare response has no commit list")
+				})?
+				.iter()
+				.filter_map(|commit| {
+					commit
+						.pointer("/commit/message")
+						.and_then(Value::as_str)
+				})
+				.collect::<Vec<_>>();
+			fill_from_commits(head, &messages)?
+		} else {
+			let title = required(params.title.as_deref(), "title is required unless fill is true")?;
+			(title.to_owned(), params.body.as_deref().unwrap_or("").to_owned())
+		};
+		let request = json!({
+			"title": title,
+			"body": body,
+			"head": head,
+			"base": base,
+			"draft": params.draft,
+		});
+		let mut created = self
+			.request(
+				repo.host(),
+				Method::Post,
+				&format!("/repos/{}/pulls", repo.slug()),
+				Some(&request),
+				cancellation,
+			)
+			.await?;
+		let metadata = PrMetadata::from_params(params);
+		if metadata.is_empty() {
+			return Ok(created);
+		}
+		let number = created
+			.value
+			.get("number")
+			.and_then(Value::as_u64)
+			.ok_or_else(|| {
+				fault("github_invalid_response", "created pull request has no number")
+			})?;
+		for (endpoint, body) in metadata.requests(repo.slug(), number) {
+			self
+				.request(repo.host(), Method::Post, &endpoint, Some(&body), cancellation)
+				.await?;
+		}
+		let refreshed = self
+			.request(
+				repo.host(),
+				Method::Get,
+				&format!("/repos/{}/pulls/{number}", repo.slug()),
+				None,
+				cancellation,
+			)
+			.await?;
+		created.value = refreshed.value;
+		created.remaining = refreshed.remaining;
+		created.reset = refreshed.reset;
+		Ok(created)
+	}
+
 	async fn search(
 		&self,
 		params: &Params,
@@ -485,6 +597,7 @@ impl GithubService {
 		params: &Params,
 		cancellation: &CancellationToken,
 	) -> Result<ApiResponse, Fault> {
+		let tail = tail_limit(params.tail)?;
 		let repo = self.repo(params.repo.as_deref())?;
 		let target = if let Some(run) = &params.run {
 			WatchTarget::Run(run_id(run)?)
@@ -570,6 +683,15 @@ impl GithubService {
 					),
 				);
 			}
+			let failed = if state == ActionsState::Failure {
+				Some(self.failed_job_logs(&repo, &response.value, tail, cancellation).await?)
+			} else {
+				None
+			};
+			if let Some(object) = response.value.as_object_mut() {
+				object.insert("tail".to_owned(), Value::from(tail));
+				object.insert("failed_logs".to_owned(), Value::Array(failed.unwrap_or_default()));
+			}
 			receipt = Some(response);
 			if state != ActionsState::Pending || attempt == 99 {
 				break;
@@ -579,6 +701,34 @@ impl GithubService {
 		}
 		receipt
 			.ok_or_else(|| fault("github_actions_missing", "no GitHub Actions response was returned"))
+	}
+
+	/// Fetches the last `tail` log lines of every failed job in a watch
+	/// response.
+	async fn failed_job_logs(
+		&self,
+		repo: &GithubRepo,
+		value: &Value,
+		tail: usize,
+		cancellation: &CancellationToken,
+	) -> Result<Vec<Value>, Fault> {
+		let mut logs = Vec::new();
+		for (run_id, job) in failed_jobs(value) {
+			let Some(job_id) = job.get("id").and_then(Value::as_u64) else {
+				continue;
+			};
+			let full = self.job_log(repo, job_id, cancellation).await?;
+			let tail_text = full.as_deref().and_then(|log| tail_lines(log, tail));
+			logs.push(json!({
+				"run_id": run_id,
+				"job_id": job_id,
+				"job_name": job.get("name").and_then(Value::as_str),
+				"conclusion": job.get("conclusion").and_then(Value::as_str),
+				"available": tail_text.is_some(),
+				"tail": tail_text,
+			}));
+		}
+		Ok(logs)
 	}
 
 	async fn fetch_run_jobs(
@@ -989,6 +1139,187 @@ async fn poll_sleep(delay: Duration, cancellation: &CancellationToken) -> Result
 fn run_jobs_endpoint(repo: &str, run_id: u64, page: u32) -> String {
 	format!("/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100&page={page}")
 }
+fn compare_endpoint(repo: &str, base: &str, head: &str) -> String {
+	format!(
+		"/repos/{repo}/compare/{}...{}",
+		encode_path_segment(base),
+		encode_path_segment(head)
+	)
+}
+/// Reads a response body under the 16 MiB ceiling, observing cancellation
+/// between chunks.
+async fn read_body(
+	response: reqwest::Response,
+	cancellation: &CancellationToken,
+) -> Result<BytesMut, Fault> {
+	let mut bytes = BytesMut::new();
+	let mut stream = response.bytes_stream();
+	while let Some(chunk) = tokio::select! {
+		chunk = stream.next() => chunk,
+		() = cancellation.cancelled() => return Err(cancelled_fault()),
+	} {
+		let chunk = chunk.map_err(http_fault)?;
+		if bytes.len().saturating_add(chunk.len()) > MAX_BODY {
+			return Err(fault("github_response_too_large", "GitHub response exceeds 16 MiB"));
+		}
+		bytes.extend_from_slice(&chunk);
+	}
+	Ok(bytes)
+}
+/// Derives a pull request title and body from the commits between base and
+/// head, matching `gh pr create --fill`: a single commit contributes its
+/// subject and body; several commits title the PR after the humanized head
+/// branch and list every subject oldest-first.
+fn fill_from_commits(head: &str, messages: &[&str]) -> Result<(String, String), Fault> {
+	match messages {
+		[] => Err(fault(
+			"github_invalid_request",
+			"fill requires at least one commit between base and head",
+		)),
+		[message] => {
+			let (subject, body) = message
+				.split_once('\n')
+				.unwrap_or((message, ""));
+			Ok((subject.trim().to_owned(), body.trim().to_owned()))
+		},
+		_ => {
+			let mut title = String::with_capacity(head.len());
+			for (index, ch) in head.chars().enumerate() {
+				match ch {
+					'-' | '_' => title.push(' '),
+					_ if index == 0 => title.extend(ch.to_uppercase()),
+					_ => title.push(ch),
+				}
+			}
+			let mut body = String::new();
+			for message in messages {
+				body.push_str("- ");
+				body.push_str(message.lines().next().unwrap_or("").trim());
+				body.push('\n');
+			}
+			Ok((title, body))
+		},
+	}
+}
+/// Post-creation pull request metadata applied through the issues and
+/// reviewers endpoints.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct PrMetadata {
+	reviewers:      Vec<String>,
+	team_reviewers: Vec<String>,
+	assignees:      Vec<String>,
+	labels:         Vec<String>,
+}
+impl PrMetadata {
+	fn from_params(params: &Params) -> Self {
+		let mut metadata = Self::default();
+		for reviewer in normalized_identifiers(&params.reviewer) {
+			match reviewer.rsplit_once('/') {
+				Some((_, team)) => metadata.team_reviewers.push(team.to_owned()),
+				None => metadata.reviewers.push(reviewer),
+			}
+		}
+		metadata.assignees = normalized_identifiers(&params.assignee);
+		metadata.labels = normalized_identifiers(&params.label);
+		metadata
+	}
+
+	fn is_empty(&self) -> bool {
+		self.reviewers.is_empty()
+			&& self.team_reviewers.is_empty()
+			&& self.assignees.is_empty()
+			&& self.labels.is_empty()
+	}
+
+	/// Endpoint/body pairs to POST, in application order.
+	fn requests(&self, repo: &str, number: u64) -> Vec<(String, Value)> {
+		let mut requests = Vec::with_capacity(3);
+		if !self.reviewers.is_empty() || !self.team_reviewers.is_empty() {
+			requests.push((
+				format!("/repos/{repo}/pulls/{number}/requested_reviewers"),
+				json!({ "reviewers": self.reviewers, "team_reviewers": self.team_reviewers }),
+			));
+		}
+		if !self.assignees.is_empty() {
+			requests.push((
+				format!("/repos/{repo}/issues/{number}/assignees"),
+				json!({ "assignees": self.assignees }),
+			));
+		}
+		if !self.labels.is_empty() {
+			requests.push((
+				format!("/repos/{repo}/issues/{number}/labels"),
+				json!({ "labels": self.labels }),
+			));
+		}
+		requests
+	}
+}
+/// Trims, drops empty entries, and de-duplicates while preserving order.
+fn normalized_identifiers(values: &[Str]) -> Vec<String> {
+	let mut output: Vec<String> = Vec::with_capacity(values.len());
+	for value in values {
+		let trimmed = value.trim();
+		if !trimmed.is_empty() && !output.iter().any(|seen| seen == trimmed) {
+			output.push(trimmed.to_string());
+		}
+	}
+	output
+}
+/// Resolves the per-job log tail: 15 lines by default, capped at 200, and
+/// never zero.
+fn tail_limit(requested: Option<u32>) -> Result<usize, Fault> {
+	match requested {
+		None => Ok(RUN_WATCH_TAIL_DEFAULT),
+		Some(0) => Err(fault("github_invalid_request", "tail must be a positive number")),
+		Some(lines) => Ok(usize::try_from(lines)
+			.unwrap_or(usize::MAX)
+			.min(RUN_WATCH_TAIL_MAX)),
+	}
+}
+/// Returns the last `tail` non-trailing lines of a log, or `None` when the
+/// log is blank.
+fn tail_lines(log: &str, tail: usize) -> Option<String> {
+	let normalized = log.replace("\r\n", "\n");
+	let trimmed = normalized.trim();
+	if trimmed.is_empty() {
+		return None;
+	}
+	let lines = trimmed.lines().collect::<Vec<_>>();
+	let start = lines.len().saturating_sub(tail);
+	Some(lines[start..].join("\n").trim_end().to_owned())
+}
+/// Lists `(run_id, job)` pairs whose completed conclusion is a failure.
+fn failed_jobs(value: &Value) -> Vec<(u64, &Value)> {
+	fn push_failed<'v>(run: &'v Value, jobs: Option<&'v Value>, out: &mut Vec<(u64, &'v Value)>) {
+		let Some(run_id) = run.get("id").and_then(Value::as_u64) else {
+			return;
+		};
+		for job in jobs
+			.and_then(Value::as_array)
+			.map(Vec::as_slice)
+			.unwrap_or_default()
+		{
+			let completed = job.get("status").and_then(Value::as_str) == Some("completed");
+			let failed = matches!(
+				job.get("conclusion").and_then(Value::as_str),
+				Some("failure" | "timed_out" | "cancelled" | "action_required")
+			);
+			if completed && failed {
+				out.push((run_id, job));
+			}
+		}
+	}
+	let mut failed = Vec::new();
+	if let Some(run) = value.get("run") {
+		push_failed(run, value.get("jobs"), &mut failed);
+	} else if let Some(runs) = value.get("workflow_runs").and_then(Value::as_array) {
+		for run in runs {
+			push_failed(run, run.get("jobs"), &mut failed);
+		}
+	}
+	failed
+}
 fn encode_path_segment(value: &str) -> String {
 	url::form_urlencoded::byte_serialize(value.as_bytes())
 		.collect::<String>()
@@ -1319,11 +1650,113 @@ mod tests {
 	use tokio_util::sync::CancellationToken;
 
 	use super::{
-		ActionsState, DateField, Operation, UNIX_EPOCH, actions_runs_endpoint, actions_state,
-		branch_endpoint, date_qualifier, days_from_civil, decode_file_response, file_endpoint,
-		normalize_date_bound, parse_pr_number, poll_sleep, pr_branch_endpoint, run_jobs_endpoint,
+		ActionsState, DateField, Operation, Params, PrMetadata, UNIX_EPOCH, actions_runs_endpoint,
+		actions_state, branch_endpoint, compare_endpoint, date_qualifier, days_from_civil,
+		decode_file_response, failed_jobs, file_endpoint, fill_from_commits, normalize_date_bound,
+		parse_pr_number, poll_sleep, pr_branch_endpoint, run_jobs_endpoint, tail_limit, tail_lines,
 	};
 	use crate::github_url::GithubRepo;
+
+	#[test]
+	fn pr_metadata_posts_reviewers_assignees_and_labels_in_order() {
+		let params: Params = serde_json::from_value(json!({
+			"op": "pr_create",
+			"head": "feature/foo",
+			"title": "t",
+			"reviewer": [" alice ", "org/core-team", "alice", ""],
+			"assignee": ["bob"],
+			"label": ["bug", "p1"],
+		}))
+		.expect("params");
+		let metadata = PrMetadata::from_params(&params);
+		assert_eq!(metadata, PrMetadata {
+			reviewers:      vec!["alice".to_owned()],
+			team_reviewers: vec!["core-team".to_owned()],
+			assignees:      vec!["bob".to_owned()],
+			labels:         vec!["bug".to_owned(), "p1".to_owned()],
+		});
+		let requests = metadata.requests("owner/repo", 7);
+		assert_eq!(requests, vec![
+			(
+				"/repos/owner/repo/pulls/7/requested_reviewers".to_owned(),
+				json!({ "reviewers": ["alice"], "team_reviewers": ["core-team"] }),
+			),
+			("/repos/owner/repo/issues/7/assignees".to_owned(), json!({ "assignees": ["bob"] })),
+			("/repos/owner/repo/issues/7/labels".to_owned(), json!({ "labels": ["bug", "p1"] })),
+		]);
+
+		let bare: Params =
+			serde_json::from_value(json!({ "op": "pr_create", "head": "h", "title": "t" }))
+				.expect("params");
+		assert!(PrMetadata::from_params(&bare).is_empty());
+		assert!(PrMetadata::from_params(&bare)
+			.requests("owner/repo", 7)
+			.is_empty());
+	}
+
+	#[test]
+	fn fill_derives_title_and_body_like_gh() {
+		assert_eq!(
+			compare_endpoint("owner/repo", "main", "feature/foo"),
+			"/repos/owner/repo/compare/main...feature%2Ffoo",
+		);
+		assert_eq!(
+			fill_from_commits("feature/foo", &["Fix parser\n\nHandles empty input.\n"])
+				.expect("single commit"),
+			("Fix parser".to_owned(), "Handles empty input.".to_owned()),
+		);
+		assert_eq!(
+			fill_from_commits("add-retry_logic", &["First change\n\ndetails", "Second change"])
+				.expect("several commits"),
+			("Add retry logic".to_owned(), "- First change\n- Second change\n".to_owned()),
+		);
+		assert_eq!(
+			fill_from_commits("feature/foo", &[])
+				.expect_err("no commits")
+				.code,
+			"github_invalid_request",
+		);
+	}
+
+	#[test]
+	fn tail_defaults_caps_and_rejects_zero() {
+		assert_eq!(tail_limit(None).expect("default"), 15);
+		assert_eq!(tail_limit(Some(40)).expect("explicit"), 40);
+		assert_eq!(tail_limit(Some(5_000)).expect("capped"), 200);
+		assert_eq!(tail_limit(Some(0)).expect_err("zero").message, "tail must be a positive number");
+		assert_eq!(
+			tail_lines("a\r\nb\r\nc\r\nd\n\n", 2).as_deref(),
+			Some("c\nd"),
+			"tail keeps the last lines after CRLF normalization",
+		);
+		assert_eq!(tail_lines("   \n", 5), None);
+	}
+
+	#[test]
+	fn failed_jobs_are_collected_per_run() {
+		let run = json!({
+			"run": { "id": 9 },
+			"jobs": [
+				{ "id": 1, "status": "completed", "conclusion": "success" },
+				{ "id": 2, "status": "completed", "conclusion": "failure" },
+				{ "id": 3, "status": "in_progress", "conclusion": null },
+			],
+		});
+		let failed = failed_jobs(&run);
+		assert_eq!(failed.len(), 1);
+		assert_eq!(failed[0].0, 9);
+		assert_eq!(failed[0].1["id"], 2);
+
+		let commit = json!({
+			"workflow_runs": [
+				{ "id": 4, "jobs": [{ "id": 40, "status": "completed", "conclusion": "timed_out" }] },
+				{ "id": 5, "jobs": [{ "id": 50, "status": "completed", "conclusion": "skipped" }] },
+			],
+		});
+		let failed = failed_jobs(&commit);
+		assert_eq!(failed.len(), 1);
+		assert_eq!((failed[0].0, failed[0].1["id"].as_u64()), (4, Some(40)));
+	}
 
 	fn instant(year: i64, month: u32, day: u32, hour: u64) -> std::time::SystemTime {
 		let days = days_from_civil(year, month, day).expect("test date");

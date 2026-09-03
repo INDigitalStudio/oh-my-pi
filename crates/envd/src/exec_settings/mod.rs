@@ -11,4 +11,4 @@ pub(crate) use sandbox::{
 	EnvironmentInheritance, ExecSandboxMode, ReadMode, SandboxNetworkMode, SandboxSettings,
 	UnscopedWrites,
 };
-pub(crate) use shell::{DirenvMode, ShellProfile, ShellSettings};
+pub(crate) use shell::{DirenvMode, ShellSettings};

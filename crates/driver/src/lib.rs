@@ -5,6 +5,7 @@
 pub mod auth_backend;
 pub mod auth_flow;
 pub mod bridges;
+pub mod cfg;
 pub mod cleanse;
 pub mod collab;
 pub mod commit;
@@ -19,6 +20,8 @@ pub mod rules;
 pub mod secrets;
 pub mod sessions;
 pub mod settings;
+/// Additional literal pi driver-setting convars.
+pub mod pi_settings;
 pub mod share;
 pub mod subagent;
 pub mod telemetry_upload;

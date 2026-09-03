@@ -7,12 +7,12 @@ omp_con::var! {
 	/// Enable project language-server bindings and tools.
 	pub static SV_LSP_ENABLED = sv_lsp_enabled: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Start matching language servers on first use.
 	pub static SV_LSP_LAZY = sv_lsp_lazy: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 

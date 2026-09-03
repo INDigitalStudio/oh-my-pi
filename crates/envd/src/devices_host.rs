@@ -1,11 +1,11 @@
 //! Envd-owned authority bridges behind the embedded shell's `dyn` builtin.
 
-use std::{collections::BTreeSet, fmt::Write as _, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
-use omp_agent::{GateEvent, GateOutcome, HookGate};
-use omp_core::{Duration, DurationUnit, Str, sf};
+use omp_agent::{ApprovalRoute, GateEvent, GateOutcome, HookGate};
+use omp_core::{Duration, DurationUnit, Hash32, Str, sf};
 use omp_proto::toolhost::v1::HookEventId;
 use omp_shell_builtins::{
 	DynDevice, DynFault, DynFuture, DynHost as ShellDynHost, DynOutput, DynSchema,
@@ -19,6 +19,13 @@ use omp_tools::{
 	staging::{ProposalDecision, ProposalRejection, StagedProposalRegistry},
 };
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
+
+use super::{
+	admission::{DynamicAdmission, DynamicInvocationSource},
+	blobs::{BlobHost, BlobId},
+	mcp::manager::McpManager,
+};
 
 /// Envd-owned loopback bridge behind the `dyn` shell builtin.
 pub struct DynHost {
@@ -26,6 +33,9 @@ pub struct DynHost {
 	invoker:            Arc<dyn ErasedDeviceInvoker>,
 	proposals:          StagedProposalRegistry,
 	hooks:              Arc<HookGate>,
+	blobs:              BlobHost,
+	mcp:                Arc<McpManager>,
+	admission:          DynamicAdmission,
 	next_invocation_id: std::sync::atomic::AtomicU64,
 }
 
@@ -37,14 +47,25 @@ impl DynHost {
 		invoker: Arc<dyn ErasedDeviceInvoker>,
 		proposals: StagedProposalRegistry,
 		hooks: Arc<HookGate>,
+		blobs: BlobHost,
+		mcp: Arc<McpManager>,
+		admission: DynamicAdmission,
 	) -> Self {
 		Self {
 			catalog,
 			invoker,
 			proposals,
 			hooks,
+			blobs,
+			mcp,
+			admission,
 			next_invocation_id: std::sync::atomic::AtomicU64::new(1),
 		}
+	}
+
+	/// Binds or clears the session's live approval route for nested calls.
+	pub(crate) fn bind_approval_route(&self, route: Option<ApprovalRoute>) {
+		self.admission.bind_route(route);
 	}
 
 	fn invocation_id(&self) -> Str {
@@ -54,15 +75,40 @@ impl DynHost {
 		sf!("dyn-{sequence}")
 	}
 
-	async fn visible_names(&self, registry: &Registry) -> Result<Option<BTreeSet<Str>>, DynFault> {
+	async fn visible_names(
+		&self,
+		registry: &Registry,
+		dynamic: &[DynDevice],
+	) -> Result<Option<BTreeSet<Str>>, DynFault> {
 		if !self.hooks.subscribed(HookEventId::HookEventDeviceList) {
 			return Ok(None);
 		}
-		let device_hash = registry.device_hash();
-		let devices = registry
+		let mut catalog_hash = Hash32::hasher();
+		catalog_hash.update(registry.device_hash().as_bytes());
+		for device in dynamic {
+			catalog_hash.update(device.name.as_bytes());
+			catalog_hash.update(b"\0");
+			if let Some(description) = &device.description {
+				catalog_hash.update(description.as_bytes());
+			}
+			catalog_hash.update(b"\0");
+		}
+		let device_hash = catalog_hash.finalize();
+		let mut devices = registry
 			.devices()
 			.map(device_event_json)
 			.collect::<Vec<_>>();
+		devices.extend(dynamic.iter().map(|device| {
+			json!({
+				"name": device.name,
+				"path": device.name,
+				"summary": device.description,
+				"place": "mcp",
+				"mounted": true,
+				"enabled": true,
+				"available": true,
+			})
+		}));
 		let payload = serde_json::to_vec(&json!({ "devices": devices, "turn_id": null }))
 			.map(Bytes::from)
 			.map_err(|_| DynFault::new("failed to encode the dynamic-device catalog"))?;
@@ -92,6 +138,28 @@ impl DynHost {
 				.filter_map(|device| device.get("name").and_then(Value::as_str).map(Str::new))
 				.collect(),
 		))
+	}
+
+	async fn call_mcp(
+		&self,
+		name: Str,
+		args: Value,
+		cancellation: CancellationToken,
+	) -> Result<DynOutput, DynFault> {
+		if let Some(effects) = self.mcp.dynamic_effects(name.as_str()) {
+			self
+				.admission
+				.admit(
+					self.invocation_id(),
+					name.clone(),
+					&effects,
+					DynamicInvocationSource::ShellDyn,
+					cancellation.clone(),
+				)
+				.await
+				.map_err(|error| DynFault::new(error.to_string()))?;
+		}
+		self.mcp.call(name.as_str(), args, cancellation).await
 	}
 
 	fn proposal_schema(name: &str) -> Option<DynSchema> {
@@ -142,19 +210,24 @@ impl ShellDynHost for DynHost {
 				.catalog
 				.registry()
 				.ok_or_else(|| DynFault::new("device catalog is not available in this session"))?;
-			let visible = self.visible_names(&registry).await?;
-			Ok(registry
+			let mcp = self.mcp.list().await?;
+			let visible = self.visible_names(&registry, &mcp).await?;
+			let mut devices = registry
 				.devices()
+				.map(|device| DynDevice {
+					name:        device.name.clone(),
+					description: Some(device.summary.clone()),
+				})
+				.chain(mcp)
 				.filter(|device| {
 					visible
 						.as_ref()
 						.is_none_or(|names| names.contains(device.name.as_str()))
 				})
-				.map(|device| DynDevice {
-					name:        device.name.clone(),
-					description: Some(device.summary.clone()),
-				})
-				.collect())
+				.collect::<Vec<_>>();
+			devices.sort_by(|left, right| left.name.cmp(&right.name));
+			devices.dedup_by(|left, right| left.name == right.name);
+			Ok(devices)
 		})
 	}
 
@@ -168,19 +241,30 @@ impl ShellDynHost for DynHost {
 				.catalog
 				.registry()
 				.ok_or_else(|| DynFault::new("device catalog is not available in this session"))?;
-			let path = DevicePath::parse(name.as_str())
-				.map_err(|_| DynFault::new(format!("unknown device `{name}`")))?;
-			let device = registry
-				.devices()
-				.find(|device| device.name.as_str() == path.root())
-				.ok_or_else(|| DynFault::new(format!("unknown device `{name}`")))?;
-			let schema = serde_json::from_slice(device.schema)
-				.map_err(|_| DynFault::new(format!("device `{name}` has an invalid JSON schema")))?;
-			Ok(DynSchema { name, description: Some(device.summary.clone()), schema })
+			if let Ok(path) = DevicePath::parse(name.as_str())
+				&& let Some(device) = registry
+					.devices()
+					.find(|device| device.name.as_str() == path.root())
+			{
+				let schema = serde_json::from_slice(device.schema).map_err(|_| {
+					DynFault::new(format!("device `{name}` has an invalid JSON schema"))
+				})?;
+				return Ok(DynSchema {
+					name,
+					description: Some(device.summary.clone()),
+					schema,
+				});
+			}
+			self.mcp.schema(name.as_str()).await
 		})
 	}
 
-	fn call(&self, name: &str, args: Value) -> DynFuture<'_, DynOutput> {
+	fn call(
+		&self,
+		name: &str,
+		args: Value,
+		cancellation: CancellationToken,
+	) -> DynFuture<'_, DynOutput> {
 		let name = Str::new(name);
 		Box::pin(async move {
 			if matches!(name.as_str(), "resolve" | "reject") {
@@ -190,12 +274,32 @@ impl ShellDynHost for DynHost {
 				.catalog
 				.registry()
 				.ok_or_else(|| DynFault::new("device catalog is not available in this session"))?;
-			let path = DevicePath::parse(name.as_str())
-				.map_err(|_| DynFault::new(format!("unknown device `{name}`")))?;
-			let target = registry
-				.resolve_device(&path)
-				.map_err(|_| DynFault::new(format!("device `{name}` rejected its path arguments")))?;
+			let Ok(path) = DevicePath::parse(name.as_str()) else {
+				return self.call_mcp(name, args, cancellation).await;
+			};
+			let target = match registry.resolve_device(&path) {
+				Ok(target) => target,
+				Err(_) if registry.devices().any(|device| device.name.as_str() == path.root()) => {
+					return Err(DynFault::new(format!(
+						"device `{name}` rejected its path arguments"
+					)));
+				},
+				Err(_) => return self.call_mcp(name, args, cancellation).await,
+			};
 			let identity = target.identity();
+			let effects = target.effects.clone();
+			let invocation_id = self.invocation_id();
+			self
+				.admission
+				.admit(
+					invocation_id.clone(),
+					target.name.clone(),
+					&effects,
+					DynamicInvocationSource::ShellDyn,
+					cancellation.clone(),
+				)
+				.await
+				.map_err(|error| DynFault::new(error.to_string()))?;
 			let raw = Str::new(args.to_string());
 			let args_json = Bytes::from(raw.clone());
 			let mut stream = match target.route.clone() {
@@ -221,28 +325,37 @@ impl ShellDynHost for DynHost {
 							owner: Some(target.claimant.clone()),
 							site: Some(site),
 							worker: Some(worker),
-							invocation_id: self.invocation_id(),
+							invocation_id,
 							deadline: Duration::new(5, DurationUnit::Minutes),
 							args_json,
 						})
 						.await
 				},
 			};
-			consume(&registry, &identity, &mut stream).await
+			consume(&registry, &self.blobs, &identity, &mut stream, cancellation).await
 		})
 	}
 }
 
 async fn consume(
 	registry: &Registry,
+	blobs: &BlobHost,
 	identity: &ToolIdentity,
 	stream: &mut ErasedStream<'_>,
+	cancellation: CancellationToken,
 ) -> Result<DynOutput, DynFault> {
 	loop {
-		match stream.next().await {
+		let event = tokio::select! {
+			biased;
+			() = cancellation.cancelled() => {
+				return Err(DynFault::new("dynamic device invocation was cancelled"));
+			},
+			event = stream.next() => event,
+		};
+		match event {
 			Some(Ok(ErasedEv::Update(_))) => {},
 			Some(Ok(ErasedEv::Done(ErasedOutcome::Done { verdict, .. }))) => {
-				return project_result(registry, identity, &verdict);
+				return project_result(registry, blobs, identity, &verdict);
 			},
 			Some(Ok(ErasedEv::Done(ErasedOutcome::Detached(job)))) => {
 				return Ok(DynOutput::Text(sf!("detached job: {}", job.id)));
@@ -257,57 +370,92 @@ async fn consume(
 
 fn project_result(
 	registry: &Registry,
+	blobs: &BlobHost,
 	identity: &ToolIdentity,
 	verdict: &[u8],
 ) -> Result<DynOutput, DynFault> {
 	let caps = PromptCaps {
 		maximum_parts:      16,
 		maximum_text_bytes: 262_144,
-		media:              false,
+		media:              true,
 		dialect:            Default::default(),
 		model_class:        Default::default(),
 	};
-	let mut rendered = String::new();
-	match registry.prompt(identity, verdict, &caps) {
+	let output = match registry.prompt(identity, verdict, &caps) {
 		Ok(Some(parts)) => {
-			for text in parts.iter().filter_map(|part| match part {
-				Part::Text { text } => Some(text.as_str()),
-				Part::Json { .. } | Part::Blob { .. } => None,
-			}) {
-				if !rendered.is_empty() {
-					rendered.push('\n');
-				}
-				rendered.push_str(text);
-			}
+			let outputs = parts
+				.iter()
+				.cloned()
+				.map(|part| project_part(blobs, part))
+				.collect::<Result<Vec<_>, _>>()?;
+			join_outputs(outputs)
 		},
-		Ok(None) => {},
-		Err(RegistryError::UnsupportedExternal { .. }) => {
-			render_external_verdict(verdict, &mut rendered);
-		},
+		Ok(None) => DynOutput::Text(Str::default()),
+		Err(RegistryError::UnsupportedExternal { .. }) => project_external_verdict(verdict)?,
 		Err(error) => {
 			return Err(DynFault::new(format!("device result projection failed: {error}")));
 		},
-	}
-	if rendered.is_empty() {
-		rendered.push_str("(device returned non-text output)");
-	}
+	};
 	if faulted(verdict) {
-		Err(DynFault::new(rendered))
+		Err(DynFault::new(output_error_message(output)))
 	} else {
-		Ok(DynOutput::Text(Str::new(rendered)))
+		Ok(output)
 	}
 }
 
-fn render_external_verdict(verdict: &[u8], rendered: &mut String) {
-	let Ok(verdict) = serde_json::from_slice::<Value>(verdict) else {
-		return;
-	};
-	let Some(value) = verdict.get("value") else {
-		return;
-	};
-	match value {
-		Value::String(text) => rendered.push_str(text),
-		other => write!(rendered, "{other}").expect("writing JSON into a string cannot fail"),
+fn project_part(blobs: &BlobHost, part: Part) -> Result<DynOutput, DynFault> {
+	match part {
+		Part::Text { text } => Ok(DynOutput::Text(text)),
+		Part::Json { json } => serde_json::from_slice(&json)
+			.map(DynOutput::Json)
+			.map_err(|_| DynFault::new("device returned a malformed JSON output part")),
+		Part::Blob { blob, .. } => {
+			let hash = blob
+				.hash
+				.parse::<Hash32>()
+				.map_err(|_| DynFault::new("device returned an invalid blob identity"))?;
+			let bytes = blobs
+				.get(BlobId { hash: hash.into_bytes(), size: blob.byte_len })
+				.map_err(|_| DynFault::new("device output blob is unavailable"))?;
+			Ok(DynOutput::Blob { mime: blob.media_type, bytes })
+		},
+	}
+}
+
+fn join_outputs(mut outputs: Vec<DynOutput>) -> DynOutput {
+	if outputs.len() == 1 {
+		outputs.pop().expect("one output")
+	} else {
+		DynOutput::Parts(outputs)
+	}
+}
+
+fn project_external_verdict(verdict: &[u8]) -> Result<DynOutput, DynFault> {
+	let verdict = serde_json::from_slice::<Value>(verdict)
+		.map_err(|_| DynFault::new("external device returned a malformed verdict"))?;
+	let value = verdict
+		.get("value")
+		.cloned()
+		.ok_or_else(|| DynFault::new("external device verdict omitted its value"))?;
+	Ok(match value {
+		Value::String(text) => DynOutput::Text(Str::new(text)),
+		other => DynOutput::Json(other),
+	})
+}
+
+fn output_error_message(output: DynOutput) -> Str {
+	match output {
+		DynOutput::Text(text) => text,
+		DynOutput::Json(value) => Str::new(value.to_string()),
+		DynOutput::Blob { mime, .. } => sf!("device returned a binary error payload ({mime})"),
+		DynOutput::Parts(parts) => {
+			let text = parts
+				.into_iter()
+				.map(output_error_message)
+				.filter(|part| !part.is_empty())
+				.collect::<Vec<_>>();
+			Str::new(text.join("\n"))
+		},
 	}
 }
 
@@ -362,4 +510,168 @@ fn device_event_json(device: omp_tool::MountedDevice<'_>) -> Value {
 		}
 	}
 	Value::Object(row)
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		future::Future,
+		sync::atomic::{AtomicUsize, Ordering},
+	};
+
+	use futures::Stream;
+	use omp_tool::{
+		Claims, Constraint, Effects, Ev, ExecEffects, Precedence, Presentation, Rev, Tool, ToolSpec,
+	};
+	use omp_tools::device::{DeviceInvokeRequest, DeviceInvoker};
+
+	use super::*;
+	use crate::{
+		admission::ApprovalMode,
+		mcp::{McpService, manager::ProductionConnector},
+	};
+
+	struct CountingDevice {
+		spec:  ToolSpec,
+		calls: Arc<AtomicUsize>,
+	}
+
+	impl Tool for CountingDevice {
+		type Fault = Value;
+		type Params = Value;
+		type Payload = Value;
+		type Update = Value;
+
+		fn spec(&self) -> &ToolSpec {
+			&self.spec
+		}
+
+		fn call<'c>(
+			&'c self,
+			_incoming: IncomingParams<'c>,
+		) -> impl Stream<Item = Ev<Value, Value, Value>> + Send + 'c {
+			self.calls.fetch_add(1, Ordering::Relaxed);
+			futures::stream::empty()
+		}
+
+		fn prompt(&self, _view: Result<&Value, &Value>, _caps: &PromptCaps) -> Vec<Part> {
+			Vec::new()
+		}
+	}
+
+	#[derive(Clone)]
+	struct NoWorker;
+
+	impl DeviceInvoker for NoWorker {
+		fn invoke(
+			&self,
+			_request: DeviceInvokeRequest,
+		) -> impl Future<Output = ErasedStream<'static>> + Send {
+			async { Box::pin(futures::stream::empty()) as ErasedStream<'static> }
+		}
+	}
+
+	#[test]
+	fn native_projection_preserves_json_and_blob_parts() {
+		let scratch = tempfile::tempdir().expect("scratch");
+		let blobs = BlobHost::open(scratch.path()).expect("blobs");
+		let id = blobs.put(b"image").expect("store image");
+		let json = project_part(
+			&blobs,
+			Part::Json { json: Bytes::from_static(br#"{"ok":true}"#) },
+		)
+		.expect("JSON part");
+		assert_eq!(json, DynOutput::Json(json!({"ok": true})));
+		let blob = project_part(
+			&blobs,
+			Part::Blob {
+				blob: omp_tool::BlobRef {
+					hash:       Str::new(Hash32::new(id.hash).to_hex().as_str()),
+					media_type: sf!("image/png"),
+					byte_len:   id.size,
+				},
+				alt: None,
+			},
+		)
+		.expect("blob part");
+		assert_eq!(
+			blob,
+			DynOutput::Blob {
+				mime:  sf!("image/png"),
+				bytes: Bytes::from_static(b"image"),
+			}
+		);
+	}
+
+	#[tokio::test]
+	async fn denied_dynamic_effects_never_invoke_native_target() {
+		let scratch = tempfile::tempdir().expect("scratch");
+		let calls = Arc::new(AtomicUsize::new(0));
+		let mut registry = Registry::new();
+		registry
+			.register(
+				CountingDevice {
+					spec: ToolSpec {
+						name:            sf!("danger"),
+						rev:             Rev { family: sf!("test"), n: 1 },
+						description:     sf!("mutating test device"),
+						schema:          Bytes::from_static(
+							br#"{"type":"object","properties":{}}"#,
+						),
+						constraint:      Constraint::None,
+						effects:         Effects {
+							exec: Some(ExecEffects {
+								commands: Arc::from([sf!("*")]),
+								network: true,
+							}),
+							..Effects::empty()
+						},
+						projection_code: [1; 32],
+					},
+					calls: Arc::clone(&calls),
+				},
+				Presentation::Device,
+				Claims {
+					precedence: Precedence::ENHANCEMENT,
+					claimant:   sf!("omp/test"),
+					replaces:   None,
+				},
+			)
+			.expect("register target");
+		let registry = Arc::new(registry);
+		let catalog = DeviceCatalog::default();
+		catalog
+			.install_registry(Arc::clone(&registry))
+			.expect("install catalog");
+		let blobs = BlobHost::open(scratch.path().join("blobs")).expect("blobs");
+		let mcp_service =
+			McpService::open(scratch.path().join("mcp.sqlite3")).expect("MCP service");
+		let mcp = McpManager::new(
+			Arc::clone(&mcp_service),
+			Arc::new(ProductionConnector::new(scratch.path().to_path_buf())),
+			Arc::from([]),
+			scratch.path().join("local"),
+		);
+		let admission =
+			DynamicAdmission::new(ApprovalMode::AlwaysAsk, std::collections::BTreeMap::new(), None);
+		let host = DynHost::new(
+			catalog,
+			Arc::new(NoWorker),
+			StagedProposalRegistry::new(),
+			Arc::new(HookGate::channel().0),
+			blobs,
+			mcp,
+			admission,
+		);
+
+		let result = ShellDynHost::call(
+			&host,
+			"danger",
+			json!({}),
+			CancellationToken::new(),
+		)
+		.await;
+		assert!(result.is_err());
+		assert_eq!(calls.load(Ordering::Relaxed), 0);
+	}
 }

@@ -2,7 +2,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet},
 	env,
 	future::{self, Future},
-	path::{Path, PathBuf},
+	path::Path,
 	pin::Pin,
 	sync::Arc,
 	time::Duration,
@@ -40,11 +40,11 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::{
+	blobs::BlobHost,
 	direnv::DirenvDelta,
 	exec::{ExecError, ExecEvent, ExecHost, ExecRun},
 	exec_settings::{
-		DirenvMode, ExecSandboxMode, ReadMode, SandboxNetworkMode, SandboxSettings, ShellProfile,
-		ShellSettings,
+		DirenvMode, ExecSandboxMode, ReadMode, SandboxNetworkMode, SandboxSettings, ShellSettings,
 	},
 	tool_url::UrlResolver,
 	tools,
@@ -102,6 +102,7 @@ impl AcpExecSlot {
 #[derive(Clone)]
 pub struct ShellExecHost {
 	host:               ExecHost,
+	blobs:              BlobHost,
 	cwd_uri:            Str,
 	resolvers:          Arc<ResolverTable<UrlResolver>>,
 	settings:           ShellSettings,
@@ -123,6 +124,7 @@ impl ShellExecHost {
 	/// detached processes.
 	pub(crate) fn new(
 		host: ExecHost,
+		blobs: BlobHost,
 		cwd_uri: Str,
 		resolvers: Arc<ResolverTable<UrlResolver>>,
 		settings: ShellSettings,
@@ -137,6 +139,7 @@ impl ShellExecHost {
 		}
 		Self {
 			host,
+			blobs,
 			cwd_uri,
 			resolvers,
 			settings,
@@ -148,102 +151,32 @@ impl ShellExecHost {
 	}
 }
 impl ShellExecHost {
-	async fn shell_profile(&self) -> ShellProfileInput {
-		use super::shell_profile::capture;
-		let mut profile = self.settings.profile;
-		let mut executable = self
-			.settings
-			.executable
-			.as_deref()
-			.unwrap_or_default()
-			.to_owned();
-		if profile == ShellProfile::User && executable.is_empty() {
-			executable = env::var("SHELL")
-				.ok()
-				.filter(|shell| {
-					let path = Path::new(shell);
-					path.is_absolute()
-						&& path.is_file()
-						&& path
-							.file_name()
-							.and_then(|name| name.to_str())
-							.is_some_and(|name| matches!(name, "bash" | "zsh" | "fish"))
-				})
-				.unwrap_or_default();
-			if executable.is_empty() {
-				profile = ShellProfile::Brush;
-			}
-		}
-		if executable.is_empty() {
-			executable = match profile {
-				ShellProfile::Bash => String::from("bash"),
-				ShellProfile::Zsh => String::from("zsh"),
-				ShellProfile::Fish => String::from("fish"),
-				ShellProfile::Brush | ShellProfile::User => String::new(),
-			};
-		}
-		let profile_name: &'static str = profile.into();
-		let args = self
-			.settings
-			.args
-			.iter()
-			.filter(|argument| {
-				profile != ShellProfile::Fish || !matches!(argument.as_str(), "-l" | "--login")
-			})
-			.map(ToString::to_string)
-			.collect();
-		let snapshot_prefix =
-			if matches!(profile, ShellProfile::Bash | ShellProfile::Zsh | ShellProfile::User) {
-				let home = env::var_os("HOME").map(PathBuf::from);
-				match home {
-					Some(home) => capture(&executable, &home)
-						.await
-						.ok()
-						.flatten()
-						.map(|path| format!(". {} &&", shell_word(&path.to_string_lossy()))),
-					None => None,
-				}
-			} else {
-				None
-			};
-		let command_prefix = match (snapshot_prefix, self.settings.command_prefix.as_deref()) {
-			(Some(snapshot), Some(prefix)) => format!("{snapshot} {prefix}"),
-			(Some(snapshot), None) => snapshot,
-			(None, Some(prefix)) => prefix.to_owned(),
-			(None, None) => String::new(),
-		};
+	/// The only shell profile is the embedded in-process interpreter (ADR 0028);
+	/// the profile input carries just the configured command prefix.
+	fn shell_profile(&self) -> ShellProfileInput {
 		ShellProfileInput {
-			profile: profile_name.to_owned(),
-			executable,
-			args,
-			command_prefix,
-			env_delta: None,
-			login: self.settings.login && profile != ShellProfile::Fish,
-			wire_revision: omp_proto::SCHEMA_REV,
+			profile:        String::from("brush"),
+			executable:     String::new(),
+			args:           Vec::new(),
+			command_prefix: self
+				.settings
+				.command_prefix
+				.as_deref()
+				.unwrap_or_default()
+				.to_owned(),
+			env_delta:      None,
+			login:          false,
+			wire_revision:  omp_proto::SCHEMA_REV,
 		}
 	}
 
-	async fn detached_command(&self, command: &Str) -> String {
-		let profile = self.shell_profile().await;
-		let command = if profile.command_prefix.is_empty() {
-			command.to_string()
-		} else {
-			format!("{} {command}", profile.command_prefix)
-		};
-		if matches!(profile.profile.as_str(), "" | "brush") {
-			return command;
+	/// Detached processes run the same in-process interpreter; only the
+	/// configured command prefix is applied to the script.
+	fn detached_command(&self, command: &Str) -> String {
+		match self.settings.command_prefix.as_deref() {
+			Some(prefix) => format!("{prefix} {command}"),
+			None => command.to_string(),
 		}
-		let mut rendered = shell_word(&profile.executable);
-		for argument in profile.args {
-			rendered.push(' ');
-			rendered.push_str(&shell_word(&argument));
-		}
-		if profile.login {
-			rendered.push_str(" -l");
-		}
-		rendered.push_str(" -c ");
-		rendered.push_str(&shell_word(&command));
-		rendered
 	}
 
 	async fn expand_internal_uris(&self, input: &str, shell_source: bool) -> Result<Str, Fault> {
@@ -349,8 +282,8 @@ impl ShellExecHost {
 		Ok(Str::from(uri.to_string()))
 	}
 
-	async fn acp_command_prefix(&self, unset: &[String]) -> Str {
-		let profile = self.shell_profile().await;
+	fn acp_command_prefix(&self, unset: &[String]) -> Str {
+		let profile = self.shell_profile();
 		let mut prefix = String::new();
 		#[cfg(not(windows))]
 		{
@@ -504,10 +437,6 @@ fn command_environment(environment: BTreeMap<Str, Option<Str>>) -> EnvironmentDe
 	EnvironmentDelta { set, unset, props: None }
 }
 
-fn shell_word(word: &str) -> String {
-	format!("'{}'", word.replace('\'', "'\\''"))
-}
-
 fn valid_env_name(name: &str) -> bool {
 	let mut bytes = name.bytes();
 	bytes
@@ -649,7 +578,7 @@ impl ShellExec for ShellExecHost {
 			env_delta: Some(environment),
 			pty: pty
 				.then(|| PtySpec { terminal: String::from("xterm-256color"), ..Default::default() }),
-			shell_profile: Some(self.shell_profile().await),
+			shell_profile: Some(self.shell_profile()),
 			..Default::default()
 		};
 		let opened = self
@@ -703,7 +632,7 @@ impl ShellExec for ShellExecHost {
 			let mut unset = options.unset;
 			unset.retain(|name| !environment.set.contains_key(name));
 			unset.extend(environment.unset.iter().cloned());
-			let command_prefix = self.acp_command_prefix(&unset).await;
+			let command_prefix = self.acp_command_prefix(&unset);
 			return backend
 				.run(AcpExecRequest {
 					command: if command_prefix.is_empty() {
@@ -734,6 +663,29 @@ impl ShellExec for ShellExecHost {
 		})
 	}
 
+	async fn store_attachment(
+		&self,
+		bytes: Bytes,
+		media_type: Str,
+	) -> Result<BlobRef, Fault> {
+		let blobs = self.blobs.clone();
+		let id = tokio::task::spawn_blocking(move || blobs.put(&bytes))
+			.await
+			.map_err(|error| Fault::Resource {
+				operation: sf!("store_shell_attachment"),
+				message:   Str::new(error.to_string()),
+			})?
+			.map_err(|error| Fault::Resource {
+				operation: sf!("store_shell_attachment"),
+				message:   Str::new(error.to_string()),
+			})?;
+		Ok(BlobRef {
+			hash: Str::from(hex::encode(&id.hash).into_string()),
+			media_type,
+			byte_len: id.size,
+		})
+	}
+
 	async fn detach(&self, request: DetachRequest) -> Result<DetachedJob, Fault> {
 		if request.options.pty && tools::pty_denied() {
 			return Err(Fault::PtyDenied);
@@ -750,7 +702,7 @@ impl ShellExec for ShellExecHost {
 			name: request.name.to_string(),
 			spec: Some(ProcessSpec {
 				source: Some(Script {
-					text: self.detached_command(&command).await,
+					text: self.detached_command(&command),
 					..Default::default()
 				}),
 				cwd_uri: cwd_uri.to_string(),
@@ -898,6 +850,7 @@ mod tests {
 			.to_string();
 		ShellExecHost::new(
 			ExecHost::new(),
+			BlobHost::open(root.join(".omp-test-blobs")).expect("blob host"),
 			Str::from(root_uri),
 			Arc::new(ResolverTable::default()),
 			ShellSettings::default(),
@@ -921,6 +874,7 @@ mod tests {
 			.to_string();
 		let host = ShellExecHost::new(
 			exec,
+			BlobHost::open(root.join(".omp-test-blobs")).expect("blob host"),
 			Str::from(root_uri),
 			Arc::new(ResolverTable::default()),
 			ShellSettings::default(),
@@ -1076,6 +1030,7 @@ mod tests {
 			.to_string();
 		let host = ShellExecHost::new(
 			exec,
+			BlobHost::open(root.path().join(".omp-test-blobs")).expect("blob host"),
 			Str::from(root_uri),
 			Arc::new(ResolverTable::default()),
 			ShellSettings::default(),

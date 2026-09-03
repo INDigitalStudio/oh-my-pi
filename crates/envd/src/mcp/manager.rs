@@ -14,7 +14,7 @@ use futures::{
 	Future, FutureExt as _, StreamExt as _, future::BoxFuture, stream::FuturesUnordered,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, header::WWW_AUTHENTICATE};
-use omp_core::Str;
+use omp_core::{Str, StrMut, sf};
 use omp_inference::{
 	auth::{
 		AuthControlHandle, StoreError,
@@ -25,7 +25,7 @@ use omp_inference::{
 use omp_oauth::{AuthChallenge, ChallengeKind, discover_auth_challenge};
 use omp_proto::env::v1 as pb;
 use omp_shell_builtins::{DynDevice, DynFault, DynFuture, DynHost, DynOutput, DynSchema};
-use omp_tool::{LeafOwner, LeafVersion, PublishedLeaf};
+use omp_tool::{DocEffects, Effects, ExecEffects, LeafOwner, LeafVersion, PublishedLeaf};
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -1114,10 +1114,28 @@ impl McpManager {
 		self.service.status(None)
 	}
 
+	/// The shared Environment MCP service this manager publishes through.
+	pub const fn service(&self) -> &Arc<McpService> {
+		&self.service
+	}
+
 	/// Returns the immutable current MCP definition catalog for CONTROL and dyn
 	/// registry epoch consumers.
 	pub fn catalog_snapshot(&self) -> omp_tool::LeafCatalogSnapshot<McpLeaf> {
 		self.service.leaf_snapshot()
+	}
+
+	/// Returns the declared approval envelope for one live dynamic MCP target.
+	pub(crate) fn dynamic_effects(&self, name: &str) -> Option<Effects> {
+		self
+			.catalog_snapshot()
+			.leaves
+			.iter()
+			.find_map(|leaf| {
+				mcp_dyn_definition(leaf)
+					.filter(|(candidate, _)| candidate == name)
+					.map(|_| mcp_tier_effects(leaf.value.tier.as_str()))
+			})
 	}
 
 	/// Captures every live MCP catalog once for UI inspection.
@@ -2379,7 +2397,12 @@ impl DynHost for McpManager {
 		})
 	}
 
-	fn call(&self, name: &str, args: Value) -> DynFuture<'_, DynOutput> {
+	fn call(
+		&self,
+		name: &str,
+		args: Value,
+		cancellation: CancellationToken,
+	) -> DynFuture<'_, DynOutput> {
 		let snapshot = self.catalog_snapshot();
 		let target = snapshot
 			.leaves
@@ -2412,7 +2435,7 @@ impl DynHost for McpManager {
 		let service = Arc::clone(&self.service);
 		Box::pin(async move {
 			let result = service
-				.invoke(request, CancellationToken::new())
+				.invoke(request, cancellation)
 				.await
 				.map_err(|error| DynFault::new(format!("MCP device invocation failed: {error}")))?;
 			mcp_dyn_output(&result)
@@ -2466,41 +2489,122 @@ fn mcp_dyn_definition(leaf: &PublishedLeaf<McpLeaf>) -> Option<(Str, Value)> {
 	Some((Str::new(format!("{}/{tool}", leaf.value.server)), definition))
 }
 
+fn mcp_tier_effects(tier: &str) -> Effects {
+	match tier {
+		"read" => Effects::empty(),
+		"write" => Effects {
+			documents: Some(DocEffects { read: true, write_globs: Arc::from([sf!("**")]) }),
+			..Effects::empty()
+		},
+		_ => Effects {
+			exec: Some(ExecEffects { commands: Arc::from([]), network: true }),
+			..Effects::empty()
+		},
+	}
+}
+
 fn mcp_dyn_output(result: &pb::McpInvokeResult) -> Result<DynOutput, DynFault> {
-	let value = if result.structured_content_json.is_empty() {
-		serde_json::from_slice::<Value>(&result.content_json)
-			.map_err(|_| DynFault::new("MCP device returned malformed JSON"))?
-	} else {
-		serde_json::from_slice::<Value>(&result.structured_content_json)
-			.map_err(|_| DynFault::new("MCP device returned malformed structured JSON"))?
-	};
-	let output = mcp_dyn_project(value);
+	let content = serde_json::from_slice::<Value>(&result.content_json)
+		.map_err(|_| DynFault::new("MCP device returned malformed JSON"))?;
+	let mut outputs = mcp_dyn_project(content)?;
+	if !result.structured_content_json.is_empty() {
+		let structured = serde_json::from_slice::<Value>(&result.structured_content_json)
+			.map_err(|_| DynFault::new("MCP device returned malformed structured JSON"))?;
+		outputs.push(DynOutput::Json(structured));
+	}
+	let output = mcp_dyn_join(outputs);
 	if result.is_error {
-		let message = match output {
-			DynOutput::Text(text) => text,
-			DynOutput::Json(value) => Str::new(value.to_string()),
-		};
-		Err(DynFault::new(message))
+		Err(DynFault::new(mcp_dyn_error_message(output)))
 	} else {
 		Ok(output)
 	}
 }
 
-fn mcp_dyn_project(value: Value) -> DynOutput {
-	let Some(content) = value.as_array() else {
-		return DynOutput::Json(value);
+fn mcp_dyn_error_message(output: DynOutput) -> Str {
+	match output {
+		DynOutput::Text(text) => text,
+		DynOutput::Json(value) => Str::new(value.to_string()),
+		DynOutput::Blob { mime, .. } => sf!("MCP device returned a binary error payload ({mime})"),
+		DynOutput::Parts(parts) => {
+			let mut message = StrMut::new("");
+			for part in parts {
+				let part = mcp_dyn_error_message(part);
+				if part.is_empty() {
+					continue;
+				}
+				if !message.is_empty() {
+					message.push('\n');
+				}
+				message.push_str(&part);
+			}
+			if message.is_empty() {
+				Str::new_static("MCP device returned an empty error payload")
+			} else {
+				message.freeze()
+			}
+		},
+	}
+}
+
+fn mcp_dyn_project(value: Value) -> Result<Vec<DynOutput>, DynFault> {
+	let Value::Array(content) = value else {
+		return Ok(vec![DynOutput::Json(value)]);
 	};
-	let text = content
-		.iter()
-		.map(|item| {
-			(item.get("type").and_then(Value::as_str) == Some("text"))
-				.then(|| item.get("text").and_then(Value::as_str))
-				.flatten()
-		})
-		.collect::<Option<Vec<_>>>();
-	match text {
-		Some(parts) => DynOutput::Text(Str::new(parts.join("\n"))),
-		None => DynOutput::Json(value),
+	content.into_iter().map(mcp_dyn_part).collect()
+}
+
+fn mcp_dyn_part(item: Value) -> Result<DynOutput, DynFault> {
+	let Some(kind) = item.get("type").and_then(Value::as_str) else {
+		return Ok(DynOutput::Json(item));
+	};
+	match kind {
+		"text" => item
+			.get("text")
+			.and_then(Value::as_str)
+			.map(|text| DynOutput::Text(Str::new(text)))
+			.ok_or_else(|| DynFault::new("MCP text content omitted text")),
+		"image" | "audio" | "blob" => mcp_dyn_blob(&item),
+		"resource" => {
+			let Some(resource) = item.get("resource") else {
+				return Err(DynFault::new("MCP resource content omitted resource"));
+			};
+			if resource.get("blob").is_some() {
+				mcp_dyn_blob_fields(resource, "blob")
+			} else if let Some(text) = resource.get("text").and_then(Value::as_str) {
+				Ok(DynOutput::Text(Str::new(text)))
+			} else {
+				Ok(DynOutput::Json(item))
+			}
+		},
+		_ => Ok(DynOutput::Json(item)),
+	}
+}
+
+fn mcp_dyn_blob(item: &Value) -> Result<DynOutput, DynFault> {
+	mcp_dyn_blob_fields(item, "data")
+}
+
+fn mcp_dyn_blob_fields(item: &Value, data_field: &str) -> Result<DynOutput, DynFault> {
+	let data = item
+		.get(data_field)
+		.and_then(Value::as_str)
+		.ok_or_else(|| DynFault::new("MCP binary content omitted data"))?;
+	let mime = item
+		.get("mimeType")
+		.or_else(|| item.get("mime_type"))
+		.and_then(Value::as_str)
+		.unwrap_or("application/octet-stream");
+	let bytes = omp_core::base64::decode(data.as_bytes())
+		.into_vec()
+		.map_err(|_| DynFault::new("MCP binary content is not valid base64"))?;
+	Ok(DynOutput::Blob { mime: Str::new(mime), bytes: Bytes::from(bytes) })
+}
+
+fn mcp_dyn_join(mut outputs: Vec<DynOutput>) -> DynOutput {
+	if outputs.len() == 1 {
+		outputs.pop().expect("one MCP output")
+	} else {
+		DynOutput::Parts(outputs)
 	}
 }
 
@@ -2971,6 +3075,108 @@ mod tests {
 		transport: Arc<CatalogTransport>,
 	}
 
+	struct DynTransport {
+		call_cancellation: Mutex<Option<CancellationToken>>,
+	}
+
+	impl McpTransport for DynTransport {
+		fn request<'a>(
+			&'a self,
+			method: &'a str,
+			_params: Value,
+			cancellation: CancellationToken,
+		) -> TransportFuture<'a, Result<TransportResponse, TransportError>> {
+			match method {
+				"tools/list" => Box::pin(async {
+					Ok(TransportResponse {
+						id:       RequestId::Number(1),
+						result:   json!({
+							"tools": [{
+								"name": "wait",
+								"description": "Waits until caller cancellation.",
+								"inputSchema": {
+									"type": "object",
+									"properties": {},
+									"additionalProperties": false
+								}
+							}]
+						}),
+						dispatch: DispatchState::Responded,
+					})
+				}),
+				"tools/call" => {
+					*self.call_cancellation.lock() = Some(cancellation.clone());
+					Box::pin(async move {
+						cancellation.cancelled().await;
+						Err(TransportError::pre_dispatch(TransportFailure::Cancelled))
+					})
+				},
+				_ => panic!("unexpected method {method}"),
+			}
+		}
+
+		fn notify<'a>(
+			&'a self,
+			_method: &'a str,
+			_params: Value,
+			_cancellation: CancellationToken,
+		) -> TransportFuture<'a, Result<DispatchState, TransportError>> {
+			Box::pin(async { Ok(DispatchState::Dispatched) })
+		}
+
+		fn next_message<'a>(
+			&'a self,
+			cancellation: CancellationToken,
+		) -> TransportFuture<'a, Result<IncomingMessage, TransportError>> {
+			Box::pin(async move {
+				cancellation.cancelled().await;
+				Err(TransportError::pre_dispatch(TransportFailure::Cancelled))
+			})
+		}
+
+		fn respond<'a>(
+			&'a self,
+			_id: RequestId,
+			_result: Result<Value, ServerResponseError>,
+			_cancellation: CancellationToken,
+		) -> TransportFuture<'a, Result<DispatchState, TransportError>> {
+			Box::pin(async { Ok(DispatchState::Dispatched) })
+		}
+
+		fn close(&self) -> TransportFuture<'_, Result<(), TransportError>> {
+			Box::pin(async { Ok(()) })
+		}
+	}
+
+	struct DynConnector {
+		transport: Arc<DynTransport>,
+	}
+
+	impl McpConnector for DynConnector {
+		fn connect<'a>(
+			&'a self,
+			_spec: &'a MountSpec,
+			roots: Arc<[Str]>,
+			_cancel: CancellationToken,
+		) -> Pin<Box<dyn Future<Output = Result<ConnectedClient, ManagerError>> + Send + 'a>> {
+			let transport: Arc<dyn McpTransport> = self.transport.clone();
+			Box::pin(async move {
+				Ok(ConnectedClient {
+					client:      Arc::new(McpClient::new(transport, roots)),
+					initialized: InitializedServer {
+						protocol_version: Str::from("2025-11-25"),
+						name:             Str::from("live"),
+						version:          None,
+						title:            None,
+						description:      None,
+						capabilities:     json!({ "tools": {} }),
+						instructions:     None,
+					},
+				})
+			})
+		}
+	}
+
 	impl McpConnector for CatalogConnector {
 		fn connect<'a>(
 			&'a self,
@@ -2994,6 +3200,105 @@ mod tests {
 				})
 			})
 		}
+	}
+
+	#[test]
+	fn dynamic_output_preserves_text_image_and_structured_json() {
+		let image = omp_core::base64::encode(b"png");
+		let result = pb::McpInvokeResult {
+			content_json: serde_json::to_vec(&json!([
+				{"type": "text", "text": "caption"},
+				{"type": "image", "mimeType": "image/png", "data": image},
+			]))
+			.expect("content")
+			.into(),
+			structured_content_json: serde_json::to_vec(&json!({"width": 1}))
+				.expect("structured content")
+				.into(),
+			..pb::McpInvokeResult::default()
+		};
+		assert_eq!(
+			mcp_dyn_output(&result).expect("project MCP output"),
+			DynOutput::Parts(vec![
+				DynOutput::Text(sf!("caption")),
+				DynOutput::Blob {
+					mime:  sf!("image/png"),
+					bytes: Bytes::from_static(b"png"),
+				},
+				DynOutput::Json(json!({"width": 1})),
+			])
+		);
+	}
+
+	#[tokio::test]
+	async fn dynamic_catalog_is_live_and_caller_cancellation_reaches_transport() {
+		let scratch = tempfile::tempdir().expect("scratch");
+		let service = McpService::open(scratch.path().join("cache.sqlite3")).expect("service");
+		let transport =
+			Arc::new(DynTransport { call_cancellation: Mutex::new(None) });
+		let manager = McpManager::new(
+			Arc::clone(&service),
+			Arc::new(DynConnector { transport: Arc::clone(&transport) }),
+			Arc::from([]),
+			scratch.path().to_path_buf(),
+		);
+		service.bind_manager(&manager);
+		let config = Arc::new(
+			serde_json::from_value::<McpServerConfig>(json!({
+				"type": "http",
+				"url": "https://example.test/mcp"
+			}))
+			.expect("config"),
+		);
+		let config_json = Bytes::from(serde_json::to_vec(config.as_ref()).expect("config JSON"));
+		manager
+			.start(vec![MountSpec {
+				name: sf!("live"),
+				config,
+				config_json,
+				values: ResolvedTransportValues::default(),
+				auth_headers: None,
+				suppressed_tools: BTreeSet::new(),
+				projection: McpDeviceProjection::all(),
+				auth: ControlMountAuth::None,
+				restart: McpRestartPolicy::Never,
+				owner: None,
+			}])
+			.await;
+		assert_eq!(
+			DynHost::list(manager.as_ref()).await.expect("live dyn catalog"),
+			vec![DynDevice {
+				name:        sf!("live/wait"),
+				description: Some(sf!("Waits until caller cancellation.")),
+			}]
+		);
+
+		let cancellation = CancellationToken::new();
+		let call_manager = Arc::clone(&manager);
+		let call_cancellation = cancellation.clone();
+		let call = tokio::spawn(async move {
+			DynHost::call(
+				call_manager.as_ref(),
+				"live/wait",
+				json!({}),
+				call_cancellation,
+			)
+			.await
+		});
+		for _ in 0..100 {
+			if transport.call_cancellation.lock().is_some() {
+				break;
+			}
+			tokio::task::yield_now().await;
+		}
+		let observed = transport
+			.call_cancellation
+			.lock()
+			.clone()
+			.expect("transport received caller cancellation");
+		cancellation.cancel();
+		assert!(call.await.expect("join call").is_err());
+		assert!(observed.is_cancelled());
 	}
 
 	#[tokio::test]

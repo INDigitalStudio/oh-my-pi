@@ -481,6 +481,55 @@ mod tests {
 		assert_eq!(content.as_ref(), b"confined");
 	}
 
+	#[tokio::test]
+	async fn production_local_entry_reads_scratch_files_and_rejects_escapes() {
+		use omp_tools::read::resolver::{ResolverTable, Scheme};
+
+		let temp = tempfile::tempdir().expect("temp dir");
+		let sessions = temp.path().join("sessions");
+		let root = session_local_root(&sessions, "scoped");
+		fs::create_dir_all(&root).expect("create session root");
+		fs::write(root.join("foo.md"), "# scratch\n").expect("write scratch file");
+		fs::write(sessions.join("outside.md"), "leaked").expect("write outside file");
+
+		let mut builder = ResolverTable::builder();
+		builder
+			.register(super::super::local_scheme_entry(), LocalResolver::open(sessions).expect("resolver"))
+			.expect("local registers once");
+		let table = builder.build();
+		let entry = table.entry(Scheme::Local).expect("local entry is installed");
+		assert!(entry.readable, "local:// must be readable");
+		assert!(!entry.mintable, "local:// is never model-minted");
+
+		let readable = crate::tools::with_invocation_session_scope(
+			Some(Str::new_static("scoped")),
+			table.read(Scheme::Local, "foo.md", &ParsedSelector::None),
+		)
+		.await
+		.expect("readable entry routes to the resolver")
+		.expect("scratch file resolves");
+		assert_eq!(readable.as_ref(), b"# scratch\n");
+
+		for escape in ["../outside.md", "/etc/passwd", "..%2Foutside.md", "a\\..\\outside.md"] {
+			let fault = crate::tools::with_invocation_session_scope(
+				Some(Str::new_static("scoped")),
+				table.read(Scheme::Local, escape, &ParsedSelector::None),
+			)
+			.await
+			.expect("readable entry routes to the resolver")
+			.expect_err("escape must be rejected");
+			assert!(
+				matches!(
+					fault,
+					Fault::Invalid { ref message }
+						if message.as_str()
+							== "local:// path must be relative and cannot traverse its root."
+				),
+				"{escape}: {fault:?}"
+			);
+		}
+	}
+
 	#[test]
 	fn session_roots_are_stable_isolated_and_confined() {
 		let sessions = Path::new("/state/sessions");

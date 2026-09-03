@@ -225,8 +225,9 @@ pub fn admit_direct_filesystem(
 use std::{env, io, iter, mem};
 
 use async_trait::async_trait;
+use omp_con::{Ctx, DynamicVarSpec, TypeSpec, Value as ConValue, VarFlags};
 use omp_core::{
-	Hash32, InvocationPhase, LifecyclePhase, Principal, Provenance, Str, encoding::hex,
+	Hash32, InvocationPhase, LifecyclePhase, Principal, Provenance, Str, encoding::hex, sf,
 };
 use omp_ext::config::{ContributedCliValue, ContributedValue};
 use omp_proto::{
@@ -258,7 +259,7 @@ use tokio::{
 		unix::{OwnedReadHalf, OwnedWriteHalf},
 	},
 	runtime,
-	sync::Mutex as AsyncMutex,
+	sync::{Mutex as AsyncMutex, broadcast},
 	task::AbortHandle,
 };
 
@@ -1486,6 +1487,347 @@ impl ControlAuthorityFactory for FixedControlAuthorityFactory {
 	}
 }
 
+#[derive(Clone, Debug)]
+struct ConvarChange {
+	sequence: u64,
+	name:     Str,
+	value:    ConValue,
+}
+
+struct ConvarBroker {
+	sequence: AtomicU64,
+	latest:   Mutex<omp_core::FastHashMap<Str, u64>>,
+	changes:  broadcast::Sender<ConvarChange>,
+}
+
+/// Factory for the shared read-only convar query and observation surface.
+///
+/// Declarations are restricted to the authenticated extension's
+/// `ext::<extension>::` namespace. The manifest remains authoritative; a
+/// reconnect may repeat an identical declaration but cannot replace it.
+pub struct ConvarControlFactory {
+	ctx:    Arc<Ctx>,
+	broker: Arc<ConvarBroker>,
+}
+
+impl ConvarControlFactory {
+	/// Installs one observer on the authoritative control context.
+	#[must_use]
+	pub fn new(ctx: Arc<Ctx>) -> Self {
+		let (changes, _) = broadcast::channel(256);
+		let broker = Arc::new(ConvarBroker {
+			sequence: AtomicU64::new(0),
+			latest: Mutex::new(omp_core::FastHashMap::default()),
+			changes,
+		});
+		let observer = Arc::clone(&broker);
+		ctx.observe(move |name, _, value| {
+			let sequence = observer.sequence.fetch_add(1, Ordering::AcqRel) + 1;
+			let name = Str::new(name);
+			observer.latest.lock().insert(name.clone(), sequence);
+			let _ = observer.changes.send(ConvarChange { sequence, name, value: value.clone() });
+		});
+		Self { ctx, broker }
+	}
+}
+
+impl ControlAuthorityFactory for ConvarControlFactory {
+	fn bind(
+		&self,
+		identity: Arc<ControlConnectionIdentity>,
+	) -> Result<Arc<dyn ControlAuthority>, ControlCompositionError> {
+		Ok(Arc::new(ConvarControlAuthority {
+			ctx: Arc::clone(&self.ctx),
+			broker: Arc::clone(&self.broker),
+			identity,
+		}))
+	}
+}
+
+struct ConvarControlAuthority {
+	ctx:      Arc<Ctx>,
+	broker:   Arc<ConvarBroker>,
+	identity: Arc<ControlConnectionIdentity>,
+}
+
+#[async_trait]
+impl ControlAuthority for ConvarControlAuthority {
+	fn handles(&self, operation: &str) -> bool {
+		matches!(
+			operation,
+			"omp.convars.declare" | "omp.convars.get" | "omp.convars.observe"
+		)
+	}
+
+	fn authorize(
+		&self,
+		_context: &ControlRequestContext,
+		operation: &str,
+		_arguments: &serde_json::Map<String, Value>,
+	) -> Result<(), ControlProtocolError> {
+		if self.handles(operation) {
+			Ok(())
+		} else {
+			Err(ControlProtocolError::new(
+				"InvalidOperation",
+				"the convar authority does not own this operation",
+			))
+		}
+	}
+
+	async fn request(
+		&self,
+		_context: ControlRequestContext,
+		operation: Str,
+		arguments: serde_json::Map<String, Value>,
+	) -> Result<Value, ControlProtocolError> {
+		match operation.as_str() {
+			"omp.convars.declare" => self.declare(&arguments),
+			"omp.convars.get" => {
+				let name = required_convar_argument(&arguments, "name")?;
+				self.snapshot(name)
+			},
+			"omp.convars.observe" => self.observe(&arguments).await,
+			_ => Err(ControlProtocolError::new(
+				"InvalidOperation",
+				"unknown convar CONTROL operation",
+			)),
+		}
+	}
+
+	async fn effect(
+		&self,
+		_context: ControlRequestContext,
+		_effect: ControlEffect,
+	) -> Result<(), ControlProtocolError> {
+		Err(ControlProtocolError::new(
+			"InvalidOperation",
+			"the convar authority accepts requests only",
+		))
+	}
+}
+
+impl ConvarControlAuthority {
+	fn declare(
+		&self,
+		arguments: &serde_json::Map<String, Value>,
+	) -> Result<Value, ControlProtocolError> {
+		let key = required_convar_argument(arguments, "key")?;
+		if key.trim() != key || key.contains("::") {
+			return Err(ControlProtocolError::new(
+				"InvalidConvarDeclaration",
+				"extension convar keys must be trimmed and cannot contain '::'",
+			));
+		}
+		let kind = required_convar_argument(arguments, "kind")?;
+		let default = arguments.get("default").ok_or_else(|| {
+			ControlProtocolError::new(
+				"InvalidConvarDeclaration",
+				"extension convar declarations require a default",
+			)
+		})?;
+		let (ty, default) = declaration_value(kind, default, arguments.get("values"))?;
+		let name =
+			omp_ext::config::extension_setting_convar_name(&self.identity.extension, key);
+		let spec = DynamicVarSpec {
+			name: name.clone(),
+			desc: arguments
+				.get("description")
+				.and_then(Value::as_str)
+				.map_or_else(
+					|| sf!("Setting {key} declared by extension {}", self.identity.extension),
+					Str::new,
+				),
+			ty,
+			flags: VarFlags::ARCHIVE
+				.with(VarFlags::SESSION)
+				.with(VarFlags::REPLICATED),
+			default,
+		};
+		if let Some(existing) = self.ctx.dynamic_var_spec(name.as_str()) {
+			if existing != spec {
+				return Err(ControlProtocolError::new(
+					"ConvarDeclarationConflict",
+					"extension convar declaration differs from the admitted declaration",
+				));
+			}
+		} else {
+			self
+				.ctx
+				.register_dynamic_var(spec)
+				.map_err(control_convar_error)?;
+		}
+		self.snapshot(name.as_str())
+	}
+
+	fn snapshot(&self, name: &str) -> Result<Value, ControlProtocolError> {
+		let value = self.ctx.value(name).map_err(control_convar_error)?;
+		let sequence = self.broker.latest.lock().get(name).copied().unwrap_or(0);
+		convar_snapshot(name, sequence, &value)
+	}
+
+	async fn observe(
+		&self,
+		arguments: &serde_json::Map<String, Value>,
+	) -> Result<Value, ControlProtocolError> {
+		let name = required_convar_argument(arguments, "name")?;
+		self.ctx.value(name).map_err(control_convar_error)?;
+		let after = arguments.get("after").and_then(Value::as_u64);
+		let mut receiver = self.broker.changes.subscribe();
+		let latest = self.broker.latest.lock().get(name).copied().unwrap_or(0);
+		if after.is_none_or(|after| latest > after) {
+			return self.snapshot(name);
+		}
+		loop {
+			match receiver.recv().await {
+				Ok(change) if change.name == name => {
+					return convar_snapshot(name, change.sequence, &change.value);
+				},
+				Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {},
+				Err(broadcast::error::RecvError::Closed) => {
+					return Err(ControlProtocolError::new(
+						"ConvarObservationClosed",
+						"the convar observation stream closed",
+					)
+					.retryable(true));
+				},
+			}
+		}
+	}
+}
+
+fn required_convar_argument<'a>(
+	arguments: &'a serde_json::Map<String, Value>,
+	name: &str,
+) -> Result<&'a str, ControlProtocolError> {
+	arguments
+		.get(name)
+		.and_then(Value::as_str)
+		.filter(|value| !value.is_empty())
+		.ok_or_else(|| {
+			ControlProtocolError::new(
+				"InvalidConvarArgument",
+				sf!("convar operation requires a non-empty {name}"),
+			)
+		})
+}
+
+fn declaration_value(
+	kind: &str,
+	default: &Value,
+	values: Option<&Value>,
+) -> Result<(&'static TypeSpec, ConValue), ControlProtocolError> {
+	let invalid = || {
+		ControlProtocolError::new(
+			"InvalidConvarDeclaration",
+			"extension convar default does not match its declared kind",
+		)
+	};
+	match kind {
+		"boolean" => default
+			.as_bool()
+			.map(|value| (TypeSpec::BOOL, ConValue::Bool(value)))
+			.ok_or_else(invalid),
+		"number" => default
+			.as_f64()
+			.map(|value| (TypeSpec::FLOAT, ConValue::Float(value)))
+			.ok_or_else(invalid),
+		"string" => default
+			.as_str()
+			.map(|value| (TypeSpec::STR, ConValue::Str(Str::new(value))))
+			.ok_or_else(invalid),
+		"enum" => {
+			let default = default.as_str().ok_or_else(invalid)?;
+			let values = values
+				.and_then(Value::as_array)
+				.ok_or_else(|| {
+					ControlProtocolError::new(
+						"InvalidConvarDeclaration",
+						"enum convar declarations require a values array",
+					)
+				})?;
+			if !values.iter().any(|value| value.as_str() == Some(default)) {
+				return Err(ControlProtocolError::new(
+					"InvalidConvarDeclaration",
+					"enum convar default is not in values",
+				));
+			}
+			Ok((TypeSpec::STR, ConValue::Str(Str::new(default))))
+		},
+		_ => Err(ControlProtocolError::new(
+			"InvalidConvarDeclaration",
+			"unknown extension convar kind",
+		)),
+	}
+}
+
+fn convar_snapshot(
+	name: &str,
+	sequence: u64,
+	value: &ConValue,
+) -> Result<Value, ControlProtocolError> {
+	Ok(json!({
+		"name": name,
+		"kind": value.kind().to_string(),
+		"value": convar_json(value)?,
+		"sequence": sequence,
+	}))
+}
+
+fn convar_json(value: &ConValue) -> Result<Value, ControlProtocolError> {
+	match value {
+		ConValue::Bool(value) => Ok(Value::Bool(*value)),
+		ConValue::Int(value) => Ok(Value::Number((*value).into())),
+		ConValue::Float(value) => serde_json::Number::from_f64(*value)
+			.map(Value::Number)
+			.ok_or_else(|| {
+				ControlProtocolError::new(
+					"InvalidConvarValue",
+					"non-finite convar values cannot cross CONTROL",
+				)
+			}),
+		ConValue::Str(value) | ConValue::Enum(value) => {
+			Ok(Value::String(value.to_string()))
+		},
+		ConValue::Duration(value) => Ok(Value::String(value.to_string())),
+		ConValue::List(values) => values
+			.iter()
+			.map(convar_json)
+			.collect::<Result<Vec<_>, _>>()
+			.map(Value::Array),
+		ConValue::Kv(values) => values
+			.iter()
+			.map(|(key, value)| Ok((key.to_string(), convar_json(value)?)))
+			.collect::<Result<serde_json::Map<_, _>, _>>()
+			.map(Value::Object),
+	}
+}
+
+fn control_convar_error(source: omp_con::ConError) -> ControlProtocolError {
+	match source {
+		omp_con::ConError::Unknown { name } => {
+			ControlProtocolError::new("UnknownConvar", "the requested convar is not declared")
+				.with_details(json!({"name": name}))
+		},
+		omp_con::ConError::Duplicate { name } => {
+			ControlProtocolError::new("ConvarAlreadyDeclared", "the convar is already declared")
+				.with_details(json!({"name": name}))
+		},
+		omp_con::ConError::TypeMismatch { name, expected, got } => {
+			ControlProtocolError::new("ConvarTypeMismatch", "the convar value has the wrong type")
+				.with_details(json!({
+					"name": name,
+					"expected": expected.to_string(),
+					"got": got,
+				}))
+		},
+		_ => ControlProtocolError::new(
+			"ConvarError",
+			"the control plane rejected the convar operation",
+		),
+	}
+}
+
 /// Registry, device, and hook authorities owned by envd.
 pub struct RegistryControlAuthorities {
 	registry: Arc<dyn ControlAuthorityFactory>,
@@ -1789,6 +2131,7 @@ impl ControlDomain {
 					|| operation == "omp.direct_filesystem.request"
 					|| operation.starts_with("omp.workers.")
 					|| operation.starts_with("omp.direct_filesystem.")
+					|| operation.starts_with("omp.convars.")
 			},
 			Self::Agents => operation.starts_with("omp.agents."),
 			Self::Mcp => operation.starts_with("omp.mcp."),
@@ -2729,4 +3072,160 @@ async fn write_json_control_frame(
 	writer.write_all(&payload).await?;
 	writer.flush().await?;
 	Ok(())
+}
+
+#[cfg(test)]
+mod convar_tests {
+	use std::{collections::BTreeSet, sync::Arc};
+
+	use omp_con::{Ctx, Origin, Value as ConValue};
+	use omp_core::{Principal, sf};
+	use serde_json::json;
+
+	use super::{
+		CompositeControlAuthority, ControlAuthority, ControlAuthorityFactory,
+		ControlConnectionIdentity, ControlRequestContext, ConvarControlFactory,
+	};
+
+	fn identity() -> Arc<ControlConnectionIdentity> {
+		Arc::new(ControlConnectionIdentity {
+			extension:          sf!("dev.example.demo"),
+			principal:          Principal::new(sf!("test"), sf!("Test")),
+			artifact_digest:    sf!("sha256:test"),
+			layer:              sf!("project"),
+			tier:               sf!("trusted"),
+			trust:              sf!("trusted"),
+			host_generation:    1,
+			session_generation: 1,
+			capabilities:       Arc::new(BTreeSet::new()),
+		})
+	}
+
+	fn context(identity: &Arc<ControlConnectionIdentity>, request_id: u64) -> ControlRequestContext {
+		ControlRequestContext {
+			connection: Arc::clone(identity),
+			request_id,
+			invocation: None,
+		}
+	}
+
+	fn routed_authority(
+		factory: &ConvarControlFactory,
+		identity: Arc<ControlConnectionIdentity>,
+	) -> Arc<dyn ControlAuthority> {
+		let convars = factory.bind(identity).expect("bind convar authority");
+		Arc::new(CompositeControlAuthority::new(
+			[Arc::clone(&convars)],
+			convars,
+		))
+	}
+
+	#[tokio::test]
+	async fn extension_declarations_are_qualified_queryable_and_observable() {
+		let ctx = Arc::new(Ctx::new());
+		let factory = ConvarControlFactory::new(Arc::clone(&ctx));
+		let identity = identity();
+		let authority = routed_authority(&factory, Arc::clone(&identity));
+		let declared = authority
+			.request(
+				context(&identity, 1),
+				sf!("omp.convars.declare"),
+				json!({
+					"key": "enabled",
+					"kind": "boolean",
+					"default": false,
+					"description": "Enable demo behavior",
+				})
+				.as_object()
+				.cloned()
+				.unwrap(),
+			)
+			.await
+			.expect("declare convar");
+		assert_eq!(declared["name"], "ext::dev.example.demo::enabled");
+		assert_eq!(
+			ctx.get("ext::dev.example.demo::enabled"),
+			Some(ConValue::Bool(false)),
+		);
+
+		let observed = authority.request(
+			context(&identity, 2),
+			sf!("omp.convars.observe"),
+			json!({"name": "ext::dev.example.demo::enabled", "after": 0})
+				.as_object()
+				.cloned()
+				.unwrap(),
+		);
+		let update = async {
+			tokio::task::yield_now().await;
+			ctx
+				.set(
+					"ext::dev.example.demo::enabled",
+					ConValue::Bool(true),
+					Origin::Session,
+				)
+				.expect("change convar");
+		};
+		let (observed, ()) = tokio::join!(observed, update);
+		let observed = observed.expect("observe convar");
+		assert_eq!(observed["value"], true);
+		assert_eq!(observed["sequence"], 1);
+
+		let queried = authority
+			.request(
+				context(&identity, 3),
+				sf!("omp.convars.get"),
+				json!({"name": "ext::dev.example.demo::enabled"})
+					.as_object()
+					.cloned()
+					.unwrap(),
+			)
+			.await
+			.expect("query convar");
+		assert_eq!(queried["value"], true);
+	}
+
+	#[tokio::test]
+	async fn reconnect_accepts_only_an_identical_extension_declaration() {
+		let ctx = Arc::new(Ctx::new());
+		let factory = ConvarControlFactory::new(ctx);
+		let identity = identity();
+		let authority = routed_authority(&factory, Arc::clone(&identity));
+		let declare = || {
+			json!({
+				"key": "mode",
+				"kind": "enum",
+				"default": "safe",
+				"values": ["safe", "fast"],
+			})
+			.as_object()
+			.cloned()
+			.unwrap()
+		};
+		authority
+			.request(context(&identity, 1), sf!("omp.convars.declare"), declare())
+			.await
+			.expect("first declaration");
+		authority
+			.request(context(&identity, 2), sf!("omp.convars.declare"), declare())
+			.await
+			.expect("identical reconnect declaration");
+		let error = authority
+			.request(
+				context(&identity, 3),
+				sf!("omp.convars.declare"),
+				json!({
+					"key": "mode",
+					"kind": "enum",
+					"default": "fast",
+					"values": ["safe", "fast"],
+				})
+				.as_object()
+				.cloned()
+				.unwrap(),
+			)
+			.await
+			.expect_err("conflicting declaration");
+		assert_eq!(error.code, "ConvarDeclarationConflict");
+	}
 }

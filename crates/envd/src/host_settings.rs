@@ -68,38 +68,38 @@ omp_con::var! {
 	/// Courtesy interval before forced interruption.
 	pub static SV_INTERRUPT_GRACE = sv_interrupt_grace: Duration {
 		default: DEFAULT_INTERRUPT_GRACE,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Default-off durable memory backend.
 	pub static AI_MEMORY_BACKEND = ai_memory_backend: MemoryBackendSetting {
 		default: MemoryBackendSetting::Off,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Canonical-project and shared-bank recall policy.
 	pub static AI_MNEMOPI_SCOPING = ai_mnemopi_scoping: BankScopingSetting {
 		default: BankScopingSetting::PerProject,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Enable managed-skill guidance and capture eligibility.
 	pub static AI_AUTOLEARN_ENABLED = ai_autolearn_enabled: bool {
 		default: false,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Run one private managed-skill or lesson capture after a substantive turn.
 	pub static AI_AUTOLEARN_AUTO_CONTINUE = ai_autolearn_auto_continue: bool {
 		default: false,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Minimum settled tool executions required in one primary turn.
 	pub static AI_AUTOLEARN_MIN_TOOL_CALLS = ai_autolearn_min_tool_calls: i64 {
 		default: 5,
 		min: 0,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Base directory for Environment-owned isolated worktrees; empty selects the default.
 	pub static SV_WORKTREE_BASE = sv_worktree_base: Str {
 		default: Str::default(),
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 
@@ -167,6 +167,9 @@ impl HostSettings {
 			MemoryBackendSetting::Off => omp_memory::MemoryBackend::Off,
 			MemoryBackendSetting::Mnemopi => omp_memory::MemoryBackend::Mnemopi,
 		};
+		let db_path = omp_inference::pi_settings::AI_MNEMOPI_DB_PATH.get(ctx);
+		settings.mnemopi.db_path =
+			(!db_path.trim().is_empty()).then(|| PathBuf::from(db_path.as_str()));
 		settings.mnemopi.scoping = match AI_MNEMOPI_SCOPING.get(ctx) {
 			BankScopingSetting::Global => omp_memory::config::BankScoping::Global,
 			BankScopingSetting::PerProject => omp_memory::config::BankScoping::PerProject,
@@ -203,10 +206,17 @@ mod tests {
 		AI_AUTOLEARN_MIN_TOOL_CALLS
 			.set(&ctx, 9)
 			.expect("set threshold");
+		omp_inference::pi_settings::AI_MNEMOPI_DB_PATH
+			.set(&ctx, Str::new_static("/tmp/mnemopi.sqlite"))
+			.expect("set Mnemopi database");
 		let settings = HostSettings::from_con(&ctx);
 		assert_eq!(settings.runtime.interrupt_grace, grace);
 		assert_eq!(settings.memory.backend, omp_memory::MemoryBackend::Mnemopi);
 		assert_eq!(settings.autolearn.min_tool_calls, 9);
+		assert_eq!(
+			settings.mnemopi.db_path.as_deref(),
+			Some(std::path::Path::new("/tmp/mnemopi.sqlite"))
+		);
 	}
 }
 

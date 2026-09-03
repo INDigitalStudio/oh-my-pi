@@ -13,6 +13,7 @@ import time
 import traceback
 
 _MAX_FRAME_BYTES = 64 * 1024 * 1024
+_OUTPUT_CHUNK_BYTES = 64 * 1024
 _connect_address = None
 _connect_secret = None
 if len(sys.argv) == 4 and sys.argv[1] == "--omp-connect":
@@ -204,10 +205,13 @@ class _Stream(io.TextIOBase):
         if not isinstance(text, str):
             text = str(text)
         if text:
-            data = list(text.encode("utf-8", errors="replace"))
-            _write({"kind": self._channel, "run_id": _active_run, "update": {
-                "channel": self._channel, "data": data, "sequence": 0
-            }})
+            data = text.encode("utf-8", errors="replace")
+            for offset in range(0, len(data), _OUTPUT_CHUNK_BYTES):
+                _write({"kind": self._channel, "run_id": _active_run, "update": {
+                    "channel": self._channel,
+                    "data": list(data[offset : offset + _OUTPUT_CHUNK_BYTES]),
+                    "sequence": 0,
+                }})
         return len(text)
 
     def flush(self):
@@ -268,10 +272,6 @@ def _done(run_id: int, outcome: str, started: float) -> None:
             "duration_ms": int((time.monotonic() - started) * 1000),
             "exception": None,
         },
-        "truncated": False,
-        "spilled_output": None,
-        "total_lines": 0,
-        "total_bytes": 0,
     })
 
 

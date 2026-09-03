@@ -600,6 +600,8 @@ fn inference_settings(
 		providers: omp_inference::settings::ProviderRuntimeSettings::from_con(ctx),
 		model:     omp_catalog::settings::ModelSettings::from_con(ctx)
 			.resolve_path_scopes(&cwd, &home),
+		context_promotion_enabled:
+			omp_inference::pi_settings::AI_CONTEXT_PROMOTION_ENABLED.get(ctx),
 	}
 }
 

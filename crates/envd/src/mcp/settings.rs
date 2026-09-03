@@ -7,7 +7,7 @@ omp_con::var! {
 	/// Load native project MCP server configuration.
 	pub static SV_MCP_ENABLE_PROJECT_CONFIG = sv_mcp_enable_project_config: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 

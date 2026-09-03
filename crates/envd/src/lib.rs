@@ -38,9 +38,11 @@ mod resource_materializer;
 mod sandbox_proxy;
 mod schedule_plan;
 pub mod schedules;
+mod security_scan;
 pub mod search_backend;
 mod server;
-pub mod shell_profile;
+/// Hidden in-process shell child used by detached named processes.
+pub mod shell_child;
 pub mod site;
 pub mod ssh;
 mod tool_debug;
@@ -49,6 +51,8 @@ mod tool_lsp;
 mod tool_read_sources;
 mod tool_search;
 pub mod tool_settings;
+/// Additional literal pi environment-setting convars.
+pub mod pi_settings;
 /// Shell-tool execution, managed process sessions, and shell URI resolution.
 pub mod tool_shell;
 pub mod tool_url;
@@ -160,22 +164,24 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("tools.enabled", "sv_tools_enabled"),
 	("tools.max_timeout", "sv_tools_max_timeout"),
 	("tools.edit_dialect", "sv_tools_edit_dialect"),
+	("edit.blackbox.enabled", "sv_tools_edit_blackbox_enabled"),
 	("tools.edit_blackbox_path", "sv_tools_edit_blackbox_path"),
 	("tools.edit_auto_repair", "sv_tools_edit_auto_repair"),
-	("tools.edit_streaming_abort", "sv_tools_edit_streaming_abort"),
+	("edit.streamingAbort", "sv_tools_edit_streaming_abort"),
 	("tools.approval_mode", "sv_tools_approval_mode"),
 	("tools.approval", "sv_tools_approval"),
-	("tools.edit_fuzzy", "sv_tools_edit_fuzzy"),
-	("tools.edit_require_seen", "sv_tools_edit_require_seen"),
+	("edit.fuzzyMatch", "sv_tools_edit_fuzzy"),
+	("edit.enforceSeenLines", "sv_tools_edit_require_seen"),
 	("tools.edit_guard_generated", "sv_tools_edit_guard_generated"),
 	("tools.read_max_bytes", "sv_tools_read_max_bytes"),
-	("tools.read_summarize", "sv_tools_read_summarize"),
-	("tools.read_line_numbers", "sv_tools_read_line_numbers"),
-	("tools.grep_context_lines", "sv_tools_grep_context_lines"),
+	("read.summarize.enabled", "sv_tools_read_summarize"),
+	("readLineNumbers", "sv_tools_read_line_numbers"),
+	("grep.contextBefore", "sv_tools_grep_context_before"),
+	("grep.contextAfter", "sv_tools_grep_context_after"),
 	("tools.eval_interpreters", "sv_tools_eval_interpreters"),
 	("tools.output_spill_bytes", "sv_tools_output_spill_bytes"),
 	("tools.output_max_bytes", "sv_tools_output_max_bytes"),
-	("tools.intent_tracing", "sv_tools_intent_tracing"),
+	("tools.intentTracing", "sv_tools_intent_tracing"),
 	("tools.loop_guard_limit", "sv_tools_loop_guard_limit"),
 	("acp.routing", "sv_acp_routing"),
 	("async.enabled", "sv_async_enabled"),
@@ -203,10 +209,6 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("sandbox.read_deny_globs", "sv_sandbox_read_deny_globs"),
 	("sandbox.write_deny", "sv_sandbox_write_deny"),
 	("shell.enabled", "sv_shell_enabled"),
-	("shell.profile", "sv_shell_profile"),
-	("shell.executable", "sv_shell_executable"),
-	("shell.args", "sv_shell_args"),
-	("shell.login", "sv_shell_login"),
 	("shell.command_prefix", "sv_shell_command_prefix"),
 	("shell.embedded_builtins", "sv_shell_embedded_builtins"),
 	("shell.auto_background.enabled", "sv_shell_auto_background_enabled"),
@@ -215,13 +217,6 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("shell.interceptor.patterns", "sv_shell_interceptor_patterns"),
 	("shell.direnv", "sv_shell_direnv"),
 	("shell.direnv_load_timeout_ms", "sv_shell_direnv_load_timeout_ms"),
-	("shell.minimizer.enabled", "sv_shell_minimizer_enabled"),
-	("shell.minimizer.settings_path", "sv_shell_minimizer_settings_path"),
-	("shell.minimizer.only", "sv_shell_minimizer_only"),
-	("shell.minimizer.except", "sv_shell_minimizer_except"),
-	("shell.minimizer.max_capture_bytes", "sv_shell_minimizer_max_capture_bytes"),
-	("shell.minimizer.source_outline_level", "sv_shell_minimizer_source_outline_level"),
-	("shell.minimizer.legacy_filters", "sv_shell_minimizer_legacy_filters"),
 	("mcp.enableProjectConfig", "sv_mcp_enable_project_config"),
 ];
 
@@ -573,6 +568,18 @@ impl McpInspectorHandle {
 		self.manager.inspector_snapshots()
 	}
 
+	/// Manually reconnects one server, clearing its burst circuit breaker
+	/// (`/mcp reconnect`, `/mcp test`).
+	pub async fn reconnect(&self, name: &str) -> Result<(), mcp::manager::ManagerError> {
+		self.manager.reset(name).await
+	}
+
+	/// Re-reads the native user/project configs and replaces the mounted
+	/// server set (`/mcp reload`).
+	pub async fn reload(&self) -> Result<mcp::manager::StartupSnapshot, mcp::McpServiceError> {
+		self.manager.service().reload_native_configs().await
+	}
+
 	/// Deletes one server's credential from the shared encrypted store and
 	/// drops its authenticated connection.
 	pub async fn clear_authorization(&self, name: &str) -> Result<bool, mcp::manager::ManagerError> {
@@ -760,6 +767,7 @@ impl ProjectEnvironment {
 			contributed_values,
 			interrupt_grace,
 		)?;
+		let convars = Arc::new(exthost::ConvarControlFactory::new(Arc::clone(&con)));
 		let server = EnvServer::open_project(
 			root,
 			state_dir,
@@ -770,6 +778,7 @@ impl ProjectEnvironment {
 			false,
 			None,
 			con.as_ref(),
+			convars,
 			bridges,
 		)
 		.await?;
@@ -855,6 +864,7 @@ impl ProjectEnvironment {
 			contributed_values,
 			interrupt_grace,
 		)?;
+		let convars = Arc::new(exthost::ConvarControlFactory::new(Arc::clone(&con)));
 		let server = EnvServer::open_session_host(
 			root,
 			state_dir,
@@ -862,6 +872,7 @@ impl ProjectEnvironment {
 			worker_config,
 			approval_mode,
 			con.as_ref(),
+			convars,
 			bridges,
 			owner_client,
 		)
@@ -962,16 +973,25 @@ impl ProjectEnvironment {
 	pub async fn isolated(
 		root: &Path,
 		state_dir: &Path,
-		con: &Ctx,
+		con: Arc<Ctx>,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let command_credentials = bridges.command_credentials.clone();
 		let dynamic_tool_factories = bridges.dynamic_tool_factories.clone();
 		let (worker_config, data_bindings) =
-			worker_config(state_dir, true, &[], &[], host_settings::SV_INTERRUPT_GRACE.get(con))?;
+			worker_config(state_dir, true, &[], &[], host_settings::SV_INTERRUPT_GRACE.get(&con))?;
+		let convars = Arc::new(exthost::ConvarControlFactory::new(Arc::clone(&con)));
 		let server = Arc::new(
-			EnvServer::open_local(root, state_dir, Registry::new(), worker_config, con, bridges)
-				.await?,
+			EnvServer::open_local(
+				root,
+				state_dir,
+				Registry::new(),
+				worker_config,
+				&con,
+				convars,
+				bridges,
+			)
+			.await?,
 		);
 		let registry = server.registry();
 		let eval_bridge = server.eval_bridge();

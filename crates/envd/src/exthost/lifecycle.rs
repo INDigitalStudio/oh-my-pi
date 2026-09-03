@@ -15,7 +15,7 @@ use flume::Receiver;
 use omp_agent::{EnvEvent, GateError, HookEvent, HookGate, HookPatch, HookPhase, KernelSender, Up};
 pub use omp_core::{ActivateReason, LifecyclePhase, Principal, RestartReason, sf};
 use omp_core::{InvocationPhase, Provenance, Str};
-use omp_ext::config::{StaticDeclaration, StaticDeclarations};
+use omp_ext::config::{SettingSchema, StaticDeclaration, StaticDeclarations};
 use omp_proto::{
 	toolhost::v1::{HookEventId, SetAvailability},
 	ui::v1::{CommandDecl, RegisterUi, ShortcutDecl, TriggerDecl, UiEffect, UiRequest},
@@ -999,6 +999,9 @@ pub struct ExtensionManifest {
 	uniform_declarations:         bool,
 	/// Whether an operator-trusted module may publish declarations at runtime.
 	runtime_declarations_trusted: bool,
+	/// Manifest-declared extension settings installed as dynamic convars before
+	/// the child starts.
+	pub setting_schemas:          BTreeMap<Str, SettingSchema>,
 	/// Per-extension CONTROL quota definitions.
 	pub resource_limits:          Box<[QuotaSpec]>,
 	/// Every boot class reachable from this manifest's declaration rows.
@@ -1081,9 +1084,17 @@ impl ExtensionManifest {
 			static_declarations: Arc::new(static_declarations),
 			uniform_declarations: true,
 			runtime_declarations_trusted: false,
+			setting_schemas: BTreeMap::new(),
 			resource_limits: resource_limits.into_iter().collect(),
 			activation_triggers,
 		}
+	}
+
+	/// Installs the authenticated extension setting declaration table.
+	#[must_use]
+	pub fn with_setting_schemas(mut self, settings: BTreeMap<Str, SettingSchema>) -> Self {
+		self.setting_schemas = settings;
+		self
 	}
 
 	/// Returns the immutable declaration snapshot admitted before child import.

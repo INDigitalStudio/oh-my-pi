@@ -20,8 +20,9 @@ pub use cancel::{
 	CancellationOutcome, MAX_KILL_ESCALATIONS_PER_SESSION,
 };
 pub use control::{
-	ControlAuthority, ControlAuthorityFactory, ControlCompositionError, EnvdControlAuthorities,
-	ExternalControlAuthorities, FixedControlAuthorityFactory, HostControlAuthorityFactory,
+	ControlAuthority, ControlAuthorityFactory, ControlCompositionError, ConvarControlFactory,
+	EnvdControlAuthorities, ExternalControlAuthorities, FixedControlAuthorityFactory,
+	HostControlAuthorityFactory,
 	PersistenceControlAuthorities, PolicyControlAuthorities, PresentationControlAuthorities,
 	ProviderControlAuthorities, RegistryControlAuthorities,
 };
@@ -33,8 +34,8 @@ pub use dispatch::{
 	UiShortcutRosterEntry, decode_ui_dispatch_result, shortcut_dispatch_succeeded,
 };
 pub use extensions::{
-	DEFAULT_EXTENSION_HOOK_TIMEOUT, PyComponent, PyDirector, PyExtensionError,
-	register_python_extensions,
+	DEFAULT_EXTENSION_HOOK_TIMEOUT, ExtensionConvarError, PyComponent, PyDirector,
+	PyExtensionError, register_extension_setting_convars, register_python_extensions,
 };
 pub use lifecycle::{
 	ActivateReason, ActivationCause, ActivationDisposition, ActivationEvent, ActivationTrigger,

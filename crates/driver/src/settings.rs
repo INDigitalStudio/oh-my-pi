@@ -150,26 +150,19 @@ impl Settings {
 	}
 }
 
-/// Loads the user `config.cfg` into a convar context and projects settings.
-pub fn current(data_dir: &Path) -> Result<Settings, io::Error> {
-	let ctx = Ctx::new();
-	let path = data_dir.join("config.cfg");
-	if path.exists() {
-		let source = fs::read_to_string(path)?;
-		ctx.run(&source).map_err(io::Error::other)?;
-	}
-	Ok(Settings::from_con(&ctx))
+/// Loads the user (profile) `config.cfg` into a convar context and projects
+/// settings — the same file `omp config set` and `writecfg` write.
+pub fn current() -> Result<Settings, io::Error> {
+	current_for_project(None)
 }
 
-/// Loads settings for one project, with project cfg layered after user cfg.
-pub fn current_for_project(data_dir: &Path, project: &Path) -> Result<Settings, io::Error> {
+/// Loads settings for one project, with `<project>/.omp/config.cfg` layered
+/// after the user cfg. Cfg files are user data: unknown statements are
+/// reported and skipped, never fatal.
+pub fn current_for_project(project: Option<&Path>) -> Result<Settings, io::Error> {
+	let files = crate::cfg::CfgFiles::new(project).map_err(io::Error::other)?;
 	let ctx = Ctx::new();
-	for path in [data_dir.join("config.cfg"), project.join(".omp/config.cfg")] {
-		if path.exists() {
-			ctx.run(&fs::read_to_string(path)?)
-				.map_err(io::Error::other)?;
-		}
-	}
+	ctx.exec_configs(&files, None);
 	Ok(Settings::from_con(&ctx))
 }
 
