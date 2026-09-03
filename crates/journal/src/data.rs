@@ -175,28 +175,29 @@ impl<'de> Deserialize<'de> for ToolResult {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnReceipt {
 	/// Input token count.
-	pub tokens_in:     u64,
+	pub tokens_in:                   u64,
 	/// Output token count.
-	pub tokens_out:    u64,
+	pub tokens_out:                  u64,
 	/// Cost in billionths of a US dollar.
-	pub cost_nano_usd: u64,
+	pub cost_nano_usd:               u64,
 	/// Prompt-cache tokens read; absent in journals written before the field
 	/// existed.
 	#[serde(default, skip_serializing_if = "is_zero")]
-	pub cache_read:    u64,
+	pub cache_read:                  u64,
 	/// Prompt-cache tokens written.
 	#[serde(default, skip_serializing_if = "is_zero")]
-	pub cache_write:   u64,
+	pub cache_write:                 u64,
 	/// Milliseconds from request start to the first streamed token, measured
 	/// on the kernel's clock.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub ttft_ms:       Option<u64>,
+	pub ttft_ms:                     Option<u64>,
 	/// Milliseconds from request start to completion.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub duration_ms:   Option<u64>,
+	pub duration_ms:                 Option<u64>,
 	/// Provider premium-request units billed for this request in millionths
-	/// (`1_000_000` = one premium request; GitHub Copilot `premium_interactions`,
-	/// fractional for discounted models); zero for every other route.
+	/// (`1_000_000` = one premium request; GitHub Copilot
+	/// `premium_interactions`, fractional for discounted models); zero for
+	/// every other route.
 	#[serde(default, skip_serializing_if = "is_zero")]
 	pub premium_requests_millionths: u64,
 }
@@ -257,7 +258,14 @@ impl Compaction {
 	/// A compaction with no method or token facts.
 	#[must_use]
 	pub const fn new(summary: BlobRef, boundary: EntryId) -> Self {
-		Self { summary, boundary, method: None, tokens_before: None, tokens_after: None, warning: None }
+		Self {
+			summary,
+			boundary,
+			method: None,
+			tokens_before: None,
+			tokens_after: None,
+			warning: None,
+		}
 	}
 }
 

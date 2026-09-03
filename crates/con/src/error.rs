@@ -146,6 +146,12 @@ pub enum ConError {
 		/// The colliding name.
 		name: Str,
 	},
+	/// Dynamic settings UI metadata is incomplete or names an unknown group.
+	#[error("`{name}` has invalid settings UI metadata")]
+	InvalidUi {
+		/// The variable carrying invalid UI metadata.
+		name: Str,
+	},
 	/// Replication API called on a context with the wrong [`Role`].
 	#[error("operation not valid for replication role {role}")]
 	RoleMismatch {

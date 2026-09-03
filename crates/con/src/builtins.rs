@@ -37,7 +37,14 @@ crate::con_enum!(ResizePolicy);
 /// Whether image attachments reach the model (pi `/vision`,
 /// `inspect_image.mode`).
 #[derive(
-	Clone, Copy, Debug, Default, Eq, PartialEq, strum::EnumString, strum::IntoStaticStr,
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Eq,
+	PartialEq,
+	strum::EnumString,
+	strum::IntoStaticStr,
 	strum::VariantNames,
 )]
 #[strum(serialize_all = "lowercase")]

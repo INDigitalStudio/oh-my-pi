@@ -226,7 +226,9 @@ impl StatsIndex {
 			.query_row(
 				"SELECT size, modified_ms FROM file_offsets WHERE session_file = ?1",
 				params![file],
-				|row| Ok(FileState { size: to_u64(row.get(0)?), modified_ms: to_u64(row.get(1)?) }),
+				|row| {
+					Ok(FileState { size: to_u64(row.get(0)?), modified_ms: to_u64(row.get(1)?) })
+				},
 			)
 			.optional()?)
 	}
@@ -329,9 +331,8 @@ impl StatsIndex {
 	/// Returns [`StatsError`] on a SQLite failure.
 	pub fn summary(&self, limit: usize) -> Result<StatsSummary, StatsError> {
 		let database = self.database.lock();
-		let files = database.query_row("SELECT COUNT(*) FROM file_offsets", [], |row| {
-			row.get::<_, i64>(0)
-		})?;
+		let files =
+			database.query_row("SELECT COUNT(*) FROM file_offsets", [], |row| row.get::<_, i64>(0))?;
 		let (requests, errors, input, output, cache_read, cache_write, cost, unpriced) = database
 			.query_row(
 				"SELECT COALESCE(SUM(requests), 0), COALESCE(SUM(errors), 0),
@@ -372,7 +373,8 @@ impl StatsIndex {
 				|row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
 			)
 			.map(|(tokens, duration)| match (tokens, duration) {
-				(Some(tokens), Some(duration)) if duration > 0 => {
+				(Some(tokens), Some(duration)) if duration > 0 =>
+				{
 					#[expect(clippy::cast_precision_loss, reason = "display precision suffices")]
 					Some(tokens as f64 * 1000.0 / duration as f64)
 				},
@@ -414,7 +416,11 @@ impl StatsIndex {
 	}
 }
 
-fn group_stats(database: &Connection, column: &str, limit: usize) -> Result<Vec<GroupStat>, StatsError> {
+fn group_stats(
+	database: &Connection,
+	column: &str,
+	limit: usize,
+) -> Result<Vec<GroupStat>, StatsError> {
 	// `column` is one of two literals chosen by this module, never user text.
 	let sql = format!(
 		"SELECT {column}, SUM(requests), COALESCE(SUM(cost_nano_usd), 0),
@@ -487,8 +493,20 @@ mod tests {
 			message("b", "openai/gpt", "/work/y", None),
 		];
 		let calls = [
-			ToolCallRow { call_id: sf!("c1"), folder: sf!("/work/x"), tool: sf!("read"), timestamp_ms: 1, is_error: false },
-			ToolCallRow { call_id: sf!("c2"), folder: sf!("/work/x"), tool: sf!("read"), timestamp_ms: 2, is_error: true },
+			ToolCallRow {
+				call_id:      sf!("c1"),
+				folder:       sf!("/work/x"),
+				tool:         sf!("read"),
+				timestamp_ms: 1,
+				is_error:     false,
+			},
+			ToolCallRow {
+				call_id:      sf!("c2"),
+				folder:       sf!("/work/x"),
+				tool:         sf!("read"),
+				timestamp_ms: 2,
+				is_error:     true,
+			},
 		];
 		index.replace_file("s1.oms", state, &rows, &calls).unwrap();
 		index.replace_file("s1.oms", state, &rows, &calls).unwrap();

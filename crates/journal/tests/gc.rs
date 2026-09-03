@@ -1,9 +1,6 @@
 //! Journal branch-pruning integration coverage.
 
-use std::{
-	env,
-	process::Command,
-};
+use std::{env, process::Command};
 
 use omp_core::Str;
 use omp_journal::{EntryDraft, Journal, Kind, gc::prune_abandoned, kind::KindName, live_chain};

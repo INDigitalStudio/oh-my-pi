@@ -1,10 +1,6 @@
 //! Laws for append, recovery, and branch selection.
 
-use std::{
-	env,
-	fs,
-	process::Command,
-};
+use std::{env, fs, process::Command};
 
 use omp_core::Str;
 use omp_journal::{
@@ -190,9 +186,7 @@ fn scan_reads_the_committed_prefix_without_locking_or_truncating() {
 	let path = directory.path().join("scan.oms");
 	let mut journal = Journal::create(&path).expect("create");
 	let genesis = journal.append(genesis()).expect("genesis");
-	journal
-		.append(draft(TURN_START, genesis.id))
-		.expect("turn");
+	journal.append(draft(TURN_START, genesis.id)).expect("turn");
 	let scanned = Journal::scan(&path).expect("scan while the writer is live");
 	assert_eq!(scanned.len(), 2);
 	drop(journal);

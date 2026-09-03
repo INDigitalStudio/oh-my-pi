@@ -164,6 +164,9 @@ pub struct DynamicVarSpec {
 	pub flags:   VarFlags,
 	/// Registration-time default.
 	pub default: Value,
+	/// Optional curated product settings metadata. Dynamic variables without
+	/// this projection remain console/config-only.
+	pub ui:      Option<crate::DynamicUiSpec>,
 }
 
 impl PartialEq for DynamicVarSpec {
@@ -173,6 +176,7 @@ impl PartialEq for DynamicVarSpec {
 			&& std::ptr::eq(self.ty, other.ty)
 			&& self.flags == other.flags
 			&& self.default == other.default
+			&& self.ui == other.ui
 	}
 }
 
@@ -315,23 +319,23 @@ impl CtxBuilder {
 	#[must_use]
 	pub fn build(self) -> Ctx {
 		let ctx = Ctx {
-			items:         AppendVec::new(),
-			dynamic_vars:  AppendVec::new(),
-			dynamic_cmds:  AppendVec::new(),
-			names:         RwLock::new(FastHashMap::default()),
-			aliases:       RwLock::new(FastHashMap::default()),
-			binds:         RwLock::new(FastHashMap::default()),
-			bind_baseline: RwLock::new(None),
-			completers:    RwLock::new(FastHashMap::default()),
-			observers:     RwLock::new(Vec::new()),
+			items:          AppendVec::new(),
+			dynamic_vars:   AppendVec::new(),
+			dynamic_cmds:   AppendVec::new(),
+			names:          RwLock::new(FastHashMap::default()),
+			aliases:        RwLock::new(FastHashMap::default()),
+			binds:          RwLock::new(FastHashMap::default()),
+			bind_baseline:  RwLock::new(None),
+			completers:     RwLock::new(FastHashMap::default()),
+			observers:      RwLock::new(Vec::new()),
 			session_writes: RwLock::new(Vec::new()),
-			user:          RwLock::new(self.user.into_iter().collect()),
-			layers:        RwLock::new(Layers::default()),
-			depth:         AtomicU32::new(0),
-			sink:          self.sink,
-			loader:        self.loader,
-			saver:         self.saver,
-			role:          self.role,
+			user:           RwLock::new(self.user.into_iter().collect()),
+			layers:         RwLock::new(Layers::default()),
+			depth:          AtomicU32::new(0),
+			sink:           self.sink,
+			loader:         self.loader,
+			saver:          self.saver,
+			role:           self.role,
 		};
 		if !self.isolated {
 			for item in crate::REGISTRY {
@@ -433,6 +437,13 @@ impl Ctx {
 				got:      spec.default.to_str(),
 			});
 		}
+		if spec
+			.ui
+			.as_ref()
+			.is_some_and(|ui| !ui.is_valid(key.as_str()))
+		{
+			return Err(ConError::InvalidUi { name: key });
+		}
 		let initial = spec.default.clone();
 		let idx = self
 			.dynamic_vars
@@ -506,11 +517,19 @@ impl Ctx {
 		self.items.iter().map(|item| item.spec)
 	}
 
+	/// All dynamically registered variables in registration order.
+	pub fn dynamic_vars(&self) -> impl Iterator<Item = &DynamicVarSpec> + '_ {
+		self.dynamic_vars.iter().map(|item| &item.spec)
+	}
+
 	/// All dynamically registered commands in registration order (the
 	/// long tail a host adds at runtime: prompt templates, extension
 	/// commands), as `(name, description)`.
 	pub fn dynamic_cmds(&self) -> impl Iterator<Item = (&Str, &Str)> + '_ {
-		self.dynamic_cmds.iter().map(|spec| (&spec.name, &spec.desc))
+		self
+			.dynamic_cmds
+			.iter()
+			.map(|spec| (&spec.name, &spec.desc))
 	}
 
 	/// Resolves a static name to its registration.
@@ -862,11 +881,7 @@ impl Ctx {
 					Origin::Default
 				},
 				Origin::Engagement(id) => {
-					match layers
-						.engagements
-						.iter_mut()
-						.find(|layer| layer.id == id)
-					{
+					match layers.engagements.iter_mut().find(|layer| layer.id == id) {
 						Some(layer) => {
 							layer.values.insert(name.clone(), value);
 							Origin::Engagement(id)
