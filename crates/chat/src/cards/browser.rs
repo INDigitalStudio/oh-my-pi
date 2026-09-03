@@ -24,8 +24,12 @@ impl Card for BrowserCard {
 	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::browser::Params>(view);
 		let result = typed_result::<omp_tools::browser::Payload>(view);
+		let fault_value = view
+			.fault::<omp_tools::browser::Fault>()
+			.and_then(|fault| serde_json::to_value(fault).ok());
 		let name = result
 			.as_ref()
+			.or(fault_value.as_ref())
 			.and_then(|value| value.get("name"))
 			.and_then(Value::as_str)
 			.or_else(|| args.as_ref()?.get("name")?.as_str())
@@ -40,6 +44,7 @@ impl Card for BrowserCard {
 			.unwrap_or_default();
 		let url = result
 			.as_ref()
+			.or(fault_value.as_ref())
 			.and_then(|value| value.get("url"))
 			.and_then(Value::as_str)
 			.unwrap_or_default()
@@ -48,6 +53,7 @@ impl Card for BrowserCard {
 		// URL; payloads journaled before the field existed show nothing.
 		let kind = result
 			.as_ref()
+			.or(fault_value.as_ref())
 			.and_then(|value| value.get("browser"))
 			.and_then(Value::as_str)
 			.unwrap_or_default()
@@ -66,6 +72,17 @@ impl Card for BrowserCard {
 		} else {
 			preview_lines(&code, PREVIEW_LINES)
 		};
+		let displayed = result
+			.as_ref()
+			.and_then(|value| value.get("display"))
+			.and_then(Value::as_array)
+			.into_iter()
+			.flatten()
+			.map(display_value)
+			.map(|text| {
+				if expanded { Str::new(text) } else { preview_lines(&text, PREVIEW_LINES) }
+			})
+			.collect::<Vec<_>>();
 		let returned = result
 			.as_ref()
 			.and_then(|value| value.get("result"))
@@ -105,6 +122,7 @@ impl Card for BrowserCard {
 					if let Some(fault) = fault {
 						<pre>{fault}</pre>
 					} else {
+						for displayed in displayed { <pre>{displayed}</pre> }
 						if let Some(returned) = returned { <pre>{returned}</pre> }
 						if expanded { {artifacts} }
 					}

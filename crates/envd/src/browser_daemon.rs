@@ -167,6 +167,7 @@ fn execute(
 				name,
 				url: None,
 				title: None,
+				display: Vec::new(),
 				result: Some(json!({ "remaining_tabs": tabs.len() })),
 				artifacts: Vec::new(),
 				browser: Some(mode_name(headless)),
@@ -231,6 +232,7 @@ fn open(
 		name,
 		url: Some(url),
 		title: Some(title),
+		display: Vec::new(),
 		result: None,
 		artifacts: Vec::new(),
 		browser: Some(mode_name(headless)),
@@ -247,19 +249,41 @@ fn run_tab(
 	let tab = view.automation();
 	let timeout = timeout(&params);
 	if let Some(url) = params.url.as_ref() {
-		tab.goto(url, timeout).map_err(webview_fault)?;
+		tab
+			.goto(url, timeout)
+			.map_err(webview_fault)
+			.map_err(|fault| tab_fault(fault, &name, view, headless))?;
 	}
-	let code = required(params.code.as_deref(), "run requires `code`")?;
-	let result = tab.evaluate(code, timeout).map_err(webview_fault)?;
+	let code = required(params.code.as_deref(), "run requires `code`")
+		.map_err(|fault| tab_fault(fault, &name, view, headless))?;
+	let evaluated = tab
+		.evaluate(&scoped_script(code), timeout)
+		.map_err(webview_fault)
+		.map_err(|fault| tab_fault(fault, &name, view, headless))?;
+	let display = evaluated
+		.get("display")
+		.and_then(serde_json::Value::as_array)
+		.cloned()
+		.unwrap_or_default();
+	let result = evaluated.get("result").cloned();
 	Ok(Payload {
 		action: Action::Run,
 		name,
 		url: Some(view.url()),
 		title: Some(view.title()),
-		result: Some(result),
+		display,
+		result,
 		artifacts: Vec::new(),
 		browser: Some(mode_name(headless)),
 	})
+}
+
+fn scoped_script(code: &str) -> String {
+	format!(
+		"(async () => {{ const __ompDisplay = []; const display = value => {{ \
+		 __ompDisplay.push(value); }}; const __ompResult = await (async () => {{ {code}\n }})(); \
+		 return {{ display: __ompDisplay, result: __ompResult ?? null }}; }})()"
+	)
 }
 
 fn validate_supported(params: &Params) -> Result<(), Fault> {
@@ -297,17 +321,53 @@ fn required<'a>(value: Option<&'a str>, field: &'static str) -> Result<&'a str, 
 }
 
 fn invalid(message: &'static str) -> Fault {
-	Fault { code: sf!("invalid_browser_request"), message: Str::new_static(message) }
+	Fault {
+		code: sf!("invalid_browser_request"),
+		message: Str::new_static(message),
+		name: None,
+		url: None,
+		title: None,
+		browser: None,
+	}
 }
 
 fn not_found(name: &str) -> Fault {
-	Fault { code: sf!("browser_tab_not_found"), message: sf!("browser tab `{name}` is not open") }
+	Fault {
+		code: sf!("browser_tab_not_found"),
+		message: sf!("browser tab `{name}` is not open"),
+		name: Some(Str::new(name)),
+		url: None,
+		title: None,
+		browser: None,
+	}
 }
 
 fn daemon_closed() -> Fault {
-	Fault { code: sf!("browser_daemon_closed"), message: sf!("browser daemon is not available") }
+	Fault {
+		code: sf!("browser_daemon_closed"),
+		message: sf!("browser daemon is not available"),
+		name: None,
+		url: None,
+		title: None,
+		browser: None,
+	}
 }
 
 fn webview_fault(error: omp_webview::Error) -> Fault {
-	Fault { code: sf!("browser_automation_failed"), message: Str::new(error.to_string()) }
+	Fault {
+		code: sf!("browser_automation_failed"),
+		message: Str::new(error.to_string()),
+		name: None,
+		url: None,
+		title: None,
+		browser: None,
+	}
+}
+
+fn tab_fault(mut fault: Fault, name: &Str, view: &WebView, headless: bool) -> Fault {
+	fault.name = Some(name.clone());
+	fault.url = Some(view.url());
+	fault.title = Some(view.title());
+	fault.browser = Some(mode_name(headless));
+	fault
 }
