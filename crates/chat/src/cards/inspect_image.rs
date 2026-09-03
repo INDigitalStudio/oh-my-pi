@@ -51,16 +51,11 @@ impl Card for InspectImageCard {
 		let fault = diag_text(view).unwrap_or_default();
 		let answer_lines = answer.lines().count();
 		let preview = answer.lines().take(4).collect::<Vec<_>>().join("\n");
-		let mut done_title = format!("{} Inspect: {path}", icon(ui, "inspect-image"));
-		if !model.is_empty() {
-			done_title.push_str(" · ");
-			done_title.push_str(&model);
-		}
-		if !mime.is_empty() {
-			done_title.push_str(" · ");
-			done_title.push_str(&mime);
-		}
-		let failed_title = format!("{} Inspect: {path}", icon(ui, "error"));
+		let meta = [model.as_str(), mime.as_str()]
+			.into_iter()
+			.filter(|value| !value.is_empty())
+			.collect::<Vec<_>>()
+			.join(" · ");
 		// The inspected image is shown under the answer when the terminal
 		// has a graphics protocol. pi's result carries no image block (only
 		// `imagePath`), so there is no text placeholder on the cells tier:
@@ -80,24 +75,27 @@ impl Card for InspectImageCard {
 				match view.status {
 				CardStatus::StreamingArgs | CardStatus::InProgress => {
 					<col>
-						<row gap=1><i:pending/><text>{"Inspect:"}</text><text>{path}</text>
+						<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Inspect"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {path}")}</text>
 							if let Some(badge) = elapsed_badge(view) { {badge} }
 						</row>
 						if !question.is_empty() {
-							<row pad-x=1 gap=1><i:tree-last/><text fg=muted>{"Question:"}</text><text fg=accent wrap=word>{question}</text></row>
+							<row pad-x=1 gap=1><i:tree-last fg=muted/><text fg=muted>{"Question:"}</text><text fg=accent wrap=word>{question}</text></row>
 						}
 					</col>
 				},
 				CardStatus::Done => {
-					<box border=round pad-x=1 title={done_title} title_pad=3 bc=muted>
+					<box border=round pad-x=1 title_pad=3 bc=border>
+						<row kind=title gap=0><i:inspect-image fg=accent/><text>{" "}</text><text fg=accent>{"Inspect"}</text><text>{":"}</text>
+							<text fg=output wrap=pre>{format!(" {path}")}</text><text fg=muted>{if meta.is_empty() { String::new() } else { format!(" · {meta}") }}</text>
+						</row>
 						<col gap=1>
 							if !question.is_empty() { <row gap=1><text fg=muted>{"Question:"}</text><text fg=accent wrap=word>{question}</text></row> }
 							if !answer.is_empty() {
 								if expanded {
-									<pre>{answer}</pre>
+									<pre fg=output>{answer}</pre>
 								} else {
 									<col>
-										<pre>{preview}</pre>
+										<pre fg=output>{preview}</pre>
 										if answer_lines > 4 {
 											<row gap=1 fg=muted>
 												<text>{format!("… {} more lines", answer_lines - 4)}</text>
@@ -112,7 +110,8 @@ impl Card for InspectImageCard {
 					</box>
 				},
 				CardStatus::Failed => {
-					<box border=round pad-x=1 title={failed_title} title_pad=3 bc=err>
+					<box border=round pad-x=1 title_pad=3 bc=err>
+						<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Inspect"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {path}")}</text></row>
 						if !question.is_empty() { <row gap=1><text fg=muted>{"Question:"}</text><text fg=accent wrap=word>{question}</text></row> }
 						<text pad-x=2 fg=err>{fault}</text>
 					</box>
@@ -122,10 +121,6 @@ impl Card for InspectImageCard {
 		}
 		.into_component()
 	}
-}
-
-fn icon<'a>(ui: &'a UiContext, name: &'a str) -> &'a str {
-	ui.charset.icon_named(name).unwrap_or(name)
 }
 
 #[cfg(test)]

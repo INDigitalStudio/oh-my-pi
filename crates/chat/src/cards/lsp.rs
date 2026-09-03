@@ -17,7 +17,7 @@ impl Card for LspCard {
 		"lsp"
 	}
 
-	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
+	fn render(&self, view: &CardView<'_>, expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::lsp::Params>(view);
 		let action = args
 			.as_ref()
@@ -76,38 +76,31 @@ impl Card for LspCard {
 			.collect::<Vec<_>>();
 		let output_hidden = output_lines.len().saturating_sub(1 + GENERIC_PREVIEW_LINES);
 		let fault = diag_text(view).unwrap_or_default();
-		let title = format!(
-			"{} LSP {action}",
-			icon(
-				ui,
-				if view.status == CardStatus::Failed {
-					"error"
-				} else {
-					"lsp"
-				}
-			),
-		);
 		dom! {
 			<col>
 				match view.status {
 				CardStatus::StreamingArgs | CardStatus::InProgress => {
-					<row gap=1>
-						<i:pending/><text>{"LSP:"}</text><text>{action}</text>
+					<row gap=0>
+						<i:pending fg=output/><text>{" "}</text><text fg=accent>{"LSP"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {action}")}</text>
 						if !path.is_empty() {
-							<text>{if let Some(line) = line { format!("{path}:{line}") } else { path.clone() }}</text>
+							<text fg=output>{if let Some(line) = line { format!(" {path}:{line}") } else { format!(" {path}") }}</text>
 						}
 						if !symbol.is_empty() {
-							<text>{format!("({symbol})")}</text>
+							<text fg=output>{format!(" ({symbol})")}</text>
 						}
 						if let Some(badge) = elapsed_badge(view) { {badge} }
 					</row>
 				},
 				CardStatus::Done | CardStatus::Failed => {
-					<box border=round pad-x=1 title={title} title_pad=3 bc={if view.status == CardStatus::Failed { "err" } else { "accent" }}>
-						if !path.is_empty() { <text>{path}</text> }
-						if let Some(line) = line { <row gap=1><text>{"line"}</text><text>{line.to_string()}</text></row> }
-						if !symbol.is_empty() { <row gap=1><text>{"symbol:"}</text><text>{symbol}</text></row> }
-						<hr title="Response" title_pad=3/>
+					<box border=round pad-x=1 title_pad=3 bc=muted>
+						<row kind=title gap=1>
+							if view.status == CardStatus::Failed { <i:error fg=err/> } else { <i:lsp fg=accent/> }
+							<text>{format!("LSP {action}")}</text>
+						</row>
+						if !path.is_empty() { <text fg=output>{path}</text> }
+						if let Some(line) = line { <text fg=muted>{format!("line {line}")}</text> }
+						if !symbol.is_empty() { <text fg=muted>{format!("symbol: {symbol}")}</text> }
+						<hr title="Response" title_pad=3 bc=muted/>
 						if view.status == CardStatus::Failed {
 							if expanded {
 								<row gap=1><i:info-status/><text>{"Output"}</text></row>
@@ -116,20 +109,20 @@ impl Card for LspCard {
 								<row gap=1><i:info-status/><text>{fault}</text></row>
 							}
 						} else if count > 0 {
-							<row gap=1><i:lsp/><text>{if expanded { format!("{count} found") } else { format!("{count} found⟨Ctrl+O: Expand⟩") }}</text></row>
+							<row gap=1><i:lsp fg=accent/><text fg=muted>{if expanded { format!("{count} found") } else { format!("{count} found⟨Ctrl+O: Expand⟩") }}</text></row>
 							<col pad-x=1>
 								for (file_index, file) in files.iter().enumerate() {
 									if expanded || file_index < 3 {
 										<row>
-											<icon name={if expanded && file_index + 1 == files.len() { "tree-last" } else { "tree-branch" }}/><text>{" "}</text>
-											<text>{file_path(file)}</text><text>{" "}</text><text>{reference_label(file)}</text>
+											<icon fg=muted name={if expanded && file_index + 1 == files.len() { "tree-last" } else { "tree-branch" }}/><text>{" "}</text>
+											<text fg=accent>{file_path(file)}</text><text>{" "}</text><text fg=muted>{reference_label(file)}</text>
 										</row>
 										for (location_index, location) in locations(file).iter().enumerate() {
 											if expanded || location_index == 0 {
 												<row>
 													if expanded && file_index + 1 == files.len() { <spacer w=2/> } else { <i:tree-vertical/><text>{"   "}</text> }
 													<icon pad-x=1 name={if expanded && location_index + 1 == locations(file).len() || !expanded && locations(file).len() == 1 { "tree-last" } else { "tree-branch" }}/>
-													<text>{format!("line {}", location_label(location))}</text>
+													<text fg=output>{format!("line {}", location_label(location))}</text>
 												</row>
 												if expanded {
 													<row>
@@ -178,10 +171,6 @@ impl Card for LspCard {
 		}
 		.into_component()
 	}
-}
-
-fn icon<'a>(ui: &'a UiContext, name: &'a str) -> &'a str {
-	ui.charset.icon_named(name).unwrap_or(name)
 }
 
 fn file_path(file: &Value) -> String {

@@ -46,9 +46,11 @@ impl Card for ReportIssueCard {
 		};
 		dom! {
 			<col pad-x=1>
-				<row gap=1>
-					if let Some(icon) = icon { <text>{icon}</text> } else { <spinner kind=status/> }
-					<text>{"Report Tool Issue"}</text>
+				<row gap=1 bg={if view.status.as_str() == "error" { "error_surface" } else { "panel" }}>
+					if let Some(icon) = icon {
+						<text fg={if view.status.as_str() == "error" { "err" } else { "ok" }}>{icon}</text>
+					} else { <spinner kind=status/> }
+					<text fg=accent>{"Report Tool Issue"}</text>
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 				if expanded {
@@ -59,10 +61,12 @@ impl Card for ReportIssueCard {
 					}
 					<spacer h=1/>
 				} else if !summary.is_empty() {
-					<text pad-x=1>{format!("{last} {summary}")}</text>
+					<text pad-x=1 fg=muted bg={if view.status.as_str() == "error" { "error_surface" } else { "panel" }}>{format!("{last} {summary}")}</text>
 				}
-				if let Some(text) = terminal { <text>{text}</text> }
-				if !expanded && matches!(view.status.as_str(), "ok" | "error") { <text fg=muted>{"⟨Ctrl+O: Expand⟩"}</text> }
+				if let Some(text) = terminal { <text fg=output bg={if view.status.as_str() == "error" { "error_surface" } else { "panel" }}>{text}</text> }
+				if !expanded && matches!(view.status.as_str(), "ok" | "error") {
+					<text fg=muted bg={if view.status.as_str() == "error" { "error_surface" } else { "panel" }}>{"⟨Ctrl+O: Expand⟩"}</text>
+				}
 			</col>
 		}.into_component()
 	}

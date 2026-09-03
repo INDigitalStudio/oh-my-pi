@@ -29,7 +29,7 @@ impl Card for ReadCard {
 			.unwrap_or_default();
 		match view.status {
 			CardStatus::StreamingArgs | CardStatus::InProgress => dom! {
-				<row gap=1><i:pending/><text bold>{"Read:"}</text><text>{target}</text>
+				<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Read"}</text><text>{": "}</text><text fg=output>{target}</text>
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 			}
@@ -129,11 +129,11 @@ fn render_done(view: &CardView<'_>, target: &str, expanded: bool, ui: &UiContext
 	});
 	let more = sf!("… {hidden} more line{} ⟨Ctrl+O: Expand⟩", if hidden == 1 { "" } else { "s" });
 	let src = content.and_then(|content| content.resolved);
-	let title = sf!("{} Read {target}", icon(ui, "card-bullet"));
 	let images = result_images(&result, target, ui);
 	dom! {
-		<box border=round bc=muted title={title} title_pad=3>
-			if let Some(preview) = preview { <pre wrap=word>{preview}</pre> }
+		<box border=round bc=muted bg=panel bleed title_pad=3>
+			<row kind=title gap=1><i:card-bullet fg=ok/><text>{format!("Read {target}")}</text></row>
+			if let Some(preview) = preview { <pre wrap=word path={target}>{preview}</pre> }
 			if hidden > 0 { <text fg=muted pad-x=1>{more}</text> }
 			for image in images { {image} }
 			if let Some(src) = src {
@@ -145,13 +145,13 @@ fn render_done(view: &CardView<'_>, target: &str, expanded: bool, ui: &UiContext
 	.into_component()
 }
 
-fn render_failed(view: &CardView<'_>, target: &str, ui: &UiContext) -> Component {
+fn render_failed(view: &CardView<'_>, target: &str, _ui: &UiContext) -> Component {
 	let fault = typed_fault::<omp_tools::read::Fault>(view)
 		.or_else(|| diag_text(view.diag))
 		.unwrap_or_else(|| Str::new_static("read failed"));
-	let title = sf!("{} Read {target}", icon(ui, "error"));
 	dom! {
-		<box border=round bc=err title={title} title_pad=3>
+		<box border=round bc=err bg=error_surface bleed title_pad=3>
+			<row kind=title gap=1><i:error fg=err/><text fg=accent>{format!("Read {target}")}</text></row>
 			<text fg=err wrap=word pad-x=1>{fault}</text>
 		</box>
 	}
@@ -162,14 +162,14 @@ fn render_group(targets: &[Value], status: CardStatus) -> Component {
 	let count = targets.len();
 	dom! {
 		<col pad-x=1>
-			<row gap=1><i:bullet/><text bold>{"Read"}</text><text>{sf!("({count})")}</text></row>
+			<row gap=1><i:bullet fg=default/><text>{"Read"}</text><text fg=muted>{sf!("({count})")}</text></row>
 			<col pad-x=2>
 				for (index, target) in targets.iter().enumerate() {
 					<row gap=1>
-						if index + 1 == targets.len() { <i:tree-last/> } else { <i:tree-branch/> }
-						if target.get("error").and_then(Value::as_bool) == Some(true) { <i:error/> }
-						else if matches!(status, CardStatus::StreamingArgs | CardStatus::InProgress) { <i:pending/> }
-						<text>{string_at(target, "label").or_else(|| string_at(target, "path")).unwrap_or_default()}</text>
+						if index + 1 == targets.len() { <i:tree-last fg=muted/> } else { <i:tree-branch fg=muted/> }
+						if target.get("error").and_then(Value::as_bool) == Some(true) { <i:error fg=err/> }
+						else if matches!(status, CardStatus::StreamingArgs | CardStatus::InProgress) { <i:pending fg=muted/> }
+						<text fg=accent>{string_at(target, "label").or_else(|| string_at(target, "path")).unwrap_or_default()}</text>
 					</row>
 					if let Some(usage) = target.get("usage") {
 						if index + 1 == targets.len() {
@@ -208,7 +208,7 @@ pub fn render_calls_group(
 	views: &[CardView<'_>],
 	_expanded: bool,
 	usage: Option<Str>,
-	ui: &UiContext,
+	_ui: &UiContext,
 ) -> Component {
 	let count = views.len();
 	let calls = views
@@ -233,20 +233,19 @@ pub fn render_calls_group(
 			(label, view.status)
 		})
 		.collect::<Vec<_>>();
-	let title = sf!("{} Read ({count})", icon(ui, "card-bullet"));
 	dom! {
 		<col pad-x=1>
-			<text bold>{title}</text>
+			<row gap=1><i:card-bullet fg=default/><text>{"Read"}</text><text fg=muted>{sf!("({count})")}</text></row>
 			<col pad-x=2>
 				for (index, (label, status)) in calls.iter().enumerate() {
 					<row gap=1>
-						if index + 1 == count { <i:tree-last/> } else { <i:tree-branch/> }
+						if index + 1 == count { <i:tree-last fg=muted/> } else { <i:tree-branch fg=muted/> }
 						match status {
-							CardStatus::Failed => <i:error/>,
-							CardStatus::StreamingArgs | CardStatus::InProgress => <spinner kind=status/>,
+							CardStatus::Failed => <i:error fg=err/>,
+							CardStatus::StreamingArgs | CardStatus::InProgress => <spinner kind=status fg=muted/>,
 							CardStatus::Done => <text>{""}</text>,
 						}
-						<text>{label.clone()}</text>
+						<text fg=accent>{label.clone()}</text>
 					</row>
 				}
 				if let Some(usage) = usage.clone() {
@@ -307,10 +306,6 @@ fn number_preview(text: &str, start: u64) -> Str {
 		out.push_str(&display);
 	}
 	Str::new(out)
-}
-
-fn icon<'a>(ui: &'a UiContext, name: &str) -> &'a str {
-	ui.charset.icon_named(name).unwrap_or_default()
 }
 
 fn string_at<'a>(value: &'a Value, key: &str) -> Option<&'a str> {

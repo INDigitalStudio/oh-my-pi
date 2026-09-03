@@ -99,7 +99,7 @@ impl Card for ComputerCard {
 						CardStatus::Failed => <i:error/>,
 					}
 					<row>
-						<text>{"Computer"}</text>
+						<text fg=accent>{"Computer"}</text>
 						if failed { <text fg=output>{": error"}</text> }
 					</row>
 					if let Some(badge) = elapsed_badge(view) { {badge} }

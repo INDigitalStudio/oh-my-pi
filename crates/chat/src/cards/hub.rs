@@ -68,16 +68,16 @@ fn render_generic(view: &CardView<'_>) -> Component {
 		.map(Str::new);
 	let fault = diag_text(view.diag);
 	let icon = match view.status {
-		CardStatus::Done => dom! { <i:check-button/> }.into_component(),
-		CardStatus::Failed => dom! { <i:error/> }.into_component(),
-		CardStatus::StreamingArgs | CardStatus::InProgress => dom! { <i:pending/> }.into_component(),
+		CardStatus::Done => dom! { <i:check-button fg=ok/> }.into_component(),
+		CardStatus::Failed => dom! { <i:error fg=err/> }.into_component(),
+		CardStatus::StreamingArgs | CardStatus::InProgress => dom! { <i:pending fg=output/> }.into_component(),
 	};
 	dom! {
 		<col>
-			<row gap=1>{icon}<text bold>{"Hub"}</text>
+			<row gap=1>{icon}<text fg=accent>{"Hub"}</text>
 				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
-			if let Some(detail) = detail { <text pad-x=2>{detail}</text> }
+			if let Some(detail) = detail { <text pad-x=2 fg=output>{detail}</text> }
 			if let Some(fault) = fault { <text pad-x=2 fg=err>{fault}</text> }
 		</col>
 	}
@@ -132,22 +132,22 @@ fn render_process(
 	};
 	dom! {
 		<col>
-			<row gap=1>
-				{icon}<text bold>{"Launch"}</text><text bold>{sf!("{op}:")}</text><text>{name}</text>
-				if view.status != CardStatus::Failed { if let Some(command) = command { <text>{command}</text> } }
+			<row gap=0>
+				{icon}<text>{" "}</text><text fg=accent>{format!("Launch {op}")}</text><text>{": "}</text><text fg=output>{name}</text>
+				if view.status != CardStatus::Failed { if let Some(command) = command { <text fg=muted>{format!(" {command}")}</text> } }
 				if let Some(detail) = detail { <text fg=muted>{detail}</text> }
 				if let Some(pid) = pid { <text fg=muted>{"· pid"}</text><text fg=muted>{sf!("{pid}")}</text> }
 				if let Some(wall_ms) = wall_ms { <text fg=muted>{"· up"}</text><time ms={wall_ms}/> }
 				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
-			if let Some(text) = text { <text>{text}</text> }
+			if let Some(text) = text { <text fg=muted>{text}</text> }
 			if let Some(fault) = fault { <text fg=err>{fault}</text> }
 		</col>
 	}
 	.into_component()
 }
 
-fn render_logs(view: &CardView<'_>, args: Option<&Value>, ui: &UiContext) -> Component {
+fn render_logs(view: &CardView<'_>, args: Option<&Value>, _ui: &UiContext) -> Component {
 	let result = result_value(view);
 	let logs = result.as_ref().and_then(|value| value.get("logs"));
 	let name = logs
@@ -167,7 +167,7 @@ fn render_logs(view: &CardView<'_>, args: Option<&Value>, ui: &UiContext) -> Com
 				.and_then(Value::as_bool)
 				.unwrap_or(false);
 			dom! {
-				<row gap=1><spinner kind=status/><text bold>{"Launch logs:"}</text><text>{name}</text>
+				<row gap=0><spinner kind=status/><text>{" "}</text><text fg=accent>{"Launch logs"}</text><text>{": "}</text><text fg=output>{name}</text>
 					if follow { <text fg=muted>{"follow"}</text> }
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
@@ -175,28 +175,24 @@ fn render_logs(view: &CardView<'_>, args: Option<&Value>, ui: &UiContext) -> Com
 			.into_component()
 		},
 		CardStatus::Done => {
-			let title = sf!(
-				"{} Launch logs: {name}{}",
-				ui.charset.icon_named("launch").unwrap_or("run"),
-				detail
-					.as_ref()
-					.map_or_else(Str::default, |value| sf!(" {value}")),
-			);
 			dom! {
-				<box border=round title={title} title_pad=3 pad="0 1">
-					<hr title="Output" title_pad=3/>
-					if let Some(text) = text { <pre>{text}</pre> }
+				<box border=round bc=muted title_pad=3 pad="0 1">
+					<row kind=title gap=0><i:launch fg=accent/><text>{" "}</text><text fg=accent>{"Launch logs"}</text><text>{": "}</text>
+						<text fg=output>{name}</text>
+						if let Some(detail) = detail { <text fg=ok>{format!(" {detail}")}</text> }
+					</row>
+					<hr title="Output" title_pad=3 bc=muted/>
+					if let Some(text) = text { <pre fg=output>{text}</pre> }
 				</box>
 			}
 			.into_component()
 		},
 		CardStatus::Failed => {
 			let fault = diag_text(view.diag).unwrap_or_else(|| Str::new_static("operation failed"));
-			let title =
-				sf!("{} Launch logs: {name}", ui.charset.icon_named("error").unwrap_or("[!!]"));
 			dom! {
-				<box border=round title={title} title_pad=3 pad="0 1">
-					<hr title="Output" title_pad=3/><pre>{fault}</pre>
+				<box border=round bc=err title_pad=3 pad="0 1">
+					<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Launch logs"}</text><text>{": "}</text><text fg=output>{name}</text></row>
+					<hr title="Output" title_pad=3 bc=err/><pre fg=err>{fault}</pre>
 				</box>
 			}
 			.into_component()
@@ -244,25 +240,25 @@ fn render_send(view: &CardView<'_>, args: Option<&Value>, raw: &str) -> Componen
 		.and_then(|value| string_at(value, "text"))
 		.map(Str::new);
 	let icon = match view.status {
-		CardStatus::Done => dom! { <i:irc/> }.into_component(),
-		CardStatus::Failed => dom! { <i:error/> }.into_component(),
-		CardStatus::StreamingArgs | CardStatus::InProgress => dom! { <i:pending/> }.into_component(),
+		CardStatus::Done => dom! { <i:irc fg=accent/> }.into_component(),
+		CardStatus::Failed => dom! { <i:error fg=err/> }.into_component(),
+		CardStatus::StreamingArgs | CardStatus::InProgress => dom! { <i:pending fg=output/> }.into_component(),
 	};
 	dom! {
 		<col>
-			<row gap=1>{icon}<text bold>{"IRC"}</text><i:selected/><text>{to.clone()}</text>
+			<row gap=1>{icon}<text fg=accent>{"IRC"}</text><i:selected fg=accent/><text fg=accent>{to.clone()}</text>
 				if let Some(kind) = kind { <text fg=muted>{kind}</text> }
 				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
 			if let Some(message) = message {
-				<row gap=1 pad-x=2><i:tree-vertical/><text>{message}</text></row>
+				<row gap=1 pad-x=2><i:tree-vertical fg=muted/><text fg=muted>{message}</text></row>
 			}
 			if let Some(reply) = reply {
-				<row gap=1 pad-x=2><i:back/><text>{to.clone()}</text><text fg=muted>{"just now"}</text></row>
-				<row gap=1 pad-x=2><i:tree-vertical/><text>{reply}</text></row>
+				<row gap=1 pad-x=2><i:back fg=muted/><text fg=accent>{to.clone()}</text><text fg=muted>{"just now"}</text></row>
+				<row gap=1 pad-x=2><i:tree-vertical fg=muted/><text fg=output>{reply}</text></row>
 			}
 			if let Some(fault) = fault {
-				<row gap=1><i:tree-last/><text fg=err>{to}</text><text fg=err>{"⟨failed⟩"}</text>
+				<row gap=1><i:tree-last fg=muted/><text fg=output>{to}</text><text fg=err>{"⟨failed⟩"}</text>
 					<text fg=err>{"–"}</text><text fg=err>{fault}</text>
 				</row>
 			}
@@ -301,22 +297,24 @@ fn render_inbox(view: &CardView<'_>, args: Option<&Value>, raw: &str, waiting: b
 		let kind = string_at(message, "kind").map(Str::new);
 		let last = index + 1 == messages.len();
 		if waiting {
-			rows
-				.push(dom! { <row gap=1><i:tree-vertical/><text>{text}</text></row> }.into_component());
+			rows.push(
+				dom! { <row gap=1><i:tree-vertical fg=muted/><text fg=output>{text}</text></row> }
+					.into_component(),
+			);
 		} else {
 			rows.push(
 				dom! {
 					<col>
 						<row gap=1>
-							if last { <i:tree-last/> } else { <i:tree-branch/> }
-							<text bold>{sender}</text>
-							if let Some(age) = age { <time ms={age} kind="relative"/> }
+							if last { <i:tree-last fg=muted/> } else { <i:tree-branch fg=muted/> }
+							<text fg=accent>{sender}</text>
+							if let Some(age) = age { <time fg=muted ms={age} kind="relative"/> }
 							if let Some(kind) = kind { <text fg=muted>{sf!("⟨{kind}⟩")}</text> }
 						</row>
 						if last {
-							<row gap=1 pad-x=3><i:tree-vertical/><text>{text}</text></row>
+							<row gap=1 pad-x=3><i:tree-vertical fg=muted/><text fg=output>{text}</text></row>
 						} else {
-							<row gap=0><i:tree-vertical/><row gap=1 pad-x=2><i:tree-vertical/><text>{text}</text></row></row>
+							<row gap=0><i:tree-vertical fg=muted/><row gap=1 pad-x=2><i:tree-vertical fg=muted/><text fg=output>{text}</text></row></row>
 						}
 					</col>
 				}
@@ -325,16 +323,16 @@ fn render_inbox(view: &CardView<'_>, args: Option<&Value>, raw: &str, waiting: b
 		}
 	}
 	let icon = match view.status {
-		CardStatus::Done => dom! { <i:irc/> }.into_component(),
-		CardStatus::Failed if waiting => dom! { <i:warning-status/> }.into_component(),
-		CardStatus::Failed => dom! { <i:error/> }.into_component(),
-		CardStatus::StreamingArgs | CardStatus::InProgress => dom! { <i:pending/> }.into_component(),
+		CardStatus::Done => dom! { <i:irc fg=accent/> }.into_component(),
+		CardStatus::Failed if waiting => dom! { <i:warning-status fg=warn/> }.into_component(),
+		CardStatus::Failed => dom! { <i:error fg=err/> }.into_component(),
+		CardStatus::StreamingArgs | CardStatus::InProgress => dom! { <i:pending fg=output/> }.into_component(),
 	};
 	dom! {
 		<col pad-x=1>
-			<row gap=1>{icon}<text bold>{"IRC"}</text>
-				if let Some(from) = from.clone() { <i:back/><text>{from}</text> } else { <text>{"inbox"}</text> }
-				if count > 0 && !waiting { <text>{sf!("{count}")}</text><text>{"messages ·"}</text> }
+			<row gap=1>{icon}<text fg=accent>{"IRC"}</text>
+				if let Some(from) = from.clone() { <i:back fg=accent/><text fg=accent>{from}</text> } else { <text fg=accent>{"inbox"}</text> }
+				if count > 0 && !waiting { <text fg=muted>{sf!("{count}")}</text><text fg=muted>{"messages ·"}</text> }
 				if peek { <text fg=muted>{"peek"}</text> }
 				if view.status == CardStatus::Done && waiting { <text fg=muted>{"just now"}</text> }
 				if view.status == CardStatus::Failed && waiting { <text fg=muted>{"timed out"}</text> }
@@ -390,10 +388,10 @@ fn render_roster(view: &CardView<'_>) -> Component {
 		rows.push(
 			dom! {
 				<row gap=1>
-					if last { <i:tree-last/> } else { <i:tree-branch/> }
-					if status == "parked" { <i:unselected/> } else { <i:bullet/> }
-					<text>{status}</text><text bold>{id}</text>
-					if let Some(kind) = kind { <text>{kind}</text> }
+					if last { <i:tree-last fg=muted/> } else { <i:tree-branch fg=muted/> }
+					if status == "parked" { <i:unselected fg=output/> } else { <i:bullet fg=ok/> }
+					<text fg={if status == "parked" { "output" } else { "ok" }}>{status}</text><text fg=accent>{id}</text>
+					if let Some(kind) = kind { <text fg=muted>{kind}</text> }
 					if let Some(detail) = detail { <text fg=muted>{detail}</text> }
 					if count > 0 { <text fg=warning>{sf!("⟨{count} unread⟩")}</text> }
 					if let Some(age) = age { <time ms={age} kind="relative"/> }
@@ -404,14 +402,16 @@ fn render_roster(view: &CardView<'_>) -> Component {
 	}
 	let fault = diag_text(view.diag);
 	let icon = match view.status {
-		CardStatus::Done => dom! { <i:irc/> }.into_component(),
-		CardStatus::Failed => dom! { <i:error/> }.into_component(),
-		CardStatus::StreamingArgs | CardStatus::InProgress => dom! { <i:pending/> }.into_component(),
+		CardStatus::Done => dom! { <i:irc fg=accent/> }.into_component(),
+		CardStatus::Failed => dom! { <i:error fg=err/> }.into_component(),
+		CardStatus::StreamingArgs | CardStatus::InProgress => dom! { <i:pending fg=output/> }.into_component(),
 	};
 	dom! {
 		<col pad-x=1>
-			<row gap=1>{icon}<text bold>{"IRC peers"}</text>
-				if !peers.is_empty() { <text>{sf!("{idle} idle · {parked} parked · {unread} unread")}</text> }
+			<row gap=1>{icon}<text fg=accent>{"IRC peers"}</text>
+				if !peers.is_empty() {
+					<text fg=muted>{sf!("{idle} idle · {parked} parked · ")}</text><text fg=warn>{sf!("{unread} unread")}</text>
+				}
 				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
 			if !rows.is_empty() { <col>{rows}</col> }
@@ -443,7 +443,7 @@ fn render_jobs(view: &CardView<'_>, args: Option<&Value>, raw: &str, cancel: boo
 		let count = ids.len();
 		let partial_id = partial_first_array_string(raw, "ids");
 		return dom! {
-			<row gap=1><i:pending/><text bold>{verb}</text>
+			<row gap=1><i:pending fg=output/><text fg=accent>{verb}</text>
 				if count == 1 { <text>{ids[0].as_str().unwrap_or_default()}</text> }
 				else if count > 1 { <text>{sf!("{count}")}</text><text>{"jobs"}</text> }
 				else if let Some(id) = partial_id { <text>{id}</text> }
@@ -473,11 +473,11 @@ fn render_jobs(view: &CardView<'_>, args: Option<&Value>, raw: &str, cancel: boo
 			dom! {
 				<col>
 					<row gap=1>
-						if last { <i:tree-last/> } else { <i:tree-branch/> }
-						if failed { <i:error/> } else { <i:done/> }
-						<text bold>{id}</text>
-						if let Some(kind) = kind { <text fg=muted>{sf!("⟨{kind}⟩")}</text> }
-						if let Some(label) = label { <text>{label}</text> }
+						if last { <i:tree-last fg=muted/> } else { <i:tree-branch fg=muted/> }
+						if failed { <i:error fg=err/> } else { <i:done fg=ok/> }
+						<text fg=output>{id}</text>
+						if let Some(kind) = kind { <text fg={if failed { "err" } else { "ok" }}>{sf!("⟨{kind}⟩")}</text> }
+						if let Some(label) = label { <text fg=output>{label}</text> }
 						if let Some(wall_ms) = wall_ms { <time ms={wall_ms}/> }
 					</row>
 					if let Some(text) = text {
@@ -500,11 +500,11 @@ fn render_jobs(view: &CardView<'_>, args: Option<&Value>, raw: &str, cancel: boo
 	};
 	dom! {
 		<col>
-			<row gap=1><i:warning-status/><text bold>{settled}</text>
-				if ok_count > 0 { <text fg=muted>{sf!("{ok_count}")}</text><text fg=muted>{"done"}</text> }
+			<row gap=1><i:warning-status fg=warn/><text fg=accent>{settled}</text>
+				if ok_count > 0 { <text fg=ok>{sf!("{ok_count} done")}</text> }
 				if failed_count > 0 {
-					if ok_count > 0 { <text fg=muted>{"·"}</text> }
-					<text fg=muted>{sf!("{failed_count}")}</text><text fg=muted>{"failed"}</text>
+					if ok_count > 0 { <text>{"·"}</text> }
+					<text fg=err>{sf!("{failed_count} failed")}</text>
 				}
 			</row>
 			if !rows.is_empty() { <col>{rows}</col> }

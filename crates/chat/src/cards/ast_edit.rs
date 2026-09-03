@@ -13,7 +13,7 @@ impl Card for AstEditCard {
 		"ast_edit"
 	}
 
-	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
+	fn render(&self, view: &CardView<'_>, expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::ast_edit::Params>(view);
 		let pattern = args
 			.as_ref()
@@ -69,36 +69,34 @@ impl Card for AstEditCard {
 			.unwrap_or_else(|| target.trim_end_matches("/**/*.ts"))
 			.to_owned();
 		let fault = diag_text(view).unwrap_or_default();
-		let done_title = format!(
-			"{} AST Edit: {pattern} {}{}{} {replacements} replacements · {file_count} files · in \
-			 {scope}",
-			icon(ui, "success"),
-			icon(ui, "bracket-left"),
-			state.unwrap_or("proposed"),
-			icon(ui, "bracket-right"),
-		);
-		let failed_title = format!("{} AST Edit", icon(ui, "error"));
+		let proposal = state.unwrap_or("proposed");
+		let summary =
+			format!("{replacements} replacements · {file_count} files · in {scope}");
 		dom! {
 			<col>
 				match view.status {
 				CardStatus::StreamingArgs | CardStatus::InProgress => {
-					<row kind=title gap=1><i:pending/><text bold>{"AST Edit:"}</text><text bold>{pattern}</text><text fg=muted>{"in"}</text><text>{target}</text>
+					<row kind=title gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"AST Edit"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {pattern}")}</text><text fg=muted wrap=pre>{format!(" in {target}")}</text>
 						if let Some(badge) = elapsed_badge(view) { {badge} }
 					</row>
 				},
 				CardStatus::Done => {
-					<box border=round pad-x=1 title={done_title} title_pad=3>
+					<box border=round bc=border bg=panel bleed pad-x=1 title_pad=3>
+						<row kind=title gap=0><i:success fg=ok/><text>{" "}</text><text fg=accent>{"AST Edit"}</text><text>{":"}</text>
+							<text fg=output wrap=pre>{format!(" {pattern}")}</text><text>{" "}</text><text fg=warn>{format!("⟨{proposal}⟩")}</text>
+							<text fg=muted wrap=pre>{format!(" {summary}")}</text>
+						</row>
 						<col>
 							for (index, file) in files.iter().enumerate() {
 								if expanded || index == 0 {
 									if expanded && index > 0 {
 										<text>{""}</text>
 									}
-									<row gap=1><text>{"#"}</text><text>{format!("{}/", parent_dir(file))}</text></row>
-									<row gap=1><text>{"##"}</text><text>{file_name(file)}</text><text>{replacement_label(file)}</text></row>
-																			for line in diff_lines(file) {
-											<pre>{line}</pre>
-										}
+									<row gap=1 fg=accent href={super::file_link(file_path(file))}><text>{"#"}</text><text>{format!("{}/", parent_dir(file))}</text></row>
+									<row gap=1 fg=muted href={super::file_link(file_path(file))}><text>{"##"}</text><text>{file_name(file)}</text><text>{replacement_label(file)}</text></row>
+									for line in diff_lines(file) {
+										<pre fg={if line.starts_with('-') { "err" } else if line.starts_with('+') { "info" } else { "output" }}>{line}</pre>
+									}
 								}
 							}
 							if !expanded && file_count > 1 {
@@ -108,7 +106,8 @@ impl Card for AstEditCard {
 					</box>
 				},
 				CardStatus::Failed => {
-					<box border=round pad-x=1 title={failed_title} title_pad=3>
+					<box border=round bc=err bg=error_surface bleed pad-x=1 title_pad=3>
+						<row kind=title gap=1><i:error fg=err/><text fg=accent>{"AST Edit"}</text></row>
 						<text pad-x=2 fg=err wrap=word>{fault}</text>
 					</box>
 				},
@@ -117,10 +116,6 @@ impl Card for AstEditCard {
 		}
 		.into_component()
 	}
-}
-
-fn icon<'a>(ui: &'a UiContext, name: &'a str) -> &'a str {
-	ui.charset.icon_named(name).unwrap_or(name)
 }
 
 fn file_path(file: &Value) -> &str {

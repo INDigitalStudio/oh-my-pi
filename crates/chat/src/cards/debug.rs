@@ -22,7 +22,7 @@ impl Card for DebugCard {
 		"debug"
 	}
 
-	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
+	fn render(&self, view: &CardView<'_>, expanded: bool, _ui: &UiContext) -> Component {
 		let raw_args = node_text(view.input).unwrap_or_default();
 		let args = typed_input::<omp_tools::debug::Params>(view).unwrap_or(Value::Null);
 		let action = args
@@ -33,16 +33,17 @@ impl Card for DebugCard {
 			.unwrap_or_default()
 			.replace('_', " ");
 		if view.status.as_str() == "error" {
-			let title =
-				format!("{} Debug {action}", ui.charset.icon_named("error").unwrap_or_default());
 			let fault = failure(view);
 			return dom! {
-				<box border=round title={title} title_pad=3 pad="0 1"><col><hr title="Output" title_pad=3/><text>{fault}</text></col></box>
+				<box border=round bc=err title_pad=3 pad="0 1">
+					<row kind=title gap=1><i:error fg=err/><text>{format!("Debug {action}")}</text></row>
+					<col><hr title="Output" title_pad=3 bc=err/><text>{fault}</text></col>
+				</box>
 			}.into_component();
 		}
 		let Some(result) = typed_result::<omp_tools::debug::Payload>(view) else {
 			return dom! {
-				<row gap=1><i:pending/><text>{format!("Debug: {action}")}</text>
+				<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Debug"}</text><text>{": "}</text><text fg=output>{action}</text>
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 			}
@@ -85,7 +86,6 @@ impl Card for DebugCard {
 		}
 		.min(output_lines.len());
 		let output_hidden = output_lines.len() - output_shown;
-		let title = format!("{} Debug {action}", ui.charset.icon_named("debug").unwrap_or_default());
 		let location = format!(
 			"{}:{}:{}",
 			str_field(session, "path"),
@@ -99,10 +99,11 @@ impl Card for DebugCard {
 				.unwrap_or_default(),
 		);
 		dom! {
-			<box border=round title={title} title_pad=3 pad="0 1">
+			<box border=round bc=muted title_pad=3 pad="0 1">
+				<row kind=title gap=1><i:debug fg=accent/><text>{format!("Debug {action}")}</text></row>
 				<col>
 					if has_session {
-						<hr title="Session" title_pad=3/>
+						<hr title="Session" title_pad=3 bc=muted/>
 						<text>{format!("Session {}", str_field(session, "id"))}</text>
 						<text>{format!("Adapter: {}", str_field(session, "adapter"))}</text>
 						<text>{format!("Status: {}", str_field(session, "status"))}</text>
@@ -113,7 +114,7 @@ impl Card for DebugCard {
 						<text>{format!("Instruction pointer: {}", str_field(session, "instruction_pointer"))}</text>
 						<text>{format!("Location: {location}")}</text>
 					}
-					<hr title="Output" title_pad=3/>
+					<hr title="Output" title_pad=3 bc=muted/>
 					if frames.is_empty() {
 						for line in output_lines.iter().take(output_shown) {
 							<text>{line.as_str()}</text>

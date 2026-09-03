@@ -17,11 +17,11 @@ impl Card for GoalCard {
 		"goal"
 	}
 
-	fn render(&self, view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Component {
+	fn render(&self, view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> Component {
 		match view.status {
 			CardStatus::StreamingArgs | CardStatus::InProgress => render_live(view),
-			CardStatus::Done => render_done(view, ui),
-			CardStatus::Failed => render_failed(view, ui),
+			CardStatus::Done => render_done(view),
+			CardStatus::Failed => render_failed(view),
 		}
 	}
 }
@@ -46,13 +46,13 @@ fn render_live(view: &CardView<'_>) -> Component {
 		.and_then(Value::as_u64)
 		.map(compact_tokens);
 	dom! {
-		<row gap=1>
-			<i:pending/>
-			<text bold>{"Goal:"}</text>
-			<text bold>{verb}</text>
-			if let Some(objective) = objective { <text>{sf!("\"{objective}\"")}</text> }
+		<row gap=0>
+			<i:pending fg=output/><text>{" "}</text>
+			<text fg=accent>{"Goal"}</text><text>{":"}</text>
+			<text fg=output wrap=pre>{format!(" {verb}")}</text>
+			if let Some(objective) = objective { <text fg=output>{sf!(" \"{objective}\"")}</text> }
 			if let Some(budget) = budget {
-				<text fg=muted>{"· budget"}</text><text fg=muted>{budget}</text>
+				<text>{sf!(" · budget {budget}")}</text>
 			}
 			if let Some(badge) = elapsed_badge(view) { {badge} }
 		</row>
@@ -60,7 +60,7 @@ fn render_live(view: &CardView<'_>) -> Component {
 	.into_component()
 }
 
-fn render_done(view: &CardView<'_>, ui: &UiContext) -> Component {
+fn render_done(view: &CardView<'_>) -> Component {
 	let result = typed_result::<omp_tools::goal::Payload>(view).unwrap_or(Value::Null);
 	let op = string_at(&result, "op").unwrap_or("create");
 	let verb = if op == "create" { "set" } else { op };
@@ -96,16 +96,13 @@ fn render_done(view: &CardView<'_>, ui: &UiContext) -> Component {
 		.and_then(Value::as_str)
 		.filter(|text| !text.is_empty())
 		.map(Str::new);
-	let title = sf!(
-		"{} Goal: {verb}{}",
-		ui.charset.icon_named("goal-tool").unwrap_or("(o)"),
-		state
-			.as_ref()
-			.map_or_else(Str::default, |state| sf!(" ⟨{state}⟩")),
-	);
 	dom! {
-		<box border=round title={title} title_pad=3 pad="0 1">
-			if let Some(objective) = objective { <text>{sf!("\"{objective}\"")}</text> }
+		<box border=round bc=border bg=panel bleed title_pad=3 pad="0 1">
+			<row kind=title gap=0><i:goal-tool fg=accent/><text>{" "}</text><text fg=accent>{"Goal"}</text><text>{":"}</text>
+				<text fg=output wrap=pre>{format!(" {verb}")}</text>
+				if let Some(state) = state { <text fg=accent>{sf!(" ⟨{state}⟩")}</text> }
+			</row>
+			if let Some(objective) = objective { <text fg=output>{sf!("\"{objective}\"")}</text> }
 			if let Some(detail) = detail { <text fg=muted>{detail}</text> }
 			if let Some(report) = report { <hr title="Report"/><pre>{report}</pre> }
 		</box>
@@ -113,7 +110,7 @@ fn render_done(view: &CardView<'_>, ui: &UiContext) -> Component {
 	.into_component()
 }
 
-fn render_failed(view: &CardView<'_>, ui: &UiContext) -> Component {
+fn render_failed(view: &CardView<'_>) -> Component {
 	let fault = typed_fault::<omp_tools::goal::Fault>(view)
 		.or_else(|| diag_text(view.diag))
 		.unwrap_or_else(|| Str::new_static("operation failed"));
@@ -123,9 +120,9 @@ fn render_failed(view: &CardView<'_>, ui: &UiContext) -> Component {
 		.and_then(|value| string_at(value, "op"))
 		.unwrap_or("create");
 	let verb = if op == "create" { "set" } else { op };
-	let title = sf!("{} Goal: {verb}", ui.charset.icon_named("error").unwrap_or("[!!]"));
 	dom! {
-		<box border=round title={title} title_pad=3 pad="0 1">
+		<box border=round bc=err bg=error_surface bleed title_pad=3 pad="0 1">
+			<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Goal"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {verb}")}</text></row>
 			<text fg=err pad-x=2>{fault}</text>
 		</box>
 	}

@@ -86,7 +86,7 @@ impl CallArgs {
 		[&self.context, &self.task]
 			.into_iter()
 			.flatten()
-			.map(|text| dom! { <md fg=muted>{text.clone()}</md> }.into_component())
+			.map(|text| dom! { <md fg=output>{text.clone()}</md> }.into_component())
 			.collect()
 	}
 }
@@ -114,16 +114,13 @@ impl Card for TaskCard {
 /// per dispatched agent.
 fn render_live(view: &CardView<'_>) -> Component {
 	let args = CallArgs::read(view);
-	let title = args
-		.agent
-		.as_deref()
-		.map_or_else(|| Str::new_static("Task"), |agent| sf!("Task: {agent}"));
 	let sections = args.sections();
 	let rows = call_rows(&args);
 	dom! {
-		<box border=round title_pad=3 pad="0 1">
-			<row kind=title gap=1 bold>
-				<i:task/><text bold>{title}</text>
+		<box border=round bc=border bg=panel bleed title_pad=3 pad="0 1">
+			<row kind=title gap=0>
+				<i:task fg=accent/><text>{" "}</text><text fg=accent>{"Task"}</text>
+				if let Some(agent) = args.agent.as_deref() { <text>{":"}</text><text fg=output wrap=pre>{format!(" {agent}")}</text> }
 				if args.isolated { <text fg=muted>{"isolated"}</text> }
 				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
@@ -187,8 +184,8 @@ fn call_row(label: Str, brief: Option<Str>, agent: Option<&str>, isolated: bool)
 	dom! {
 		<row gap=1>
 			<text fg=muted>{"•"}</text>
-			<text bold fg=accent>{name}</text>
-			if let Some(brief) = brief { <text fg=muted>{brief}</text> }
+			<text fg=accent>{name}</text>
+			if let Some(brief) = brief { <text fg=output>{brief}</text> }
 			if let Some(badge) = badge { <text fg=muted>{badge}</text> }
 			if isolated { <text fg=muted>{"[isolated]"}</text> }
 		</row>
@@ -236,9 +233,9 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 		.unwrap_or_default();
 	if rows.is_empty() {
 		let fault = diag_text(view.diag).unwrap_or_else(|| Str::new_static("operation failed"));
-		let title = sf!("{} Task 1 agent", ui.charset.icon_named("error").unwrap_or("[!!]"));
 		return dom! {
-			<box border=round title={title} title_pad=3 pad="0 1">
+			<box border=round bc=err bg=error_surface bleed title_pad=3 pad="0 1">
+				<row kind=title gap=1><i:error fg=err/><text fg=accent>{"Task"}</text><text fg=muted>{"1 agent"}</text></row>
 				{sections}
 				if !sections_empty { <hr/> }
 				<text fg=err pad-x=2>{fault}</text>
@@ -249,12 +246,6 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 	let failed = rows.iter().any(row_failed);
 	let count = rows.len();
 	let agent_word = if count == 1 { "agent" } else { "agents" };
-	let title = sf!(
-		"{} Task {count} {agent_word}",
-		ui.charset
-			.icon_named(if failed { "error" } else { "done" })
-			.unwrap_or(if failed { "[!!]" } else { "*" })
-	);
 	let mut rendered_rows = Vec::with_capacity(rows.len());
 	for (index, row) in rows.iter().enumerate() {
 		let job = row
@@ -308,10 +299,10 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 			dom! {
 				<col>
 					<row gap=1>
-						if ok { <i:done/> } else { <i:error/> }
-						if desc.is_some() { <text bold>{sf!("{job}:")}</text> } else { <text bold>{job}</text> }
-						if let Some(desc) = desc { <text>{desc}</text> }
-						<text fg=muted>{state}</text>
+						if ok { <i:done fg=ok/> } else { <i:error fg=err/> }
+						if desc.is_some() { <text fg=accent>{sf!("{job}:")}</text> } else { <text fg=accent>{job}</text> }
+						if let Some(desc) = desc { <text fg=output>{desc}</text> }
+						<text fg={if ok { "ok" } else { "err" }}>{state}</text>
 						if let Some(badge) = badge { <text fg=muted>{badge}</text> }
 						if let Some(detail) = detail {
 							<text fg=muted>{"·"}</text><text fg=muted>{detail}</text>
@@ -323,7 +314,7 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 						}
 					}
 					if let Some(output) = output {
-						<text fg=muted pad-x=2>{"Output"}</text><pre pad-x=4>{output}</pre>
+						<text fg=muted pad-x=2>{"Output"}</text><pre fg=muted pad-x=4>{output}</pre>
 					}
 					if let Some(error) = error { <text fg=err pad-x=2>{error}</text> }
 				</col>
@@ -347,7 +338,11 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 	let status = if failed { "failed" } else { "succeeded" };
 	let summary = sf!("⟨{count} {status} · {requests} req · {:.1}s⟩", duration_ms as f64 / 1_000.0);
 	dom! {
-		<box border=round title={title} title_pad=3 pad="0 1">
+		<box border=round bc={if failed { "err" } else { "border" }} bg={if failed { "error_surface" } else { "panel" }} bleed title_pad=3 pad="0 1">
+			<row kind=title gap=1>
+				if failed { <i:error fg=err/> } else { <text fg=accent>{"•"}</text> }
+				<text fg=accent>{"Task"}</text><text fg=muted>{format!("{count} {agent_word}")}</text>
+			</row>
 			{sections}
 			if !sections_empty { <hr/> }
 			{rendered_rows}

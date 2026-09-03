@@ -33,9 +33,9 @@ use omp_con::{Ctx, Severity};
 use omp_core::{Str, Ulid};
 use omp_dom::{Event, Handle, KnownTag, NodeSpec, Op, PropId, PropKey, Tag, Txn, Value};
 use omp_driver::headless::kernel::{ComposedInference, KernelOptions, SessionHome};
-use omp_journal::EntryId;
+use omp_journal::{EntryId, blob::BlobStore, data::Attachment};
 use omp_proto::toolhost::v1::HookEventId;
-use omp_session::{Session, SessionError, components::jobs};
+use omp_session::{AttachmentInput, Session, SessionError, components::jobs};
 use parking_lot::RwLock;
 
 /// pi `background-tan-dispatch.md`.
@@ -58,6 +58,20 @@ enum SessionHookError {
 		/// Mutable field without an implementation.
 		field: &'static str,
 	},
+}
+
+fn store_attachments(
+	blobs: &BlobStore,
+	inputs: Vec<AttachmentInput>,
+) -> Result<Vec<Attachment>, omp_journal::blob::Error> {
+	inputs
+		.into_iter()
+		.map(|input| {
+			blobs
+				.put(&input.bytes)
+				.map(|blob| Attachment { blob, mime: input.mime })
+		})
+		.collect()
 }
 
 /// What the idle loop does next after one command.
@@ -442,14 +456,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 							let _ = self.up.send(Up::Steer { text, attachments: Vec::new() });
 						},
 						Ok(HostCommand::SubmitWithAttachments { text, attachments }) => {
-							let stored = attachments
-								.into_iter()
-								.map(|input| {
-									blobs
-										.put(&input.bytes)
-										.map(|blob| omp_journal::data::Attachment { blob, mime: input.mime })
-								})
-								.collect::<Result<Vec<_>, _>>();
+							let stored = store_attachments(&blobs, attachments);
 							match stored {
 								Ok(attachments) => {
 									let _ = self.up.send(Up::Steer { text, attachments });
@@ -481,14 +488,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 						Ok(HostCommand::PushToTalk { active }) => self.voice.set_active(active, &self.ctx),
 						Ok(HostCommand::LiveVoice { active }) => self.voice.set_live(active, &self.ctx),
 						Ok(HostCommand::Queue { prompt, attachments }) => {
-							let stored = attachments
-								.into_iter()
-								.map(|input| {
-									blobs
-										.put(&input.bytes)
-										.map(|blob| omp_journal::data::Attachment { blob, mime: input.mime })
-								})
-								.collect::<Result<Vec<_>, _>>();
+							let stored = store_attachments(&blobs, attachments);
 							match stored {
 								Ok(attachments) => {
 									let _ = self.up.send(Up::Queue { text: prompt, attachments });
@@ -1010,6 +1010,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 	) -> miette::Result<bool> {
 		let mut quit = false;
 		let ask = self.ask.clone();
+		let blobs = self.session.blobs().clone();
 		let failure = {
 			let local =
 				self
@@ -1032,6 +1033,22 @@ impl<C: omp_agent::Inference> Controller<C> {
 						},
 						Ok(HostCommand::Submit(text) | HostCommand::Steer(text)) => {
 							let _ = self.up.send(Up::Steer { text, attachments: Vec::new() });
+						},
+						Ok(HostCommand::SubmitWithAttachments { text, attachments }) => {
+							match store_attachments(&blobs, attachments) {
+								Ok(attachments) => {
+									let _ = self.up.send(Up::Steer { text, attachments });
+								},
+								Err(error) => {
+									let _ = self.up.send(Up::Env(omp_agent::EnvEvent::Notice {
+										kind: Str::new_static("error"),
+										name: None,
+										body: Str::new(format!(
+											"Could not store the attached images: {error}"
+										)),
+									}));
+								},
+							}
 						},
 						Ok(HostCommand::AskAnswer { id, answers }) => answer_ask(&ask, &id, answers),
 						Ok(HostCommand::Overlay { .. }) => {},
@@ -2000,7 +2017,10 @@ mod tests {
 		DispatchPolicy, KernelEvent, SessionStateBridge, StaticPrompt, TurnStop,
 		hooks::{GateDecision, HookGate, HookPhase, OnFailure, SourceRef, Subscription, When},
 	};
-	use omp_chat::composer::{LocalInput, PrefixMode};
+	use omp_chat::{
+		composer::{LocalInput, PrefixMode},
+		overlays::services::SessionScope,
+	};
 	use omp_inference::{
 		BlockKind, ChatEvent, ChatRequest, ChatStream, Completion, ExecutionReceipt, FinishReason,
 		ProviderId, RequestId, ResponseMeta, RouteId, ToolCall, ToolCallId, Usage, call::OpaqueJson,
@@ -2543,6 +2563,80 @@ mod tests {
 			.expect("controller exits")
 			.expect("controller task")
 			.expect("controller run");
+	}
+
+	/// An image prompt typed while a local command runs is re-queued for the
+	/// next model turn with its bytes and MIME intact.
+	#[tokio::test]
+	async fn image_prompt_during_local_run_reaches_the_next_turn() {
+		const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x04\0\0\0\x03";
+		let harness = harness(Duration::from_millis(50));
+		harness.commands.send(sleep_command()).expect("local command");
+		next_event(
+			&harness.events,
+			|event| matches!(event, KernelEvent::ToolReady { name, .. } if name == "bash"),
+		)
+		.await;
+		harness
+			.commands
+			.send(HostCommand::SubmitWithAttachments {
+				text:        Str::new_static("inspect [Image #1]"),
+				attachments: vec![AttachmentInput {
+					mime:  Str::new_static("image/png"),
+					bytes: bytes::Bytes::from_static(PNG),
+				}],
+			})
+			.expect("image prompt");
+		harness
+			.commands
+			.send(HostCommand::Interrupt)
+			.expect("interrupt local run");
+		// This command is deferred by `run_local`; observing its outcome proves
+		// the controller has returned to its idle loop before the next submit.
+		harness
+			.commands
+			.send(HostCommand::SessionIndex { scope: SessionScope::Project })
+			.expect("idle barrier");
+		next_event(&harness.events, |event| {
+			matches!(event, KernelEvent::TurnEnded { stop: TurnStop::Cancelled })
+		})
+		.await;
+		let _ = next_outcome(&harness.mailbox()).await;
+		harness
+			.commands
+			.send(HostCommand::Submit(Str::new_static("continue")))
+			.expect("next model turn");
+		next_event(&harness.events, |event| matches!(event, KernelEvent::TurnEnded { .. })).await;
+
+		let (journal, _dir) = harness.quit().await;
+		let session = Session::open(&journal, omp_session::ComponentRegistry::standard())
+			.expect("journal replays");
+		let dom = session.dom();
+		let steering = dom
+			.select("user[steering=true]")
+			.expect("selector")
+			.find(|handle| {
+				dom.get(*handle)
+					.and_then(|node| node.content.as_deref())
+					== Some("inspect [Image #1]")
+			})
+			.expect("image prompt is not dropped");
+		let node = dom.get(steering).expect("steering node");
+		let Some(Value::Json(raw)) = node.prop(&PropKey::from(PropId::Data)) else {
+			panic!("steering prompt carries attachment data: {node:?}");
+		};
+		let attachments: Vec<Attachment> =
+			serde_json::from_str(raw.get()).expect("attachment json");
+		assert_eq!(attachments.len(), 1);
+		assert_eq!(attachments[0].mime, "image/png");
+		assert_eq!(
+			session
+				.blobs()
+				.get(&attachments[0].blob)
+				.expect("image blob")
+				.as_ref(),
+			PNG
+		);
 	}
 
 	/// A `/queue` prompt posted while a turn runs is journaled as a pending

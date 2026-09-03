@@ -28,8 +28,8 @@ impl Card for GrepCard {
 		match view.status {
 			CardStatus::StreamingArgs | CardStatus::InProgress => dom! {
 				<row gap=1 pad-x=1>
-					<i:pending/><text bold>{"Grep:"}</text><text>{query}</text>
-					if let Some(path) = path { <text fg=muted>{"in"}</text><text>{path}</text> }
+					<i:pending fg=output/><text>{"Grep:"}</text><text fg=output>{query}</text>
+					if let Some(path) = path { <text fg=muted>{format!("in {path}")}</text> }
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 			}
@@ -69,16 +69,16 @@ fn render_done(
 	dom! {
 		<col pad-x=1 w="100%">
 			<row gap=1>
-				<i:search/><text bold>{"Grep:"}</text><text>{query}</text><text>{&match_count}</text><text>{"matches"}</text>
-				<text fg=muted>{"·"}</text><text>{&file_count}</text><text>{"files"}</text>
-				if let Some(path) = path { <text fg=muted>{"· in"}</text><text>{path}</text> }
+				<i:search/><text>{"Grep:"}</text><text fg=output>{query}</text>
+				<text fg=muted>{format!("{match_count} matches · {file_count} files · in")}</text>
+				if let Some(path) = path { <text fg=muted href={super::file_link(path)}>{path}</text> }
 			</row>
 			<col>
 				for (group_index, files_shown) in plan.iter().enumerate() {
 					if let Some(group) = groups.get(group_index) {
 						<row gap=1>
-							if group_index + 1 == plan.len() && hidden == 0 { <i:tree-last/> } else { <i:tree-branch/> }
-							<text>{"#"}</text><text bold>{group.dir.clone()}</text>
+							if group_index + 1 == plan.len() && hidden == 0 { <i:tree-last fg=muted/> } else { <i:tree-branch fg=muted/> }
+							<text fg=accent href={super::file_link(&group.dir)}>{format!("# {}", group.dir)}</text>
 						</row>
 						for (file_index, matches_shown) in files_shown.iter().enumerate() {
 							if let Some(file) = group.files.get(file_index) {
@@ -194,7 +194,7 @@ fn render_failed(view: &CardView<'_>) -> Component {
 	let fault = typed_fault::<omp_tools::grep::Fault>(view)
 		.or_else(|| diag_text(view.diag))
 		.unwrap_or_else(|| Str::new_static("grep failed"));
-	dom! { <row gap=1 pad-x=1><i:error/><text bold>{"Error:"}</text><text fg=err>{fault}</text></row> }
+	dom! { <row gap=1 pad-x=1 fg=err><i:error/><text>{sf!("Error: {fault}")}</text></row> }
 		.into_component()
 }
 

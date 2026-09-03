@@ -39,13 +39,13 @@ impl GenericCard {
 			.map(Str::new);
 		dom! {
 			<col pad="1 0">
-				<row pad-x=1 gap=1>
+				<row pad-x=1 gap=1 bg={if view.status == CardStatus::Failed { "error_surface" } else { "panel" }}>
 					match view.status {
-						CardStatus::Failed => <i:error/>,
-						CardStatus::Done => <i:done/>,
-						CardStatus::StreamingArgs | CardStatus::InProgress => <spinner kind=status fg=muted/>,
+						CardStatus::Failed => <i:error fg=err/>,
+						CardStatus::Done => <i:done fg=ok/>,
+						CardStatus::StreamingArgs | CardStatus::InProgress => <spinner kind=status/>,
 					}
-					<text bold>{title}</text>
+					<text fg=accent>{title}</text>
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 				if expanded {
@@ -58,13 +58,13 @@ impl GenericCard {
 						<row><i:space/></row>
 					}
 				} else if let Some(detail) = detail {
-					<row pad-x=2 gap=1><text>{"└─"}</text><text>{detail}</text></row>
+					<row pad-x=2 gap=1 fg=muted bg={if view.status == CardStatus::Failed { "error_surface" } else { "panel" }}><text>{"└─"}</text><text>{detail}</text></row>
 				}
-				if let Some(result) = result { <pre pad-x=1>{result}</pre> }
+				if let Some(result) = result { <pre pad-x=1 fg=output bg={if view.status == CardStatus::Failed { "error_surface" } else { "panel" }}>{result}</pre> }
 				if expanded { {images} }
-				if let Some(fault) = fault { <text pad-x=1>{fault}</text> }
+				if let Some(fault) = fault { <text pad-x=1 fg=output bg=error_surface>{fault}</text> }
 				if !expanded && matches!(view.status, CardStatus::Done | CardStatus::Failed) {
-					<text pad-x=1>{"⟨Ctrl+O: Expand⟩"}</text>
+					<text pad-x=1 fg=muted bg={if view.status == CardStatus::Failed { "error_surface" } else { "panel" }}>{"⟨Ctrl+O: Expand⟩"}</text>
 				}
 			</col>
 		}

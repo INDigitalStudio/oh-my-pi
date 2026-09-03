@@ -89,21 +89,23 @@ impl Card for EvalCard {
 			.unwrap_or_default();
 		dom! {
 			<col>
-				<box border=round pad-x=1 title_pad=3>
-					<row kind=title gap=1 bold>
-						<i:python/>
+				<box border=round bc={if failed { "err" } else if live { "accent" } else { "muted" }} bg={if failed { "error_surface" } else { "panel" }} bleed pad-x=1 title_pad=3>
+					<row kind=title gap=1>
+						<i:python fg=python/>
 						if live { <spinner kind=status/> }
-						<text bold>{state}</text>
-						if !title.is_empty() { <text bold>{title}</text> }
-						if let Some(duration) = duration { <text bold>{duration}</text> }
+						if failed { <text fg=err>{state}</text> }
+						else if live { <text>{state}</text> }
+						else { <text fg=ok>{state}</text> }
+						if !title.is_empty() { <text>{title}</text> }
+						if let Some(duration) = duration { <text fg=muted>{duration}</text> }
 						if let Some(badge) = elapsed_badge(view) { {badge} }
 					</row>
 					if !code.is_empty() {
-						<pre>{code}</pre>
+						<pre path="cell.py">{code}</pre>
 					}
 					if !output.is_empty() {
-						<hr title="Output" title_pad=3/>
-						<pre>{output}</pre>
+						<hr title="Output" title_pad=3 bc={if failed { "err" } else { "muted" }}/>
+						<pre fg={if failed { "err" } else { "output" }}>{output}</pre>
 					}
 				</box>
 				if !tree.is_empty() {

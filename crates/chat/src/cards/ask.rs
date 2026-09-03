@@ -17,11 +17,11 @@ impl Card for AskCard {
 		"ask"
 	}
 
-	fn render(&self, view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Component {
+	fn render(&self, view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> Component {
 		if view.status.as_str() == "error" {
 			let fault = failure(view);
 			return dom! {
-				<col><row gap=1><icon name="warning-status"/><text>{"Ask"}</text></row><text>{fault}</text></col>
+				<col><row gap=1><icon name="warning-status" fg=warn/><text fg=accent>{"Ask"}</text></row><text fg=muted>{fault}</text></col>
 			}.into_component();
 		}
 		let raw = node_text(view.input).unwrap_or_default();
@@ -72,15 +72,7 @@ impl Card for AskCard {
 				}))
 			})
 			.collect();
-		let title = if answered {
-			format!(
-				"{} Ask {} questions",
-				ui.charset.icon_named("success").unwrap_or_default(),
-				questions.len()
-			)
-		} else {
-			format!("Ask {} questions", questions.len())
-		};
+		let count = format!("{} questions", questions.len());
 		let mut question_rows = Vec::new();
 		for question in &questions {
 			let id = question
@@ -103,14 +95,16 @@ impl Card for AskCard {
 			} else {
 				format!("[{id}] · options:{}", options.len())
 			};
-			question_rows.push(dom! { <hr title={divider} title_pad=3/> }.into_component());
+			question_rows.push(
+				dom! { <hr title={divider} title_pad=3 bc=border fg=muted/> }.into_component(),
+			);
 			let question_text = Str::new(
 				question
 					.get("question")
 					.and_then(Value::as_str)
 					.unwrap_or_default(),
 			);
-			question_rows.push(dom! { <text pad-x=1>{question_text}</text> }.into_component());
+			question_rows.push(dom! { <text pad-x=1 fg=accent>{question_text}</text> }.into_component());
 			for option in options {
 				let label = Str::new(
 					option
@@ -124,11 +118,11 @@ impl Card for AskCard {
 				question_rows.push(
 					dom! {
 						<row gap=1 pad-x=1>
-							if multi && checked { <i:checked/> }
-							else if multi { <i:unchecked/> }
-							else if checked { <icon name="radio-selected"/> }
-							else { <i:unselected/> }
-							<text>{label}</text>
+							if multi && checked { <i:checked fg=ok/> }
+							else if multi { <i:unchecked fg=muted/> }
+							else if checked { <icon name="radio-selected" fg=ok/> }
+							else { <i:unselected fg=muted/> }
+							<text fg=output>{label}</text>
 						</row>
 					}
 					.into_component(),
@@ -172,7 +166,11 @@ impl Card for AskCard {
 			}
 		}
 		dom! {
-			<box border=round title={title} title_pad=3 pad="0 1">
+			<box border=round bc=border bg=panel bleed title_pad=3 pad="0 1">
+				<row kind=title gap=1>
+					if answered { <i:success fg=ok/> }
+					<text>{"Ask"}</text><text fg=output>{count}</text>
+				</row>
 				<col>{question_rows}</col>
 			</box>
 		}

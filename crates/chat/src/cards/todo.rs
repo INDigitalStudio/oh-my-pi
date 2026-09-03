@@ -16,11 +16,11 @@ impl Card for TodoCard {
 		"todo"
 	}
 
-	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
+	fn render(&self, view: &CardView<'_>, expanded: bool, _ui: &UiContext) -> Component {
 		match view.status {
 			CardStatus::StreamingArgs | CardStatus::InProgress => render_live(view),
-			CardStatus::Done => render_checklist(view, expanded, ui),
-			CardStatus::Failed => render_failed(view, ui),
+			CardStatus::Done => render_checklist(view, expanded),
+			CardStatus::Failed => render_failed(view),
 		}
 	}
 }
@@ -34,7 +34,7 @@ fn render_live(view: &CardView<'_>) -> Component {
 		.or_else(|| partial_string(view.args_text().unwrap_or_default(), "op"))
 		.unwrap_or_default();
 	dom! {
-		<row gap=1><i:pending/><text>{"Todo"}</text><text>{op}</text>
+		<row gap=1><i:pending fg=output/><text fg=accent>{"Todo"}</text><text fg=muted>{op}</text>
 			if let Some(badge) = elapsed_badge(view) { {badge} }
 		</row>
 	}
@@ -182,7 +182,7 @@ fn touched_phases(
 	(!touched.is_empty()).then_some(touched)
 }
 
-fn render_checklist(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
+fn render_checklist(view: &CardView<'_>, expanded: bool) -> Component {
 	let completed_now = newly_completed(view);
 	let sweep = sf!("{}ms", TODO_STRIKE_FRAME_MS * u64::from(STRIKE_TOTAL_FRAMES));
 	let (phases, completed) = view
@@ -214,7 +214,7 @@ fn render_checklist(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Comp
 			continue;
 		}
 		phase_rows.push(
-			dom! { <row gap=2><text>{heading}</text><text>{sf!("{done}/{}", tasks.len())}</text></row> }
+			dom! { <row gap=2><text fg=accent>{heading}</text><text fg=muted>{sf!("{done}/{}", tasks.len())}</text></row> }
 				.into_component(),
 		);
 		let (shown, summary) = if expanded {
@@ -235,11 +235,12 @@ fn render_checklist(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Comp
 			phase_rows.push(
 				dom! {
 					<row gap=1 pad-x=2>
-						if last { <i:tree-last/> } else { <i:tree-branch/> }
-						if completed { <i:checked/> } else { <i:unchecked/> }
-						if sweeping { <strike reveal={sweep.clone()}>{text}</strike> }
-						else if completed { <text strike>{text}</text> }
-						else { <text>{text}</text> }
+						if last { <i:tree-last fg=muted/> } else { <i:tree-branch fg=muted/> }
+						if completed { <i:checked fg=ok/> } else if last { <i:unchecked fg=accent/> } else { <i:unchecked fg=muted/> }
+						if sweeping { <strike reveal={sweep.clone()} fg=ok>{text}</strike> }
+						else if completed { <text strike fg=muted>{text}</text> }
+						else if last { <text fg=accent>{text}</text> }
+						else { <text fg=muted>{text}</text> }
 						if let Some(blocker) = blocker { <text fg=muted>{sf!("— {blocker}")}</text> }
 					</row>
 				}
@@ -253,23 +254,23 @@ fn render_checklist(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Comp
 			);
 		}
 	}
-	let title = sf!("{} Todo {total} tasks", ui.charset.icon_named("todo").unwrap_or("[x]"));
 	dom! {
-		<box border=round title={title} title_pad=3 pad="0 1">
+		<box border=round bc=border title_pad=3 pad="0 1">
+			<row kind=title gap=1><i:todo fg=accent/><text fg=accent>{"Todo"}</text><text fg=muted>{sf!("{total} tasks")}</text></row>
 			{phase_rows}
 		</box>
 	}
 	.into_component()
 }
 
-fn render_failed(view: &CardView<'_>, ui: &UiContext) -> Component {
+fn render_failed(view: &CardView<'_>) -> Component {
 	let fault = typed_fault::<omp_tools::todo::Fault>(view)
 		.or_else(|| diag_text(view.diag))
 		.unwrap_or_else(|| Str::new_static("operation failed"));
-	let title = sf!("{} Todo", ui.charset.icon_named("error").unwrap_or("[!!]"));
 	dom! {
-		<box border=round title={title} title_pad=3 pad="0 1">
-			<text pad-x=2>{fault}</text>
+		<box border=round bc=err bg=error_surface bleed title_pad=3 pad="0 1">
+			<row kind=title gap=1><i:error fg=err/><text fg=accent>{"Todo"}</text></row>
+			<text pad-x=2 fg=err>{fault}</text>
 		</box>
 	}
 	.into_component()

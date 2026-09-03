@@ -66,27 +66,23 @@ impl Card for AstGrepCard {
 			<col>
 				match view.status {
 					CardStatus::StreamingArgs | CardStatus::InProgress => {
-						<row kind=title gap=1>
-							<i:pending/>
-							<text bold>{"AST Grep:"}</text>
-							<text bold>{pattern}</text>
+						<row kind=title gap=0>
+							<i:pending fg=output/><text>{" "}</text>
+							<text fg=accent>{"AST Grep"}</text><text>{":"}</text>
+							<text fg=output wrap=pre>{format!(" {pattern}")}</text>
 							if !path.is_empty() {
-								<text fg=muted>{"in"}</text><text>{path}</text>
+								<text fg=muted wrap=pre>{format!(" in {path}")}</text>
 							}
 							if let Some(badge) = elapsed_badge(view) { {badge} }
 						</row>
 					},
 					CardStatus::Done => {
-						<row kind=title gap=1>
-							<i:search/>
-							<text bold>{"AST Grep:"}</text><text bold>{pattern}</text>
-							<text>{match_count.to_string()}</text><text>{"matches"}</text>
-							<text fg=muted>{"·"}</text><text>{file_count.to_string()}</text><text>{"files"}</text>
-							if !scope.is_empty() {
-								<text fg=muted>{"·"}</text><text fg=muted>{"in"}</text><text>{scope.clone()}</text>
-							}
+						<row kind=title gap=0>
+							<i:search fg=accent/><text>{" "}</text>
+							<text fg=accent>{"AST Grep"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {pattern}")}</text>
+							<text fg=muted wrap=pre>{format!(" {match_count} matches · {file_count} files · in {scope}")}</text>
 							if let Some(searched) = searched {
-								<text fg=muted>{"·"}</text><text fg=muted>{"searched"}</text><text>{searched.to_string()}</text>
+								<text fg=muted wrap=pre>{format!(" · searched {searched}")}</text>
 							}
 						</row>
 						for (group_index, (dir, entries)) in groups.iter().take(shown).enumerate() {
@@ -107,11 +103,11 @@ impl Card for AstGrepCard {
 							</col>
 						}
 						if hidden > 0 {
-							<row gap=1><i:tree-last/><text>{format!("… {hidden} more {}", if hidden == 1 { "match" } else { "matches" })}</text></row>
+							<row gap=1 fg=muted><i:tree-last/><text fg=output>{format!("… {hidden} more {}", if hidden == 1 { "match" } else { "matches" })}</text></row>
 						}
 					},
 					CardStatus::Failed => {
-						<row kind=title gap=1><i:error/><text bold>{"Error:"}</text><text fg=err wrap=word>{fault.unwrap_or_default()}</text></row>
+						<row kind=title gap=1 fg=err><i:error/><text>{format!("Error: {}", fault.unwrap_or_default())}</text></row>
 					},
 				}
 			</col>

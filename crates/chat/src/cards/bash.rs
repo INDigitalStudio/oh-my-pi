@@ -118,26 +118,26 @@ impl Card for BashCard {
 		// block never jumps when the call settles; only ctrl+o uncaps.
 		let settled = output_tail(&output, expanded);
 		dom! {
-			<box border=round>
-				<row pad-x=1 gap=1><text>{"$"}</text><text>{shown_command}</text>
+			<box border=round bc={if view.status == CardStatus::Failed { "err" } else { "border" }} bg={if view.status == CardStatus::Failed { "error_surface" } else { "panel" }} bleed>
+				<row pad-x=1 gap=1><text fg=muted>{"$"}</text><pre path="command.sh">{shown_command}</pre>
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 				if let Some((marker, lines)) = tail {
-					<hr title="Output" title_pad=3/>
+					<hr title="Output" title_pad=3 bc=muted/>
 					<col pad-x=1>
 						if let Some(marker) = marker { <text fg=muted truncate>{marker}</text> }
-						<pre>{lines}</pre>
+						<pre fg=output>{lines}</pre>
 					</col>
 				}
 				if matches!(view.status, CardStatus::Done | CardStatus::Failed) && (settled.is_some() || fault.is_some()) {
-					<hr title="Output" title_pad=3/>
+					<hr title="Output" title_pad=3 bc={if view.status == CardStatus::Failed { "err" } else { "muted" }}/>
 					<col pad-x=1>
 						if let Some((marker, lines)) = settled {
 							if let Some(marker) = marker { <text fg=muted truncate>{marker}</text> }
-							<text wrap=word>{lines}</text>
+							<text wrap=word fg={if view.status == CardStatus::Failed { "err" } else { "output" }}>{lines}</text>
 						}
 						if let Some(message) = fault {
-							<pre>{message}</pre>
+							<pre fg={if view.status == CardStatus::Failed { "err" } else { "output" }}>{message}</pre>
 						}
 						if let Some(meta) = meta {
 							<row fg=muted><i:bracket-left/><text>{meta}</text><i:bracket-right/></row>

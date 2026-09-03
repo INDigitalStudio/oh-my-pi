@@ -4,7 +4,10 @@ use omp_core::Str;
 use omp_dom::{Node, PropId};
 use omp_tui::{
 	Component as TuiComponent, PaintCtx, Props, Rect, Slot, Style, UiContext,
-	components::{CompactionBoundaries, ContextGauge, GaugeCell},
+	components::{
+		CompactionBoundaries, ContextGauge, GaugeCell, compaction_boundary_color,
+		compaction_threshold_color,
+	},
 	next_slot,
 };
 use serde_json::Value;
@@ -81,9 +84,12 @@ impl TuiComponent for GaugeRows {
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
-		let style = Style::default();
-		pc.frame
-			.put(rect.x, rect.y, &format!("  {}", self.label), style);
+		pc.frame.put(
+			rect.x,
+			rect.y,
+			&format!("  {}", self.label),
+			Style::new().fg(pc.ctx.theme.muted),
+		);
 		if rect.height < 2 {
 			return;
 		}
@@ -103,23 +109,49 @@ impl TuiComponent for GaugeRows {
 			.unwrap_or_default();
 		let rule = pc.ctx.charset.rule();
 		let window = compact(self.window);
-		let left = format!(" {model} {} {cap}", self.model);
-		let right = format!("{left_cap} {context} {:.1}%/{window} {auto} ", self.percent);
+		let left = format!(" {model} {} ", self.model);
+		let right = format!(" {context} {:.1}%/{window} {auto} ", self.percent);
 		let boundary =
-			usize::from(rect.width).saturating_sub(left.chars().count() + right.chars().count());
+			usize::from(rect.width).saturating_sub(left.chars().count() + right.chars().count() + 2);
 		let tick = ((boundary as f64) * 0.85).round() as usize;
-		let numeric = format!(
-			"{left}{}{threshold}{}{right}",
-			rule.to_string().repeat(tick.min(boundary)),
-			rule.to_string().repeat(boundary.saturating_sub(tick + 1))
+		let theme = pc.ctx.theme;
+		let model_style = Style::new().fg(theme.accent).bg(theme.panel);
+		let cap_style = Style::new().fg(theme.panel);
+		let used = Style::new().fg(compaction_threshold_color(&theme));
+		let unused = Style::new().fg(theme.status_rule);
+		let boundary_style = Style::new().fg(compaction_boundary_color(&theme));
+		let right_style = Style::new().bg(theme.panel);
+		let percent_style = Style::new()
+			.fg(if self.percent >= 85.0 {
+				theme.err
+			} else if self.percent >= 50.0 {
+				theme.warn
+			} else {
+				theme.output
+			})
+			.bg(theme.panel);
+		let mut x = pc.frame.put(rect.x, rect.y + 1, &left, model_style);
+		x = pc.frame.put(x, rect.y + 1, cap, cap_style);
+		x = pc
+			.frame
+			.put(x, rect.y + 1, &rule.to_string().repeat(tick.min(boundary)), used);
+		x = pc.frame.put(x, rect.y + 1, threshold, boundary_style);
+		x = pc.frame.put(
+			x,
+			rect.y + 1,
+			&rule.to_string().repeat(boundary.saturating_sub(tick + 1)),
+			unused,
 		);
-		pc.frame.put(rect.x, rect.y + 1, &numeric, style);
+		x = pc.frame.put(x, rect.y + 1, left_cap, cap_style);
+		let split = right.find(|ch: char| ch.is_ascii_digit()).unwrap_or(right.len());
+		x = pc.frame.put(x, rect.y + 1, &right[..split], right_style);
+		pc.frame.put(x, rect.y + 1, &right[split..], percent_style);
 		if rect.height < 3 {
 			return;
 		}
-		let right = format!("{left_cap} {} ", self.directory);
+		let right = format!(" {} ", self.directory);
 		let boundary_width =
-			usize::from(rect.width).saturating_sub(left.chars().count() + right.chars().count());
+			usize::from(rect.width).saturating_sub(left.chars().count() + right.chars().count() + 2);
 		let width = u16::try_from(boundary_width).unwrap_or(u16::MAX);
 		let tokens = (self.percent / 100.0 * self.window as f64).round() as u64;
 		let gauge = ContextGauge::plan(
@@ -128,16 +160,26 @@ impl TuiComponent for GaugeRows {
 			Some(self.window),
 			Some(CompactionBoundaries { threshold_percent: 85.0, speculation_percent: None }),
 		);
-		let mut middle = String::with_capacity(boundary_width * 3);
+		let mut x = pc.frame.put(rect.x, rect.y + 2, &left, model_style);
+		x = pc.frame.put(x, rect.y + 2, cap, cap_style);
 		for index in 0..gauge.width() {
-			match gauge.cell(index) {
-				GaugeCell::Used | GaugeCell::Unused => middle.push(rule),
-				GaugeCell::Threshold | GaugeCell::Speculation => middle.push_str(threshold),
-				GaugeCell::Percent(text) | GaugeCell::Window(text) => middle.push_str(text),
-			}
+			x = match gauge.cell(index) {
+				GaugeCell::Used => pc.frame.put(x, rect.y + 2, &rule.to_string(), used),
+				GaugeCell::Unused => pc.frame.put(x, rect.y + 2, &rule.to_string(), unused),
+				GaugeCell::Threshold | GaugeCell::Speculation => {
+					pc.frame.put(x, rect.y + 2, threshold, boundary_style)
+				},
+				GaugeCell::Percent(text) => pc.frame.put(
+					x,
+					rect.y + 2,
+					text,
+					if gauge.overflowed() { Style::new().fg(theme.err) } else { used },
+				),
+				GaugeCell::Window(text) => pc.frame.put(x, rect.y + 2, text, boundary_style),
+			};
 		}
-		pc.frame
-			.put(rect.x, rect.y + 2, &format!("{left}{middle}{right}"), style);
+		x = pc.frame.put(x, rect.y + 2, left_cap, cap_style);
+		pc.frame.put(x, rect.y + 2, &right, model_style);
 	}
 }
 

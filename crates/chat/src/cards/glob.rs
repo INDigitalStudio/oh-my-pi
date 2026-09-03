@@ -31,8 +31,8 @@ impl Card for GlobCard {
 					.map(|value| value as u64);
 				dom! {
 					<row gap=1 pad-x=1>
-						<i:pending/><text bold>{"Glob:"}</text><text>{query}</text>
-						if let Some(limit) = limit { <text>{sf!("limit:{limit}")}</text> }
+						<i:pending fg=output/><text>{"Glob:"}</text><text fg=output>{query}</text>
+						if let Some(limit) = limit { <text fg=muted>{sf!("limit:{limit}")}</text> }
 						if let Some(badge) = elapsed_badge(view) { {badge} }
 					</row>
 				}
@@ -73,14 +73,14 @@ fn render_done(view: &CardView<'_>, query: &str, expanded: bool) -> Component {
 	dom! {
 		<col pad-x=1>
 			<row gap=1>
-				<i:search/><text bold>{"Glob:"}</text><text>{query}</text><text>{&count}</text><text>{"files"}</text>
-				<text fg=muted>{"· in"}</text><text>{scope}</text>
+				<i:search/><text>{"Glob:"}</text><text fg=output>{query}</text>
+				<text fg=muted>{sf!("{count} files · in {scope}")}</text>
 			</row>
 			<col>
 				for (index, file) in files.iter().take(shown).enumerate() {
 					<row gap=1>
-						if index + 1 == shown && hidden == 0 { <i:tree-last/> } else { <i:tree-branch/> }
-						<icon name={path_language_icon(file_path(file))}/><text>{file_path(file)}</text>
+						if index + 1 == shown && hidden == 0 { <i:tree-last fg=muted/> } else { <i:tree-branch fg=muted/> }
+						<icon name={path_language_icon(file_path(file))} fg=output/><text fg=output href={super::file_link(file_path(file))}>{file_path(file)}</text>
 					</row>
 				}
 				if hidden > 0 {
@@ -96,7 +96,7 @@ fn render_failed(view: &CardView<'_>) -> Component {
 	let fault = typed_fault::<omp_tools::glob::Fault>(view)
 		.or_else(|| diag_text(view.diag))
 		.unwrap_or_else(|| Str::new_static("glob failed"));
-	dom! { <row gap=1 pad-x=1><i:error/><text bold>{"Error:"}</text><text fg=err>{fault}</text></row> }
+	dom! { <row gap=1 pad-x=1 fg=err><i:error/><text>{sf!("Error: {fault}")}</text></row> }
 		.into_component()
 }
 

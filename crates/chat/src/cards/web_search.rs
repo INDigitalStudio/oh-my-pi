@@ -38,16 +38,18 @@ impl Card for WebSearchCard {
 				.filter(|provider| !provider.is_empty());
 			let error = typed_fault::<omp_tools::web_search::Fault>(view)
 				.unwrap_or_else(|| omp_core::Str::new_static("search failed"));
-			let title = format!(
-				"{} Web Search{}",
-				ui.charset.icon_named("error").unwrap_or_default(),
-				provider.map_or_else(String::new, |provider| format!(": {provider}")),
-			);
-			return dom! { <box border=round title={title} title_pad=3 pad="0 1"><text>{format!("Error: {error}")}</text></box> }.into_component();
+			return dom! {
+				<box border=round bc=err bg=error_surface bleed title_pad=3 pad="0 1">
+					<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Web Search"}</text>
+						if let Some(provider) = provider { <text>{":"}</text><text fg=output wrap=pre>{format!(" {provider}")}</text> }
+					</row>
+					<text fg=err>{format!("Error: {error}")}</text>
+				</box>
+			}.into_component();
 		}
 		let Some(_typed) = typed_result::<omp_tools::web_search::Payload>(view) else {
 			return dom! {
-				<row gap=1><i:pending/><text>{format!("Web Search: {query}")}</text>
+				<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Web Search"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {query}")}</text>
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 			}
@@ -66,11 +68,7 @@ impl Card for WebSearchCard {
 			.and_then(Value::as_array)
 			.cloned()
 			.unwrap_or_default();
-		let title = format!(
-			"{} Web Search: {provider} {} sources",
-			ui.charset.icon_named("web-search").unwrap_or_default(),
-			sources.len()
-		);
+		let source_count = format!("{} sources", sources.len());
 		let answer = result
 			.get("answer")
 			.and_then(Value::as_str)
@@ -124,10 +122,7 @@ impl Card for WebSearchCard {
 				.and_then(Value::as_str)
 				.map(domain_of)
 				.filter(|domain| !domain.is_empty());
-			let head = match domain {
-				Some(domain) => sf!("{prefix} {name} ({domain})"),
-				None => sf!("{prefix} {name}"),
-			};
+			let href = source.get("url").and_then(Value::as_str).unwrap_or_default();
 			let age = source_age(source).map(|age| match age {
 				SourceAge::Relative(ms) => {
 					dom! { <row gap=1 fg=muted><text>{"·"}</text><time kind="relative" ms={ms}/></row> }
@@ -140,9 +135,10 @@ impl Card for WebSearchCard {
 			});
 			source_rows.push(
 				dom! {
-					<row gap=1>
-						<text>{head}</text>
-						if let Some(age) = age { {age} }
+					<row gap=0>
+						<text fg=muted wrap=pre>{format!("{prefix} ")}</text><text fg=accent href={href} wrap=pre>{name}</text>
+						if let Some(domain) = domain { <text fg=muted wrap=pre>{format!(" ({domain})")}</text> }
+						if let Some(age) = age { <text>{" "}</text>{age} }
 					</row>
 				}
 				.into_component(),
@@ -160,7 +156,7 @@ impl Card for WebSearchCard {
 		} else {
 			Str::new(answer)
 		};
-		let query = format!("Query: {query}");
+		let query = query.to_owned();
 		let provider_line = format!(
 			"Provider: {} @ {provider} (API)",
 			result
@@ -169,16 +165,19 @@ impl Card for WebSearchCard {
 				.unwrap_or_default(),
 		);
 		dom! {
-			<box border=round title={title} title_pad=3 pad="0 1">
+			<box border=round bc=muted bg=panel bleed title_pad=3 pad="0 1">
+				<row kind=title gap=0><i:web-search fg=accent/><text>{" "}</text><text fg=accent>{"Web Search"}</text><text>{":"}</text>
+					<text fg=output wrap=pre>{format!(" {provider}")}</text><text fg=muted wrap=pre>{format!(" {source_count}")}</text>
+				</row>
 				<col>
-					<text>{query}</text>
-					<hr title="Answer" title_pad=3/>
+					<row gap=0><text fg=output>{"Query:"}</text><text wrap=pre>{format!(" {query}")}</text></row>
+					<hr title="Answer" title_pad=3 bc=muted/>
 					<pre>{answer}</pre>
-					<hr title="Sources" title_pad=3/>
+					<hr title="Sources" title_pad=3 bc=muted/>
 					{source_rows}
-					<hr title="Metadata" title_pad=3/>
-					<text>{provider_line}</text>
-					<text>{usage_text}</text>
+					<hr title="Metadata" title_pad=3 bc=muted/>
+					<text fg=output>{provider_line}</text>
+					<text fg=output>{usage_text}</text>
 				</col>
 			</box>
 		}

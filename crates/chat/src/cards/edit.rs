@@ -6,8 +6,8 @@ use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
 use super::{
-	Card, CardStatus, CardView, Component, elapsed_badge, path_language_icon, typed_fault,
-	typed_input, typed_result,
+	Card, CardStatus, CardView, Component, elapsed_badge, file_link, path_language_icon,
+	typed_fault, typed_input, typed_result,
 };
 
 /// Card for `edit` calls.
@@ -110,12 +110,18 @@ fn render_section(
 	} else {
 		Str::default()
 	};
-	let title = sf!("Edit: {} {path}{stats}", icon(ui, path_language_icon(path)));
+	let href = file_link(path);
 	dom! {
-		<box border=round title_pad=3>
-			<row kind=title gap=1 bold>
-				if !lead.is_empty() { <text bold>{lead}</text> }
-				<text bold>{title}</text>
+		<box border=round bc={if fault.is_some() { "err" } else { "border" }} bg={if fault.is_some() { "error_surface" } else { "panel" }} bleed title_pad=3>
+			<row kind=title gap=0>
+				if !lead.is_empty() { <text fg={if fault.is_some() { "err" } else { "accent" }}>{lead}</text><text>{" "}</text> }
+				<text fg=accent>{"Edit"}</text><text>{":"}</text><text>{" "}</text>
+				<icon name={path_language_icon(path)} fg=output/><text>{" "}</text>
+				<text fg=accent href={href}>{path}</text>
+				if !stats.is_empty() {
+					<text>{" "}</text><text fg=muted>{"⟨"}</text><text fg=info>{sf!("+{added}")}</text>
+					<text fg=muted>{"/"}</text><text fg=err>{sf!("-{removed}")}</text><text fg=muted>{"⟩"}</text>
+				}
 				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
 			if let Some(fault) = fault {
@@ -136,15 +142,17 @@ fn render_section(
 	.into_component()
 }
 
-fn render_delete(view: &CardView<'_>, path: &str, ui: &UiContext) -> Component {
+fn render_delete(view: &CardView<'_>, path: &str, _ui: &UiContext) -> Component {
 	if matches!(view.status, CardStatus::Failed) {
 		let fault = typed_fault::<omp_tools::edit::Fault>(view)
 			.or_else(|| diag_text(view.diag))
 			.unwrap_or_else(|| Str::new_static("delete failed"));
-		let title =
-			sf!("{} Delete: {} {path}", icon(ui, "error"), icon(ui, path_language_icon(path)));
+		let href = file_link(path);
 		return dom! {
-			<box border=round bc=err title={title} title_pad=3>
+			<box border=round bc=err bg=error_surface bleed title_pad=3>
+				<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Delete"}</text><text>{":"}</text><text>{" "}</text>
+					<icon name={path_language_icon(path)} fg=output/><text>{" "}</text><text fg=accent href={href}>{path}</text>
+				</row>
 				<text fg=err wrap=word>{fault}</text>
 			</box>
 		}
@@ -153,26 +161,27 @@ fn render_delete(view: &CardView<'_>, path: &str, ui: &UiContext) -> Component {
 	let done = matches!(view.status, CardStatus::Done);
 	let lang = path_language_icon(path);
 	dom! {
-		<row gap=1>
-			if done { <i:delete/> } else { <i:pending/> }
-			<text bold>{"Delete:"}</text><icon name={lang}/><text>{path}</text>
+		<row gap=0>
+			if done { <i:delete fg=accent/> } else { <i:pending fg=output/> }
+			<text>{" "}</text><text fg=accent>{"Delete"}</text><text>{":"}</text><text>{" "}</text>
+			<icon name={lang} fg=output/><text>{" "}</text><text fg=accent href={file_link(path)}>{path}</text>
 		</row>
 	}
 	.into_component()
 }
 
-fn render_move(view: &CardView<'_>, source: &str, destination: &str, ui: &UiContext) -> Component {
+fn render_move(view: &CardView<'_>, source: &str, destination: &str, _ui: &UiContext) -> Component {
 	if matches!(view.status, CardStatus::Failed) {
 		let fault = typed_fault::<omp_tools::edit::Fault>(view)
 			.or_else(|| diag_text(view.diag))
 			.unwrap_or_else(|| Str::new_static("move failed"));
-		let title = sf!(
-			"{} Edit: {} {source} → {destination}",
-			icon(ui, "error"),
-			icon(ui, path_language_icon(source))
-		);
 		return dom! {
-			<box border=round bc=err title={title} title_pad=3>
+			<box border=round bc=err bg=error_surface bleed title_pad=3>
+				<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Edit"}</text><text>{":"}</text><text>{" "}</text>
+					<icon name={path_language_icon(source)} fg=output/><text>{" "}</text>
+					<text fg=accent href={file_link(source)} wrap=pre>{source}</text><text fg=muted wrap=pre>{" → "}</text>
+					<text fg=accent href={file_link(destination)} wrap=pre>{destination}</text>
+				</row>
 				<text fg=err wrap=word>{fault}</text>
 			</box>
 		}
@@ -181,10 +190,11 @@ fn render_move(view: &CardView<'_>, source: &str, destination: &str, ui: &UiCont
 	let done = matches!(view.status, CardStatus::Done);
 	let lang = path_language_icon(source);
 	dom! {
-		<row gap=1>
-			if done { <i:move/> } else { <i:pending/> }
-			<text bold>{"Move:"}</text><icon name={lang}/><text>{source}</text>
-			<text fg=muted>{"→"}</text><text>{destination}</text>
+		<row gap=0>
+			if done { <i:move fg=accent/> } else { <i:pending fg=output/> }
+			<text>{" "}</text><text fg=accent>{"Move"}</text><text>{":"}</text><text>{" "}</text><icon name={lang} fg=output/><text>{" "}</text>
+			<text fg=accent href={file_link(source)} wrap=pre>{source}</text>
+			<text fg=muted wrap=pre>{" → "}</text><text fg=accent href={file_link(destination)} wrap=pre>{destination}</text>
 		</row>
 	}
 	.into_component()

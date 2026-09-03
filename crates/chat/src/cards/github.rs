@@ -17,24 +17,18 @@ impl Card for GithubCard {
 		"github"
 	}
 
-	fn render(&self, view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Component {
+	fn render(&self, view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::github::Params>(view).unwrap_or(Value::Null);
 		let op = args
 			.get("op")
 			.cloned()
 			.and_then(|value| serde_json::from_value::<Operation>(value).ok());
-		let mut heading = String::from("GitHub");
-		if let Some(title) = op.and_then(|op| op.get_message()) {
-			heading.push(' ');
-			heading.push_str(title);
-		}
-		for (index, item) in operation_meta(op, &args).iter().enumerate() {
-			heading.push_str(if index == 0 { " " } else { " · " });
-			heading.push_str(item);
-		}
+		let action = op
+			.and_then(|op| op.get_message())
+			.map_or_else(|| "GitHub".to_owned(), |title| format!("GitHub {title}"));
+		let detail = operation_meta(op, &args).join(" · ");
 		match view.status.as_str() {
 			"ok" => {
-				let title = format!("{} {heading}", ui.charset.icon_named("gh").unwrap_or_default());
 				let output = result_value(view)
 					.and_then(|value| {
 						value
@@ -48,16 +42,24 @@ impl Card for GithubCard {
 							.map(str::to_owned)
 					})
 					.unwrap_or_default();
-				dom! { <box border=round title={title} title_pad=3 pad="0 1"><pre>{output}</pre></box> }
-					.into_component()
+				dom! {
+					<box border=round bc=border title_pad=3 pad="0 1">
+						<row kind=title gap=1><i:gh fg=accent/><text fg=accent>{action}</text><text fg=muted>{detail}</text></row>
+						<pre fg=output>{output}</pre>
+					</box>
+				}.into_component()
 			},
 			"error" => {
-				let title = format!("{} {heading}", ui.charset.icon_named("error").unwrap_or_default());
 				let fault = failure(view);
-				dom! { <box border=round title={title} title_pad=3 pad="0 1"><text>{fault}</text></box> }.into_component()
+				dom! {
+					<box border=round bc=err title_pad=3 pad="0 1">
+						<row kind=title gap=1><i:error fg=err/><text fg=err>{action}</text><text fg=muted>{detail}</text></row>
+						<text fg=err>{fault}</text>
+					</box>
+				}.into_component()
 			},
 			_ => dom! {
-				<row gap=1><i:pending/><text>{heading}</text>
+				<row gap=1><i:pending fg=output/><text fg=accent>{action}</text><text fg=muted>{detail}</text>
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 			}

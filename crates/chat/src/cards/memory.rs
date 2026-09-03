@@ -48,12 +48,12 @@ fn render_recall(view: &CardView<'_>, expanded: bool) -> Component {
 	let query = field(&args, "query").unwrap_or_default();
 	if failed(view) {
 		let message = failure(view);
-		return dom! { <row gap=1><i:error/><text>{format!("Error: {message}")}</text></row> }
+		return dom! { <row gap=1 fg=err><i:error/><text>{format!("Error: {message}")}</text></row> }
 			.into_component();
 	}
 	let Some(result) = typed_result::<omp_tools::memory::RecallPayload>(view) else {
 		return dom! {
-			<row gap=1><i:pending/><text>{format!("Recall: {query}")}</text>
+			<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Recall"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {query}")}</text>
 				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
 		}
@@ -70,16 +70,13 @@ fn render_recall(view: &CardView<'_>, expanded: bool) -> Component {
 	// expanded bodies stop at `PREVIEW_LIMITS.OUTPUT_EXPANDED`.
 	let found = items.len();
 	let hidden = found.saturating_sub(RECALL_EXPANDED_ITEMS);
-	let title = if found == 0 {
-		format!("Recall: {result_query} no matches")
-	} else {
-		format!("Recall: {result_query} {found} found")
-	};
+	let summary =
+		if found == 0 { "no matches".to_owned() } else { format!("{found} found") };
 	dom! {
 		<col>
-			<row gap=1>
-				if found == 0 { <i:warning-status/> } else { <icon name="memory-tool"/> }
-				<text>{title}</text>
+			<row gap=0>
+				if found == 0 { <i:warning-status fg=warn/> } else { <icon name="memory-tool" fg=accent/> }
+				<text>{" "}</text><text fg=accent>{"Recall"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {result_query}")}</text><text fg=muted wrap=pre>{format!(" {summary}")}</text>
 			</row>
 			if found > 0 {
 				if expanded {
@@ -112,12 +109,12 @@ fn render_reflect(view: &CardView<'_>, expanded: bool) -> Component {
 	.unwrap_or_default();
 	if failed(view) {
 		let message = failure(view);
-		return dom! { <row gap=1><i:error/><text>{format!("Error: {message}")}</text></row> }
+		return dom! { <row gap=1 fg=err><i:error/><text>{format!("Error: {message}")}</text></row> }
 			.into_component();
 	}
 	let Some(result) = typed_result::<omp_tools::memory::ReflectPayload>(view) else {
 		return dom! {
-			<row gap=1><i:pending/><text>{format!("Reflect: {query}")}</text>
+			<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Reflect"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {query}")}</text>
 				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
 		}
@@ -132,8 +129,8 @@ fn render_reflect(view: &CardView<'_>, expanded: bool) -> Component {
 	};
 	dom! {
 		<col>
-			<row gap=1><icon name="memory-tool"/><text>{format!("Reflect: {query}")}</text></row>
-			for line in lines.iter().take(shown) { <text pad-x=2>{*line}</text> }
+			<row gap=0><icon name="memory-tool" fg=accent/><text>{" "}</text><text fg=accent>{"Reflect"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {query}")}</text></row>
+			for line in lines.iter().take(shown) { <text pad-x=2 fg=output>{*line}</text> }
 			if shown < lines.len() {
 				<text pad-x=2 fg=muted>{format!("… {} more lines ⟨Ctrl+O: Expand⟩", lines.len() - shown)}</text>
 			}
@@ -147,7 +144,7 @@ fn render_retain(view: &CardView<'_>) -> Component {
 		typed_input::<omp_tools::memory::RetainParams>(view).unwrap_or_else(|| partial_input(view));
 	if failed(view) {
 		let message = failure(view);
-		return dom! { <row gap=1><i:error/><text>{format!("Error: {message}")}</text></row> }
+		return dom! { <row gap=1 fg=err><i:error/><text>{format!("Error: {message}")}</text></row> }
 			.into_component();
 	}
 	let items = args
@@ -156,20 +153,17 @@ fn render_retain(view: &CardView<'_>) -> Component {
 		.cloned()
 		.unwrap_or_default();
 	let settled = view.result::<omp_tools::memory::RetainPayload>().is_some();
-	let title = if settled {
-		format!("Retain {} memories stored", items.len())
-	} else {
-		"Retain".to_owned()
-	};
+	let summary = settled.then(|| format!("{} memories stored", items.len()));
 	dom! {
 		<col>
 			<row gap=1>
-				if settled { <icon name="memory-tool"/> } else { <i:pending/> }
-				<text>{title}</text>
+				if settled { <icon name="memory-tool" fg=accent/> } else { <i:pending fg=output/> }
+				<text fg=accent>{"Retain"}</text>
+				if let Some(summary) = summary { <text fg=muted>{summary}</text> }
 				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
 			for item in &items {
-				<row gap=1 pad-x=2><i:enabled/><text>{field(item, "content").unwrap_or_default()}</text></row>
+				<row gap=1 pad-x=2><i:enabled fg=ok/><text fg=output>{field(item, "content").unwrap_or_default()}</text></row>
 			}
 		</col>
 	}

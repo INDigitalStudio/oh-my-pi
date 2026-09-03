@@ -112,22 +112,22 @@ impl Card for BrowserCard {
 			CardStatus::Failed => format!("{} tab \"{name}\"", icon(ui, "error")),
 		};
 		dom! {
-			<box border=round pad-x=1 title_pad=3>
-				<row kind=title gap=1 bold>
+			<box border=round bc={if view.status == CardStatus::Failed { "err" } else if live { "accent" } else { "muted" }} bg={if view.status == CardStatus::Failed { "error_surface" } else { "panel" }} bleed pad-x=1 title_pad=3>
+				<row kind=title gap=1>
 					if live { <spinner kind=status/> }
-					<text bold>{state}</text>
-					if !url.is_empty() { <text bold>{"·"}</text><text bold>{url}</text> }
-					if !kind.is_empty() { <text bold>{"·"}</text><text bold>{kind}</text> }
+					<text fg={if view.status == CardStatus::Failed { "err" } else { "output" }}>{state}</text>
+					if !url.is_empty() { <text fg=muted>{"·"}</text><text fg=muted>{url}</text> }
+					if !kind.is_empty() { <text fg=muted>{"·"}</text><text fg=muted>{kind}</text> }
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
-				if !code.is_empty() { <pre>{code}</pre> }
+				if !code.is_empty() { <pre path="cell.js">{code}</pre> }
 				if matches!(view.status, CardStatus::Done | CardStatus::Failed) {
-					<hr title="Output" title_pad=3/>
+					<hr title="Output" title_pad=3 bc={if view.status == CardStatus::Failed { "err" } else { "muted" }}/>
 					if let Some(fault) = fault {
-						<pre>{fault}</pre>
+						<pre fg=err>{fault}</pre>
 					} else {
-						for displayed in displayed { <pre>{displayed}</pre> }
-						if let Some(returned) = returned { <pre>{returned}</pre> }
+						for displayed in displayed { <pre fg=ok>{displayed}</pre> }
+						if let Some(returned) = returned { <pre fg=output>{returned}</pre> }
 						if expanded { {artifacts} }
 					}
 				}

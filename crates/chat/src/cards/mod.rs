@@ -37,7 +37,7 @@ pub use generic::GenericCard;
 use omp_core::{Str, sf};
 use omp_dom::{Node, PropId};
 use omp_tool::{ArgPath, CallOutcome};
-use omp_tui::{Graphics, IntoComponent as _, Prop, UiContext, dom};
+use omp_tui::{Graphics, IntoComponent as _, UiContext, dom};
 use serde::de::DeserializeOwned;
 
 /// A boxed retained TUI component.
@@ -55,6 +55,14 @@ pub(crate) const INLINE_IMAGE_MAX_ROWS: u16 = 20;
 /// `TERMINAL.imageProtocol`): Kitty, Sixel, or iTerm2 graphics.
 pub(crate) const fn inline_images(ui: &UiContext) -> bool {
 	!matches!(ui.graphics, Graphics::Cells)
+}
+
+/// Builds an absolute `file://` target for a project-relative card path.
+pub(crate) fn file_link(path: &str) -> Str {
+	std::path::absolute(path).map_or_else(
+		|_| sf!("file://{path}"),
+		|absolute| sf!("file://{}", absolute.display()),
+	)
 }
 
 /// pi `imageFallback`: `[Image: <name> [<mime>] <WxH>]`, the text stand-in
@@ -584,53 +592,10 @@ impl CardRegistry {
 		expanded: bool,
 		ui: &UiContext,
 	) -> Component {
-		let mut component = self.cards.get(tool).map_or_else(
+		self.cards.get(tool).map_or_else(
 			|| self.fallback.render_named(tool, view, expanded, ui),
 			|card| card.render(view, expanded, ui),
-		);
-		style_tool_surfaces(component.as_mut(), view.status, "output");
-		component
-	}
-}
-
-fn style_tool_surfaces(
-	component: &mut dyn omp_tui::Component,
-	status: CardStatus,
-	inherited: &'static str,
-) {
-	let role = if component
-		.props()
-		.str_of(Prop::Kind)
-		.is_some_and(|kind| kind == "title")
-	{
-		"accent"
-	} else {
-		inherited
-	};
-	component.props_mut().set(Prop::Bold, false);
-	component.props_mut().set(Prop::Italic, false);
-	if !component.props().contains(Prop::Fg) && !component.kind().ends_with("::Icon") {
-		component.props_mut().set(Prop::Fg, role);
-	}
-	if component.props().border().is_some() {
-		let props = component.props_mut();
-		props.set(Prop::Fg, "output");
-		props.set(
-			Prop::Bg,
-			if status == CardStatus::Failed {
-				"error_surface"
-			} else {
-				"panel"
-			},
-		);
-		props.set(Prop::Bc, match status {
-			CardStatus::StreamingArgs | CardStatus::InProgress => "accent",
-			CardStatus::Done => "border",
-			CardStatus::Failed => "err",
-		});
-	}
-	for child in component.children_mut() {
-		style_tool_surfaces(child.comp_mut(), status, role);
+		)
 	}
 }
 

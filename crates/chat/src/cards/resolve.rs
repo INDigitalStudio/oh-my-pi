@@ -102,8 +102,10 @@ fn render_resolution(view: &CardView<'_>, action: Action, _ui: &UiContext) -> Co
 		CardStatus::StreamingArgs | CardStatus::InProgress => {
 			let reason = reason(view);
 			dom! {
-				<row gap=1><i:pending/><text>{sf!("Resolve: {} {}", action.name(), action.badge())}</text>
-					if let Some(reason) = reason { <text fg=muted>{reason}</text> }
+				<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Resolve"}</text><text>{":"}</text>
+					<text fg=output wrap=pre>{format!(" {}", action.name())}</text><text>{" "}</text>
+					<text fg={if action == Action::Apply { "ok" } else { "warn" }}>{action.badge()}</text>
+					if let Some(reason) = reason { <text fg=output>{sf!(" {reason}")}</text> }
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 			}
@@ -131,11 +133,11 @@ fn render_resolution(view: &CardView<'_>, action: Action, _ui: &UiContext) -> Co
 				<col fg={color}>
 					<spacer h=1/>
 					<row gap=1 pad-x=1>
-						if action == Action::Apply && !failed { <i:resolve/> } else { <i:error/> }
-						<text bold>{header}</text>
+						if action == Action::Apply && !failed { <i:resolve fg={color}/> } else { <i:error fg={color}/> }
+						<text>{header}</text>
 					</row>
 					<spacer h=1/>
-					<text pad-x=1 italic>{reason}</text>
+					<text pad-x=1>{reason}</text>
 					<spacer h=1/>
 				</col>
 			}
