@@ -4,7 +4,10 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use futures::{FutureExt, future::BoxFuture};
+use futures::{
+	FutureExt,
+	future::{BoxFuture, Either},
+};
 use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
@@ -16,6 +19,7 @@ use zeroize::Zeroizing;
 
 use super::super::{
 	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthEngine,
+	OAuthRefreshFuture,
 	OAuthError, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthPkceSpec, OAuthTokenSet,
 	PkceCompletion,
 };
@@ -100,13 +104,15 @@ impl OAuthCustomHandler for GoogleAntigravityHandler {
 		&'a self,
 		spec: &'a OAuthCustomSpec,
 		refresh_token: SecretString,
-	) -> BoxFuture<'a, Result<OAuthTokenSet, OAuthError>> {
-		async move {
-			OAuthEngine::new(self.http.as_ref(), self.clock.as_ref())
-				.refresh(&spec.client, refresh_token)
-				.await
-		}
-		.boxed()
+	) -> OAuthRefreshFuture<'a> {
+		Either::Right(
+			async move {
+				OAuthEngine::new(self.http.as_ref(), self.clock.as_ref())
+					.refresh(&spec.client, refresh_token)
+					.await
+			}
+			.boxed(),
+		)
 	}
 }
 

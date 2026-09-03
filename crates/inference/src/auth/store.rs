@@ -11,7 +11,6 @@ use std::{
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use futures::future::{BoxFuture, FutureExt};
 use omp_core::{ExposeSecret, Secret, SecretBox, SecretString, Str, sf};
 use ring::hmac;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -22,7 +21,8 @@ use super::{
 	crypto::{CryptoError, EncryptedBlob, SecretContext, decrypt, encrypt},
 	key::{EncryptionKey, KeyError, KeyId, KeySource},
 	lease::{
-		AuthRejection, CredentialError, CredentialLease, CredentialNeed, CredentialSource, LeaseMeta,
+		AuthRejection, CredentialError, CredentialFuture, CredentialLease, CredentialNeed,
+		CredentialSource, LeaseMeta, credential_ready,
 	},
 	oauth,
 	oauth::OAuthError,
@@ -1156,80 +1156,86 @@ impl CredentialStore {
 	}
 }
 
+impl StoredCredentialSource {
+	/// Reads one lease from the encrypted store; SQLite access is synchronous
+	/// so the answer is known before any future is returned.
+	fn lease_now(&self, need: CredentialNeed) -> Result<CredentialLease, CredentialError> {
+		let account = need.account.ok_or(CredentialError::Unavailable)?;
+		if let Ok(stored) = self.store.load_oauth_bundle(&account) {
+			let lease = oauth::lease_stored_bundle(stored, need.valid_after)?;
+			if need
+				.principal
+				.as_ref()
+				.is_some_and(|principal| principal != &lease.meta().principal)
+			{
+				return Err(CredentialError::Unavailable);
+			}
+			return Ok(lease);
+		}
+		let stored = self.store.get(&account).map_err(|error| match error {
+			StoreError::NotFound => CredentialError::Unavailable,
+			_ => CredentialError::SourceFailure,
+		})?;
+		if need
+			.principal
+			.as_ref()
+			.is_some_and(|principal| principal != &stored.metadata.principal_id)
+		{
+			return Err(CredentialError::Unavailable);
+		}
+		let expires_at = stored
+			.metadata
+			.expires_at_ms
+			.map(system_time_from_ms)
+			.transpose()
+			.map_err(|_| CredentialError::SourceFailure)?;
+		if expires_at.is_some_and(|expires_at| expires_at <= need.valid_after) {
+			return Err(CredentialError::Expired);
+		}
+		let material = String::from_utf8(stored.secret.expose_secret().clone())
+			.map_err(|_| CredentialError::SourceFailure)?;
+		let meta = LeaseMeta {
+			account: stored.metadata.account_id,
+			principal: stored.metadata.principal_id,
+			generation: stored.metadata.generation,
+			expires_at,
+		};
+		let material = SecretString::from(material);
+		match stored.metadata.kind.as_str() {
+			"api-key" => Ok(CredentialLease::api_key(meta, material)),
+			"bearer" => Ok(CredentialLease::bearer(meta, material)),
+			"session-token" => Ok(CredentialLease::session_token(meta, material)),
+			_ => Err(CredentialError::InvalidSource),
+		}
+	}
+
+	fn reject_now(&self, lease: &CredentialLease) -> Result<(), CredentialError> {
+		let metadata = self
+			.store
+			.metadata(&lease.meta().account)
+			.map_err(|_| CredentialError::SourceFailure)?
+			.ok_or(CredentialError::Unavailable)?;
+		if metadata.generation != lease.meta().generation {
+			return Err(CredentialError::StaleGeneration);
+		}
+		Ok(())
+	}
+}
+
 impl CredentialSource for StoredCredentialSource {
 	fn lease(
 		&self,
 		need: CredentialNeed,
-	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
-		async move {
-			let account = need.account.ok_or(CredentialError::Unavailable)?;
-			if let Ok(stored) = self.store.load_oauth_bundle(&account) {
-				let lease = oauth::lease_stored_bundle(stored, need.valid_after)?;
-				if need
-					.principal
-					.as_ref()
-					.is_some_and(|principal| principal != &lease.meta().principal)
-				{
-					return Err(CredentialError::Unavailable);
-				}
-				return Ok(lease);
-			}
-			let stored = self.store.get(&account).map_err(|error| match error {
-				StoreError::NotFound => CredentialError::Unavailable,
-				_ => CredentialError::SourceFailure,
-			})?;
-			if need
-				.principal
-				.as_ref()
-				.is_some_and(|principal| principal != &stored.metadata.principal_id)
-			{
-				return Err(CredentialError::Unavailable);
-			}
-			let expires_at = stored
-				.metadata
-				.expires_at_ms
-				.map(system_time_from_ms)
-				.transpose()
-				.map_err(|_| CredentialError::SourceFailure)?;
-			if expires_at.is_some_and(|expires_at| expires_at <= need.valid_after) {
-				return Err(CredentialError::Expired);
-			}
-			let material = String::from_utf8(stored.secret.expose_secret().clone())
-				.map_err(|_| CredentialError::SourceFailure)?;
-			let meta = LeaseMeta {
-				account: stored.metadata.account_id,
-				principal: stored.metadata.principal_id,
-				generation: stored.metadata.generation,
-				expires_at,
-			};
-			let material = SecretString::from(material);
-			match stored.metadata.kind.as_str() {
-				"api-key" => Ok(CredentialLease::api_key(meta, material)),
-				"bearer" => Ok(CredentialLease::bearer(meta, material)),
-				"session-token" => Ok(CredentialLease::session_token(meta, material)),
-				_ => Err(CredentialError::InvalidSource),
-			}
-		}
-		.boxed()
+	) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>> {
+		credential_ready(self.lease_now(need))
 	}
 
 	fn reject<'a>(
 		&'a self,
 		lease: &'a CredentialLease,
 		_evidence: AuthRejection,
-	) -> BoxFuture<'a, Result<(), CredentialError>> {
-		async move {
-			let metadata = self
-				.store
-				.metadata(&lease.meta().account)
-				.map_err(|_| CredentialError::SourceFailure)?
-				.ok_or(CredentialError::Unavailable)?;
-			if metadata.generation != lease.meta().generation {
-				return Err(CredentialError::StaleGeneration);
-			}
-			Ok(())
-		}
-		.boxed()
+	) -> CredentialFuture<'a, Result<(), CredentialError>> {
+		credential_ready(self.reject_now(lease))
 	}
 }
 

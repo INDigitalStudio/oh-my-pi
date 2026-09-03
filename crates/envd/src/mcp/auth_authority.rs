@@ -7,9 +7,9 @@ use omp_catalog::AuthSpecId;
 use omp_core::{ExposeSecret as _, Hash32, SecretBox, SecretString, Str};
 use omp_inference::{
 	auth::{
-		AuditedCredentialReveal, AuthRejection, CredentialError, CredentialLease, CredentialNeed,
-		CredentialOrigin, CredentialSource, CredentialStore, CredentialWrite, StoreError,
-		StoredCredentialSource,
+		AuditedCredentialReveal, AuthRejection, CredentialError, CredentialFuture, CredentialLease,
+		CredentialNeed, CredentialOrigin, CredentialSource, CredentialStore, CredentialWrite,
+		StoreError, StoredCredentialSource,
 	},
 	id::{AccountId, PrincipalId},
 };
@@ -76,7 +76,7 @@ pub trait CredentialAuthority: CredentialSource {
 	fn provider_lease(
 		&self,
 		need: CredentialNeed,
-	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>>;
+	) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>>;
 
 	/// Issues an MCP lease pinned to session-safe affinity.
 	fn mcp_lease<'a>(
@@ -280,7 +280,7 @@ impl CredentialAuthority for CombinedAuthAuthority {
 	fn provider_lease(
 		&self,
 		need: CredentialNeed,
-	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
+	) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>> {
 		self.stored.lease(need)
 	}
 
@@ -310,7 +310,7 @@ impl CredentialSource for CombinedAuthAuthority {
 	fn lease(
 		&self,
 		need: CredentialNeed,
-	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
+	) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>> {
 		self.stored.lease(need)
 	}
 
@@ -318,7 +318,7 @@ impl CredentialSource for CombinedAuthAuthority {
 		&'a self,
 		lease: &'a CredentialLease,
 		evidence: AuthRejection,
-	) -> BoxFuture<'a, Result<(), CredentialError>> {
+	) -> CredentialFuture<'a, Result<(), CredentialError>> {
 		self.stored.reject(lease, evidence)
 	}
 }

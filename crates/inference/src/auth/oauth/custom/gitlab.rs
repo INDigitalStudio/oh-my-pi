@@ -4,7 +4,10 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use futures::{FutureExt, future::BoxFuture};
+use futures::{
+	FutureExt,
+	future::{BoxFuture, Either},
+};
 use omp_catalog::provider::OAuthExchangeKind;
 use omp_core::{ExposeSecret, SecretString, Str, base64_url, sf};
 use serde::Deserialize;
@@ -20,6 +23,7 @@ use crate::{
 	answer::{AuthEvent, AuthPrompt, AuthPromptKind},
 	auth::{
 		LoginDriver, OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler,
+		OAuthRefreshFuture,
 		OAuthCustomSpec, OAuthEntropy, OAuthError, OAuthHttpClient, OAuthRefreshSpec, OAuthTokenSet,
 		SystemEntropySource,
 	},
@@ -192,32 +196,34 @@ impl OAuthCustomHandler for GitlabExternalRedirectHandler {
 		&'a self,
 		spec: &'a OAuthCustomSpec,
 		refresh_token: SecretString,
-	) -> BoxFuture<'a, Result<OAuthTokenSet, OAuthError>> {
-		async move {
-			let (url, parameters) = match &spec.client.refresh {
-				OAuthRefreshSpec::Unsupported => return Err(OAuthError::RefreshUnsupported),
-				OAuthRefreshSpec::TokenEndpoint => {
-					(spec.client.token_url.as_str(), spec.client.token_params.as_slice())
-				},
-				OAuthRefreshSpec::Endpoint { url, parameters } => (url.as_str(), parameters.as_slice()),
-			};
-			let redirect_uri = catalog_redirect_uri(spec)?;
-			let fields = [
-				("grant_type", FormValue::Public("refresh_token")),
-				("client_id", FormValue::Public(&spec.client.client_id)),
-				("redirect_uri", FormValue::Public(redirect_uri)),
-				("refresh_token", FormValue::Secret(refresh_token.expose_secret())),
-			];
-			let response = self
-				.http
-				.execute(form_request(url, &fields, parameters)?)
-				.await?;
-			if !(200..300).contains(&response.status) {
-				return Err(provider_error(response.status, &response.body, true));
+	) -> OAuthRefreshFuture<'a> {
+		Either::Right(
+			async move {
+				let (url, parameters) = match &spec.client.refresh {
+					OAuthRefreshSpec::Unsupported => return Err(OAuthError::RefreshUnsupported),
+					OAuthRefreshSpec::TokenEndpoint => {
+						(spec.client.token_url.as_str(), spec.client.token_params.as_slice())
+					},
+					OAuthRefreshSpec::Endpoint { url, parameters } => (url.as_str(), parameters.as_slice()),
+				};
+				let redirect_uri = catalog_redirect_uri(spec)?;
+				let fields = [
+					("grant_type", FormValue::Public("refresh_token")),
+					("client_id", FormValue::Public(&spec.client.client_id)),
+					("redirect_uri", FormValue::Public(redirect_uri)),
+					("refresh_token", FormValue::Secret(refresh_token.expose_secret())),
+				];
+				let response = self
+					.http
+					.execute(form_request(url, &fields, parameters)?)
+					.await?;
+				if !(200..300).contains(&response.status) {
+					return Err(provider_error(response.status, &response.body, true));
+				}
+				gitlab_token_response(response, self.clock.now(), Some(refresh_token))
 			}
-			gitlab_token_response(response, self.clock.now(), Some(refresh_token))
-		}
-		.boxed()
+			.boxed(),
+		)
 	}
 }
 

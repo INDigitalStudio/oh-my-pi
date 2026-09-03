@@ -10,7 +10,7 @@ use std::{
 };
 
 use bytes::BytesMut;
-use futures::{StreamExt as _, future::BoxFuture};
+use futures::StreamExt as _;
 use http::{
 	HeaderMap, HeaderValue,
 	header::{ACCEPT, ETAG, IF_NONE_MATCH, USER_AGENT},
@@ -19,7 +19,7 @@ use omp_cache::github_cache::{GithubCache, GithubCacheKey, GithubCacheStatus, Gi
 use omp_catalog::AuthSpecId;
 use omp_core::{CowBytes, Str, sf};
 use omp_inference::{
-	auth::{CredentialError, CredentialLease, CredentialNeed, HeaderPlacement},
+	auth::{CredentialError, CredentialFuture, CredentialLease, CredentialNeed, HeaderPlacement},
 	id::{AccountId, PrincipalId},
 };
 use omp_tools::read::{Fault, resolver::Resolve, selector::ParsedSelector};
@@ -108,7 +108,7 @@ pub trait CredentialAuthority: Send + Sync + 'static {
 	fn provider_lease(
 		&self,
 		need: CredentialNeed,
-	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>>;
+	) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>>;
 }
 
 /// Late-bound projection of the one combined daemon credential authority.

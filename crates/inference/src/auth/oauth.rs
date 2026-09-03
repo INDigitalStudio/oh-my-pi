@@ -13,7 +13,7 @@ use std::{
 
 use futures::{
 	FutureExt,
-	future::{BoxFuture, Either, select},
+	future::{BoxFuture, Either, Ready, ready, select},
 };
 use http::{
 	HeaderMap, HeaderValue, Method,
@@ -113,14 +113,23 @@ pub trait OAuthCustomHandler: Send + Sync {
 	) -> BoxFuture<'a, Result<OAuthTokenSet, OAuthError>>;
 
 	/// Refreshes a token for protocols whose renewal wire shape is custom.
+	///
+	/// Protocols without renewal answer `RefreshUnsupported` without
+	/// allocating; a real refresh boxes one cold network round trip.
 	fn refresh<'a>(
 		&'a self,
 		_spec: &'a OAuthCustomSpec,
 		_refresh_token: SecretString,
-	) -> BoxFuture<'a, Result<OAuthTokenSet, OAuthError>> {
-		async { Err(OAuthError::RefreshUnsupported) }.boxed()
+	) -> OAuthRefreshFuture<'a> {
+		Either::Left(ready(Err(OAuthError::RefreshUnsupported)))
 	}
 }
+
+/// Future returned by [`OAuthCustomHandler::refresh`].
+pub type OAuthRefreshFuture<'a> = Either<
+	Ready<Result<OAuthTokenSet, OAuthError>>,
+	BoxFuture<'a, Result<OAuthTokenSet, OAuthError>>,
+>;
 
 /// Registry dispatching custom OAuth strictly by catalog exchange enum.
 #[derive(Default)]

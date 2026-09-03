@@ -84,7 +84,7 @@ impl omp_envd::github_url::CredentialAuthority for GithubCredentialAuthority {
 	fn provider_lease(
 		&self,
 		need: omp_inference::auth::CredentialNeed,
-	) -> futures::future::BoxFuture<
+	) -> omp_inference::auth::CredentialFuture<
 		'_,
 		Result<omp_inference::auth::CredentialLease, omp_inference::auth::CredentialError>,
 	> {

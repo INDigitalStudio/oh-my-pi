@@ -23,7 +23,7 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::super::{
-	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthEntropy,
+	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthRefreshFuture, OAuthEntropy,
 	OAuthError, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthTokenSet,
 	SystemEntropySource, parse_http_url, provider_error,
 };
@@ -201,38 +201,40 @@ impl OAuthCustomHandler for CursorHandler {
 		&'a self,
 		spec: &'a OAuthCustomSpec,
 		refresh_token: SecretString,
-	) -> BoxFuture<'a, Result<OAuthTokenSet, OAuthError>> {
-		async move {
-			let OAuthRefreshSpec::Endpoint { url, .. } = &spec.client.refresh else {
-				return Err(OAuthError::RefreshUnsupported);
-			};
-			let mut bearer = Zeroizing::new(String::with_capacity(
-				"Bearer ".len() + refresh_token.expose_secret().len(),
-			));
-			bearer.push_str("Bearer ");
-			bearer.push_str(refresh_token.expose_secret());
-			let mut headers = HeaderMap::new();
-			headers.insert(
-				AUTHORIZATION,
-				HeaderValue::from_bytes(bearer.as_bytes())
-					.map_err(|_| OAuthError::MalformedResponse)?,
-			);
-			headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-			let response = self
-				.http
-				.execute(OAuthHttpRequest::new(
-					Method::POST,
-					url,
-					headers,
-					Some(SecretString::from("{}".to_owned())),
-				)?)
-				.await?;
-			if !(200..300).contains(&response.status) {
-				return Err(provider_error(response.status, &response.body, true));
+	) -> OAuthRefreshFuture<'a> {
+		Either::Right(
+			async move {
+				let OAuthRefreshSpec::Endpoint { url, .. } = &spec.client.refresh else {
+					return Err(OAuthError::RefreshUnsupported);
+				};
+				let mut bearer = Zeroizing::new(String::with_capacity(
+					"Bearer ".len() + refresh_token.expose_secret().len(),
+				));
+				bearer.push_str("Bearer ");
+				bearer.push_str(refresh_token.expose_secret());
+				let mut headers = HeaderMap::new();
+				headers.insert(
+					AUTHORIZATION,
+					HeaderValue::from_bytes(bearer.as_bytes())
+						.map_err(|_| OAuthError::MalformedResponse)?,
+				);
+				headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+				let response = self
+					.http
+					.execute(OAuthHttpRequest::new(
+						Method::POST,
+						url,
+						headers,
+						Some(SecretString::from("{}".to_owned())),
+					)?)
+					.await?;
+				if !(200..300).contains(&response.status) {
+					return Err(provider_error(response.status, &response.body, true));
+				}
+				cursor_token_response(response, self.clock.now(), Some(refresh_token))
 			}
-			cursor_token_response(response, self.clock.now(), Some(refresh_token))
-		}
-		.boxed()
+			.boxed(),
+		)
 	}
 }
 

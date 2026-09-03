@@ -1,6 +1,9 @@
 use std::{mem, sync::Arc, time::Duration};
 
-use futures::{FutureExt, future::BoxFuture};
+use futures::{
+	FutureExt,
+	future::{BoxFuture, Either},
+};
 use http::{
 	HeaderMap, HeaderName, HeaderValue, Method,
 	header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
@@ -13,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::super::{
-	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthError,
+	OAuthClock, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomHandler, OAuthRefreshFuture, OAuthError,
 	OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthTokenSet, callback_code,
 	parse_http_url, provider_error, receive_callback_input, start_callback_server,
 };
@@ -54,8 +57,10 @@ impl OAuthCustomHandler for AnthropicPkceHandler {
 		&'a self,
 		spec: &'a OAuthCustomSpec,
 		refresh_token: SecretString,
-	) -> BoxFuture<'a, Result<OAuthTokenSet, OAuthError>> {
-		async move { refresh(self.http.as_ref(), spec, refresh_token).await }.boxed()
+	) -> OAuthRefreshFuture<'a> {
+		Either::Right(
+			async move { refresh(self.http.as_ref(), spec, refresh_token).await }.boxed(),
+		)
 	}
 }
 

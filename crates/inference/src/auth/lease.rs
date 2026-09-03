@@ -3,7 +3,7 @@
 use std::{fmt, io::Write as _, sync::Arc, time::SystemTime};
 
 use bytes::Bytes;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, Either, Ready, ready};
 use http::{Extensions, HeaderMap, HeaderName, HeaderValue, Request, Uri};
 use omp_catalog::AuthSpecId;
 use omp_core::{ExposeSecret, SecretString, Str, encoding::base64};
@@ -717,11 +717,25 @@ pub enum CredentialError {
 	SourceFailure,
 }
 
+/// Future returned across the `dyn CredentialSource` boundary.
+///
+/// Sources that answer synchronously (environment variables, invocation
+/// overrides, the encrypted store) ride `Ready` without allocating; only a
+/// source that performs real I/O (OAuth refresh, ADC, AWS chain, provider
+/// sessions) boxes one cold future per acquisition.
+pub type CredentialFuture<'a, T> = Either<Ready<T>, BoxFuture<'a, T>>;
+
+/// Wraps an already-known answer in a [`CredentialFuture`] without allocating.
+#[inline]
+pub fn credential_ready<'a, T: Send + 'a>(value: T) -> CredentialFuture<'a, T> {
+	Either::Left(ready(value))
+}
+
 /// Secret-isolating credential acquisition and rejection boundary.
 pub trait CredentialSource: Send + Sync {
 	/// Acquires one opaque credential generation.
 	fn lease(&self, need: CredentialNeed)
-	-> BoxFuture<'_, Result<CredentialLease, CredentialError>>;
+	-> CredentialFuture<'_, Result<CredentialLease, CredentialError>>;
 
 	/// Explicitly refreshes a renewable credential, then leases the resulting
 	/// generation once.
@@ -731,8 +745,8 @@ pub trait CredentialSource: Send + Sync {
 	fn refresh_lease(
 		&self,
 		_need: CredentialNeed,
-	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
-		Box::pin(async { Err(CredentialError::Unavailable) })
+	) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>> {
+		credential_ready(Err(CredentialError::Unavailable))
 	}
 
 	/// Rejects a generation using structured, secret-free provider evidence.
@@ -740,7 +754,7 @@ pub trait CredentialSource: Send + Sync {
 		&'a self,
 		lease: &'a CredentialLease,
 		evidence: AuthRejection,
-	) -> BoxFuture<'a, Result<(), CredentialError>>;
+	) -> CredentialFuture<'a, Result<(), CredentialError>>;
 }
 
 /// Failure to apply a lease to a finalized request.

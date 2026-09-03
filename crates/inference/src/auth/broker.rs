@@ -2,13 +2,13 @@
 
 use std::{collections::BTreeMap, env, fmt, sync::Arc};
 
-use futures::future::{BoxFuture, FutureExt as _};
+use futures::future::{Either, FutureExt as _};
 use omp_catalog::{AuthSpecId, Catalog, provider::AuthSpecKind};
 use omp_core::{SecretString, Str, sf};
 
 use super::lease::{
-	AuthRejection, CredentialError, CredentialKind, CredentialLease, CredentialNeed,
-	CredentialSource, LeaseMeta,
+	AuthRejection, CredentialError, CredentialFuture, CredentialKind, CredentialLease,
+	CredentialNeed, CredentialSource, LeaseMeta, credential_ready,
 };
 use crate::{AccountId, PrincipalId};
 
@@ -251,30 +251,30 @@ impl CredentialBroker {
 	pub fn refresh_account(
 		&self,
 		need: CredentialNeed,
-	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
-		async move {
-			let plan = self
-				.plans
-				.get(&need.spec)
-				.ok_or(CredentialError::InvalidSource)?;
-			let selected = [EngineKind::Stored, EngineKind::OAuth]
-				.into_iter()
-				.find(|kind| {
-					self.engine(*kind).is_some()
-						&& plan
-							.sources
-							.iter()
-							.any(|source| source == &BrokerSource::Engine(*kind))
-				})
-				.ok_or(CredentialError::Unavailable)?;
-			self
-				.engine(selected)
-				.expect("selected installed renewable engine")
-				.refresh_lease(need.clone())
-				.await
-				.and_then(|lease| Self::validate_lease(lease, &need, plan.kind, selected.tag()))
-		}
-		.boxed()
+	) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>> {
+		let Some(plan) = self.plans.get(&need.spec) else {
+			return credential_ready(Err(CredentialError::InvalidSource));
+		};
+		let Some(selected) = [EngineKind::Stored, EngineKind::OAuth]
+			.into_iter()
+			.find(|kind| {
+				self.engine(*kind).is_some()
+					&& plan
+						.sources
+						.iter()
+						.any(|source| source == &BrokerSource::Engine(*kind))
+			})
+		else {
+			return credential_ready(Err(CredentialError::Unavailable));
+		};
+		let kind = plan.kind;
+		let refreshed = self
+			.engine(selected)
+			.expect("selected installed renewable engine")
+			.refresh_lease(need.clone());
+		map_credential(refreshed, move |result| {
+			result.and_then(|lease| Self::validate_lease(lease, &need, kind, selected.tag()))
+		})
 	}
 
 	/// Refreshes the exact source that produced a rejected lease and returns
@@ -286,31 +286,28 @@ impl CredentialBroker {
 		&'a self,
 		rejected: &'a CredentialLease,
 		need: CredentialNeed,
-	) -> BoxFuture<'a, Result<CredentialLease, CredentialError>> {
-		async move {
-			let Some(tag) = rejected.source_tag() else {
-				return Err(CredentialError::InvalidSource);
-			};
-			let kind = match tag {
-				STORED_TAG => EngineKind::Stored,
-				OAUTH_TAG => EngineKind::OAuth,
-				ENVIRONMENT_TAG | INVOCATION_TAG | ADC_TAG | AWS_TAG | SESSION_TAG => {
-					return Err(CredentialError::Unavailable);
-				},
-				_ => return Err(CredentialError::InvalidSource),
-			};
-			let plan = self
-				.plans
-				.get(&need.spec)
-				.ok_or(CredentialError::InvalidSource)?;
-			self
-				.engine(kind)
-				.ok_or(CredentialError::Unavailable)?
-				.refresh_lease(need.clone())
-				.await
-				.and_then(|lease| Self::validate_lease(lease, &need, plan.kind, kind.tag()))
-		}
-		.boxed()
+	) -> CredentialFuture<'a, Result<CredentialLease, CredentialError>> {
+		let Some(tag) = rejected.source_tag() else {
+			return credential_ready(Err(CredentialError::InvalidSource));
+		};
+		let engine = match tag {
+			STORED_TAG => EngineKind::Stored,
+			OAUTH_TAG => EngineKind::OAuth,
+			ENVIRONMENT_TAG | INVOCATION_TAG | ADC_TAG | AWS_TAG | SESSION_TAG => {
+				return credential_ready(Err(CredentialError::Unavailable));
+			},
+			_ => return credential_ready(Err(CredentialError::InvalidSource)),
+		};
+		let Some(plan) = self.plans.get(&need.spec) else {
+			return credential_ready(Err(CredentialError::InvalidSource));
+		};
+		let Some(source) = self.engine(engine) else {
+			return credential_ready(Err(CredentialError::Unavailable));
+		};
+		let kind = plan.kind;
+		map_credential(source.refresh_lease(need.clone()), move |result| {
+			result.and_then(|lease| Self::validate_lease(lease, &need, kind, engine.tag()))
+		})
 	}
 
 	fn invocation_lease(
@@ -465,72 +462,116 @@ impl fmt::Debug for CredentialBroker {
 	}
 }
 
+impl CredentialBroker {
+	/// Tries one plan source; `Err(Unavailable)` means "try the next".
+	fn source_lease(
+		&self,
+		source: &BrokerSource,
+		need: &CredentialNeed,
+		kind: CredentialKind,
+	) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>> {
+		match source {
+			BrokerSource::Environment(names) => {
+				credential_ready(self.environment_lease(names, need, kind))
+			},
+			BrokerSource::BasicEnvironment { username_names, password_names } => {
+				credential_ready(self.basic_environment_lease(username_names, password_names, need))
+			},
+			BrokerSource::Engine(engine) => match self.engine(*engine) {
+				Some(installed) => {
+					let need = need.clone();
+					let tag = engine.tag();
+					map_credential(installed.lease(need.clone()), move |result| {
+						result.and_then(|lease| Self::validate_lease(lease, &need, kind, tag))
+					})
+				},
+				None => credential_ready(Err(CredentialError::Unavailable)),
+			},
+		}
+	}
+}
+
 impl CredentialSource for CredentialBroker {
+	/// Walks the plan's sources in order. Every source that answers
+	/// synchronously (environment, invocation, the encrypted store) is
+	/// resolved inline; the first source that must perform I/O boxes the
+	/// remainder of the walk once.
 	fn lease(
 		&self,
 		need: CredentialNeed,
-	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
-		async move {
-			if let Some(lease) = self.invocation_lease(&need) {
-				return lease;
-			}
-			let plan = self
-				.plans
-				.get(&need.spec)
-				.ok_or(CredentialError::InvalidSource)?;
-			for source in &plan.sources {
-				let result = match source {
-					BrokerSource::Environment(names) => self.environment_lease(names, &need, plan.kind),
-					BrokerSource::BasicEnvironment { username_names, password_names } => {
-						self.basic_environment_lease(username_names, password_names, &need)
-					},
-					BrokerSource::Engine(kind) => match self.engine(*kind) {
-						Some(engine) => engine
-							.lease(need.clone())
-							.await
-							.and_then(|lease| Self::validate_lease(lease, &need, plan.kind, kind.tag())),
-						None => Err(CredentialError::Unavailable),
-					},
-				};
-				if !matches!(&result, Err(CredentialError::Unavailable)) {
-					return result;
-				}
-			}
-			Err(CredentialError::Unavailable)
+	) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>> {
+		if let Some(lease) = self.invocation_lease(&need) {
+			return credential_ready(lease);
 		}
-		.boxed()
+		let Some(plan) = self.plans.get(&need.spec) else {
+			return credential_ready(Err(CredentialError::InvalidSource));
+		};
+		let mut sources = plan.sources.iter();
+		while let Some(source) = sources.next() {
+			let pending = match self.source_lease(source, &need, plan.kind) {
+				Either::Left(ready) => {
+					let result = ready.into_inner();
+					if matches!(&result, Err(CredentialError::Unavailable)) {
+						continue;
+					}
+					return credential_ready(result);
+				},
+				Either::Right(pending) => pending,
+			};
+			let kind = plan.kind;
+			return Either::Right(
+				async move {
+					let result = pending.await;
+					if !matches!(&result, Err(CredentialError::Unavailable)) {
+						return result;
+					}
+					for source in sources {
+						let result = self.source_lease(source, &need, kind).await;
+						if !matches!(&result, Err(CredentialError::Unavailable)) {
+							return result;
+						}
+					}
+					Err(CredentialError::Unavailable)
+				}
+				.boxed(),
+			);
+		}
+		credential_ready(Err(CredentialError::Unavailable))
 	}
 
 	fn reject<'a>(
 		&'a self,
 		lease: &'a CredentialLease,
 		evidence: AuthRejection,
-	) -> BoxFuture<'a, Result<(), CredentialError>> {
-		async move {
-			let Some(tag) = lease.source_tag() else {
-				return Err(CredentialError::InvalidSource);
-			};
-			if tag == ENVIRONMENT_TAG {
-				return Ok(());
-			}
-			if tag == INVOCATION_TAG {
-				return Ok(());
-			}
-			let kind = match tag {
-				STORED_TAG => EngineKind::Stored,
-				ADC_TAG => EngineKind::ApplicationDefault,
-				AWS_TAG => EngineKind::Aws,
-				OAUTH_TAG => EngineKind::OAuth,
-				SESSION_TAG => EngineKind::Session,
-				_ => return Err(CredentialError::InvalidSource),
-			};
-			self
-				.engine(kind)
-				.ok_or(CredentialError::Unavailable)?
-				.reject(lease, evidence)
-				.await
+	) -> CredentialFuture<'a, Result<(), CredentialError>> {
+		let Some(tag) = lease.source_tag() else {
+			return credential_ready(Err(CredentialError::InvalidSource));
+		};
+		let kind = match tag {
+			ENVIRONMENT_TAG | INVOCATION_TAG => return credential_ready(Ok(())),
+			STORED_TAG => EngineKind::Stored,
+			ADC_TAG => EngineKind::ApplicationDefault,
+			AWS_TAG => EngineKind::Aws,
+			OAUTH_TAG => EngineKind::OAuth,
+			SESSION_TAG => EngineKind::Session,
+			_ => return credential_ready(Err(CredentialError::InvalidSource)),
+		};
+		match self.engine(kind) {
+			Some(engine) => engine.reject(lease, evidence),
+			None => credential_ready(Err(CredentialError::Unavailable)),
 		}
-		.boxed()
+	}
+}
+
+/// Applies a synchronous continuation to a credential future without
+/// allocating when the answer is already known.
+fn map_credential<'a, T: Send + 'a, U: Send + 'a>(
+	future: CredentialFuture<'a, T>,
+	map: impl FnOnce(T) -> U + Send + 'a,
+) -> CredentialFuture<'a, U> {
+	match future {
+		Either::Left(ready) => credential_ready(map(ready.into_inner())),
+		Either::Right(pending) => Either::Right(pending.map(map).boxed()),
 	}
 }
 
@@ -562,7 +603,7 @@ mod tests {
 	use omp_core::ExposeSecret as _;
 	use parking_lot::Mutex;
 
-	use super::*;
+	use super::{*, super::lease::AuthRejectionKind};
 	use crate::{
 		auth::AuthSpec,
 		id::{AccountId, PrincipalId},
@@ -597,17 +638,17 @@ mod tests {
 		fn lease(
 			&self,
 			_: CredentialNeed,
-		) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
+		) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>> {
 			self.leases.fetch_add(1, Ordering::Relaxed);
-			futures::future::ready(Err(CredentialError::Unavailable)).boxed()
+			credential_ready(Err(CredentialError::Unavailable))
 		}
 
 		fn reject<'a>(
 			&'a self,
 			_: &'a CredentialLease,
 			_: AuthRejection,
-		) -> BoxFuture<'a, Result<(), CredentialError>> {
-			futures::future::ready(Ok(())).boxed()
+		) -> CredentialFuture<'a, Result<(), CredentialError>> {
+			credential_ready(Ok(()))
 		}
 	}
 
@@ -865,5 +906,54 @@ mod tests {
 			sf!("OMP_ANTHROPIC_API_KEY"),
 			sf!("ANTHROPIC_API_KEY")
 		]);
+	}
+
+	/// Environment, invocation, and encrypted-store sources answer without
+	/// touching the heap: the broker resolves the plan walk inline and only a
+	/// source that performs I/O boxes.
+	#[test]
+	fn synchronous_sources_lease_and_reject_without_boxing() {
+		let spec = AuthSpecId::new("ordered");
+		let stored: Arc<dyn CredentialSource> = Arc::new(TrackingStore::default());
+		let broker = CredentialBroker {
+			plans:       Arc::new(BTreeMap::from([(spec.clone(), BrokerPlan {
+				kind:    CredentialKind::ApiKey,
+				sources: vec![
+					BrokerSource::Engine(EngineKind::Stored),
+					BrokerSource::Environment(vec![sf!("ANTHROPIC_API_KEY")].into_boxed_slice()),
+				]
+				.into_boxed_slice(),
+			})])),
+			environment: Arc::new(OrderedEnvironment { calls: Mutex::new(Vec::new()) }),
+			engines:     CredentialBrokerEngines { stored: Some(stored), ..Default::default() },
+			invocation:  None,
+		};
+		let need = CredentialNeed {
+			spec,
+			account: None,
+			principal: None,
+			valid_after: SystemTime::UNIX_EPOCH,
+		};
+		let Either::Left(ready) = broker.lease(need.clone()) else {
+			panic!("stored miss followed by environment hit must resolve inline");
+		};
+		let lease = ready.into_inner().expect("environment lease");
+		assert_eq!(lease.source_tag(), Some(ENVIRONMENT_TAG));
+		let Either::Left(rejected) = broker.reject(&lease, AuthRejection {
+			kind:        AuthRejectionKind::Unauthorized,
+			status:      Some(403),
+			code:        None,
+			refreshable: false,
+		}) else {
+			panic!("environment rejection is synchronous");
+		};
+		assert_eq!(rejected.into_inner(), Ok(()));
+		let Either::Left(unknown) = broker.lease(CredentialNeed {
+			spec: AuthSpecId::new("missing"),
+			..need
+		}) else {
+			panic!("unknown spec is rejected inline");
+		};
+		assert_eq!(unknown.into_inner().map(|_| ()), Err(CredentialError::InvalidSource));
 	}
 }

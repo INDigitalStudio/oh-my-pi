@@ -11,7 +11,7 @@ use std::{
 };
 
 use flume::Sender;
-use futures::future::{BoxFuture, FutureExt as _};
+use futures::future::{BoxFuture, Either, FutureExt as _};
 use omp_catalog::{
 	AuthSpecId, Catalog, ProviderId,
 	provider::{AuthSpecKind, OAuthExchangeKind, OAuthFlowSpec},
@@ -22,13 +22,14 @@ use zeroize::Zeroizing;
 
 use super::{
 	AuditedCredentialReveal, AuthRejection, AuthSpec, CredentialBroker, CredentialError,
-	CredentialLease, CredentialMetadata, CredentialNeed, CredentialOrigin, CredentialSource,
-	CredentialStore, CredentialWrite, KeyError, LeaseMeta, LoginChannelError, OAuthClientSpec,
+	CredentialFuture, CredentialLease, CredentialMetadata, CredentialNeed, CredentialOrigin,
+	CredentialSource, CredentialStore, CredentialWrite, KeyError, LeaseMeta, LoginChannelError,
+	OAuthClientSpec,
 	OAuthClock, OAuthCredentialImport, OAuthCredentialManagerError, OAuthCustomDispatchError,
 	OAuthCustomDispatcher, OAuthCustomSpec, OAuthEngine, OAuthError, OAuthHttpClient,
 	OAuthHttpRequest, OAuthHttpResponse, OAuthParameter, OAuthTransportError,
 	PROVIDER_NAME_PARAMETER, ScopedCredentialGrant, ScopedCredentialToken, StoreError,
-	default_login_channels,
+	credential_ready, default_login_channels,
 };
 use crate::{
 	account::{
@@ -998,53 +999,83 @@ impl fmt::Debug for RefreshingCredentialSource {
 	}
 }
 
+impl RefreshingCredentialSource {
+	/// Refreshes `account` through the engine, then leases the new
+	/// generation once. This is the only path that performs I/O.
+	fn refresh_then_lease(
+		&self,
+		account: AccountId,
+		need: CredentialNeed,
+	) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>> {
+		let stored = Arc::clone(&self.stored);
+		let refresh = Arc::clone(&self.refresh);
+		Either::Right(
+			async move {
+				refresh
+					.refresh(account)
+					.await
+					.map_err(|_| CredentialError::SourceFailure)?;
+				stored.lease(need).await
+			}
+			.boxed(),
+		)
+	}
+}
+
 impl CredentialSource for RefreshingCredentialSource {
+	/// A stored lease that is still fresh is answered without allocating;
+	/// only an expired generation boxes the refresh round trip.
 	fn lease(
 		&self,
 		mut need: CredentialNeed,
-	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
-		let stored = Arc::clone(&self.stored);
-		let refresh = Arc::clone(&self.refresh);
+	) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>> {
 		self.apply_skew(&mut need);
-		async move {
-			let account = need.account.clone().ok_or(CredentialError::Unavailable)?;
-			match stored.lease(need.clone()).await {
-				Err(CredentialError::Expired) => {
-					refresh
-						.refresh(account)
-						.await
-						.map_err(|_| CredentialError::SourceFailure)?;
-					stored.lease(need).await
-				},
-				result => result,
-			}
+		let Some(account) = need.account.clone() else {
+			return credential_ready(Err(CredentialError::Unavailable));
+		};
+		match self.stored.lease(need.clone()) {
+			Either::Left(ready) => match ready.into_inner() {
+				Err(CredentialError::Expired) => self.refresh_then_lease(account, need),
+				result => credential_ready(result),
+			},
+			Either::Right(pending) => {
+				let stored = Arc::clone(&self.stored);
+				let refresh = Arc::clone(&self.refresh);
+				Either::Right(
+					async move {
+						match pending.await {
+							Err(CredentialError::Expired) => {
+								refresh
+									.refresh(account)
+									.await
+									.map_err(|_| CredentialError::SourceFailure)?;
+								stored.lease(need).await
+							},
+							result => result,
+						}
+					}
+					.boxed(),
+				)
+			},
 		}
-		.boxed()
 	}
 
 	fn refresh_lease(
 		&self,
 		mut need: CredentialNeed,
-	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
-		let stored = Arc::clone(&self.stored);
-		let refresh = Arc::clone(&self.refresh);
+	) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>> {
 		self.apply_skew(&mut need);
-		async move {
-			let account = need.account.clone().ok_or(CredentialError::Unavailable)?;
-			refresh
-				.refresh(account)
-				.await
-				.map_err(|_| CredentialError::SourceFailure)?;
-			stored.lease(need).await
-		}
-		.boxed()
+		let Some(account) = need.account.clone() else {
+			return credential_ready(Err(CredentialError::Unavailable));
+		};
+		self.refresh_then_lease(account, need)
 	}
 
 	fn reject<'a>(
 		&'a self,
 		lease: &'a CredentialLease,
 		evidence: AuthRejection,
-	) -> BoxFuture<'a, Result<(), CredentialError>> {
+	) -> CredentialFuture<'a, Result<(), CredentialError>> {
 		self.stored.reject(lease, evidence)
 	}
 }
@@ -1857,6 +1888,8 @@ mod tests {
 	use omp_catalog::{ProviderId, provider::AuthSpecKind, snapshot::Catalog};
 	use omp_core::{ExposeSecret as _, SecretString};
 	use parking_lot::Mutex;
+
+	use crate::auth::{CredentialFuture, credential_ready};
 	use tokio::time;
 
 	use super::{
@@ -1917,31 +1950,28 @@ mod tests {
 		fn lease(
 			&self,
 			need: CredentialNeed,
-		) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
+		) -> CredentialFuture<'_, Result<CredentialLease, CredentialError>> {
 			let call = self.calls.fetch_add(1, Ordering::SeqCst);
-			async move {
-				if call == 0 {
-					return Err(CredentialError::Expired);
-				}
-				Ok(CredentialLease::bearer(
-					LeaseMeta {
-						account:    need.account.expect("account"),
-						principal:  need.principal.expect("principal"),
-						generation: 2,
-						expires_at: need.valid_after.checked_add(Duration::from_secs(3600)),
-					},
-					SecretString::from("refreshed"),
-				))
+			if call == 0 {
+				return credential_ready(Err(CredentialError::Expired));
 			}
-			.boxed()
+			credential_ready(Ok(CredentialLease::bearer(
+				LeaseMeta {
+					account:    need.account.expect("account"),
+					principal:  need.principal.expect("principal"),
+					generation: 2,
+					expires_at: need.valid_after.checked_add(Duration::from_secs(3600)),
+				},
+				SecretString::from("refreshed"),
+			)))
 		}
 
 		fn reject<'a>(
 			&'a self,
 			_: &'a CredentialLease,
 			_: AuthRejection,
-		) -> BoxFuture<'a, Result<(), CredentialError>> {
-			async { Ok(()) }.boxed()
+		) -> CredentialFuture<'a, Result<(), CredentialError>> {
+			credential_ready(Ok(()))
 		}
 	}
 

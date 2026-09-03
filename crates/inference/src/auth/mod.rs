@@ -56,7 +56,8 @@ pub use key::{
 };
 pub use lease::{
 	AppliedCredentials, AuthRejection, AuthRejectionKind, AuthScheme, CredentialApplyError,
-	CredentialError, CredentialKind, CredentialLease, CredentialNeed, CredentialSource, LeaseMeta,
+	CredentialError, CredentialFuture, CredentialKind, CredentialLease, CredentialNeed,
+	CredentialSource, LeaseMeta, credential_ready,
 };
 pub use login::{
 	DEFAULT_LOGIN_CHANNEL_CAPACITY, LoginCancellation, LoginChannelError, LoginDriver,
@@ -74,7 +75,8 @@ pub use oauth::{
 	DevicePending, OAuthClock, OAuthCredentialManagerError, OAuthCustomDispatchError,
 	OAuthCustomDispatcher, OAuthCustomHandler, OAuthEngine, OAuthEntropy, OAuthError,
 	OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthProviderCode, OAuthTokenSet,
-	OAuthTransportError, PkcePending, SystemEntropySource, SystemOAuthClock, SystemOAuthHttpClient,
+	OAuthRefreshFuture, OAuthTransportError, PkcePending, SystemEntropySource, SystemOAuthClock,
+	SystemOAuthHttpClient,
 };
 pub use scope::{CredentialGrants, CredentialScope, CredentialScopeError};
 pub use search::{
