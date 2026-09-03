@@ -21,6 +21,9 @@ interface CloseDocumentParams {
 	textDocument: { uri: string };
 }
 
+const mode = Bun.argv[2] ?? "default";
+const VOLAR_TSSERVER_REQUEST_ID = 1;
+
 let initializeCount = 0;
 let processId: number | null = null;
 const didOpen: Record<string, number> = {};
@@ -33,6 +36,7 @@ const pendingServerRequests = new Map<
 	string | number,
 	{ resolve: (response: { result: unknown; error: unknown }) => void }
 >();
+let pendingVolarDocumentSymbol: string | number | undefined;
 
 function send(message: JsonRpcMessage): void {
 	const json = JSON.stringify(message);
@@ -83,12 +87,43 @@ async function handleRequest(message: JsonRpcMessage): Promise<void> {
 			initializeCount++;
 			const params = message.params as { processId?: number | null } | undefined;
 			processId = params?.processId ?? null;
+			const capabilities =
+				mode === "volar"
+					? { documentSymbolProvider: true }
+					: mode === "typescript"
+						? { executeCommandProvider: { commands: ["typescript.tsserverRequest"] } }
+						: {};
 			respond(id, {
-				capabilities: {},
-				serverInfo: { name: "fake-lsp", version: String(process.pid) },
+				capabilities,
+				serverInfo: { name: mode === "default" ? "fake-lsp" : `fake-lsp-${mode}`, version: String(process.pid) },
 			});
 			break;
 		}
+		case "textDocument/documentSymbol":
+			if (mode !== "volar") {
+				respond(id, undefined, { code: -32601, message: `Method not found: ${message.method}` });
+				break;
+			}
+			pendingVolarDocumentSymbol = id;
+			send({
+				jsonrpc: "2.0",
+				method: "tsserver/request",
+				params: [[VOLAR_TSSERVER_REQUEST_ID, "_vue:projectInfo", { file: "/workspace/App.vue" }]],
+			});
+			break;
+		case "workspace/executeCommand":
+			if (
+				mode !== "typescript" ||
+				typeof message.params !== "object" ||
+				message.params === null ||
+				!("command" in message.params) ||
+				message.params.command !== "typescript.tsserverRequest"
+			) {
+				respond(id, undefined, { code: -32601, message: `Method not found: ${message.method}` });
+				break;
+			}
+			respond(id, { body: message.params });
+			break;
 		case "test/state": {
 			const didChangeSnapshot: Record<string, number[]> = {};
 			for (const uri in didChange) didChangeSnapshot[uri] = [...didChange[uri]];
@@ -152,6 +187,15 @@ function handleNotification(message: JsonRpcMessage): void {
 			const { uri } = params.textDocument;
 			didClose.push(uri);
 			documents.delete(uri);
+			break;
+		}
+		case "tsserver/response": {
+			if (mode !== "volar" || pendingVolarDocumentSymbol === undefined || !Array.isArray(message.params)) break;
+			const response = message.params[0];
+			if (!Array.isArray(response) || response[0] !== VOLAR_TSSERVER_REQUEST_ID) break;
+			const requestId = pendingVolarDocumentSymbol;
+			pendingVolarDocumentSymbol = undefined;
+			respond(requestId, response[1] ?? null);
 			break;
 		}
 		case "exit":

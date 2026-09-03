@@ -326,6 +326,68 @@ function queueWriteMessage(
 	return result;
 }
 
+const TSSERVER_REQUEST_NOTIFICATION = "tsserver/request";
+const TSSERVER_RESPONSE_NOTIFICATION = "tsserver/response";
+const TSSERVER_REQUEST_COMMAND = "typescript.tsserverRequest";
+
+type TsserverRequestParams = [[LspJsonRpcId, string, unknown]];
+
+function isTsserverRequestParams(params: unknown): params is TsserverRequestParams {
+	if (!Array.isArray(params) || params.length !== 1) return false;
+	const request = params[0];
+	return (
+		Array.isArray(request) &&
+		request.length === 3 &&
+		(typeof request[0] === "number" || typeof request[0] === "string") &&
+		typeof request[1] === "string"
+	);
+}
+
+function supportsExecuteCommand(client: LspClient, command: string): boolean {
+	const provider = client.serverCapabilities?.executeCommandProvider;
+	if (typeof provider !== "object" || provider === null || !("commands" in provider)) return false;
+	return Array.isArray(provider.commands) && provider.commands.includes(command);
+}
+
+function findExecuteCommandClient(cwd: string, command: string): LspClient | undefined {
+	const resolvedCwd = path.resolve(cwd);
+	for (const client of clients.values()) {
+		if (path.resolve(client.cwd) === resolvedCwd && supportsExecuteCommand(client, command)) return client;
+	}
+	return undefined;
+}
+
+async function handleTsserverRequestNotification(client: LspClient, params: unknown): Promise<void> {
+	if (!isTsserverRequestParams(params)) {
+		logger.warn("LSP received malformed tsserver/request notification", { server: client.name });
+		return;
+	}
+
+	const [id, command, payload] = params[0];
+	const tsClient = findExecuteCommandClient(client.cwd, TSSERVER_REQUEST_COMMAND);
+	let body: unknown = null;
+	if (tsClient) {
+		try {
+			const response = await sendRequest(tsClient, "workspace/executeCommand", {
+				command: TSSERVER_REQUEST_COMMAND,
+				arguments: [command, payload],
+			});
+			if (typeof response === "object" && response !== null && "body" in response) {
+				body = response.body ?? null;
+			}
+		} catch (error) {
+			logger.warn("LSP tsserver request forwarding failed", {
+				server: client.name,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	} else {
+		logger.warn("LSP tsserver bridge has no compatible TypeScript client", { server: client.name });
+	}
+
+	await sendNotification(client, TSSERVER_RESPONSE_NOTIFICATION, [[id, body]]);
+}
+
 // =============================================================================
 // Message Reader
 // =============================================================================
@@ -400,6 +462,13 @@ async function startMessageReader(client: LspClient): Promise<void> {
 										client.resolveProjectLoaded();
 									}
 								}
+							} else if (message.method === TSSERVER_REQUEST_NOTIFICATION) {
+								void handleTsserverRequestNotification(client, message.params).catch(error => {
+									logger.warn("LSP tsserver response notification failed", {
+										server: client.name,
+										error: error instanceof Error ? error.message : String(error),
+									});
+								});
 							}
 						}
 					} else if ("id" in message && message.id !== undefined) {
