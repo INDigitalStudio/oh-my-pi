@@ -83,26 +83,6 @@ fn render_done<T: DeserializeOwned + Serialize>(
 }
 
 #[test]
-fn every_vibe_identity_dispatches_to_the_vibe_card() {
-	let registry = CardRegistry::standard();
-	for identity in ["vibe", "vibe_spawn", "vibe_send", "vibe_wait", "vibe_kill", "vibe_list"] {
-		assert!(registry.contains(identity), "{identity} must not fall back to GenericCard");
-	}
-	// The pi identity fixes the operation even when the arguments carry no
-	// `op`, so a forced `vibe_spawn` call never reads as a session list.
-	let input = node(KnownTag::Input, "{}");
-	let text = render("vibe_spawn", &input, None, None, CardStatus::InProgress, false);
-	assert!(text.contains("vibe spawn"), "{text}");
-	assert!(!text.contains("vibe sessions"), "{text}");
-	let text = render("vibe_kill", &input, None, None, CardStatus::InProgress, false);
-	assert!(text.contains("vibe kill"), "{text}");
-	// The roster identity still derives the operation from `op`.
-	let input = node(KnownTag::Input, r#"{"op":"wait"}"#);
-	let text = render("vibe", &input, None, None, CardStatus::InProgress, false);
-	assert!(text.contains("vibe wait"), "{text}");
-}
-
-#[test]
 fn task_card_lists_detached_jobs_instead_of_failing() {
 	let text = render_done::<omp_tools::task::Payload>(
 		"task",
@@ -1050,20 +1030,4 @@ fn task_card_names_the_dispatched_agent_and_brief_while_the_call_is_live() {
 	assert!(expanded.contains("finding 10"), "{expanded}");
 	assert!(!expanded.contains("finding 11"), "{expanded}");
 	assert!(expanded.contains("… 2 more lines"), "{expanded}");
-}
-
-#[test]
-fn vibe_card_derives_the_operation_from_the_op_argument() {
-	// The single `vibe` identity reads its operation from `op`; the completed
-	// row names it with the same spelling, and an unknown op lists sessions.
-	let result = node(KnownTag::Result, "ok");
-	for op in ["spawn", "send", "wait", "kill", "list"] {
-		let input = node(KnownTag::Input, &format!(r#"{{"op":"{op}"}}"#));
-		let text = render("vibe", &input, Some(&result), None, CardStatus::Done, false);
-		assert!(text.contains(&format!("vibe_{op} completed")), "{op}: {text}");
-	}
-	let input = node(KnownTag::Input, r#"{"op":"bogus"}"#);
-	let unknown = render("vibe", &input, Some(&result), None, CardStatus::Done, false);
-	assert!(unknown.contains("vibe sessions"), "{unknown}");
-	assert!(unknown.contains("vibe_list completed"), "{unknown}");
 }

@@ -730,7 +730,8 @@ fn fixture_payload(
 			"name": value.get("name").or_else(|| args.get("name")).cloned().unwrap_or_else(|| serde_json::json!("main")),
 			"url": value.get("url").cloned(),
 			"title": value.get("title").cloned(),
-			"result": value.get("result").cloned().or_else(|| value.get("display").cloned()),
+			"display": value.get("display").cloned().unwrap_or_else(|| serde_json::json!([])),
+			"result": value.get("result").cloned(),
 			"artifacts": value.get("artifacts").cloned().unwrap_or_else(|| serde_json::json!([])),
 			"browser": value.get("browser").cloned()
 		}),
@@ -1056,11 +1057,6 @@ mod tests {
 			"task",
 			"think",
 			"todo",
-			"vibe_kill",
-			"vibe_list",
-			"vibe_send",
-			"vibe_spawn",
-			"vibe_wait",
 			"web_search",
 			"write",
 		]);
