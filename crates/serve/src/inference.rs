@@ -458,6 +458,12 @@ impl InferenceRpc {
 				response_hooks: self.response_hooks.clone(),
 			},
 		)
+		// The invocation key rides on the call so it reaches the wire whether
+		// or not a provider conversation is bound.
+		.with_affinity(call::CallAffinity {
+			prompt_cache:     self.prompt_cache_affinity.clone(),
+			provider_session: None,
+		})
 	}
 
 	fn management_target(
@@ -533,7 +539,6 @@ impl InferenceRpc {
 					revision: revision.clone(),
 					turn,
 					strategy,
-					prompt_cache_affinity: self.prompt_cache_affinity.clone(),
 					append_only: true,
 					provider_reset,
 					forked: false,
@@ -643,7 +648,6 @@ impl InferenceRpc {
 					revision,
 					turn,
 					strategy,
-					prompt_cache_affinity: self.prompt_cache_affinity.clone(),
 					append_only: true,
 					provider_reset,
 					forked,
