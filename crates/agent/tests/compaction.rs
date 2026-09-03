@@ -67,6 +67,7 @@ fn request(text: &str) -> ChatRequest {
 		top_logprobs:      None,
 		safety:            Arc::<[SafetySetting]>::from([]),
 		negotiation:       NegotiationPolicy::default(),
+		forced_call:       None,
 	}
 }
 
@@ -110,7 +111,7 @@ async fn under_threshold_skips_compaction() {
 	session.begin_turn().expect("turn");
 	session.user("short", Vec::new()).expect("user");
 	let mut inference = FakeInference::with_reply("unused");
-	let route = RouteFacts { forced_choice_free: false, context_window: 16_000 };
+	let route = RouteFacts { forced_choice_free: false, context_window: 16_000, image_input: false };
 	let turn = turn_handle(&session);
 	let mut cx = MutDirectorCx {
 		session: &mut session,
@@ -119,6 +120,7 @@ async fn under_threshold_skips_compaction() {
 		route: &route,
 		turn,
 		director: None,
+		events: None,
 	};
 	let prepared = CompactionDirector::new()
 		.before_inference(&mut cx, &request("short"))
@@ -140,7 +142,7 @@ async fn dom_ai_compact_threshold_controls_compaction() {
 	session.user(text.clone(), Vec::new()).expect("user");
 	set_compact_threshold(&mut session, 0.10);
 	let mut inference = FakeInference::with_reply("threshold summary");
-	let route = RouteFacts { forced_choice_free: false, context_window: 512 };
+	let route = RouteFacts { forced_choice_free: false, context_window: 512, image_input: false };
 	let turn = turn_handle(&session);
 	let mut cx = MutDirectorCx {
 		session: &mut session,
@@ -149,6 +151,7 @@ async fn dom_ai_compact_threshold_controls_compaction() {
 		route: &route,
 		turn,
 		director: None,
+		events: None,
 	};
 	assert_eq!(
 		CompactionDirector::new()
@@ -170,7 +173,7 @@ async fn over_threshold_commits_one_resolvable_compaction_and_replays_projection
 	let text = "history ".repeat(100);
 	let boundary = session.user(text.clone(), Vec::new()).expect("user");
 	let mut inference = FakeInference::with_reply("durable compacted context");
-	let route = RouteFacts { forced_choice_free: false, context_window: 128 };
+	let route = RouteFacts { forced_choice_free: false, context_window: 128, image_input: false };
 	let turn = turn_handle(&session);
 	let mut cx = MutDirectorCx {
 		session: &mut session,
@@ -179,6 +182,7 @@ async fn over_threshold_commits_one_resolvable_compaction_and_replays_projection
 		route: &route,
 		turn,
 		director: None,
+		events: None,
 	};
 	let prepared = CompactionDirector::new()
 		.before_inference(&mut cx, &request(&text))
@@ -208,7 +212,7 @@ async fn over_threshold_commits_one_resolvable_compaction_and_replays_projection
 	assert_eq!(projected, Some("durable compacted context"));
 	drop(session);
 
-	let (journal, entries) = Journal::open(&path).expect("journal reopens");
+	let entries = Journal::scan(&path).expect("journal reopens");
 	let compact_entries = entries
 		.iter()
 		.filter(|entry| entry.kind.name == kind::COMPACTION && entry.kind.rev == 1)
@@ -222,7 +226,6 @@ async fn over_threshold_commits_one_resolvable_compaction_and_replays_projection
 		blobs.get(&payload.summary).expect("summary blob"),
 		b"durable compacted context".as_slice()
 	);
-	drop(journal);
 
 	let reopened = Session::open(&path, ComponentRegistry::standard()).expect("session replays");
 	assert_eq!(project_thread(reopened.dom()), live_projection);
@@ -237,7 +240,7 @@ async fn manual_compaction_carries_focus_and_ignores_threshold() {
 	session.begin_turn().expect("turn");
 	session.user("small history", Vec::new()).expect("user");
 	let mut inference = FakeInference::with_reply("focused context");
-	let route = RouteFacts { forced_choice_free: false, context_window: 1_000_000 };
+	let route = RouteFacts { forced_choice_free: false, context_window: 1_000_000, image_input: false };
 	let turn = turn_handle(&session);
 	let mut cx = MutDirectorCx {
 		session: &mut session,
@@ -246,6 +249,7 @@ async fn manual_compaction_carries_focus_and_ignores_threshold() {
 		route: &route,
 		turn,
 		director: None,
+		events: None,
 	};
 	let prepared = CompactionDirector::manual(Some(Str::new_static("database migration")))
 		.before_inference(&mut cx, &request("small history"))

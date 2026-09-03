@@ -6,7 +6,10 @@ use std::{
 	collections::VecDeque,
 	future::{Future, ready},
 	path::Path,
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	},
 	time::{Duration, SystemTime},
 };
 
@@ -45,6 +48,8 @@ pub struct TestTool {
 	output: Str,
 	update: Option<Str>,
 	delay:  Duration,
+	barrier: Option<Arc<tokio::sync::Barrier>>,
+	started: Option<Arc<AtomicUsize>>,
 	fault:  bool,
 }
 
@@ -61,11 +66,19 @@ pub fn tool_spec(name: &str, revision: u16) -> ToolSpec {
 }
 
 pub fn spec(name: &str, revision: u16, output: &str) -> TestTool {
+	spec_family(name, "test", revision, output)
+}
+
+pub fn spec_family(name: &str, family: &str, revision: u16, output: &str) -> TestTool {
+	let mut tool = tool_spec(name, revision);
+	tool.rev.family = Str::new(family);
 	TestTool {
-		spec:   tool_spec(name, revision),
+		spec:   tool,
 		output: Str::new(output),
 		update: None,
 		delay:  Duration::ZERO,
+		barrier: None,
+		started: None,
 		fault:  false,
 	}
 }
@@ -74,6 +87,16 @@ impl TestTool {
 	pub fn streaming(mut self, update: &str, delay: Duration) -> Self {
 		self.update = Some(Str::new(update));
 		self.delay = delay;
+		self
+	}
+
+	pub fn concurrency_probe(
+		mut self,
+		started: Arc<AtomicUsize>,
+		barrier: Arc<tokio::sync::Barrier>,
+	) -> Self {
+		self.started = Some(started);
+		self.barrier = Some(barrier);
 		self
 	}
 
@@ -101,6 +124,12 @@ impl Tool for TestTool {
 			let _ = params.committed().await;
 			if let Some(update) = self.update.clone() {
 				yield Ev::Update(update);
+			}
+			if let Some(started) = &self.started {
+				started.fetch_add(1, Ordering::SeqCst);
+			}
+			if let Some(barrier) = &self.barrier {
+				barrier.wait().await;
 			}
 			if !self.delay.is_zero() {
 				tokio::time::sleep(self.delay).await;
@@ -209,9 +238,7 @@ pub fn assert_journal_cause(session: &Session, call: EntryId) {
 }
 
 pub fn journal_entries(path: &Path) -> Vec<Entry> {
-	let (journal, entries) = Journal::open(path).expect("journal opens");
-	drop(journal);
-	entries
+	Journal::scan(path).expect("journal scans")
 }
 
 pub fn assert_all_entries_caused(entries: &[Entry]) {

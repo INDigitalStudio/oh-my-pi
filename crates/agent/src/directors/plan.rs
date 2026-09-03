@@ -69,14 +69,13 @@ impl Director for Plan {
 			(Str::new_static("decision_made"), BindValue::Bool(self.decision_made)),
 			(Str::new_static("write_attempts"), BindValue::Int(i64::from(self.write_attempts))),
 			(Str::new_static("decision_attempts"), BindValue::Int(i64::from(self.decision_attempts))),
-			(Str::new_static("tools"), BindValue::Str(Str::new_static("write,ask,xd://propose"))),
+			(Str::new_static("tools"), BindValue::Str(Str::new_static("write,ask"))),
 		]
 	}
 
 	fn observe_turn(&self, dom: &Dom, _cx: &DirectorCx<'_>, turn: &TurnView) -> Vec<StateUpdate> {
 		let wrote_plan = call_wrote_path(dom, turn.turn, self.plan_file.as_str());
-		let proposed =
-			turn_called(dom, turn.turn, "ask") || call_wrote_path(dom, turn.turn, "xd://propose");
+		let proposed = turn_called(dom, turn.turn, "ask");
 		let mut updates = Vec::with_capacity(2);
 		if wrote_plan && !self.plan_written {
 			updates.push(StateUpdate::new("plan_written", BindValue::Bool(true)));

@@ -12,6 +12,7 @@ use omp_journal::{
 	kind,
 };
 use omp_tool::Part as ToolPart;
+use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::{Draft, Session, SessionError};
@@ -194,11 +195,6 @@ impl Session {
 			Op::Ins {
 				parent: tool,
 				after:  Handle::new(start + 2),
-				node:   NodeSpec::new(KnownTag::Diag),
-			},
-			Op::Ins {
-				parent: tool,
-				after:  Handle::new(start + 3),
 				node:   NodeSpec::new(KnownTag::Usage),
 			},
 		];
@@ -276,21 +272,15 @@ impl Session {
 	fn fold_tool_result(&mut self, entry: &Entry) -> Result<(), SessionError> {
 		let payload: ToolResult = serde_json::from_str(entry.data.as_str())?;
 		let call = self.entry_call_handle(entry)?;
-		let (status, target, raw, prompt_parts) = match payload {
-			ToolResult::Outcome { outcome, prompt_parts } => {
-				("ok", KnownTag::Result, outcome, prompt_parts)
-			},
-			ToolResult::Fault { fault, prompt_parts } => {
-				("error", KnownTag::Diag, fault, prompt_parts)
-			},
+		let (status, raw, prompt_parts) = match payload {
+			ToolResult::Outcome { outcome, prompt_parts } => ("ok", outcome, prompt_parts),
+			ToolResult::Fault { fault, prompt_parts } => ("error", fault, prompt_parts),
 		};
-		let child = child_with_tag(&self.dom, call, target)
-			.ok_or(SessionError::UnknownCall { id: entry.by.expect("journal enforces causes") })?;
 		let text = prompt_parts
 			.as_deref()
 			.map(prompt_parts_text)
 			.transpose()?
-			.unwrap_or_else(|| json_text(&raw));
+			.unwrap_or_else(|| outcome_text(&raw));
 		let mut ops = vec![
 			Op::Set {
 				h:     call,
@@ -302,21 +292,45 @@ impl Session {
 				prop:  PropId::Status.into(),
 				value: Value::Str(Str::new_static(status)),
 			},
-			Op::Set { h: child, prop: PropId::Text.into(), value: Value::Str(text) },
 		];
-		if let Some(prompt_parts) = prompt_parts {
-			ops.push(Op::Set {
-				h:     child,
-				prop:  PropId::Data.into(),
-				value: Value::Json(prompt_parts),
-			});
-		}
 		if status == "error" {
-			ops.push(Op::Set {
-				h:     child,
-				prop:  PropId::Severity.into(),
-				value: Value::Str(Str::new_static("error")),
+			// A fault is its own `<diag severity=error>` (ADR 0008): it never
+			// overwrites a warning the tool emitted earlier.
+			let mut node = NodeSpec::new(KnownTag::Diag)
+				.with_prop(PropId::Severity, Value::Str(Str::new_static("error")))
+				.with_prop(PropId::Text, Value::Str(text))
+				.with_prop(PropId::Fault, Value::Json(raw));
+			if let Some(prompt_parts) = prompt_parts {
+				node = node.with_prop(PropId::Data, Value::Json(prompt_parts));
+			}
+			ops.push(Op::Ins {
+				parent: call,
+				after: self.dom.children(call).last().copied(),
+				node,
 			});
+		} else {
+			let child = child_with_tag(&self.dom, call, KnownTag::Result)
+				.ok_or(SessionError::UnknownCall { id: entry.by.expect("journal enforces causes") })?;
+			let has_streamed_text = self.dom.get(child).is_some_and(|node| {
+				node.content.as_ref().is_some_and(|value| !value.is_empty())
+					|| node
+						.prop(&PropKey::from(PropId::Text))
+						.and_then(Value::as_str)
+						.is_some_and(|value| !value.is_empty())
+			});
+			if !has_streamed_text {
+				ops.push(Op::Set { h: child, prop: PropId::Text.into(), value: Value::Str(text) });
+			}
+			// The tool's durable truth (ADR 0008: the element carries the
+			// payload); `data` stays the model-facing projection.
+			ops.push(Op::Set { h: child, prop: PropId::Outcome.into(), value: Value::Json(raw) });
+			if let Some(prompt_parts) = prompt_parts {
+				ops.push(Op::Set {
+					h:     child,
+					prop:  PropId::Data.into(),
+					value: Value::Json(prompt_parts),
+				});
+			}
 		}
 		self.apply_ops(entry, ops)
 	}
@@ -509,6 +523,13 @@ fn child_with_tag(dom: &Dom, parent: Handle, tag: KnownTag) -> Option<Handle> {
 	})
 }
 
+fn last_child_with_tag(dom: &Dom, parent: Handle, tag: KnownTag) -> Option<Handle> {
+	dom.children(parent).iter().rev().copied().find(|handle| {
+		dom.get(*handle)
+			.is_some_and(|node| node.tag == Tag::Known(tag))
+	})
+}
+
 fn project_update(
 	dom: &Dom,
 	call: Handle,
@@ -516,11 +537,48 @@ fn project_update(
 	ops: &mut Vec<Op>,
 ) -> Result<(), SessionError> {
 	let object = value.as_object();
-	let (target, severity, projected) = if let Some(diag) =
-		object.and_then(|map| map.get("diag").or_else(|| map.get("diagnostic")))
+	// Ordered output bytes are revealed by the dispatcher's bounded DOM stream.
+	// Its journaled typed update retains only metadata plus an emptied `data`
+	// field and must not overwrite or prefix that authoritative stream.
+	if object.is_some_and(|map| {
+		map.get("sequence").and_then(serde_json::Value::as_u64).is_some()
+			&& map.get("data").is_some_and(|data| match data {
+				serde_json::Value::String(text) => text.is_empty(),
+				serde_json::Value::Array(bytes) => bytes.is_empty(),
+				_ => false,
+			})
+	}) {
+		return Ok(());
+	}
+	if let Some(diag) = object.and_then(|map| map.get("diag").or_else(|| map.get("diagnostic"))) {
+		// Every warning is its own structured child (ADR 0008); a tool that
+		// warns twice keeps both on the element and on replay.
+		let severity = diag
+			.get("severity")
+			.and_then(serde_json::Value::as_str)
+			.unwrap_or("info");
+		let text = match diag {
+			serde_json::Value::String(text) => Str::new(text),
+			_ => Str::new(serde_json::to_string(diag)?),
+		};
+		let node = NodeSpec::new(KnownTag::Diag)
+			.with_prop(PropId::Severity, Value::Str(Str::new(severity)))
+			.with_prop(PropId::Text, Value::Str(text))
+			.with_prop(
+				PropId::Data,
+				Value::Json(RawValue::from_string(serde_json::to_string(diag)?)?),
+			);
+		ops.push(Op::Ins {
+			parent: call,
+			after: last_child_with_tag(dom, call, KnownTag::Diag)
+				.or_else(|| dom.children(call).last().copied()),
+			node,
+		});
+		return Ok(());
+	}
+	let (target, severity, projected) = if let Some(usage) =
+		object.and_then(|map| map.get("usage"))
 	{
-		(KnownTag::Diag, Some("info"), diag)
-	} else if let Some(usage) = object.and_then(|map| map.get("usage")) {
 		(KnownTag::Usage, None, usage)
 	} else {
 		let result = object
@@ -555,6 +613,22 @@ fn project_update(
 
 fn json_text(raw: &RawValue) -> Str {
 	serde_json::from_str::<Str>(raw.get()).unwrap_or_else(|_| Str::new(raw.get()))
+}
+
+/// Text projection of a journaled outcome when no prompt parts were
+/// recorded: the `value` of a `CallOutcome` envelope
+/// (`{"kind":…,"value":…}`), else the raw JSON.
+fn outcome_text(raw: &RawValue) -> Str {
+	#[derive(Deserialize)]
+	struct Envelope<'a> {
+		#[expect(dead_code, reason = "presence proves the envelope shape")]
+		kind:  &'a str,
+		value: Option<Box<RawValue>>,
+	}
+	match serde_json::from_str::<Envelope<'_>>(raw.get()) {
+		Ok(Envelope { value: Some(value), .. }) => json_text(&value),
+		Ok(Envelope { value: None, .. }) | Err(_) => json_text(raw),
+	}
 }
 
 pub(crate) fn prompt_parts_text(raw: &RawValue) -> Result<Str, SessionError> {

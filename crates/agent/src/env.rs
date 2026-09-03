@@ -27,4 +27,15 @@ pub enum EnvEvent {
 		/// Tool that produced the proposal.
 		source_tool: Str,
 	},
+	/// A hook or extension message journaled as `<notice kind=… name=…>` under
+	/// the current turn at the next mailbox drain (pi `hookMessage` /
+	/// `custom_message`).
+	Notice {
+		/// Notice kind (`hook`, `custom`, …).
+		kind: Str,
+		/// Producer-chosen name (pi `customType`).
+		name: Option<Str>,
+		/// Notice body.
+		body: Str,
+	},
 }

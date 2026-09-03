@@ -29,4 +29,4 @@ mod session;
 pub use component::{Component, ComponentRegistry, Draft};
 pub use projection::{ProjectionError, project_thread, project_thread_history};
 pub use rewind::{LifecycleWork, diff};
-pub use session::{Session, SessionError};
+pub use session::{Session, SessionError, UnsettledCall};

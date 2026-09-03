@@ -277,11 +277,42 @@ pub fn project_thread(dom: &Dom) -> Vec<Item> {
 		if !is_tag(dom, *turn, KnownTag::Turn) {
 			continue;
 		}
-		let usage = turn_usage(dom, *turn, boundary);
-		for child in dom.children(*turn) {
+		// A tool element before any message in its turn is a local run (the
+		// host's `!`/`$` prefix modes): no assistant issued it, so the model
+		// sees what ran as a user message (pi `bashExecutionToText`).
+		let mut local = true;
+		let children = dom.children(*turn);
+		let mut receipts = BTreeMap::new();
+		let mut awaiting_receipt = None;
+		for child in children {
 			let Some(node) = dom.get(*child) else {
 				continue;
 			};
+			if !element_after_boundary(node, boundary) {
+				continue;
+			}
+			match &node.tag {
+				Tag::Known(KnownTag::Assistant) => awaiting_receipt = Some(*child),
+				Tag::Known(KnownTag::Usage) => {
+					if let Some(assistant) = awaiting_receipt.take()
+						&& let Some(usage) = usage_of(node, boundary)
+					{
+						receipts.insert(assistant, usage);
+					}
+				},
+				_ => {},
+			}
+		}
+		for child in children {
+			let Some(node) = dom.get(*child) else {
+				continue;
+			};
+			if matches!(
+				node.tag,
+				Tag::Known(KnownTag::User | KnownTag::Developer | KnownTag::Assistant)
+			) {
+				local = false;
+			}
 			if !element_after_boundary(node, boundary) {
 				continue;
 			}
@@ -291,7 +322,12 @@ pub fn project_thread(dom: &Dom) -> Vec<Item> {
 					project_message(node, thread::Role::System, &mut items);
 				},
 				Tag::Known(KnownTag::Assistant) => {
-					project_assistant(node, usage.clone(), &mut items);
+					// Receipts are consumed one-for-one in ordered turn
+					// sequence; no completion can reuse another's accounting.
+					project_assistant(node, receipts.remove(child), &mut items);
+				},
+				Tag::Custom(name) if local => {
+					project_local_tool(dom, *child, name.as_str(), node, &mut items);
 				},
 				Tag::Custom(name) => project_tool(dom, *child, name.as_str(), node, &mut items),
 				_ => {},
@@ -299,6 +335,80 @@ pub fn project_thread(dom: &Dom) -> Vec<Item> {
 		}
 	}
 	items
+}
+
+/// Prop a local run carries when the host excluded it from the model's
+/// context (pi `!!` / `$$`).
+pub const LOCAL_CONTEXT_PROP: &str = "context";
+/// [`LOCAL_CONTEXT_PROP`] value hiding the run.
+pub const LOCAL_CONTEXT_EXCLUDED: &str = "excluded";
+
+/// Projects a host-run tool element as the user message pi builds for a
+/// `bashExecution` / `pythonExecution` entry. A run still in flight or one
+/// excluded from context contributes nothing.
+fn project_local_tool(dom: &Dom, handle: Handle, name: &str, node: &Node, items: &mut Vec<Item>) {
+	let excluded = node
+		.prop(&PropKey::Custom(Str::new_static(LOCAL_CONTEXT_PROP)))
+		.and_then(Value::as_str)
+		== Some(LOCAL_CONTEXT_EXCLUDED);
+	let status = prop_text(node, PropId::Status).unwrap_or("running");
+	if excluded || matches!(status, "arguments" | "running") {
+		return;
+	}
+	let args = child(dom, handle, KnownTag::Input)
+		.and_then(|handle| dom.get(handle))
+		.and_then(node_text)
+		.and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
+		.unwrap_or(serde_json::Value::Null);
+	let result_node = terminal_node(dom, handle, status);
+	let mut output = String::new();
+	let parts = result_node
+		.and_then(projected_tool_parts)
+		.unwrap_or_else(|| {
+			let result = result_node.and_then(node_text).unwrap_or_default();
+			vec![thread::Part { kind: Some(part::Kind::Text(result.to_owned())) }]
+		});
+	for part in parts {
+		if let Some(part::Kind::Text(text)) = part.kind {
+			if !output.is_empty() {
+				output.push('\n');
+			}
+			output.push_str(&text);
+		}
+	}
+	let output = output.trim_end();
+	let mut text = match name {
+		"bash" => format!("Ran `{}`\n", args["command"].as_str().unwrap_or_default()),
+		"eval" => format!(
+			"Ran Python:\n```python\n{}\n```\n",
+			args["code"].as_str().unwrap_or_default()
+		),
+		other => format!("Ran `{other}` with `{args}`\n"),
+	};
+	if output.is_empty() {
+		text.push_str("(no output)");
+	} else {
+		if name != "bash" {
+			text.push_str("Output:\n");
+		}
+		text.push_str("```\n");
+		text.push_str(output);
+		text.push_str("\n```");
+	}
+	match status {
+		"cancelled" | "aborted" => text.push_str(if name == "bash" {
+			"\n\n(command cancelled)"
+		} else {
+			"\n\n(execution cancelled)"
+		}),
+		"error" => text.push_str(if name == "bash" {
+			"\n\nCommand failed"
+		} else {
+			"\n\nExecution failed"
+		}),
+		_ => {},
+	}
+	items.push(message_item(thread::Role::User, &text, None, false));
 }
 
 fn project_message(node: &Node, role: thread::Role, items: &mut Vec<Item>) {
@@ -366,6 +476,15 @@ fn project_assistant(node: &Node, usage: Option<inference::Usage>, items: &mut V
 
 fn project_tool(dom: &Dom, handle: Handle, name: &str, node: &Node, items: &mut Vec<Item>) {
 	let id = prop_text(node, PropId::Id).unwrap_or_default().to_owned();
+	let status = prop_text(node, PropId::Status).unwrap_or("running");
+	// A live in-flight call is not history yet. Omit it until the controller
+	// journals its terminal state; `Session::open` turns crash leftovers into
+	// durable aborted results before returning. This defensive path keeps any
+	// direct DOM projection acceptable to providers that require every call
+	// to have a matching result without inventing lifecycle state.
+	if matches!(status, "arguments" | "running") {
+		return;
+	}
 	let input = child(dom, handle, KnownTag::Input)
 		.and_then(|handle| dom.get(handle))
 		.and_then(node_text)
@@ -382,16 +501,7 @@ fn project_tool(dom: &Dom, handle: Handle, name: &str, node: &Node, items: &mut 
 		})),
 		props:         None,
 	});
-	let status = prop_text(node, PropId::Status).unwrap_or("running");
-	if matches!(status, "arguments" | "running") {
-		return;
-	}
-	let result_tag = if status == "error" {
-		KnownTag::Diag
-	} else {
-		KnownTag::Result
-	};
-	let result_node = child(dom, handle, result_tag).and_then(|handle| dom.get(handle));
+	let result_node = terminal_node(dom, handle, status);
 	let parts = result_node
 		.and_then(projected_tool_parts)
 		.unwrap_or_else(|| {
@@ -411,6 +521,27 @@ fn project_tool(dom: &Dom, handle: Handle, name: &str, node: &Node, items: &mut 
 		})),
 		props:         None,
 	});
+}
+
+/// The child carrying a settled call's model-facing terminal: `<result>` for
+/// success, the `<diag>` carrying the fault for an error (a tool's earlier
+/// warnings are separate diag children and never the terminal).
+fn terminal_node<'a>(dom: &'a Dom, call: Handle, status: &str) -> Option<&'a Node> {
+	if status != "error" {
+		return child(dom, call, KnownTag::Result).and_then(|handle| dom.get(handle));
+	}
+	let diags = dom
+		.children(call)
+		.iter()
+		.filter_map(|handle| dom.get(*handle))
+		.filter(|node| node.tag == Tag::Known(KnownTag::Diag))
+		.collect::<Vec<_>>();
+	diags
+		.iter()
+		.rev()
+		.find(|node| node.prop(&PropKey::from(PropId::Fault)).is_some())
+		.or_else(|| diags.first())
+		.copied()
 }
 
 fn projected_tool_parts(node: &Node) -> Option<Vec<thread::Part>> {
@@ -498,8 +629,7 @@ fn element_after_boundary(node: &Node, boundary: Option<EntryId>) -> bool {
 		.is_some_and(|id| id > boundary)
 }
 
-fn turn_usage(dom: &Dom, turn: Handle, boundary: Option<EntryId>) -> Option<inference::Usage> {
-	let usage = child(dom, turn, KnownTag::Usage).and_then(|handle| dom.get(handle))?;
+fn usage_of(usage: &Node, boundary: Option<EntryId>) -> Option<inference::Usage> {
 	if !element_after_boundary(usage, boundary) {
 		return None;
 	}

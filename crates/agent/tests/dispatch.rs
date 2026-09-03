@@ -415,6 +415,56 @@ fn worker_registry() -> Arc<omp_tool::Registry> {
 	Arc::new(tools)
 }
 
+#[tokio::test]
+async fn dispatch_timed_out_call_remains_observable_as_an_adopted_job() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let tools = worker_registry();
+	let identity = tools.resolved_identity("worker").expect("worker identity");
+	let started = Arc::new(tokio::sync::Notify::new());
+	let dispatcher = Dispatcher::new(
+		Arc::clone(&tools),
+		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store")).with_limits(
+			64 * 1024,
+			512,
+			Duration::from_millis(20),
+		),
+	)
+	.with_external_executor(Arc::new(StuckExternal {
+		honors_cancel: true,
+		started,
+	}));
+	let mut session = session(&directory.path().join("detached.oms"));
+	let (entry, args) = call(&mut session, &identity, "detached-1");
+	let report = tokio::time::timeout(
+		Duration::from_secs(1),
+		dispatcher.dispatch(
+			&mut session,
+			request(
+				entry,
+				identity,
+				args,
+				ToolCancellation::ReadOnly(CancelTree::new().begin_turn().read_only_tool()),
+				false,
+			),
+		),
+	)
+	.await
+	.expect("blocking limit detaches promptly")
+	.expect("detachment journals a terminal");
+	let detached = report.detached.expect("call returns a job reference");
+	let jobs = dispatcher.jobs().list();
+	assert_eq!(jobs.len(), 1);
+	assert_eq!(jobs[0].id, detached.id);
+	assert!(
+		dispatcher
+			.jobs()
+			.terminate(&mut session, jobs[0].handle)
+			.await
+			.expect("cancel journals")
+	);
+	assert_eq!(dispatcher.jobs().list()[0].status, "cancelled");
+}
+
 /// The journaled `tool.result@1` abort kind for `call_id`, after proving the
 /// aborted result projects to the model.
 fn abort_kind(session: &omp_session::Session, call_id: &str) -> String {

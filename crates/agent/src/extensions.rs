@@ -31,7 +31,7 @@ pub trait LiveComponent: Send + Sync {
 	/// Returns whether this reducer consumes `kind`.
 	fn interested(&self, kind: &Kind) -> bool;
 	/// Produces ordinary ADR 0003 DOM operations.
-	fn reduce(&mut self, entry: &Entry, dom: &Dom) -> Result<Vec<Op>, LiveComponentError>;
+	fn reduce(&self, entry: &Entry, dom: &Dom) -> Result<Vec<Op>, LiveComponentError>;
 }
 
 /// Sending half of the kernel's single upward mailbox.

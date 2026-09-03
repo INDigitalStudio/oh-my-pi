@@ -91,6 +91,8 @@ pub struct RouteFacts {
 	pub forced_choice_free: bool,
 	/// Maximum context window for the resolved route.
 	pub context_window:     u64,
+	/// The route accepts image input (catalog input modalities).
+	pub image_input:        bool,
 }
 
 /// The outcome of one Director inspecting a candidate yield.
@@ -273,9 +275,19 @@ pub struct MutDirectorCx<'a> {
 	pub turn:      Handle,
 	/// Current Director element, set by the stack while invoking a hook.
 	pub director:  Option<Handle>,
+	/// Observer notifications for progress that is not journaled (the
+	/// compaction speculation pulse); `None` in headless tests.
+	pub events:    Option<&'a crate::KernelEvents>,
 }
 
 impl MutDirectorCx<'_> {
+	/// Publishes an ephemeral observer notification when a sink is attached.
+	pub fn notify(&self, event: crate::KernelEvent) {
+		if let Some(events) = self.events {
+			events.publish(event);
+		}
+	}
+
 	/// Returns one durable state property from the current Director element.
 	#[must_use]
 	pub fn state(&self, key: &str) -> Option<&Value> {
@@ -524,6 +536,44 @@ impl DirectorStack {
 			.iter()
 			.map(|frame| frame.director.id())
 			.collect()
+	}
+
+	/// The convar engagement chain this stack projects, outermost first:
+	/// one `(owner, binds)` entry per active `<director>` element, the
+	/// owner being `<family>#<handle>` and the binds the element's `bind/*`
+	/// props (ADR 0015: binds live on the element, so rewind, resume, and
+	/// promotion re-derive them without an engage or exit call).
+	#[must_use]
+	pub fn con_chain(&self, dom: &Dom) -> Vec<(Str, Vec<(Str, omp_con::Value)>)> {
+		self
+			.active
+			.iter()
+			.filter_map(|frame| {
+				let node = dom.get(frame.handle)?;
+				let binds = node
+					.props
+					.iter()
+					.filter_map(|(key, value)| {
+						let PropKey::Custom(key) = key else {
+							return None;
+						};
+						let name = key.strip_prefix(BIND_PREFIX)?;
+						Some((Str::new(name), con_value(BindValue::from_dom(value)?)))
+					})
+					.collect();
+				let mut owner = omp_core::StrMut::new(frame.director.id());
+				owner.push('#');
+				let _ = std::fmt::Write::write_fmt(&mut owner, format_args!("{}", frame.handle.get()));
+				Some((owner.freeze(), binds))
+			})
+			.collect()
+	}
+
+	/// Derives the control-plane engagement layers from this stack
+	/// ([`Ctx::derive_layers`](omp_con::Ctx::derive_layers)): a no-op when
+	/// the chain is unchanged, so it is safe after every re-derivation.
+	pub fn apply_binds(&self, dom: &Dom, con: &omp_con::Ctx) {
+		con.derive_layers(&self.con_chain(dom));
 	}
 
 	/// Engages a Director through one `patch@1`, queueing on claim conflict.
@@ -952,6 +1002,16 @@ fn director_node(director: &dyn Director, status: &'static str) -> NodeSpec {
 		node = node.with_prop(custom(&format!("{STATE_PREFIX}{key}")), value.into_dom());
 	}
 	node
+}
+
+/// Lowers a Director bind to the control plane's dynamic value.
+fn con_value(value: BindValue) -> omp_con::Value {
+	match value {
+		BindValue::Bool(value) => omp_con::Value::Bool(value),
+		BindValue::Int(value) => omp_con::Value::Int(value),
+		BindValue::Str(value) => omp_con::Value::Str(value),
+		BindValue::Float(value) => omp_con::Value::Float(value),
+	}
 }
 
 fn directors_root(dom: &Dom) -> Option<Handle> {

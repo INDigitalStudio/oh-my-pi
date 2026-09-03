@@ -77,7 +77,9 @@ fn latest_assistant(session: &Session) -> Option<omp_dom::Handle> {
 
 fn assert_journal_unchanged(path: &std::path::Path, before: &[u8]) {
 	assert_eq!(std::fs::read(path).expect("journal reads"), before);
-	Session::open(path, ComponentRegistry::default()).expect("journal remains replayable");
+	// The writer under test still holds the journal lock; the read-only scan
+	// proves the committed prefix remains decodable.
+	omp_journal::Journal::scan(path).expect("journal remains replayable");
 }
 
 #[test]
@@ -256,6 +258,14 @@ fn custom_stream_property_keeps_its_wire_discriminator() {
 	let node = session.dom().get(tool).expect("tool remains");
 	assert_eq!(node.prop(&custom).and_then(omp_dom::Value::as_str), Some("custom"));
 	assert!(matches!(node.prop(&omp_dom::PropKey::from(PropId::Rev)), Some(Value::Int(1))));
+	let call = session
+		.unsettled_calls()
+		.first()
+		.expect("call remains unsettled")
+		.entry;
+	session
+		.settle(call, raw(serde_json::json!({"ok": true})))
+		.expect("call settles before replay");
 	let live = session.dom().snapshot();
 	drop(session);
 	let restored = Session::open(path, ComponentRegistry::default()).expect("session replays");

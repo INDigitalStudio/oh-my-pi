@@ -1,16 +1,20 @@
 //! Rewind-to-runtime lifecycle integration for the shared job primitive.
 
-use omp_agent::JobBoard;
+use std::sync::{
+	Arc,
+	atomic::{AtomicUsize, Ordering},
+};
+
+use omp_agent::{JobBoard, JobSettlement};
 use omp_core::Str;
 use omp_session::{
 	ComponentRegistry, Session,
 	components::jobs::{self, JobSpec},
 };
 use tempfile::tempdir;
-use tokio_util::sync::CancellationToken;
 
-#[test]
-fn jobs_rewind_removing_a_subagent_terminates_it() {
+#[tokio::test]
+async fn jobs_rewind_removing_a_subagent_terminates_it() {
 	let temp = tempdir().expect("temporary session directory");
 	let path = temp.path().join("parent.oms");
 	let mut session = Session::create(&path, ComponentRegistry::standard()).expect("create session");
@@ -32,13 +36,33 @@ fn jobs_rewind_removing_a_subagent_terminates_it() {
 		.into_iter()
 		.next()
 		.expect("subagent element");
-	let cancel = CancellationToken::new();
+	let inserted = session.head().expect("insert head");
+	let starts = Arc::new(AtomicUsize::new(0));
 	let board = JobBoard::new();
-	assert!(board.attach(session.dom(), handle, cancel.clone()));
+	assert!(board.attach_restartable(session.dom(), handle, {
+		let starts = Arc::clone(&starts);
+		move |cancel| {
+			starts.fetch_add(1, Ordering::SeqCst);
+			tokio::spawn(async move {
+				cancel.cancelled().await;
+				JobSettlement {
+					status: Str::new_static("cancelled"),
+					output: None,
+					error: None,
+				}
+			})
+		}
+	}));
+	assert_eq!(starts.load(Ordering::SeqCst), 1);
 
 	let work = session.rewind(before).expect("rewind before spawn");
 	assert_eq!(work.terminate, vec![handle]);
-	board.apply_lifecycle(&work);
-	assert!(cancel.is_cancelled());
+	board.apply_lifecycle(&session, &work).await;
 	assert!(board.list().is_empty());
+
+	let work = session.rewind(inserted).expect("rewind onto spawned branch");
+	assert_eq!(work.spawn.len(), 1);
+	board.apply_lifecycle(&session, &work).await;
+	assert_eq!(starts.load(Ordering::SeqCst), 2);
+	assert_eq!(board.list().len(), 1);
 }

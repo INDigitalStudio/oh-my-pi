@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 
 /// One requirement merged into an invocation's approval prompt.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -40,7 +41,7 @@ pub struct ApprovalSpec {
 	pub timeout_ms:    u64,
 	/// Unreachable-route behavior.
 	pub unreachable:   Str,
-	/// Forbids extension-sourced decisions.
+	/// Forbids non-human decisions.
 	pub require_human: bool,
 	/// Scope-bearing approval pattern.
 	pub pattern:       Option<Str>,
@@ -490,6 +491,17 @@ struct PendingRequest {
 	reply:  flume::Sender<ApprovalDecision>,
 }
 
+struct PendingGuard {
+	inner:     Arc<RouteInner>,
+	ticket_id: Str,
+}
+
+impl Drop for PendingGuard {
+	fn drop(&mut self) {
+		self.inner.pending.lock().remove(&self.ticket_id);
+	}
+}
+
 /// Host-facing receiving half of an approval route.
 pub struct ApprovalInbox {
 	rx: flume::Receiver<ApprovalRequest>,
@@ -552,6 +564,27 @@ impl ApprovalRoute {
 		reasons: Vec<ApprovalSpec>,
 		created_at_ms: u64,
 	) -> ApprovalTicket {
+		self
+			.request_cancellable(
+				invocation_id,
+				reasons,
+				created_at_ms,
+				CancellationToken::new(),
+			)
+			.await
+	}
+
+	/// Files and awaits one approval, withdrawing it if cancellation wins.
+	///
+	/// The pending-table guard is owned by this future, so dropping the future
+	/// also removes the exact request it filed.
+	pub async fn request_cancellable(
+		&self,
+		invocation_id: Option<Str>,
+		reasons: Vec<ApprovalSpec>,
+		created_at_ms: u64,
+		cancellation: CancellationToken,
+	) -> ApprovalTicket {
 		let ticket_id = sf!("approval-{}", self.inner.next_id.fetch_add(1, Ordering::Relaxed));
 		let mut ticket = ApprovalTicket {
 			ticket_id: ticket_id.clone(),
@@ -570,6 +603,7 @@ impl ApprovalRoute {
 				ticket: ticket.clone(),
 				reply:  reply.clone(),
 			});
+		let _guard = PendingGuard { inner: Arc::clone(&self.inner), ticket_id: ticket_id.clone() };
 		let timeout_ms = ticket
 			.reasons
 			.iter()
@@ -590,16 +624,29 @@ impl ApprovalRoute {
 		}
 		let decision = match timeout_ms {
 			Some(timeout_ms) => {
-				match time::timeout(Duration::from_millis(timeout_ms), response.recv_async()).await {
-					Ok(Ok(decision)) => decision,
-					Ok(Err(_)) => unreachable_decision(&ticket, "approval host became unreachable"),
-					Err(_) => timeout_decision(&ticket),
+				tokio::select! {
+					biased;
+					() = cancellation.cancelled() => {
+						unreachable_decision(&ticket, "approval request cancelled")
+					},
+					result = time::timeout(Duration::from_millis(timeout_ms), response.recv_async()) => {
+						match result {
+							Ok(Ok(decision)) => decision,
+							Ok(Err(_)) => unreachable_decision(&ticket, "approval host became unreachable"),
+							Err(_) => timeout_decision(&ticket),
+						}
+					},
 				}
 			},
-			None => response
-				.recv_async()
-				.await
-				.unwrap_or_else(|_| unreachable_decision(&ticket, "approval host became unreachable")),
+			None => tokio::select! {
+				biased;
+				() = cancellation.cancelled() => {
+					unreachable_decision(&ticket, "approval request cancelled")
+				},
+				result = response.recv_async() => result.unwrap_or_else(|_| {
+					unreachable_decision(&ticket, "approval host became unreachable")
+				}),
+			},
 		};
 		self.inner.pending.lock().remove(&ticket_id);
 		ticket.state = TicketState::Decided;

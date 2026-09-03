@@ -1,7 +1,10 @@
 #![allow(missing_docs, reason = "strum IntoStaticStr emits undocumented inherent methods")]
 //! Subscription masks and the per-invocation hook decision procedure.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+	Arc,
+	atomic::{AtomicU64, Ordering},
+};
 
 use bytes::{Bytes, BytesMut};
 use flume::Receiver;
@@ -12,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use smallvec::SmallVec;
 use strum::{Display, EnumString, IntoStaticStr};
+use thiserror::Error;
 
 use crate::ApprovalSpec;
 
@@ -551,6 +555,116 @@ pub struct DomainOutcome<R> {
 	pub contributions: SmallVec<(SourceRef, R), 2>,
 }
 
+/// Error returned by a production lifecycle hook gate.
+#[derive(Debug, Error)]
+pub enum LifecycleHookError {
+	/// A subscribed hook denied the lifecycle transition.
+	#[error("hook {event:?} denied the lifecycle transition: {reason}")]
+	Denied {
+		/// Closed event identity.
+		event:  HookEventId,
+		/// Stable extension-supplied denial reason.
+		reason: Str,
+	},
+	/// A lifecycle seam cannot open a durable approval ticket.
+	#[error("hook {event:?} requested approval at a lifecycle seam")]
+	ApprovalUnsupported {
+		/// Closed event identity.
+		event: HookEventId,
+	},
+	/// A transform returned bytes outside the JSON payload contract.
+	#[error("hook {event:?} returned a malformed transformed payload")]
+	MalformedTransform {
+		/// Closed event identity.
+		event:  HookEventId,
+		/// Typed JSON decoding failure.
+		#[source]
+		source: serde_json::Error,
+	},
+	/// Encoding the caller-owned JSON payload failed.
+	#[error("hook {event:?} payload could not be encoded")]
+	MalformedPayload {
+		/// Closed event identity.
+		event:  HookEventId,
+		/// Typed JSON encoding failure.
+		#[source]
+		source: serde_json::Error,
+	},
+}
+
+/// Cloneable production seam for lifecycle admission and observation.
+///
+/// The wrapper keeps the unsubscribed path to one bitmap load and returns the
+/// caller's payload without serializing it. Kernel and environment owners can
+/// clone this handle without exposing dispatch internals.
+#[derive(Clone)]
+pub struct LifecycleHooks {
+	gate: Arc<HookGate>,
+}
+
+impl LifecycleHooks {
+	/// Wraps the live extension hook gate.
+	#[must_use]
+	pub const fn new(gate: Arc<HookGate>) -> Self {
+		Self { gate }
+	}
+
+	/// Returns the shared gate for facilities which install subscriptions.
+	#[must_use]
+	pub const fn hook_gate(&self) -> &Arc<HookGate> {
+		&self.gate
+	}
+
+	/// Runs a revision-1 JSON lifecycle gate.
+	///
+	/// This seam does not own approval tickets, so an approval response is a
+	/// typed error rather than an implicit allow.
+	pub async fn gate(
+		&self,
+		event: HookEventId,
+		payload: JsonValue,
+	) -> Result<JsonValue, LifecycleHookError> {
+		if !self.gate.subscribed(event) {
+			return Ok(payload);
+		}
+		let encoded = serde_json::to_vec(&payload)
+			.map_err(|source| LifecycleHookError::MalformedPayload { event, source })?;
+		match self
+			.gate
+			.gate(event, GateEvent::new(Str::default(), Bytes::from(encoded)))
+			.await
+		{
+			GateOutcome::Allow { event: effective, .. } => {
+				serde_json::from_slice(&effective.effective_args)
+					.map_err(|source| LifecycleHookError::MalformedTransform { event, source })
+			},
+			GateOutcome::Deny { reason, .. } => {
+				Err(LifecycleHookError::Denied { event, reason })
+			},
+			GateOutcome::Approval { .. } => {
+				Err(LifecycleHookError::ApprovalUnsupported { event })
+			},
+		}
+	}
+
+	/// Publishes a revision-1 JSON lifecycle observation.
+	///
+	/// A full observer queue remains lossy and is accounted by [`HookGate`].
+	pub fn notify(
+		&self,
+		event: HookEventId,
+		payload: JsonValue,
+	) -> Result<(), LifecycleHookError> {
+		if !self.gate.subscribed(event) {
+			return Ok(());
+		}
+		let encoded = serde_json::to_vec(&payload)
+			.map_err(|source| LifecycleHookError::MalformedPayload { event, source })?;
+		self.gate.notify_payload(event, 1, Bytes::from(encoded));
+		Ok(())
+	}
+}
+
 /// Invalid dispatch input or illegal host decision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GateError {
@@ -1004,7 +1118,10 @@ pub(crate) const fn event_position(event: HookEventId) -> (usize, u64) {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	};
 
 	use bytes::Bytes;
 	use omp_core::sf;
@@ -1012,9 +1129,110 @@ mod tests {
 
 	use super::{
 		AgentSettled, DomainReturn, GateDecision, GateError, GateEvent, GateOutcome, HookEvent,
-		HookGate, HookPatch, HookPhase, JsonGateOutcome, OnFailure, ProviderFailover, SourceRef,
-		Subscription, When, gate_json, notify_json,
+		HookGate, HookPatch, HookPhase, JsonGateOutcome, LifecycleHookError, LifecycleHooks,
+		OnFailure, ProviderFailover, SourceRef, Subscription, When, gate_json, notify_json,
 	};
+
+	#[tokio::test]
+	async fn lifecycle_hooks_bypass_unsubscribed_payload_without_dispatch() {
+		let (gate, receiver) = HookGate::channel();
+		let hooks = LifecycleHooks::new(Arc::new(gate));
+		let payload = serde_json::json!({"turn_id": "t"});
+		assert_eq!(
+			hooks
+				.gate(HookEventId::HookEventTurnStart, payload.clone())
+				.await
+				.expect("unsubscribed lifecycle gate"),
+			payload,
+		);
+		hooks
+			.notify(HookEventId::HookEventTurnEnd, serde_json::json!({"turn_id": "t"}))
+			.expect("unsubscribed lifecycle observation");
+		assert!(receiver.try_recv().is_err());
+	}
+
+	#[tokio::test]
+	async fn lifecycle_hooks_preserve_typed_denials() {
+		let (gate, receiver) = HookGate::channel();
+		let mut precheck = subscription(HookPhase::Precheck, 41);
+		precheck.event = HookEventId::HookEventTurnStart;
+		gate.subscribe("test", [precheck]).unwrap();
+		let gate = Arc::new(gate);
+		let hooks = LifecycleHooks::new(Arc::clone(&gate));
+		let work = hooks.gate(
+			HookEventId::HookEventTurnStart,
+			serde_json::json!({"turn_id": "t"}),
+		);
+		let driver = async {
+			let dispatch = receiver.recv_async().await.unwrap();
+			gate
+				.answer(dispatch.dispatch_id, vec![(41, GateDecision::Deny(sf!("blocked")))])
+				.unwrap();
+		};
+		let (outcome, ()) = tokio::join!(work, driver);
+		assert!(matches!(
+			outcome,
+			Err(LifecycleHookError::Denied {
+				event: HookEventId::HookEventTurnStart,
+				ref reason,
+			}) if reason == "blocked"
+		));
+	}
+
+	#[tokio::test]
+	async fn lifecycle_hooks_preserve_malformed_transform_source() {
+		let (gate, receiver) = HookGate::channel();
+		let mut transform = subscription(HookPhase::Transform, 43);
+		transform.event = HookEventId::HookEventTurnStart;
+		gate.subscribe("test", [transform]).unwrap();
+		let gate = Arc::new(gate);
+		let hooks = LifecycleHooks::new(Arc::clone(&gate));
+		let work = hooks.gate(
+			HookEventId::HookEventTurnStart,
+			serde_json::json!({"turn_id": "t"}),
+		);
+		let driver = async {
+			let dispatch = receiver.recv_async().await.unwrap();
+			gate
+				.answer(dispatch.dispatch_id, vec![(
+					43,
+					GateDecision::Modify(HookPatch {
+						target: None,
+						args:   Some(Bytes::from_static(b"{")),
+					}),
+				)])
+				.unwrap();
+		};
+		let (outcome, ()) = tokio::join!(work, driver);
+		assert!(matches!(
+			outcome,
+			Err(LifecycleHookError::MalformedTransform {
+				event: HookEventId::HookEventTurnStart,
+				..
+			})
+		));
+	}
+
+	#[test]
+	fn lifecycle_hooks_publish_observations() {
+		let (gate, receiver) = HookGate::channel();
+		let mut observe = subscription(HookPhase::Observe, 42);
+		observe.event = HookEventId::HookEventTurnEnd;
+		gate.subscribe("test", [observe]).unwrap();
+		let hooks = LifecycleHooks::new(Arc::new(gate));
+		hooks
+			.notify(
+				HookEventId::HookEventTurnEnd,
+				serde_json::json!({"turn_id": "t", "status": "complete"}),
+			)
+			.expect("lifecycle observation");
+		let dispatch = receiver.try_recv().expect("turn_end dispatch");
+		assert_eq!(dispatch.event, HookEventId::HookEventTurnEnd);
+		assert_eq!(
+			serde_json::from_slice::<serde_json::Value>(&dispatch.payload).unwrap(),
+			serde_json::json!({"turn_id": "t", "status": "complete"}),
+		);
+	}
 
 	#[test]
 	fn provider_failover_requires_a_nonempty_typed_route_chain() {

@@ -1,7 +1,15 @@
 //! Bounded empty-output recovery as durable developer nudges and a terminal
 //! notice.
 
-use omp_agent::{DispatchPolicy, Kernel, RunControl, StaticPrompt, TurnInput, TurnStop};
+use std::sync::{
+	Arc,
+	atomic::{AtomicBool, Ordering},
+};
+
+use omp_agent::{
+	Director, DirectorCx, DirectorRegistry, DirectorStack, DispatchPolicy, Kernel, RunControl,
+	StaticPrompt, TurnInput, TurnStop, TurnView, Verdict,
+};
 use omp_core::Str;
 use omp_dom::{PropId, PropKey};
 use omp_inference::{BlockKind, ChatEvent, ContentPart, FinishReason, Role};
@@ -17,6 +25,20 @@ use support::{
 const RETRY_PREFIX: &str =
 	"<system-injection>\nStopped without actionable output; task incomplete.";
 const CAP_NOTICE: &str = "Assistant returned no final output after retry cap; try switching models";
+
+struct EmptyObserver(Arc<AtomicBool>);
+
+impl Director for EmptyObserver {
+	fn id(&self) -> &str {
+		"empty_observer"
+	}
+
+	fn on_yield(&self, _: &DirectorCx<'_>, turn: &TurnView) -> Verdict {
+		assert!(turn.assistant_text.is_empty());
+		self.0.store(true, Ordering::SeqCst);
+		Verdict::Yield
+	}
+}
 
 fn input(text: &str) -> TurnInput {
 	TurnInput { text: Str::new(text), attachments: Vec::new() }
@@ -172,6 +194,34 @@ async fn fourth_empty_output_yields_after_exactly_three_nudges_with_error_notice
 			.count(),
 		1
 	);
+}
+
+#[tokio::test]
+async fn empty_output_exhaustion_is_offered_to_the_director_stack() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("director-empty.oms");
+	let (inference, _) =
+		ScriptedInference::new([empty_script(), empty_script(), empty_script(), empty_script()]);
+	let observed = Arc::new(AtomicBool::new(false));
+	let mut directors = DirectorRegistry::standard();
+	directors.register_extension(Box::new(EmptyObserver(Arc::clone(&observed))));
+	let mut kernel = Kernel::new(
+		inference,
+		registry(std::iter::empty()),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	)
+	.with_director_registry(directors.clone());
+	let mut session = fresh_session(&journal_path);
+	let mut stack = DirectorStack::from_dom(session.dom(), &directors);
+	stack
+		.engage_registered(&mut session, "empty_observer")
+		.expect("observer engages");
+	kernel
+		.run_turn(&mut session, input("empty"), RunControl::default())
+		.await
+		.expect("turn yields through Director");
+	assert!(observed.load(Ordering::SeqCst));
 }
 
 #[tokio::test]

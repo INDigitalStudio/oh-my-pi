@@ -63,10 +63,25 @@ pub enum KernelEvent {
 		/// Whether the outcome is model-facing error content.
 		is_error: bool,
 	},
+	/// The compaction Director started producing a summary (pi
+	/// `compactionSpeculation`): hosts pulse the gauge's threshold tick until
+	/// [`KernelEvent::CompactionSettled`].
+	CompactionSpeculating {
+		/// Estimated context occupancy that triggered it, in percent of the
+		/// usable window.
+		percent: u8,
+	},
+	/// The summary settled: journaled as a `compaction@1` boundary
+	/// (`applied`) or abandoned.
+	CompactionSettled {
+		/// Whether a boundary landed.
+		applied: bool,
+	},
 }
 
+/// Fan-out of [`KernelEvent`]s to every subscribed host.
 #[derive(Clone, Default)]
-pub(crate) struct KernelEvents {
+pub struct KernelEvents {
 	subscribers: Arc<Mutex<Vec<flume::Sender<KernelEvent>>>>,
 }
 
@@ -77,7 +92,8 @@ impl KernelEvents {
 		receiver
 	}
 
-	pub(crate) fn publish(&self, event: KernelEvent) {
+	/// Delivers `event` to every live subscriber.
+	pub fn publish(&self, event: KernelEvent) {
 		self
 			.subscribers
 			.lock()

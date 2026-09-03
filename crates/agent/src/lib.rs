@@ -7,9 +7,12 @@ pub mod directors;
 pub mod dispatch;
 pub mod env;
 pub mod events;
+/// Image-input policy (`ai_vision`).
+pub mod vision;
 pub mod extensions;
 pub mod hooks;
 pub mod jobs;
+pub mod local;
 #[path = "loop.rs"]
 pub mod loop_;
 pub mod prompt;
@@ -25,6 +28,7 @@ pub use events::*;
 pub use extensions::*;
 pub use hooks::*;
 pub use jobs::*;
+pub use local::*;
 pub use loop_::*;
 pub use prompt::*;
 pub use registry::*;

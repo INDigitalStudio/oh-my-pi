@@ -23,7 +23,7 @@ fn test_stall_then_write_then_propose_advances_the_gate() {
 	assert_eq!(world.active(), vec!["plan", "force_tool"]);
 	let result = world.turn(
 		"",
-		&[Call::new("write", serde_json::json!({"path": "xd://propose", "content": "approve?"}))],
+		&[Call::new("ask", serde_json::json!({"question": "approve?"}))],
 		0,
 	);
 	assert_eq!(result, LoopDecision::Yield);

@@ -2,22 +2,21 @@
 
 use omp_core::Str;
 use omp_dom::{Dom, Node};
-use omp_inference::{ChatRequest, Setting, ToolChoice};
+use omp_inference::{ChatRequest, ForcedCall, Setting, ToolChoice};
 
 use crate::director::{
 	BindValue, Director, DirectorCx, DirectorEffect, ForceUntil, StateUpdate, TurnView, Verdict,
-	prepend_system, state_int, state_str, turn_called,
+	state_bool, state_int, state_str, turn_called,
 };
-
-const SOFT_PROMPT_PREFIX: &str = "You must invoke the following tool before yielding: ";
 
 /// Requires a named tool call before its parent may inspect the yield.
 pub struct ForceTool {
 	name:     Str,
 	until:    ForceUntil,
 	reminder: Option<Str>,
-	retries:  u32,
-	attempts: u32,
+	retries:   u32,
+	attempts:  u32,
+	satisfied: bool,
 }
 
 impl ForceTool {
@@ -29,7 +28,7 @@ impl ForceTool {
 		reminder: Option<Str>,
 		retries: u32,
 	) -> Self {
-		Self { name: name.into(), until, reminder, retries, attempts: 0 }
+		Self { name: name.into(), until, reminder, retries, attempts: 0, satisfied: false }
 	}
 
 	/// Reconstructs a forced-call engagement from DOM properties.
@@ -47,10 +46,11 @@ impl ForceTool {
 		let attempts = state_int(node, "attempts")
 			.and_then(|value| u32::try_from(value).ok())
 			.unwrap_or(0);
-		Self { name, until, reminder, retries, attempts }
+		let satisfied = state_bool(node, "satisfied").unwrap_or(false);
+		Self { name, until, reminder, retries, attempts, satisfied }
 	}
 
-	fn satisfied(&self, dom: &Dom, turn: &TurnView) -> bool {
+	fn turn_satisfies(&self, dom: &Dom, turn: &TurnView) -> bool {
 		match &self.until {
 			ForceUntil::AnyToolCall => turn.had_tool_calls,
 			ForceUntil::ToolCalled(tool) => turn_called(dom, turn.turn, tool),
@@ -80,19 +80,29 @@ impl Director for ForceTool {
 			(Str::new_static("reminder"), BindValue::Str(self.reminder.clone().unwrap_or_default())),
 			(Str::new_static("retries"), BindValue::Int(i64::from(self.retries))),
 			(Str::new_static("attempts"), BindValue::Int(i64::from(self.attempts))),
+			(Str::new_static("satisfied"), BindValue::Bool(self.satisfied)),
 		]
 	}
 
-	fn prepare_inference(&self, cx: &DirectorCx<'_>, req: &mut ChatRequest) {
-		let directive = Str::new(format!("{SOFT_PROMPT_PREFIX}{}.", self.name));
-		prepend_system(req, directive);
-		if cx.route.forced_choice_free || self.attempts >= self.retries {
-			req.tool_choice = Setting::Require(ToolChoice::Named(self.name.clone()));
+	fn prepare_inference(&self, _cx: &DirectorCx<'_>, req: &mut ChatRequest) {
+		// This is semantic intent only. Inference owns the soft/native/costly
+		// translation and receipts each rung (ADRs 0016 and 0019).
+		req.tool_choice = Setting::Require(ToolChoice::Named(self.name.clone()));
+		req.forced_call = Some(ForcedCall {
+			non_compliant_turns: u8::try_from(self.attempts).unwrap_or(u8::MAX),
+			escalations_left:    u8::from(self.attempts >= self.retries),
+		});
+	}
+
+	fn observe_turn(&self, dom: &Dom, _cx: &DirectorCx<'_>, turn: &TurnView) -> Vec<StateUpdate> {
+		if self.satisfied || !self.turn_satisfies(dom, turn) {
+			return Vec::new();
 		}
+		vec![StateUpdate::new("satisfied", BindValue::Bool(true))]
 	}
 
 	fn evaluate(&self, dom: &Dom, _cx: &DirectorCx<'_>, turn: &TurnView) -> DirectorEffect {
-		if self.satisfied(dom, turn) {
+		if self.satisfied || self.turn_satisfies(dom, turn) {
 			return DirectorEffect::new(Verdict::Done);
 		}
 		if self.attempts >= self.retries {

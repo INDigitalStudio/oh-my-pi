@@ -40,7 +40,7 @@ impl Harness {
 			session,
 			stack,
 			registry,
-			route: RouteFacts { forced_choice_free: true, context_window: 128_000 },
+			route: RouteFacts { forced_choice_free: true, context_window: 128_000, image_input: false },
 			next_call: 0,
 		}
 	}
@@ -96,6 +96,43 @@ impl Harness {
 			.stack
 			.on_yield(&mut self.session, &cx, &view)
 			.expect("yield")
+	}
+
+	pub fn observe_only(&mut self, text: &str, calls: &[Call<'_>], tokens: u64) {
+		self.session.begin_turn().expect("turn");
+		let turn = *self
+			.session
+			.dom()
+			.children(self.session.dom().body())
+			.last()
+			.expect("turn handle");
+		self
+			.session
+			.assistant_start("test-model", "test-provider", "test-route")
+			.expect("assistant");
+		for call in calls {
+			self.next_call += 1;
+			let args = RawValue::from_string(call.args.to_string()).expect("raw args");
+			let id = self
+				.session
+				.call(call.tool, 1, format!("call-{}", self.next_call), None, Some(args), None)
+				.expect("tool call");
+			let outcome = RawValue::from_string("{}".to_owned()).expect("raw result");
+			self.session.settle(id, outcome).expect("tool result");
+		}
+		self.session.receipt(omp_journal::data::TurnReceipt::tokens(0, tokens, 0)).expect("receipt");
+		self.session.assistant_end("stop").expect("assistant end");
+		let view = TurnView {
+			turn,
+			had_tool_calls: !calls.is_empty(),
+			assistant_text: Str::new(text),
+			stop_reason: Str::new_static("stop"),
+		};
+		let cx = DirectorCx::new(turn, &self.route);
+		self
+			.stack
+			.observe_turn(&mut self.session, &cx, &view)
+			.expect("observe");
 	}
 
 	pub fn add_todo(&mut self, text: &str) -> Handle {

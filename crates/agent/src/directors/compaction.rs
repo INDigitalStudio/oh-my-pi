@@ -11,7 +11,10 @@ use omp_inference::{
 };
 use omp_journal::{EntryId, data::Compaction};
 
-use crate::director::{BoxFut, Director, DirectorError, MutDirectorCx, Prepared};
+use crate::{
+	KernelEvent,
+	director::{BoxFut, Director, DirectorError, MutDirectorCx, Prepared},
+};
 
 const DEFAULT_THRESHOLD: f64 = 0.80;
 const BYTES_PER_TOKEN: u64 = 4;
@@ -71,6 +74,35 @@ impl CompactionDirector {
 			}
 		}
 
+		// pi `compactionSpeculation`: the gauge tick pulses while the summary
+		// is produced and settles once the boundary lands (or the run fails).
+		cx.notify(KernelEvent::CompactionSpeculating {
+			percent: occupancy_percent(request, cx.route.context_window),
+		});
+		let summarized = self.summarize(cx, request).await;
+		cx.notify(KernelEvent::CompactionSettled { applied: summarized.is_ok() });
+		let summary = summarized?;
+		let tokens_before = estimate_request_tokens(request);
+		let tokens_after = estimate_text_tokens(summary.as_str());
+		let blob = cx.session.blobs().put(summary.as_bytes())?;
+		cx.session.compaction(Compaction {
+			summary: blob,
+			boundary,
+			method: Some(self.method.clone().unwrap_or_else(|| {
+				Str::new_static(if self.manual { "manual" } else { "auto" })
+			})),
+			tokens_before: Some(tokens_before),
+			tokens_after: Some(tokens_after),
+			warning: None,
+		})?;
+		Ok(Prepared::Rebuild)
+	}
+
+	async fn summarize(
+		&self,
+		cx: &mut MutDirectorCx<'_>,
+		request: &ChatRequest,
+	) -> Result<Str, DirectorError> {
 		let summary_request = summary_request(request, self.focus.as_deref());
 		let mut stream = cx.inference.execute(summary_request).await?;
 		let mut summary = StrMut::new("");
@@ -83,20 +115,7 @@ impl CompactionDirector {
 		if summary.trim().is_empty() {
 			return Err(DirectorError::EmptyCompactionSummary);
 		}
-		let tokens_before = estimate_request_tokens(request);
-		let tokens_after = estimate_text_tokens(summary.as_str());
-		let blob = cx.blobs.put(summary.as_bytes())?;
-		cx.session.compaction(Compaction {
-			summary: blob,
-			boundary,
-			method: Some(self.method.clone().unwrap_or_else(|| {
-				Str::new_static(if self.manual { "manual" } else { "auto" })
-			})),
-			tokens_before: Some(tokens_before),
-			tokens_after: Some(tokens_after),
-			warning: None,
-		})?;
-		Ok(Prepared::Rebuild)
+		Ok(summary)
 	}
 }
 
@@ -134,6 +153,20 @@ fn summary_request(request: &ChatRequest, focus: Option<&str>) -> ChatRequest {
 	summary.hosted_tools = Arc::from([]);
 	summary.tool_choice = Setting::Require(ToolChoice::Disabled);
 	summary
+}
+
+/// Estimated occupancy of the usable window in whole percent, saturating
+/// at 100 (an unknown window reads as 0).
+fn occupancy_percent(request: &ChatRequest, context_window: u64) -> u8 {
+	let usable_window = context_window.saturating_sub(request.max_output_tokens.unwrap_or_default());
+	if usable_window == 0 {
+		return if context_window == 0 { 0 } else { 100 };
+	}
+	let percent = estimate_request_tokens(request)
+		.saturating_mul(100)
+		.checked_div(usable_window)
+		.unwrap_or(100);
+	u8::try_from(percent.min(100)).unwrap_or(100)
 }
 
 fn over_threshold(request: &ChatRequest, context_window: u64, threshold: f64) -> bool {

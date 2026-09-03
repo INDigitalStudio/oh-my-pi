@@ -81,7 +81,6 @@ fn every_body_element_is_inside_an_explicit_turn() {
 	assert_eq!(child_tags, [
 		Tag::Known(KnownTag::Input),
 		Tag::Known(KnownTag::Result),
-		Tag::Known(KnownTag::Diag),
 		Tag::Known(KnownTag::Usage),
 	]);
 
@@ -241,11 +240,54 @@ fn projection_excludes_pre_compaction_turns_and_prepends_summary() {
 }
 
 #[test]
-fn streamed_call_ready_and_abandoned_argument_state_replay_identically() {
+fn compaction_uses_the_composed_session_blob_store_across_reopen() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let session_dir = directory.path().join("sessions");
+	let blob_dir = directory.path().join("artifacts");
+	std::fs::create_dir_all(&session_dir).expect("session directory");
+	let path = session_dir.join("compact.oms");
+	let blobs = BlobStore::open(&blob_dir).expect("blob store opens");
+	let mut session =
+		Session::create_with_blob_store(&path, ComponentRegistry::default(), blobs)
+			.expect("session creates");
+	session.begin_turn().expect("turn starts");
+	let boundary = session.user("old context", Vec::new()).expect("user appends");
+	let summary = session
+		.blobs()
+		.put(b"summary from the composed store")
+		.expect("summary stores");
+	session
+		.compaction(omp_journal::data::Compaction::new(summary, boundary))
+		.expect("compaction appends");
+	drop(session);
+
+	let blobs = BlobStore::open(&blob_dir).expect("blob store reopens");
+	let restored =
+		Session::open_with_blob_store(&path, ComponentRegistry::default(), blobs)
+			.expect("session restores");
+	let items = project_thread(restored.dom());
+	let text = items
+		.first()
+		.and_then(|item| match item.kind.as_ref()? {
+			item::Kind::Message(message) => match message.parts.first()?.kind.as_ref()? {
+				part::Kind::Text(text) => Some(text.as_str()),
+				_ => None,
+			},
+			_ => None,
+		})
+		.expect("summary projects");
+	assert_eq!(text, "summary from the composed store");
+}
+
+#[test]
+fn reopen_journals_abort_results_for_ready_and_partial_calls() {
 	let directory = tempfile::tempdir().expect("temporary session directory");
 	let path = directory.path().join("streamed-call.oms");
 	let mut session = Session::create(&path, ComponentRegistry::default()).expect("session creates");
 	session.begin_turn().expect("turn starts");
+	session
+		.assistant_start("test-model", "test-provider", "test-route")
+		.expect("assistant starts tool turn");
 	let (ready_call, ready_sid) = session
 		.call_streaming("read", 1, "ready-call", None)
 		.expect("streaming call starts");
@@ -264,11 +306,10 @@ fn streamed_call_ready_and_abandoned_argument_state_replay_identically() {
 	session
 		.stream_append(abandoned_sid, r#"{"pattern":"#)
 		.expect("partial argument delta");
-	let live = session.dom().snapshot();
 	drop(session);
 
 	let restored = Session::open(&path, ComponentRegistry::default()).expect("session restores");
-	assert_eq!(restored.dom().snapshot().as_bytes(), live.as_bytes());
+	assert!(restored.unsettled_calls().is_empty());
 	let statuses: std::collections::BTreeMap<_, _> = restored
 		.dom()
 		.handles()
@@ -286,8 +327,46 @@ fn streamed_call_ready_and_abandoned_argument_state_replay_identically() {
 			Some((id.to_owned(), status.to_owned()))
 		})
 		.collect();
-	assert_eq!(statuses.get("ready-call").map(String::as_str), Some("running"));
-	assert_eq!(statuses.get("abandoned-call").map(String::as_str), Some("arguments"));
+	assert_eq!(statuses.get("ready-call").map(String::as_str), Some("error"));
+	assert_eq!(statuses.get("abandoned-call").map(String::as_str), Some("error"));
+	let items = project_thread(restored.dom());
+	let calls: Vec<_> = items
+		.iter()
+		.filter_map(|item| match &item.kind {
+			Some(item::Kind::ToolCall(call)) => Some((
+				call.id.as_str(),
+				std::str::from_utf8(call.args_json.as_ref()).expect("canonical UTF-8 arguments"),
+			)),
+			_ => None,
+		})
+		.collect();
+	let results: Vec<_> = items
+		.iter()
+		.filter_map(|item| match &item.kind {
+			Some(item::Kind::ToolResult(result)) => {
+				Some((result.call_id.as_str(), result.is_error))
+			},
+			_ => None,
+		})
+		.collect();
+	assert_eq!(
+		calls,
+		[
+			("ready-call", r#"{"path":"README.md"}"#),
+			("abandoned-call", "{}"),
+		]
+	);
+	assert_eq!(results, [("ready-call", true), ("abandoned-call", true)]);
+	drop(restored);
+	let recovered_journal = std::fs::read(&path).expect("recovered journal bytes");
+	let reopened = Session::open(&path, ComponentRegistry::default()).expect("session reopens");
+	assert!(reopened.unsettled_calls().is_empty(), "recovery is idempotent");
+	drop(reopened);
+	assert_eq!(
+		std::fs::read(&path).expect("journal bytes"),
+		recovered_journal,
+		"second reopen appends no duplicate aborts"
+	);
 }
 
 #[test]
@@ -311,7 +390,6 @@ fn streamed_call_carries_intent_on_ready() {
 			})),
 		)
 		.expect("streaming call becomes executable");
-	let live = session.dom().snapshot();
 	let tool = session
 		.dom()
 		.handles()
@@ -333,6 +411,10 @@ fn streamed_call_carries_intent_on_ready() {
 			.and_then(omp_dom::Value::as_str),
 		Some("Reading project manifest"),
 	);
+	session
+		.settle(call, raw(serde_json::json!({"text":"done"})))
+		.expect("call settles");
+	let live = session.dom().snapshot();
 	drop(session);
 
 	let restored = Session::open(&path, ComponentRegistry::default()).expect("session restores");
@@ -395,4 +477,240 @@ fn projected_results_and_reserved_ready_updates_preflight_before_journaling() {
 	);
 	assert_eq!(std::fs::read(&path).expect("journal unchanged"), before_file);
 	assert_eq!(session.dom().snapshot().as_bytes(), before_dom.as_bytes());
+}
+
+/// ADR 0008: the settled element carries the tool's durable truth. The
+/// journaled `CallOutcome` envelope lands on `<result outcome>` (or `<diag
+/// fault>`), while `data` stays the model-facing prompt parts, and both
+/// survive a reopen.
+#[test]
+fn settled_calls_carry_the_journaled_outcome_beside_the_prompt_parts() {
+	use omp_dom::{KnownTag, PropId, PropKey, Tag, Value};
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let path = directory.path().join("outcome-truth.oms");
+	let mut session = Session::create(&path, ComponentRegistry::default()).expect("session creates");
+	session.begin_turn().expect("turn starts");
+	let ok = session
+		.call("bash", 1, "call-ok", None, Some(raw(serde_json::json!({"command":"true"}))), None)
+		.expect("call");
+	let outcome = serde_json::json!({"kind":"ok","value":{"transcript":[],"status":{"exit_code":0}}});
+	session
+		.settle_projected(ok, raw(outcome.clone()), raw(serde_json::json!([])))
+		.expect("settles");
+	let failed = session
+		.call("bash", 1, "call-aborted", None, Some(raw(serde_json::json!({"command":"sleep 9"}))), None)
+		.expect("call");
+	let fault = serde_json::json!({"kind":"aborted","value":{"abort":{"kind":"interrupted","reason":"cancelled"},"kind":"cancelled"}});
+	session
+		.fail_projected(failed, raw(fault.clone()), raw(serde_json::json!([{"kind":"text","text":"interrupted: cancelled"}])))
+		.expect("fails");
+
+	let check = |session: &Session| {
+		let dom = session.dom();
+		let tool = |id: &str| -> omp_dom::Handle {
+			dom.handles()
+				.find(|handle| {
+					dom.get(*handle).is_some_and(|node| {
+						matches!(node.tag, Tag::Custom(_))
+							&& node.prop(&PropKey::from(PropId::Id)).and_then(Value::as_str) == Some(id)
+					})
+				})
+				.expect("tool element exists")
+		};
+		let child_json = |id: &str, tag: KnownTag, prop: PropId| -> serde_json::Value {
+			let child = dom
+				.children(tool(id))
+				.iter()
+				.copied()
+				.find(|handle| dom.get(*handle).is_some_and(|node| node.tag == Tag::Known(tag)))
+				.expect("child element");
+			match dom.get(child).and_then(|node| node.prop(&PropKey::from(prop)).cloned()) {
+				Some(Value::Json(json)) => serde_json::from_str(json.get()).expect("json prop"),
+				other => panic!("{prop:?} missing: {other:?}"),
+			}
+		};
+		assert_eq!(child_json("call-ok", KnownTag::Result, PropId::Outcome), outcome);
+		assert_eq!(child_json("call-ok", KnownTag::Result, PropId::Data), serde_json::json!([]));
+		assert_eq!(child_json("call-aborted", KnownTag::Diag, PropId::Fault), fault);
+		let diag = dom
+			.children(tool("call-aborted"))
+			.iter()
+			.copied()
+			.find(|handle| dom.get(*handle).is_some_and(|node| node.tag == Tag::Known(KnownTag::Diag)))
+			.expect("diag element");
+		assert_eq!(
+			dom.get(diag).and_then(|node| node.prop(&PropKey::from(PropId::Text)).and_then(Value::as_str)),
+			Some("interrupted: cancelled"),
+		);
+	};
+	check(&session);
+	let live = session.dom().snapshot();
+	drop(session);
+	let restored = Session::open(&path, ComponentRegistry::default()).expect("session restores");
+	assert_eq!(restored.dom().snapshot().as_bytes(), live.as_bytes());
+	check(&restored);
+}
+
+#[test]
+fn assistant_receipts_pair_in_turn_order() {
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let mut session =
+		Session::create(directory.path().join("receipts.oms"), ComponentRegistry::default())
+			.expect("session creates");
+	session.begin_turn().expect("turn starts");
+	session.user("question", Vec::new()).expect("user appends");
+	session
+		.assistant_start("model", "provider", "route")
+		.expect("first assistant starts");
+	session.assistant_end("tool_use").expect("first assistant ends");
+	session
+		.receipt(omp_journal::data::TurnReceipt::tokens(1, 2, 3))
+		.expect("first receipt");
+	let call = session
+		.call("read", 1, "call-1", None, Some(raw(serde_json::json!({}))), None)
+		.expect("call");
+	session
+		.settle(call, raw(serde_json::json!({"text":"ok"})))
+		.expect("call settles");
+	session
+		.assistant_start("model", "provider", "route")
+		.expect("second assistant starts");
+	session.assistant_end("stop").expect("second assistant ends");
+	session
+		.receipt(omp_journal::data::TurnReceipt::tokens(10, 20, 30))
+		.expect("second receipt");
+
+	let usage: Vec<_> = project_thread(session.dom())
+		.into_iter()
+		.filter_map(|item| match item.kind {
+			Some(item::Kind::Message(message))
+				if message.role == omp_proto::thread::v1::Role::Assistant as i32 =>
+			{
+				message.usage.map(|usage| (usage.input_tokens, usage.output_tokens))
+			},
+			_ => None,
+		})
+		.collect();
+	assert_eq!(usage, [(1, 2), (10, 20)]);
+}
+
+#[test]
+fn diagnostics_are_separate_ordered_children_and_fault_is_last() {
+	use omp_dom::{PropId, PropKey, Value};
+
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let path = directory.path().join("diagnostics.oms");
+	let mut session = Session::create(&path, ComponentRegistry::default()).expect("session creates");
+	session.begin_turn().expect("turn starts");
+	let call = session
+		.call("read", 1, "call-1", None, Some(raw(serde_json::json!({}))), None)
+		.expect("call");
+	session
+		.call_update(
+			call,
+			raw(serde_json::json!({"diag":{"severity":"warn","text":"first"}})),
+		)
+		.expect("first diagnostic");
+	session
+		.call_update(
+			call,
+			raw(serde_json::json!({"diag":{"severity":"info","text":"second"}})),
+		)
+		.expect("second diagnostic");
+	session
+		.fail_projected(
+			call,
+			raw(serde_json::json!({"kind":"faulted","value":{"code":"failed"}})),
+			raw(serde_json::json!([{"kind":"text","text":"failed"}])),
+		)
+		.expect("fault settles");
+
+	let inspect = |session: &Session| {
+		let dom = session.dom();
+		let call = dom
+			.handles()
+			.find(|handle| {
+				dom.get(*handle).is_some_and(|node| {
+					matches!(node.tag, Tag::Custom(_))
+						&& node.prop(&PropKey::from(PropId::Id)).and_then(Value::as_str)
+							== Some("call-1")
+				})
+			})
+			.expect("call element");
+		dom.children(call)
+			.iter()
+			.filter_map(|handle| {
+				let node = dom.get(*handle)?;
+				(node.tag == Tag::Known(KnownTag::Diag)).then(|| {
+					(
+						node.prop(&PropKey::from(PropId::Severity))
+							.and_then(Value::as_str)
+							.unwrap_or_default()
+							.to_owned(),
+						node.prop(&PropKey::from(PropId::Fault)).is_some(),
+					)
+				})
+			})
+			.collect::<Vec<_>>()
+	};
+	assert_eq!(
+		inspect(&session),
+		[
+			("warn".to_owned(), false),
+			("info".to_owned(), false),
+			("error".to_owned(), true),
+		]
+	);
+	let live = session.dom().snapshot();
+	drop(session);
+	let reopened = Session::open(&path, ComponentRegistry::default()).expect("session reopens");
+	assert_eq!(reopened.dom().snapshot(), live);
+	assert_eq!(
+		inspect(&reopened),
+		[
+			("warn".to_owned(), false),
+			("info".to_owned(), false),
+			("error".to_owned(), true),
+		]
+	);
+}
+
+/// Even before the controller can journal crash recovery, projection remains
+/// acceptable to strict providers by omitting all in-flight calls.
+#[test]
+fn live_projection_never_emits_an_unmatched_tool_call() {
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let path = directory.path().join("unfinished.oms");
+	let mut session =
+		Session::create(&path, ComponentRegistry::default()).expect("session creates");
+	session.begin_turn().expect("turn starts");
+	session.user("question", Vec::new()).expect("user appends");
+	session
+		.assistant_start("model", "provider", "route")
+		.expect("assistant starts");
+	session
+		.call(
+			"read",
+			1,
+			"call-running",
+			None,
+			Some(raw(serde_json::json!({"path":"README.md"}))),
+			None,
+		)
+		.expect("committed call appends");
+	session
+		.call_streaming("grep", 1, "call-arguments", None)
+		.expect("streaming call appends");
+	let items = project_thread(session.dom());
+	let mut calls = Vec::new();
+	let mut results = Vec::new();
+	for item in &items {
+		match &item.kind {
+			Some(item::Kind::ToolCall(call)) => calls.push(call.id.clone()),
+			Some(item::Kind::ToolResult(result)) => results.push((result.call_id.clone(), result.is_error)),
+			_ => {},
+		}
+	}
+	assert!(calls.is_empty(), "in-flight calls are not historical context");
+	assert!(results.is_empty(), "omitted calls have no orphan results");
 }

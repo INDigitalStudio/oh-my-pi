@@ -23,7 +23,7 @@ impl LiveComponent for ExtState {
 		kind.name.as_str() == kind::MSG_USER
 	}
 
-	fn reduce(&mut self, _: &Entry, dom: &Dom) -> Result<Vec<Op>, LiveComponentError> {
+	fn reduce(&self, _: &Entry, dom: &Dom) -> Result<Vec<Op>, LiveComponentError> {
 		let meta = dom.meta();
 		Ok(vec![Op::Ins {
 			parent: meta,

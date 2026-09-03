@@ -21,7 +21,7 @@ fn test_two_rung_program_forces_write_then_none_and_completes() {
 		&mut req,
 	);
 	assert!(
-		matches!(req.tool_choice, Setting::Require(ToolChoice::Named(ref name)) if name == "write")
+		matches!(&req.tool_choice, Setting::Require(ToolChoice::Named(name)) if name == "write")
 	);
 	world.turn("", &[Call::new("write", serde_json::json!({}))], 0);
 	assert!(!world.active().iter().any(|&id| id == "force_tool"));
@@ -38,7 +38,7 @@ fn test_run_scope_starts_after_prompt_and_expires_at_run_end() {
 }
 
 #[test]
-fn test_provider_downgrade_injects_requirement_before_turn() {
+fn test_forced_call_is_semantic_intent_for_inference_to_lower() {
 	let mut world = Harness::new();
 	world.route.forced_choice_free = false;
 	world.engage(ForceTool::new("write", ForceUntil::AnyToolCall, None, 2));
@@ -49,8 +49,14 @@ fn test_provider_downgrade_injects_requirement_before_turn() {
 		&cx,
 		&mut req,
 	);
-	assert!(matches!(req.tool_choice, Setting::Unset));
-	assert_eq!(req.messages.len(), 1);
+	assert!(
+		matches!(&req.tool_choice, Setting::Require(ToolChoice::Named(name)) if name == "write")
+	);
+	assert_eq!(req.messages.len(), 0, "Directors do not author provider-strategy prompts");
+	assert_eq!(
+		req.forced_call,
+		Some(omp_inference::ForcedCall { non_compliant_turns: 0, escalations_left: 0 })
+	);
 	assert!(matches!(world.turn("provider response", &[], 0), LoopDecision::Continue { .. }));
 	assert!(
 		world
@@ -74,11 +80,21 @@ fn test_claim_holder_outranks_queued_settle_force_and_ladder_pauses() {
 }
 
 #[test]
+fn successful_any_call_stays_satisfied_until_the_next_candidate_yield() {
+	let mut world = Harness::new();
+	world.engage(ForceTool::new("grep", ForceUntil::AnyToolCall, None, 1));
+	world.observe_only("", &[Call::new("read", serde_json::json!({}))], 0);
+	assert_eq!(world.state_bool("force_tool", "satisfied"), Some(true));
+	assert!(matches!(world.turn("now yielding", &[], 0), LoopDecision::Yield));
+	assert!(world.active().is_empty());
+}
+
+#[test]
 fn test_force_tool_is_evaluated_from_engagement_state() {
 	let mut world = Harness::new();
 	world.engage(ForceTool::new("grep", ForceUntil::AnyToolCall, None, 1));
 	let mut req = request();
-	let facts = RouteFacts { forced_choice_free: true, context_window: 128_000 };
+	let facts = RouteFacts { forced_choice_free: true, context_window: 128_000, image_input: false };
 	let cx = DirectorCx::new(world.session.dom().body(), &facts);
 	DirectorStack::from_dom(world.session.dom(), &world.registry).prepare_inference(
 		world.session.dom(),
@@ -86,7 +102,7 @@ fn test_force_tool_is_evaluated_from_engagement_state() {
 		&mut req,
 	);
 	assert!(
-		matches!(req.tool_choice, Setting::Require(ToolChoice::Named(ref name)) if name == "grep")
+		matches!(&req.tool_choice, Setting::Require(ToolChoice::Named(name)) if name == "grep")
 	);
 }
 
@@ -106,5 +122,6 @@ fn request() -> ChatRequest {
 		top_logprobs:      None,
 		safety:            Arc::from([]),
 		negotiation:       NegotiationPolicy::default(),
+		forced_call:       None,
 	}
 }

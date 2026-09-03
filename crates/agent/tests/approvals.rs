@@ -79,6 +79,49 @@ fn approvals_merge_and_withdraw_round_trip_through_replay() {
 }
 
 #[tokio::test]
+async fn cancelled_or_dropped_route_requests_remove_only_their_pending_entry() {
+	let (route, inbox) = ApprovalRoute::new(Arc::new(ApprovalBook::new()), None);
+	let cancellation = tokio_util::sync::CancellationToken::new();
+	let waiting = {
+		let route = route.clone();
+		let cancellation = cancellation.clone();
+		tokio::spawn(async move {
+			route
+				.request_cancellable(
+					Some(Str::new_static("same-call")),
+					vec![spec(0, None)],
+					1,
+					cancellation,
+				)
+				.await
+		})
+	};
+	let first = inbox.recv().await.expect("first request dispatched");
+	assert_eq!(route.pending().len(), 1);
+	cancellation.cancel();
+	let cancelled = waiting.await.expect("cancelled request joins");
+	assert_eq!(cancelled.state, TicketState::Decided);
+	assert!(!cancelled.decision.expect("cancel decision").approved);
+	assert!(route.pending().is_empty());
+
+	let dropped = {
+		let route = route.clone();
+		tokio::spawn(async move {
+			route
+				.request(Some(Str::new_static("same-call")), vec![spec(0, None)], 2)
+				.await
+		})
+	};
+	let second = inbox.recv().await.expect("second request dispatched");
+	assert_ne!(first.ticket.ticket_id, second.ticket.ticket_id);
+	assert_eq!(route.pending().len(), 1);
+	dropped.abort();
+	let _ = dropped.await;
+	tokio::task::yield_now().await;
+	assert!(route.pending().is_empty());
+}
+
+#[tokio::test]
 async fn approvals_route_timeout_round_trips_through_session_replay() {
 	let (route, inbox) = ApprovalRoute::new(Arc::new(ApprovalBook::new()), None);
 	let waiting = tokio::spawn(async move {

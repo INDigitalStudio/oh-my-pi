@@ -11,23 +11,28 @@ use omp_inference::{
 	Usage,
 };
 use omp_journal::{EntryId, blob::BlobRef, data::TurnReceipt};
-use omp_proto::thread::v1::{Item, Message, Part as ThreadPart, Role, item, part};
+use omp_proto::{
+	thread::v1::{Item, Message, Part as ThreadPart, Role, item, part},
+	toolhost::v1::HookEventId,
+};
 use omp_session::{Session, SessionError, project_thread};
-use omp_tool::{LoweringCaps, Registry, RegistryError, ToolIdentity};
+use omp_tool::{Abort, LoweringCaps, Registry, RegistryError, ToolIdentity};
 use serde_json::value::RawValue;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tower::Service;
 
 use crate::{
-	CancelTree, Director as _, DirectorCx, DirectorError, DirectorRegistry, DirectorStack, DispatchError,
-	DispatchOptions, DispatchPolicy, DispatchRequest, Dispatcher, ExternalToolExecutor, KernelEvent,
-	LiveComponent, LiveComponentError, LoopDecision, MutDirectorCx, Prepared, RouteFacts,
-	SessionTool, ToolCancellation, TurnView, Up,
+	CallControl, CancelTree, Director as _, DirectorCx, DirectorError, DirectorRegistry,
+	DirectorStack, DispatchError, DispatchPolicy, Dispatcher,
+	ExternalToolExecutor, KernelEvent, LiveComponent, LiveComponentError, LoopDecision,
+	MutDirectorCx, Prepared, PreparedCall, Received, RouteFacts, SessionTool, ToolCancellation,
+	TurnView, Up,
 	directors::compaction::CompactionDirector,
 	steering::{
 		EMPTY_OUTPUT_RETRY_CAP, append_empty_output_cap_notice, append_empty_output_retry,
-		append_error_notice, append_interrupt_notice, append_notice, append_steering,
+		append_error_notice, append_interrupt_notice, append_named_notice, append_notice,
+		consume_steering, steering_pending,
 	},
 };
 
@@ -138,13 +143,45 @@ pub struct TurnOutcome {
 pub struct RunControl {
 	cancellation: CancellationToken,
 	deadline:     Option<Instant>,
+	max_requests:          Option<u32>,
+	request_budget_notice: bool,
 }
 
 impl RunControl {
 	/// Creates turn control from an external cancellation token and deadline.
 	#[must_use]
 	pub const fn new(cancellation: CancellationToken, deadline: Option<Instant>) -> Self {
-		Self { cancellation, deadline }
+		Self { cancellation, deadline, max_requests: None, request_budget_notice: true }
+	}
+
+	/// Limits the number of provider requests this turn may start.
+	#[must_use]
+	pub const fn with_request_budget(mut self, max_requests: u32) -> Self {
+		self.max_requests = Some(max_requests);
+		self
+	}
+
+	/// Controls whether reaching the soft request budget grants one wrap-up
+	/// request carrying a durable notice.
+	#[must_use]
+	pub const fn with_request_budget_notice(mut self, enabled: bool) -> Self {
+		self.request_budget_notice = enabled;
+		self
+	}
+
+	/// Returns whether request ordinal `started` may begin.
+	#[must_use]
+	pub fn permits_request(&self, started: u32, notice_sent: bool) -> bool {
+		self.max_requests.is_none_or(|maximum| {
+			started < maximum
+				|| (self.request_budget_notice && started == maximum && !notice_sent)
+		})
+	}
+
+	fn should_emit_request_budget_notice(&self, started: u32, notice_sent: bool) -> bool {
+		self.request_budget_notice
+			&& !notice_sent
+			&& self.max_requests.is_some_and(|maximum| started == maximum)
 	}
 
 	/// Reports whether cancellation or the deadline has already fired.
@@ -156,7 +193,7 @@ impl RunControl {
 				.is_some_and(|deadline| Instant::now() >= deadline)
 	}
 
-	async fn cancelled(&self) {
+	pub(crate) async fn cancelled(&self) {
 		if let Some(deadline) = self.deadline {
 			tokio::select! {
 				() = self.cancellation.cancelled() => {},
@@ -214,6 +251,9 @@ pub enum KernelError {
 	/// A ready tool call conflicts with its streamed call identity.
 	#[error("ready tool call does not match its streamed call")]
 	ToolCallMismatch,
+	/// A live lifecycle hook denied or malformed a transition.
+	#[error(transparent)]
+	LifecycleHook(#[from] crate::LifecycleHookError),
 	/// A live extension Component reducer failed.
 	#[error(transparent)]
 	LiveComponent(#[from] LiveComponentError),
@@ -222,18 +262,57 @@ pub enum KernelError {
 	Prompt(#[source] crate::PromptError),
 }
 
+/// Journal-backed host state which must flush and rehydrate with the session.
+pub trait SessionStateBridge: Send + Sync {
+	/// Journals pending host writes before session readers project state.
+	fn flush(&self, session: &mut Session) -> Result<(), SessionError>;
+	/// Rehydrates disposable host state after rewind or session switch.
+	fn resync(&self, dom: &omp_dom::Dom);
+}
+
+/// Cross-crate runtime switches resolved by the composition owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeFlags {
+	/// Whether automatic context compaction may engage.
+	pub automatic_compaction:    bool,
+	/// Whether Goal engagements may remain active.
+	pub goal_enabled:            bool,
+	/// Whether a substantive turn schedules automatic learning.
+	pub autolearn_enabled:       bool,
+	/// Minimum settled non-learn calls before automatic learning.
+	pub autolearn_min_tool_calls: usize,
+	/// Whether plain-text sloppy edit payloads become real edit calls.
+	pub recover_inline_edits:     bool,
+}
+
+impl Default for RuntimeFlags {
+	fn default() -> Self {
+		Self {
+			automatic_compaction: true,
+			goal_enabled: true,
+			autolearn_enabled: false,
+			autolearn_min_tool_calls: 5,
+			recover_inline_edits: true,
+		}
+	}
+}
+
 /// Agent kernel composed from inference, tool, prompt, and Director registries.
 pub struct Kernel<C> {
-	client:            C,
-	dispatcher:        Dispatcher,
-	cancel:            CancelTree,
-	director_registry: DirectorRegistry,
-	live_components:   Vec<Box<dyn LiveComponent>>,
-	events:            crate::events::KernelEvents,
-	prompt:            Arc<dyn PromptSource>,
-	route:             RouteFacts,
-	mailbox_tx:        flume::Sender<Up>,
-	mailbox_rx:        flume::Receiver<Up>,
+	client:                       C,
+	pub(crate) dispatcher:        Dispatcher,
+	pub(crate) cancel:            CancelTree,
+	director_registry:            DirectorRegistry,
+	live_components:              Vec<Box<dyn LiveComponent>>,
+	lifecycle_hooks:              Option<crate::LifecycleHooks>,
+	state_bridges:                Vec<Arc<dyn SessionStateBridge>>,
+	pub(crate) events:            crate::events::KernelEvents,
+	prompt:                       Arc<dyn PromptSource>,
+	route:                        RouteFacts,
+	con:                          Option<Arc<omp_con::Ctx>>,
+	runtime_flags:                RuntimeFlags,
+	pub(crate) mailbox_tx:        flume::Sender<Up>,
+	mailbox_rx:                   flume::Receiver<Up>,
 }
 
 impl<C> Kernel<C> {
@@ -265,9 +344,13 @@ impl<C> Kernel<C> {
 			cancel: CancelTree::new(),
 			director_registry: DirectorRegistry::standard(),
 			live_components: Vec::new(),
+			lifecycle_hooks: None,
+			state_bridges: Vec::new(),
 			events,
 			prompt: Arc::new(prompt),
 			route: RouteFacts::default(),
+			con: None,
+			runtime_flags: RuntimeFlags::default(),
 			mailbox_tx,
 			mailbox_rx,
 		}
@@ -280,6 +363,44 @@ impl<C> Kernel<C> {
 		self
 	}
 
+	/// Installs the shared extension lifecycle gate.
+	#[must_use]
+	pub fn with_hook_gate(mut self, gate: Arc<crate::HookGate>) -> Self {
+		let hooks = crate::LifecycleHooks::new(gate);
+		self.dispatcher = self.dispatcher.with_lifecycle_hooks(hooks.clone());
+		self.lifecycle_hooks = Some(hooks);
+		self
+	}
+
+	/// Returns the shared lifecycle facade for host-side session transitions.
+	#[must_use]
+	pub fn lifecycle_hooks(&self) -> Option<crate::LifecycleHooks> {
+		self.lifecycle_hooks.clone()
+	}
+
+	/// Retains a journal-backed host state bridge for turn and session boundaries.
+	#[must_use]
+	pub fn with_session_state_bridge(mut self, bridge: Arc<dyn SessionStateBridge>) -> Self {
+		self.state_bridges.push(bridge);
+		self
+	}
+
+	/// Flushes pending host state into the authoritative journal.
+	pub fn flush_session_state(&self, session: &mut Session) -> Result<(), SessionError> {
+		for bridge in &self.state_bridges {
+			bridge.flush(session)?;
+		}
+		Ok(())
+	}
+
+	/// Rehydrates disposable host state and Director layers from the current DOM.
+	pub fn resync_session_state(&self, session: &Session) {
+		for bridge in &self.state_bridges {
+			bridge.resync(session.dom());
+		}
+		self.reconcile_director_binds(session);
+	}
+
 	/// Registers a live extension Component reducer.
 	pub fn register_live_component(&mut self, component: Box<dyn LiveComponent>) {
 		self.live_components.push(component);
@@ -289,6 +410,20 @@ impl<C> Kernel<C> {
 	#[must_use]
 	pub const fn with_route_facts(mut self, route: RouteFacts) -> Self {
 		self.route = route;
+		self
+	}
+
+	/// Injects the effective control-plane context used for Director layers.
+	#[must_use]
+	pub fn with_con_context(mut self, con: Arc<omp_con::Ctx>) -> Self {
+		self.con = Some(con);
+		self
+	}
+
+	/// Replaces cross-crate runtime switches resolved by host composition.
+	#[must_use]
+	pub const fn with_runtime_flags(mut self, flags: RuntimeFlags) -> Self {
+		self.runtime_flags = flags;
 		self
 	}
 
@@ -342,7 +477,24 @@ impl<C> Kernel<C> {
 		self.cancel.cancel_session();
 	}
 
-	fn apply_live_components(&mut self, session: &mut Session) -> Result<(), KernelError> {
+	/// Applies rewind/resume lifecycle work to every runtime execution unit.
+	pub fn apply_lifecycle(
+		&self,
+		session: &Session,
+		work: &omp_session::LifecycleWork,
+	) -> impl Future<Output = ()> + Send + 'static {
+		self.dispatcher.jobs().apply_lifecycle(session, work)
+	}
+
+	/// Re-derives effective Director convar layers after rewind or session switch.
+	pub fn reconcile_director_binds(&self, session: &Session) {
+		if let Some(con) = &self.con {
+			DirectorStack::from_dom(session.dom(), &self.director_registry)
+				.apply_binds(session.dom(), con);
+		}
+	}
+
+	pub(crate) fn apply_live_components(&mut self, session: &mut Session) -> Result<(), KernelError> {
 		let Some(head) = session.head() else {
 			return Ok(());
 		};
@@ -351,7 +503,7 @@ impl<C> Kernel<C> {
 		};
 		let mut patches = Vec::new();
 		let mut failed = false;
-		for component in &mut self.live_components {
+		for component in &self.live_components {
 			if !component.interested(&entry.kind) {
 				continue;
 			}
@@ -392,11 +544,43 @@ impl<C: Inference> Kernel<C> {
 	pub async fn run_turn(
 		&mut self,
 		session: &mut Session,
-		input: TurnInput,
+		mut input: TurnInput,
 		control: RunControl,
 	) -> Result<TurnOutcome, KernelError> {
 		if control.is_expired() || self.cancel.is_session_cancelled() {
 			return Ok(cancelled_outcome());
+		}
+		self.flush_session_state(session)?;
+		let submission_id = session
+			.head()
+			.map_or_else(|| Str::new_static("submission"), |id| Str::new(id.to_string()));
+		if let Some(hooks) = &self.lifecycle_hooks {
+			let payload = hooks
+				.gate(
+					HookEventId::HookEventBeforeAgentStart,
+					serde_json::json!({
+						"submission_id": submission_id,
+						"text": input.text,
+						"items": [],
+						"source": "interactive",
+						"prompt_rev": "1",
+						"staged_interrupts": 0,
+						"resuming": false,
+						"schedule_id": serde_json::Value::Null,
+					}),
+				)
+				.await?;
+			if let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) {
+				input.text = Str::new(text);
+			}
+			hooks.notify(
+				HookEventId::HookEventAgentStart,
+				serde_json::json!({
+					"submission_id": submission_id,
+					"from_phase": "idle",
+					"pending_items": 1,
+				}),
+			)?;
 		}
 		let turn_cancel = self.cancel.begin_turn();
 		session.begin_turn()?;
@@ -420,6 +604,63 @@ impl<C: Inference> Kernel<C> {
 				Err(_) => TurnStop::Failed,
 			},
 		});
+		self.flush_session_state(session)?;
+		self.resync_session_state(session);
+		if let Some(hooks) = &self.lifecycle_hooks {
+			let (stop, interrupted, error) = match &result {
+				Ok(outcome) => (
+					format!("{:?}", outcome.stop).to_ascii_lowercase(),
+					outcome.stop == TurnStop::Cancelled,
+					None,
+				),
+				Err(_) => ("error".to_owned(), false, Some("agent turn failed")),
+			};
+			hooks.notify(
+				HookEventId::HookEventTurnEnd,
+				serde_json::json!({
+					"turn_id": turn.to_string(),
+					"turn_index": 0,
+					"event_index": 0,
+					"stop": stop,
+					"usage": {
+						"input_tokens": result.as_ref().map_or(0, |value| value.tokens_in),
+						"cached_input_tokens": 0,
+						"output_tokens": result.as_ref().map_or(0, |value| value.tokens_out),
+						"reasoning_tokens": 0,
+						"cache_write_tokens": 0,
+						"requests": 0,
+						"cost_usd": 0.0,
+						"wall": "0s",
+					},
+					"session_usage": {
+						"input_tokens": result.as_ref().map_or(0, |value| value.tokens_in),
+						"cached_input_tokens": 0,
+						"output_tokens": result.as_ref().map_or(0, |value| value.tokens_out),
+						"reasoning_tokens": 0,
+						"cache_write_tokens": 0,
+						"requests": 0,
+						"cost_usd": 0.0,
+						"wall": "0s",
+					},
+					"revision": serde_json::Value::Null,
+					"calls": [],
+					"items": [],
+				}),
+			)?;
+			hooks.notify(
+				HookEventId::HookEventAgentEnd,
+				serde_json::json!({
+					"submission_id": submission_id,
+					"summary": {
+						"committed_turns": 1,
+						"interrupted": interrupted,
+						"stop": stop,
+					},
+					"continued": false,
+					"error": error,
+				}),
+			)?;
+		}
 		result
 	}
 
@@ -468,7 +709,18 @@ impl<C: Inference> Kernel<C> {
 		control: &RunControl,
 	) -> Result<TurnOutcome, KernelError> {
 		let mut directors = DirectorStack::from_dom(session.dom(), &self.director_registry);
-		if !directors.active_ids().contains(&"compaction")
+		if !self.runtime_flags.goal_enabled
+			&& let Some((goal, _)) = crate::find_director(session.dom(), "goal")
+		{
+			session.patch(Txn {
+				cause: session.head().ok_or(SessionError::NoActiveTurn)?,
+				label: Some(Str::new_static("director.goal-disabled")),
+				ops: vec![omp_dom::Op::Rm(goal)],
+			})?;
+			directors = DirectorStack::from_dom(session.dom(), &self.director_registry);
+		}
+		if self.runtime_flags.automatic_compaction
+			&& !directors.active_ids().contains(&"compaction")
 			&& !directors.queued_ids().contains(&"compaction")
 		{
 			directors.engage(session, Box::new(CompactionDirector::new()))?;
@@ -478,6 +730,8 @@ impl<C: Inference> Kernel<C> {
 		let mut tokens_out = 0_u64;
 		let mut was_steered = false;
 		let mut empty_output_retries = 0_u8;
+		let mut requests_started = 0_u32;
+		let mut request_budget_notice_sent = false;
 		let route = self.route;
 
 		loop {
@@ -485,8 +739,82 @@ impl<C: Inference> Kernel<C> {
 				turn_cancel.cancel_turn();
 				return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
 			}
+			if !control.permits_request(requests_started, request_budget_notice_sent) {
+				append_named_notice(
+					session,
+					turn,
+					Str::new_static("warn"),
+					Some(Str::new_static("request-budget")),
+					Str::new_static("Subagent request budget exhausted before another inference"),
+				)?;
+				self.apply_live_components(session)?;
+				return Ok(outcome(TurnStop::Completed, total_text, tokens_in, tokens_out));
+			}
+			if control.should_emit_request_budget_notice(
+				requests_started,
+				request_budget_notice_sent,
+			) {
+				append_named_notice(
+					session,
+					turn,
+					Str::new_static("warn"),
+					Some(Str::new_static("request-budget")),
+					Str::new_static(
+						"Soft request budget reached; use this final request to yield a concise result.",
+					),
+				)?;
+				request_budget_notice_sent = true;
+			}
+			self.flush_session_state(session)?;
+			if let Some(con) = &self.con {
+				directors.apply_binds(session.dom(), con);
+			}
 			let mut request = self.build_request(session)?;
-			let prepared = {
+			if let Some(hooks) = &self.lifecycle_hooks {
+				let enabled_tools =
+					request.tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>();
+				let payload = hooks
+					.gate(
+						HookEventId::HookEventTurnStart,
+						serde_json::json!({
+							"turn_id": turn.to_string(),
+							"turn_index": requests_started,
+							"prompt_hash": "",
+							"toolset_hash": "",
+							"enabled_tools": enabled_tools,
+							"input_mode": "full",
+							"model": {"provider": "", "api": "", "model": ""},
+							"route": {"provider": "", "route": ""},
+							"thinking": "none",
+							"deadline": serde_json::Value::Null,
+							"attempt": requests_started,
+							"prompt_changed": requests_started == 0,
+							"toolset_changed": requests_started == 0,
+						}),
+					)
+					.await?;
+				hooks.notify(HookEventId::HookEventTurnStart, payload.clone())?;
+				if let Some(enabled) =
+					payload.get("enabled_tools").and_then(serde_json::Value::as_array)
+				{
+					request.tools = request
+						.tools
+						.iter()
+						.filter(|tool| {
+							enabled.iter().any(|name| name.as_str() == Some(tool.name.as_str()))
+						})
+						.cloned()
+						.collect::<Vec<_>>()
+						.into();
+				}
+			}
+			let preflight_control = CallControl::new(
+				self.mailbox_rx.clone(),
+				turn_cancel.clone(),
+				self.cancel.clone(),
+				Some(control.clone()),
+			);
+			let preflight = {
 				let mut cx = MutDirectorCx {
 					session,
 					inference: &mut self.client,
@@ -494,8 +822,37 @@ impl<C: Inference> Kernel<C> {
 					route: &route,
 					turn,
 					director: None,
+					events: Some(&self.events),
 				};
-				directors.before_inference(&mut cx, &request).await?
+				let preparing = directors.before_inference(&mut cx, &request);
+				tokio::pin!(preparing);
+				tokio::select! {
+					biased;
+					result = &mut preparing => PreflightSignal::Ready(result),
+					() = control.cancelled() => PreflightSignal::Cancelled,
+					message = preflight_control.recv() => PreflightSignal::Control(message),
+				}
+			};
+			let prepared = match preflight {
+				PreflightSignal::Ready(result) => result?,
+				PreflightSignal::Cancelled => {
+					turn_cancel.cancel_turn();
+					return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
+				},
+				PreflightSignal::Control(message) => {
+					match preflight_control.handle(session, message)? {
+						Received::Cancelled => {
+							return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
+						},
+						Received::Rewound(work) => {
+							self.dispatcher.jobs().apply_lifecycle(session, &work).await;
+							turn_cancel.cancel_turn();
+							return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
+						},
+						Received::None | Received::Steering => {},
+					}
+					continue;
+				},
 			};
 			self.apply_live_components(session)?;
 			if prepared == Prepared::Rebuild {
@@ -505,7 +862,55 @@ impl<C: Inference> Kernel<C> {
 			let director_cx = DirectorCx::new(turn, &route);
 			directors.prepare_inference(session.dom(), &director_cx, &mut request);
 			let request_started = Instant::now();
-			let stream = self.client.chat(request).await?;
+			requests_started = requests_started.saturating_add(1);
+			let opening_control = CallControl::new(
+				self.mailbox_rx.clone(),
+				turn_cancel.clone(),
+				self.cancel.clone(),
+				Some(control.clone()),
+			);
+			let stream = {
+				let opening = self.client.chat(request);
+				tokio::pin!(opening);
+				loop {
+					tokio::select! {
+						biased;
+						result = &mut opening => break result?,
+						() = control.cancelled() => {
+							turn_cancel.cancel_turn();
+							return Ok(outcome(
+								TurnStop::Cancelled,
+								total_text,
+								tokens_in,
+								tokens_out,
+							));
+						},
+						message = opening_control.recv() => {
+							match opening_control.handle(session, message)? {
+								Received::Cancelled => {
+									return Ok(outcome(
+										TurnStop::Cancelled,
+										total_text,
+										tokens_in,
+										tokens_out,
+									));
+								},
+								Received::Rewound(work) => {
+									self.dispatcher.jobs().apply_lifecycle(session, &work).await;
+									turn_cancel.cancel_turn();
+									return Ok(outcome(
+										TurnStop::Cancelled,
+										total_text,
+										tokens_in,
+										tokens_out,
+									));
+								},
+								Received::None | Received::Steering => {},
+							}
+						},
+					}
+				}
+			};
 			let mut driven = self
 				.drive_inference(session, stream, control, turn_cancel, request_started)
 				.await?;
@@ -515,73 +920,110 @@ impl<C: Inference> Kernel<C> {
 			if driven.cancelled {
 				return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
 			}
-			let mut streamed_steering = std::mem::take(&mut driven.steering);
-			for call in driven.calls {
-				let cancellation = tool_cancellation(
-					self.dispatcher.registry(),
-					call.identity.name.as_str(),
-					turn_cancel,
-				)?;
-				let call_id = call.call_id;
-				// The mailbox stays live while a tool runs: an interrupt cancels
-				// the turn scope the tool observes (pi aborts running tools on
-				// ctrl+c) instead of waiting for the tool to finish on its own.
-				let mut approvals = Vec::new();
-				let report = {
-					let dispatch = self.dispatcher.dispatch(session, DispatchRequest {
-						identity: call.identity,
-						call_id: call_id.clone(),
-						call: call.entry,
-						options: DispatchOptions::from_args(&call.args),
-						args: call.args,
-						cancellation,
-					});
-					tokio::pin!(dispatch);
-					loop {
-						tokio::select! {
-							biased;
-							report = &mut dispatch => break report?,
-							() = control.cancelled() => turn_cancel.cancel_turn(),
-							message = self.mailbox_rx.recv_async() => match message {
-								Ok(Up::Interrupt) => turn_cancel.cancel_turn(),
-								Ok(Up::Cancel) => {
-									self.cancel.cancel_session();
-									turn_cancel.cancel_turn();
+			let had_tool_calls = driven.had_tool_calls;
+			if had_tool_calls {
+				if let Some(hooks) = &self.lifecycle_hooks {
+					for call in &driven.calls {
+						hooks.notify(
+							HookEventId::HookEventToolExecutionStart,
+							serde_json::json!({
+								"call_id": call.call_id(),
+								"invocation_id": call.call_id(),
+								"target": {
+									"kind": "core",
+									"name": call.identity().name,
+									"rev": format!(
+										"{}@{}",
+										call.identity().rev.family,
+										call.identity().rev.n,
+									),
+									"args": {},
 								},
-								Ok(Up::Steer(text)) => streamed_steering.push(text),
-								Ok(Up::Unqueue(reply)) => {
-									let _ = reply.send(std::mem::take(&mut streamed_steering));
-								},
-								Ok(Up::Approve { id, decision }) => approvals.push((id, decision)),
-								Ok(Up::Env(_)) | Err(_) => {},
-							},
-						}
+								"place": {"kind": "host", "name": serde_json::Value::Null},
+								"deadline": serde_json::Value::Null,
+							}),
+						)?;
 					}
-				};
-				for (id, decision) in approvals {
-					let _ = crate::ApprovalBook::new().decide(session, id.as_str(), decision);
 				}
+				let settled_calls = driven
+					.calls
+					.iter()
+					.map(|call| (call.call_id().clone(), call.identity().clone()))
+					.collect::<Vec<_>>();
+				let call_control = CallControl::new(
+					self.mailbox_rx.clone(),
+					turn_cancel.clone(),
+					self.cancel.clone(),
+					Some(control.clone()),
+				);
+				let reports = self
+					.dispatcher
+					.drive(session, std::mem::take(&mut driven.calls), Some(&call_control))
+					.await?;
 				self.apply_live_components(session)?;
-				self
-					.events
-					.publish(KernelEvent::ToolSettled { call_id, is_error: report.is_error });
+				if let Some(hooks) = &self.lifecycle_hooks {
+					for ((call_id, identity), report) in settled_calls.into_iter().zip(reports) {
+						let target = serde_json::json!({
+							"kind": "core",
+							"name": identity.name,
+							"rev": format!("{}@{}", identity.rev.family, identity.rev.n),
+							"args": {},
+						});
+						hooks.notify(
+							HookEventId::HookEventToolExecutionEnd,
+							serde_json::json!({
+								"call_id": call_id,
+								"target": target.clone(),
+								"outcome": if report.is_error { "faulted" } else { "ok" },
+								"duration": "0s",
+								"spilled": report.spilled.is_some(),
+								"artifact": report.spilled.as_ref().map(|blob| {
+									format!("artifact://sha256/{}", blob.to_hex())
+								}),
+								"effects_unknown": false,
+							}),
+						)?;
+						hooks.notify(
+							HookEventId::HookEventToolResult,
+							serde_json::json!({
+								"call_id": call_id,
+								"target": target,
+								"outcome": if report.is_error { "faulted" } else { "ok" },
+								"payload": if report.is_error {
+									serde_json::Value::Null
+								} else {
+									serde_json::json!({})
+								},
+								"fault": if report.is_error {
+									serde_json::json!({})
+								} else {
+									serde_json::Value::Null
+								},
+								"abort": serde_json::Value::Null,
+								"artifact": report.spilled.as_ref().map(|blob| {
+									format!("artifact://sha256/{}", blob.to_hex())
+								}),
+								"useless": false,
+								"annotate": [],
+								"spill": serde_json::Value::Null,
+							}),
+						)?;
+					}
+				}
 			}
-			let mut steering = self.drain_mailbox(session, turn, turn_cancel);
-			steering.items.extend(streamed_steering);
+			let steering = self.drain_mailbox(session, turn_cancel)?;
 			if steering.cancelled {
 				return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
 			}
-			let steering_received = !steering.items.is_empty();
+			let steering_received = steering.received || steering_pending(session);
 			if steering_received {
 				was_steered = true;
-				for text in steering.items {
-					append_steering(session, turn, text)?;
-					self.apply_live_components(session)?;
-				}
+				let _ = consume_steering(session, turn)?;
+				self.apply_live_components(session)?;
 			}
 			let turn_view = TurnView {
 				turn,
-				had_tool_calls: !driven.call_ids.is_empty(),
+				had_tool_calls,
 				assistant_text: driven.text,
 				stop_reason: driven.stop_reason,
 			};
@@ -599,15 +1041,44 @@ impl<C: Inference> Kernel<C> {
 				}
 				append_empty_output_cap_notice(session, turn)?;
 				self.apply_live_components(session)?;
-				let stop = if was_steered {
-					TurnStop::Steered
-				} else {
-					TurnStop::Completed
-				};
-				return Ok(outcome(stop, total_text, tokens_in, tokens_out));
+			}
+			if self.runtime_flags.autolearn_enabled
+				&& should_schedule_autolearn(
+					session.dom(),
+					turn,
+					self.runtime_flags.autolearn_min_tool_calls,
+				)
+				&& self.dispatcher.registry().resolved_identity("learn").is_some()
+			{
+				directors.engage(
+					session,
+					Box::new(crate::directors::force_tool::ForceTool::new(
+						"learn",
+						crate::ForceUntil::ToolCalled(Str::new_static("learn")),
+						Some(Str::new_static(
+							"Capture the substantive work from this turn with the learn tool.",
+						)),
+						1,
+					)),
+				)?;
+				self.apply_live_components(session)?;
+				continue;
 			}
 			let decision = directors.on_yield(session, &director_cx, &turn_view)?;
 			self.apply_live_components(session)?;
+			if let Some(con) = &self.con {
+				directors.apply_binds(session.dom(), con);
+			}
+			let late = self.drain_mailbox(session, turn_cancel)?;
+			if late.cancelled {
+				return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
+			}
+			if late.received || steering_pending(session) {
+				was_steered = true;
+				let _ = consume_steering(session, turn)?;
+				self.apply_live_components(session)?;
+				continue;
+			}
 			match decision {
 				LoopDecision::Continue { .. } => continue,
 				LoopDecision::Yield => {
@@ -622,6 +1093,40 @@ impl<C: Inference> Kernel<C> {
 		}
 	}
 
+	/// Dispatches one ready call and journals its outcome. The mailbox stays
+	/// live while the tool runs: an interrupt cancels the turn scope the tool
+	/// observes (pi aborts running tools on ctrl+c) instead of waiting for
+	/// the tool to finish on its own; steering arriving meanwhile lands in
+	/// `streamed_steering` for the next safe point.
+	pub(crate) async fn dispatch_call(
+		&mut self,
+		session: &mut Session,
+		call: ReadyCall,
+		turn_cancel: &crate::TurnCancellation,
+		control: &RunControl,
+		streamed_steering: &mut Vec<Str>,
+	) -> Result<bool, KernelError> {
+		let cancellation =
+			tool_cancellation(self.dispatcher.registry(), call.identity.name.as_str(), turn_cancel)?;
+		let call_id = call.call_id;
+		let mut prepared =
+			self.dispatcher.prepare(call.identity, call_id, call.entry, cancellation)?;
+		prepared.commit(call.args);
+		let call_control = CallControl::new(
+			self.mailbox_rx.clone(),
+			turn_cancel.clone(),
+			self.cancel.clone(),
+			Some(control.clone()),
+		);
+		let mut reports = self.dispatcher.drive(session, vec![prepared], Some(&call_control)).await?;
+		let report = reports.remove(0);
+		if steering_pending(session) {
+			streamed_steering.extend(crate::steering::queued_steering(session));
+		}
+		self.apply_live_components(session)?;
+		Ok(report.is_error)
+	}
+
 	fn build_request(&self, session: &Session) -> Result<ChatRequest, KernelError> {
 		let mut items = self
 			.prompt
@@ -630,6 +1135,7 @@ impl<C: Inference> Kernel<C> {
 		items.extend(project_thread(session.dom()));
 		let mut messages = InferenceMessage::from_thread_items(&items)?;
 		crate::events::strip_unsigned_reasoning(&mut messages);
+		crate::vision::apply(session.dom(), &self.route, &mut messages);
 		let tools = self
 			.dispatcher
 			.registry()
@@ -657,6 +1163,7 @@ impl<C: Inference> Kernel<C> {
 			top_logprobs:      None,
 			safety:            Arc::<[SafetySetting]>::from([]),
 			negotiation:       NegotiationPolicy::default(),
+			forced_call:       None,
 		})
 	}
 
@@ -675,9 +1182,14 @@ impl<C: Inference> Kernel<C> {
 		let mut text = String::new();
 		let mut usage = Usage::default();
 		let mut stop_reason = Str::new_static("stop");
-		let mut call_ids = Vec::new();
 		let mut completed = false;
-		let mut steering = Vec::new();
+		let mut had_tool_calls = false;
+		let call_control = CallControl::new(
+			self.mailbox_rx.clone(),
+			turn_cancel.clone(),
+			self.cancel.clone(),
+			Some(control.clone()),
+		);
 		// pi `message.ttft`: first visible or reasoning byte (or the first
 		// streamed tool-call fragment) after the request left the kernel.
 		let mut first_token: Option<Instant> = None;
@@ -694,26 +1206,16 @@ impl<C: Inference> Kernel<C> {
 						turn_cancel.cancel_turn();
 						return Ok(Fold::Cancelled);
 					},
-					StreamSignal::Control(Some(Up::Steer(text))) => {
-						steering.push(text);
-						continue;
-					},
-					StreamSignal::Control(Some(Up::Unqueue(reply))) => {
-						let _ = reply.send(std::mem::take(&mut steering));
-						continue;
-					},
-					StreamSignal::Control(Some(Up::Interrupt)) => {
-						turn_cancel.cancel_turn();
-						return Ok(Fold::Cancelled);
-					},
-					StreamSignal::Control(Some(Up::Cancel)) => {
-						self.cancel.cancel_session();
-						turn_cancel.cancel_turn();
-						return Ok(Fold::Cancelled);
-					},
-					StreamSignal::Control(Some(Up::Env(_))) => continue,
-					StreamSignal::Control(Some(Up::Approve { id, decision })) => {
-						let _ = crate::ApprovalBook::new().decide(session, id.as_str(), decision);
+					StreamSignal::Control(Some(message)) => {
+						match call_control.handle(session, message)? {
+							Received::Cancelled => return Ok(Fold::Cancelled),
+							Received::Rewound(work) => {
+								self.dispatcher.jobs().apply_lifecycle(session, &work).await;
+								turn_cancel.cancel_turn();
+								return Ok(Fold::Cancelled);
+							},
+							Received::None | Received::Steering => {},
+						}
 						continue;
 					},
 					StreamSignal::Control(None) => continue,
@@ -733,6 +1235,17 @@ impl<C: Inference> Kernel<C> {
 						)?;
 						self.apply_live_components(session)?;
 						assistant = Some(current_assistant(session)?);
+						if let (Some(hooks), Some(item)) = (&self.lifecycle_hooks, assistant) {
+							hooks.notify(
+								HookEventId::HookEventMessageStart,
+								serde_json::json!({
+									"turn_id": current_turn(session)?.to_string(),
+									"item_id": item.to_string(),
+									"role": "assistant",
+									"index": 0,
+								}),
+							)?;
+						}
 						self.events.publish(KernelEvent::InferenceStarted);
 					},
 					ChatEvent::BlockStarted { index, kind } => match kind {
@@ -758,6 +1271,20 @@ impl<C: Inference> Kernel<C> {
 						self.apply_live_components(session)?;
 						self.events.publish(KernelEvent::TextDelta(delta.clone()));
 						text.push_str(delta.as_str());
+						if let (Some(hooks), Some(item)) = (&self.lifecycle_hooks, assistant) {
+							hooks.notify(
+								HookEventId::HookEventMessageUpdate,
+								serde_json::json!({
+									"turn_id": current_turn(session)?.to_string(),
+									"item_id": item.to_string(),
+									"part_index": index,
+									"kind": "text",
+									"delta": delta,
+									"coalesced": 1,
+									"total_chars": text.chars().count(),
+								}),
+							)?;
+						}
 					},
 					ChatEvent::ThinkingDelta { index, text: delta } => {
 						first_token.get_or_insert_with(Instant::now);
@@ -770,6 +1297,20 @@ impl<C: Inference> Kernel<C> {
 						)?;
 						session.stream_append(sid, delta.as_str())?;
 						self.apply_live_components(session)?;
+						if let (Some(hooks), Some(item)) = (&self.lifecycle_hooks, assistant) {
+							hooks.notify(
+								HookEventId::HookEventMessageUpdate,
+								serde_json::json!({
+									"turn_id": current_turn(session)?.to_string(),
+									"item_id": item.to_string(),
+									"part_index": index,
+									"kind": "reasoning",
+									"delta": delta,
+									"coalesced": 1,
+									"total_chars": 0,
+								}),
+							)?;
+						}
 						self.events.publish(KernelEvent::ThinkingDelta(delta));
 					},
 					ChatEvent::ToolCallStarted { index, id, name } => {
@@ -786,31 +1327,73 @@ impl<C: Inference> Kernel<C> {
 							None,
 						)?;
 						self.apply_live_components(session)?;
+						let call_id = Str::new(id.to_string());
+						let cancellation = tool_cancellation(
+							self.dispatcher.registry(),
+							identity.name.as_str(),
+							turn_cancel,
+						)?;
+						let prepared = self.dispatcher.prepare(
+							identity.clone(),
+							call_id.clone(),
+							entry,
+							cancellation,
+						)?;
+						if let Some(hooks) = &self.lifecycle_hooks {
+							hooks.notify(
+								HookEventId::HookEventCallOpen,
+								serde_json::json!({
+									"call_id": call_id,
+									"target": {
+										"kind": "core",
+										"name": identity.name,
+										"rev": format!("{}@{}", identity.rev.family, identity.rev.n),
+										"args": {},
+									},
+									"kind": "core",
+									"turn_id": current_turn(session)?.to_string(),
+									"place": {"kind": "host", "name": serde_json::Value::Null},
+								}),
+							)?;
+						}
 						pending.insert(index, StreamingCall {
 							entry,
 							sid,
 							identity,
-							call_id: Str::new(id.to_string()),
+							call_id,
+							prepared,
+							raw_args: String::new(),
 						});
 					},
 					ChatEvent::ToolArgumentsDelta { index, bytes } => {
-						let call = pending.get(&index).ok_or(KernelError::ToolCallMismatch)?;
+						let call = pending.get_mut(&index).ok_or(KernelError::ToolCallMismatch)?;
 						let fragment = std::str::from_utf8(&bytes)
 							.map_err(|source| KernelError::ToolArgumentUtf8 { source })?;
 						session.stream_append(call.sid, fragment)?;
+						call.raw_args.push_str(fragment);
+						call.prepared.arg_delta(fragment);
 						self.apply_live_components(session)?;
+						let abort_invalid_edit = streamed_edit_must_abort(
+							self.con.as_deref(),
+							call.identity.name.as_str(),
+							&call.raw_args,
+						);
+						if abort_invalid_edit {
+							turn_cancel.cancel_turn();
+							return Ok(Fold::InvalidEditArguments);
+						}
 					},
 					ChatEvent::ToolCallReady { index, call } => {
+						had_tool_calls = true;
 						let args = serde_json::value::to_raw_value(call.arguments.as_value())?;
-						let (entry, identity) = if let Some(streaming) = pending.remove(&index) {
+						let (entry, identity, mut prepared) =
+							if let Some(streaming) = pending.remove(&index) {
 							if streaming.call_id.as_str() != call.id.to_string()
 								|| streaming.identity.name != call.name
 							{
 								return Err(KernelError::ToolCallMismatch);
 							}
-							session.call_ready(streaming.entry, args.clone())?;
-							self.apply_live_components(session)?;
-							(streaming.entry, streaming.identity)
+							(streaming.entry, streaming.identity, streaming.prepared)
 						} else {
 							let identity = self
 								.dispatcher
@@ -823,24 +1406,85 @@ impl<C: Inference> Kernel<C> {
 								.get("i")
 								.and_then(serde_json::Value::as_str)
 								.map(Str::new);
-							let entry = session.call(
+							let call_id = Str::new(call.id.to_string());
+							let (entry, _) = session.call_streaming(
 								call.name.clone(),
 								crate::journal_revision(&identity.rev),
-								Str::new(call.id.to_string()),
+								call_id.clone(),
 								intent,
-								Some(args.clone()),
-								None,
 							)?;
 							self.apply_live_components(session)?;
-							(entry, identity)
+							let cancellation = tool_cancellation(
+								self.dispatcher.registry(),
+								identity.name.as_str(),
+								turn_cancel,
+							)?;
+							let prepared = self.dispatcher.prepare(
+								identity.clone(),
+								call_id,
+								entry,
+								cancellation,
+							)?;
+							(entry, identity, prepared)
 						};
 						let call_id = Str::new(call.id.to_string());
-						call_ids.push(call_id.clone());
+						let denied_args = args.clone();
+						let session_id = session
+							.journal_path()
+							.file_stem()
+							.and_then(|value| value.to_str())
+							.map_or_else(|| Str::new_static("session"), Str::new);
+						let turn_id = current_turn(session)
+							.map(|handle| Str::new(handle.to_string()))
+							.unwrap_or_else(|_| Str::new_static("turn"));
+						let (identity, args) =
+							match Self::gate_tool_call(
+								self.lifecycle_hooks.clone(),
+								Arc::clone(self.dispatcher.registry()),
+								&session_id,
+								&turn_id,
+								&identity,
+								&call_id,
+								args,
+							)
+							.await
+							{
+								ToolGate::Allow { identity, args } => (identity, args),
+								ToolGate::Deny(reason) => {
+									session.call_ready(entry, denied_args.clone())?;
+									prepared.commit(denied_args);
+									self.dispatcher.abort_prepared(
+										session,
+										prepared,
+										Abort::Skipped { reason },
+									)?;
+									self.apply_live_components(session)?;
+									continue;
+								},
+							};
+						session.call_ready(entry, args.clone())?;
+						self.apply_live_components(session)?;
+						if prepared.identity().name != identity.name || args.get() != denied_args.get() {
+							prepared.discard();
+							let cancellation = tool_cancellation(
+								self.dispatcher.registry(),
+								identity.name.as_str(),
+								turn_cancel,
+							)?;
+							prepared = self.dispatcher.prepare(
+								identity.clone(),
+								call_id.clone(),
+								entry,
+								cancellation,
+							)?;
+							prepared.arg_delta(args.get());
+						}
+						prepared.commit(args);
 						self.events.publish(KernelEvent::ToolReady {
 							call_id: call_id.clone(),
 							name:    identity.name.clone(),
 						});
-						ready.push(ReadyCall { entry, identity, call_id, args });
+						ready.push(prepared);
 					},
 					ChatEvent::Usage(update) => {
 						usage = update.usage;
@@ -853,9 +1497,84 @@ impl<C: Inference> Kernel<C> {
 						close_streams(session, &mut content_streams)?;
 						self.apply_live_components(session)?;
 						stop_reason = finish_reason(&completion.reason);
+						if self.runtime_flags.recover_inline_edits
+							&& matches!(completion.reason, FinishReason::Stop)
+							&& pending.is_empty()
+							&& ready.is_empty()
+							&& let Some(identity) =
+								self.dispatcher.registry().resolved_identity("edit")
+							&& identity.rev.family.as_str() == "sloppy"
+							&& let Some((remaining, input, _regions)) =
+								extract_inline_sloppy_edits(&text)
+						{
+							let assistant =
+								assistant.ok_or(KernelError::MissingResponseStart)?;
+							session.patch(Txn {
+								cause: session.head().ok_or(SessionError::NoActiveTurn)?,
+								label: Some(Str::new_static("edit.inline-recovery")),
+								ops: vec![omp_dom::Op::Set {
+									h: assistant,
+									prop: PropId::Text.into(),
+									value: omp_dom::Value::Str(Str::new(remaining.clone())),
+								}],
+							})?;
+							text = remaining;
+							let args = serde_json::value::to_raw_value(
+								&serde_json::json!({"input": input}),
+							)?;
+							let call_id = Str::new(format!(
+								"inline-edit-{}",
+								session.head().ok_or(SessionError::NoActiveTurn)?
+							));
+							let entry = session.call(
+								"edit",
+								crate::journal_revision(&identity.rev),
+								call_id.clone(),
+								None,
+								Some(args.clone()),
+								None,
+							)?;
+							let cancellation = tool_cancellation(
+								self.dispatcher.registry(),
+								"edit",
+								turn_cancel,
+							)?;
+							let mut prepared = self.dispatcher.prepare(
+								identity,
+								call_id.clone(),
+								entry,
+								cancellation,
+							)?;
+							prepared.arg_delta(args.get());
+							prepared.commit(args);
+							ready.push(prepared);
+							had_tool_calls = true;
+							self.events.publish(KernelEvent::ToolReady {
+								call_id,
+								name: Str::new_static("edit"),
+							});
+						}
 						usage = completion.usage;
 						session.assistant_end(stop_reason.clone())?;
 						self.apply_live_components(session)?;
+						if let (Some(hooks), Some(item)) = (&self.lifecycle_hooks, assistant) {
+							hooks.notify(
+								HookEventId::HookEventMessageEnd,
+								serde_json::json!({
+									"turn_id": current_turn(session)?.to_string(),
+									"item_id": item.to_string(),
+									"role": "assistant",
+									"parts": completion.blocks,
+									"finish": if matches!(completion.reason, FinishReason::Length) {
+										"truncated"
+									} else if matches!(completion.reason, FinishReason::Cancelled) {
+										"interrupted"
+									} else {
+										"complete"
+									},
+								}),
+							)?;
+						}
 						session.receipt(receipt_facts(
 							&usage,
 							cost_nano_usd(&completion),
@@ -905,19 +1624,66 @@ impl<C: Inference> Kernel<C> {
 		.await;
 		match fold {
 			Ok(Fold::Ended) => {},
-			Ok(Fold::Cancelled) => {
-				// The reveal stopped mid-stream: close its open text streams so
-				// the tree never carries a dangling stream past the interrupt.
+			Ok(state @ (Fold::Cancelled | Fold::InvalidEditArguments)) => {
+				let invalid_edit = matches!(state, Fold::InvalidEditArguments);
 				close_streams(session, &mut content_streams)?;
+				for (_, streaming) in pending.drain() {
+					let _ = session.stream_close(streaming.sid);
+					self.dispatcher.abort_prepared(
+						session,
+						streaming.prepared,
+						if invalid_edit {
+							Abort::Skipped {
+								reason: Str::new_static(
+									"streamed edit arguments became irrecoverably invalid before commit",
+								),
+							}
+						} else {
+							Abort::Interrupted {
+								reason: Str::new_static(
+									"inference cancelled before tool arguments settled",
+								),
+							}
+						},
+					)?;
+				}
+				for prepared in ready.drain(..) {
+					self.dispatcher.abort_prepared(
+						session,
+						prepared,
+						Abort::Interrupted {
+							reason: Str::new_static("inference cancelled before tool execution"),
+						},
+					)?;
+				}
 				return Ok(DrivenInference::cancelled(text, usage));
 			},
 			Err(error) => {
-				// The stream failed mid-reveal: close its open text streams so the
-				// tree never carries a dangling stream, then surface the failure.
 				if let Err(journal) = close_streams(session, &mut content_streams) {
 					tracing::warn!(error = ?journal, "failed to close reveal streams after a stream error");
 				}
-				return Err(error);
+				for (_, streaming) in pending.drain() {
+					let _ = session.stream_close(streaming.sid);
+					self.dispatcher.abort_prepared(
+						session,
+						streaming.prepared,
+						Abort::InputDropped,
+					)?;
+				}
+				if ready.is_empty() {
+					return Err(error);
+				}
+				// A trailer/read failure does not discard already-complete calls.
+				// They remain a valid tool-use turn and execute below.
+				append_notice(
+					session,
+					current_turn(session)?,
+					Str::new(format!(
+						"inference stream ended after complete tool calls: {}",
+						error_chain(&error)
+					)),
+				)?;
+				stop_reason = Str::new_static("tool_calls");
 			},
 		}
 		if !completed {
@@ -933,10 +1699,79 @@ impl<C: Inference> Kernel<C> {
 			usage,
 			stop_reason,
 			calls: ready,
-			call_ids,
-			steering,
+			had_tool_calls,
 			cancelled: false,
 		})
+	}
+
+	async fn gate_tool_call(
+		hooks: Option<crate::LifecycleHooks>,
+		registry: Arc<Registry>,
+		session_id: &Str,
+		turn_id: &Str,
+		identity: &ToolIdentity,
+		call_id: &Str,
+		args: Box<RawValue>,
+	) -> ToolGate {
+		let Some(hooks) = hooks else {
+			return ToolGate::Allow { identity: identity.clone(), args };
+		};
+		let Ok(args_value) = serde_json::from_str::<serde_json::Value>(args.get()) else {
+			return ToolGate::Deny(Str::new_static("tool-call arguments are not valid JSON"));
+		};
+		let rev = format!("{}@{}", identity.rev.family, identity.rev.n);
+		let target = serde_json::json!({
+			"kind": "core",
+			"name": identity.name,
+			"rev": rev,
+			"args": args_value.clone(),
+		});
+		let payload = serde_json::json!({
+			"call_id": call_id,
+			"invocation_id": call_id,
+			"target": target.clone(),
+			"kind": "core",
+			"args": args_value,
+			"raw_args": {
+				"$bytes": omp_core::base64::encode(args.get().as_bytes()).into_string(),
+			},
+			"repaired": false,
+			"turn_id": turn_id,
+			"session_id": session_id,
+			"cwd": ".",
+			"origin": "model",
+			"batch": [{"call_id": call_id, "target": target}],
+			"deadline": serde_json::Value::Null,
+			"bash": serde_json::Value::Null,
+		});
+		let transformed = match hooks.gate(HookEventId::HookEventToolCall, payload).await {
+			Ok(value) => value,
+			Err(crate::LifecycleHookError::Denied { reason, .. }) => return ToolGate::Deny(reason),
+			Err(error) => {
+				tracing::warn!(?error, "tool-call lifecycle hook failed");
+				return ToolGate::Deny(Str::new_static("tool-call lifecycle hook failed"));
+			},
+		};
+		let Some(name) = transformed
+			.get("target")
+			.and_then(|target| target.get("name"))
+			.and_then(serde_json::Value::as_str)
+		else {
+			return ToolGate::Deny(Str::new_static("tool-call hook removed the target name"));
+		};
+		let Some(identity) = registry.resolved_identity(name) else {
+			return ToolGate::Deny(Str::new_static("tool-call hook selected an unknown target"));
+		};
+		let Some(args) = transformed.get("args") else {
+			return ToolGate::Deny(Str::new_static("tool-call hook removed canonical arguments"));
+		};
+		match serde_json::value::to_raw_value(args) {
+			Ok(args) => ToolGate::Allow { identity, args },
+			Err(error) => {
+				tracing::warn!(?error, "tool-call hook returned malformed arguments");
+				ToolGate::Deny(Str::new_static("tool-call hook returned malformed arguments"))
+			},
+		}
 	}
 
 	async fn artifact_uri(&self, artifact: omp_inference::Artifact) -> Result<Str, KernelError> {
@@ -962,44 +1797,19 @@ impl<C: Inference> Kernel<C> {
 	fn drain_mailbox(
 		&self,
 		session: &mut Session,
-		turn_handle: Handle,
 		turn: &crate::TurnCancellation,
-	) -> DrainedSteering {
+	) -> Result<DrainedSteering, SessionError> {
 		let mut drained = DrainedSteering::default();
+		let control =
+			CallControl::new(self.mailbox_rx.clone(), turn.clone(), self.cancel.clone(), None);
 		while let Ok(message) = self.mailbox_rx.try_recv() {
-			match message {
-				Up::Steer(text) => drained.items.push(text),
-				Up::Unqueue(reply) => {
-					let _ = reply.send(std::mem::take(&mut drained.items));
-				},
-				Up::Interrupt => {
-					turn.cancel_turn();
-					drained.cancelled = true;
-				},
-				Up::Cancel => {
-					self.cancel.cancel_session();
-					drained.cancelled = true;
-				},
-				Up::Env(crate::EnvEvent::DeviceAvailability { payload }) => {
-					let _ = append_notice(session, turn_handle, payload);
-				},
-				Up::Env(crate::EnvEvent::StagedPreview { proposal_id, source_tool }) => {
-					let _ = append_notice(
-						session,
-						turn_handle,
-						Str::new(format!(
-							"Staged proposal {proposal_id} from {source_tool} awaits `dyn resolve` or \
-							 `dyn reject`."
-						)),
-					);
-				},
-				Up::Env(crate::EnvEvent::CheckpointControl { .. }) => {},
-				Up::Approve { id, decision } => {
-					let _ = crate::ApprovalBook::new().decide(session, id.as_str(), decision);
-				},
+			match control.handle(session, message)? {
+				Received::Steering => drained.received = true,
+				Received::Cancelled | Received::Rewound(_) => drained.cancelled = true,
+				Received::None => {},
 			}
 		}
-		drained
+		Ok(drained)
 	}
 
 	/// Runs the manual compaction path between turns (`/compact`,
@@ -1027,6 +1837,7 @@ impl<C: Inference> Kernel<C> {
 				route: &route,
 				turn,
 				director: None,
+				events: Some(&self.events),
 			};
 			director.before_inference(&mut cx, &request).await?
 		};
@@ -1040,23 +1851,24 @@ struct StreamingCall {
 	sid:      u32,
 	identity: ToolIdentity,
 	call_id:  Str,
+	prepared: PreparedCall,
+	raw_args: String,
 }
 
-struct ReadyCall {
-	entry:    EntryId,
-	identity: ToolIdentity,
-	call_id:  Str,
-	args:     Box<RawValue>,
+pub(crate) struct ReadyCall {
+	pub(crate) entry:    EntryId,
+	pub(crate) identity: ToolIdentity,
+	pub(crate) call_id:  Str,
+	pub(crate) args:     Box<RawValue>,
 }
 
 struct DrivenInference {
 	text:        Str,
 	usage:       Usage,
 	stop_reason: Str,
-	calls:       Vec<ReadyCall>,
-	call_ids:    Vec<Str>,
-	steering:    Vec<Str>,
-	cancelled:   bool,
+	calls:          Vec<PreparedCall>,
+	had_tool_calls: bool,
+	cancelled:      bool,
 }
 
 impl DrivenInference {
@@ -1066,11 +1878,24 @@ impl DrivenInference {
 			usage,
 			stop_reason: Str::new_static("cancelled"),
 			calls: Vec::new(),
-			call_ids: Vec::new(),
-			steering: Vec::new(),
+			had_tool_calls: false,
 			cancelled: true,
 		}
 	}
+}
+
+enum ToolGate {
+	Allow {
+		identity: ToolIdentity,
+		args:     Box<RawValue>,
+	},
+	Deny(Str),
+}
+
+enum PreflightSignal {
+	Ready(Result<Prepared, DirectorError>),
+	Control(Up),
+	Cancelled,
 }
 
 enum StreamSignal {
@@ -1085,6 +1910,8 @@ enum Fold {
 	Ended,
 	/// Caller control ended the stream before completion.
 	Cancelled,
+	/// Strict streamed edit validation proved the argument prefix invalid.
+	InvalidEditArguments,
 }
 
 /// Renders an error with its full `source()` chain, one cause per line.
@@ -1101,7 +1928,7 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 
 #[derive(Default)]
 struct DrainedSteering {
-	items:     Vec<Str>,
+	received:  bool,
 	cancelled: bool,
 }
 
@@ -1131,7 +1958,7 @@ fn close_streams(
 	Ok(())
 }
 
-fn current_turn(session: &Session) -> Result<Handle, KernelError> {
+pub(crate) fn current_turn(session: &Session) -> Result<Handle, KernelError> {
 	session
 		.dom()
 		.children(session.dom().body())
@@ -1187,6 +2014,70 @@ fn tool_cancellation(
 	})
 }
 
+fn extract_inline_sloppy_edits(text: &str) -> Option<(String, String, usize)> {
+	const OPEN: &str = "<SM:EDIT ";
+	const CLOSE: &str = "</SM:EDIT>";
+	let mut remaining = String::with_capacity(text.len());
+	let mut payloads = Vec::new();
+	let mut cursor = 0;
+	while let Some(relative) = text[cursor..].find(OPEN) {
+		let start = cursor + relative;
+		let Some(close_relative) = text[start..].find(CLOSE) else {
+			break;
+		};
+		let end = start + close_relative + CLOSE.len();
+		let payload = &text[start..end];
+		let valid = payload.contains("<SM:FIND>")
+			&& payload.contains("</SM:FIND>")
+			&& (payload.contains("<SM:PUT>") || payload.contains("<SM:PUT></SM:PUT>"))
+			&& (payload.contains("</SM:PUT>") || payload.contains("<SM:PUT></SM:PUT>"));
+		if !valid {
+			remaining.push_str(&text[cursor..end]);
+			cursor = end;
+			continue;
+		}
+		remaining.push_str(&text[cursor..start]);
+		payloads.push(payload.to_owned());
+		cursor = end;
+	}
+	if payloads.is_empty() {
+		return None;
+	}
+	remaining.push_str(&text[cursor..]);
+	let regions = payloads.len();
+	Some((remaining, payloads.join("\n"), regions))
+}
+
+fn should_schedule_autolearn(dom: &omp_dom::Dom, turn: Handle, minimum: usize) -> bool {
+	let mut settled = 0_usize;
+	for handle in dom.children(turn) {
+		let Some(node) = dom.get(*handle) else {
+			continue;
+		};
+		let Tag::Custom(name) = &node.tag else {
+			continue;
+		};
+		if name.as_str() == "learn" {
+			return false;
+		}
+		let done = node
+			.prop(&omp_dom::PropKey::from(PropId::Status))
+			.and_then(omp_dom::Value::as_str)
+			.is_some_and(|status| matches!(status, "ok" | "error"));
+		settled += usize::from(done);
+	}
+	settled >= minimum
+}
+
+fn streamed_edit_must_abort(con: Option<&omp_con::Ctx>, name: &str, raw: &str) -> bool {
+	name == "edit"
+		&& con
+			.and_then(|con| con.get("sv_tools_edit_streaming_abort"))
+			.is_some_and(|value| matches!(value, omp_con::Value::Bool(true)))
+		&& serde_json::from_str::<serde_json::Value>(raw)
+			.is_err_and(|error| error.classify() != serde_json::error::Category::Eof)
+}
+
 fn finish_reason(reason: &FinishReason) -> Str {
 	match reason {
 		FinishReason::Stop => Str::new_static("stop"),
@@ -1230,11 +2121,96 @@ fn cost_nano_usd(completion: &Completion) -> u64 {
 		.unwrap_or(u64::MAX)
 }
 
-fn outcome(stop: TurnStop, text: String, tokens_in: u64, tokens_out: u64) -> TurnOutcome {
+pub(crate) fn outcome(stop: TurnStop, text: String, tokens_in: u64, tokens_out: u64) -> TurnOutcome {
 	TurnOutcome { stop, assistant_text: Str::new(text), tokens_in, tokens_out }
 }
 
-fn cancelled_outcome() -> TurnOutcome {
+#[cfg(test)]
+mod streaming_edit_tests {
+	use omp_con::{Ctx, DynamicVarSpec, Origin, TypeSpec, Value, VarFlags};
+	use omp_core::Str;
+	use omp_session::{ComponentRegistry, Session};
+
+	use super::{should_schedule_autolearn, streamed_edit_must_abort};
+
+	fn context(enabled: bool) -> Ctx {
+		let ctx = Ctx::new();
+		ctx.register_dynamic_var(DynamicVarSpec {
+			name: Str::new_static("sv_tools_edit_streaming_abort"),
+			desc: Str::new_static("Abort invalid streamed edit arguments"),
+			ty: TypeSpec::BOOL,
+			flags: VarFlags::SESSION,
+			default: Value::Bool(false),
+		})
+		.expect("setting registers");
+		ctx.set(
+			"sv_tools_edit_streaming_abort",
+			Value::Bool(enabled),
+			Origin::Session,
+		)
+		.expect("setting writes");
+		ctx
+	}
+
+	#[test]
+	fn autolearn_threshold_counts_settled_non_learn_calls_at_the_boundary() {
+		let temp = tempfile::tempdir().expect("tempdir");
+		let mut session =
+			Session::create(temp.path().join("autolearn.oms"), ComponentRegistry::standard())
+				.expect("session");
+		session.begin_turn().expect("turn");
+		let turn = *session.dom().children(session.dom().body()).last().expect("turn");
+		for index in 0..2 {
+			let call = session
+				.call(
+					"read",
+					1,
+					format!("call-{index}"),
+					None,
+					Some(serde_json::value::to_raw_value(&serde_json::json!({})).expect("args")),
+					None,
+				)
+				.expect("call");
+			session
+				.settle(
+					call,
+					serde_json::value::to_raw_value(&serde_json::json!({})).expect("outcome"),
+				)
+				.expect("settle");
+		}
+		assert!(!should_schedule_autolearn(session.dom(), turn, 3));
+		assert!(should_schedule_autolearn(session.dom(), turn, 2));
+		let learn = session
+			.call(
+				"learn",
+				1,
+				"learn-1",
+				None,
+				Some(serde_json::value::to_raw_value(&serde_json::json!({})).expect("args")),
+				None,
+			)
+			.expect("learn");
+		session
+			.settle(
+				learn,
+				serde_json::value::to_raw_value(&serde_json::json!({})).expect("outcome"),
+			)
+			.expect("settle learn");
+		assert!(!should_schedule_autolearn(session.dom(), turn, 2));
+	}
+
+	#[test]
+	fn edit_streaming_abort_only_fires_when_enabled_and_irrecoverably_invalid() {
+		let disabled = context(false);
+		let enabled = context(true);
+		assert!(!streamed_edit_must_abort(Some(&disabled), "edit", r#"{"input":]"#));
+		assert!(streamed_edit_must_abort(Some(&enabled), "edit", r#"{"input":]"#));
+		assert!(!streamed_edit_must_abort(Some(&enabled), "edit", r#"{"input":"#));
+		assert!(!streamed_edit_must_abort(Some(&enabled), "read", r#"{"input":]"#));
+	}
+}
+
+pub(crate) fn cancelled_outcome() -> TurnOutcome {
 	TurnOutcome {
 		stop:           TurnStop::Cancelled,
 		assistant_text: Str::new_static(""),

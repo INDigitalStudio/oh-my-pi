@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 omp-core.workspace = true
 omp-journal.workspace = true
+omp-con.workspace = true
 omp-dom.workspace = true
 omp-vocab.workspace = true
 omp-session.workspace = true

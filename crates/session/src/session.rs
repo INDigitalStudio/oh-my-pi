@@ -5,15 +5,16 @@ use std::{
 
 use flume::Receiver;
 use omp_core::{FastHashMap, Str};
-use omp_dom::{Dom, Event, Handle, Op, PropKey, Sid, Snapshot, Txn, Value};
+use omp_dom::{Dom, Event, Handle, Op, PropKey, Sid, Snapshot, Tag, Txn, Value};
 use omp_journal::{
 	Entry, EntryDraft, EntryId, Journal, JournalError, Kind, KindName,
-	blob::BlobRef,
+	blob::{BlobRef, BlobStore},
 	data::{
 		Compaction, Genesis, MsgAssistantEnd, MsgAssistantStart, MsgUser, Patch, Stream, StreamOp,
 		ToolCall, ToolResult, ToolUpdate, TurnReceipt, TurnStart,
 	},
 };
+use omp_tool::{Abort, CallOutcome, Part as ToolPart};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use thiserror::Error;
@@ -130,6 +131,27 @@ pub struct Session {
 	pub(crate) entry_patch_published: bool,
 	pub(crate) next_sid:              Sid,
 	pending_prior:                    Option<EntryId>,
+	/// Content-addressed store every blob this session references resolves
+	/// against: compaction summaries, spilled tool output, attachments.
+	blobs:                            BlobStore,
+}
+
+/// One tool-call element on the live chain that has no terminal result yet.
+#[derive(Clone, Debug)]
+pub struct UnsettledCall {
+	/// Journal identity of the `tool.call@1`.
+	pub entry:   EntryId,
+	/// Provider call identity recorded on the element.
+	pub call_id: Str,
+	/// Tool name (the element tag).
+	pub name:    Str,
+	/// Journaled tool revision.
+	pub rev:     u32,
+	/// Whether canonical arguments were committed (`running`) or the argument
+	/// stream never closed (`arguments`).
+	pub committed: bool,
+	/// Canonical committed arguments, when `committed`.
+	pub args:    Option<Box<RawValue>>,
 }
 
 impl Session {
@@ -139,6 +161,25 @@ impl Session {
 		components: ComponentRegistry,
 	) -> Result<Self, SessionError> {
 		let journal = Journal::create(path)?;
+		let blobs = Self::default_blob_store(journal.path())?;
+		Self::initialize(journal, components, blobs)
+	}
+
+	/// Creates a new journal whose content-addressed references all resolve
+	/// through the supplied session blob store.
+	pub fn create_with_blob_store(
+		path: impl AsRef<Path>,
+		components: ComponentRegistry,
+		blobs: BlobStore,
+	) -> Result<Self, SessionError> {
+		Self::initialize(Journal::create(path)?, components, blobs)
+	}
+
+	fn initialize(
+		journal: Journal,
+		components: ComponentRegistry,
+		blobs: BlobStore,
+	) -> Result<Self, SessionError> {
 		let cwd =
 			std::env::current_dir().map_err(|source| SessionError::CurrentDirectory { source })?;
 		let created = SystemTime::now()
@@ -146,7 +187,7 @@ impl Session {
 			.map_err(|source| SessionError::Clock { source })?
 			.as_millis()
 			.to_string();
-		let mut session = Self::empty(journal, components);
+		let mut session = Self::empty(journal, components, blobs);
 		let genesis = Genesis {
 			version: 1,
 			cwd:     Str::new(cwd.to_string_lossy()),
@@ -163,7 +204,28 @@ impl Session {
 		components: ComponentRegistry,
 	) -> Result<Self, SessionError> {
 		let (journal, entries) = Journal::open(path)?;
-		let mut session = Self::empty(journal, components);
+		let blobs = Self::default_blob_store(journal.path())?;
+		Self::restore(journal, entries, components, blobs)
+	}
+
+	/// Opens a journal using the supplied store for every referenced blob,
+	/// including compaction summaries written before the process restarted.
+	pub fn open_with_blob_store(
+		path: impl AsRef<Path>,
+		components: ComponentRegistry,
+		blobs: BlobStore,
+	) -> Result<Self, SessionError> {
+		let (journal, entries) = Journal::open(path)?;
+		Self::restore(journal, entries, components, blobs)
+	}
+
+	fn restore(
+		journal: Journal,
+		entries: Vec<Entry>,
+		components: ComponentRegistry,
+		blobs: BlobStore,
+	) -> Result<Self, SessionError> {
+		let mut session = Self::empty(journal, components, blobs);
 		session.entries = entries;
 		session.entry_index = session
 			.entries
@@ -172,12 +234,19 @@ impl Session {
 			.map(|(index, entry)| (entry.id, index))
 			.collect();
 		session.rebuild_all()?;
+		session.recover_unsettled_calls()?;
 		Ok(session)
 	}
 
-	fn empty(journal: Journal, components: ComponentRegistry) -> Self {
+	fn default_blob_store(journal: &Path) -> Result<BlobStore, SessionError> {
+		let root = journal.parent().unwrap_or_else(|| Path::new("."));
+		Ok(BlobStore::open(root)?)
+	}
+
+	fn empty(journal: Journal, components: ComponentRegistry, blobs: BlobStore) -> Self {
 		Self {
 			journal,
+			blobs,
 			entries: Vec::new(),
 			entry_index: FastHashMap::default(),
 			handle_floors: vec![4],
@@ -221,6 +290,138 @@ impl Session {
 	#[must_use]
 	pub fn journal_path(&self) -> &Path {
 		self.journal.path()
+	}
+
+	/// Returns the content-addressed store this session's blob references
+	/// resolve against.
+	#[must_use]
+	pub const fn blobs(&self) -> &BlobStore {
+		&self.blobs
+	}
+
+	/// Returns every tool-call element on the live chain without a terminal
+	/// result, oldest first. A crash, a killed process, or a cancelled stream
+	/// leaves these behind; the kernel settles or re-dispatches them before
+	/// projecting the next request so no unpaired call reaches a provider.
+	#[must_use]
+	pub fn unsettled_calls(&self) -> Vec<UnsettledCall> {
+		let dom = &self.dom;
+		let mut out = Vec::new();
+		for turn in dom.children(dom.body()) {
+			for child in dom.children(*turn) {
+				let Some(node) = dom.get(*child) else { continue };
+				let Tag::Custom(name) = &node.tag else { continue };
+				let status = node
+					.prop(&PropKey::from(omp_dom::PropId::Status))
+					.and_then(Value::as_str)
+					.unwrap_or("running");
+				if !matches!(status, "arguments" | "running") {
+					continue;
+				}
+				let Some(entry) = node
+					.prop(&PropKey::from(omp_dom::PropId::Cause))
+					.and_then(Value::as_str)
+					.and_then(|value| value.parse::<EntryId>().ok())
+				else {
+					continue;
+				};
+				if !self.call_handles.contains_key(&entry) {
+					continue;
+				}
+				let committed = status == "running";
+				let args = committed
+					.then(|| {
+						dom.children(*child).iter().find_map(|grandchild| {
+							let input = dom.get(*grandchild)?;
+							(input.tag == Tag::Known(omp_dom::KnownTag::Input)).then(|| {
+								match input.prop(&PropKey::from(omp_dom::PropId::Data)) {
+									Some(Value::Json(raw)) => Some(raw.clone()),
+									_ => input
+										.content
+										.as_deref()
+										.and_then(|text| RawValue::from_string(text.to_owned()).ok()),
+								}
+							})?
+						})
+					})
+					.flatten();
+				out.push(UnsettledCall {
+					entry,
+					call_id: node
+						.prop(&PropKey::from(omp_dom::PropId::Id))
+						.and_then(Value::as_str)
+						.map_or_else(|| Str::new(entry.to_string()), Str::new),
+					name: name.clone(),
+					rev: match node.prop(&PropKey::from(omp_dom::PropId::Rev)) {
+						Some(Value::Int(rev)) => u32::try_from(*rev).unwrap_or(1),
+						_ => 1,
+					},
+					committed,
+					args,
+				});
+			}
+		}
+		out
+	}
+
+	/// Journals synthetic aborts for every call left without a terminal result.
+	///
+	/// Reopening invokes this before returning the session, so strict-provider
+	/// projection never has to hide or invent a result for a call whose process
+	/// disappeared. Calls cut off during argument streaming first receive
+	/// canonical empty arguments, closing their durable stream before the
+	/// abort is appended.
+	pub fn recover_unsettled_calls(&mut self) -> Result<usize, SessionError> {
+		let calls = self.unsettled_calls();
+		for call in &calls {
+			let abort = if call.committed { Abort::MissingOutcome } else { Abort::InputDropped };
+			if !call.committed {
+				self.call_ready(call.entry, RawValue::from_string("{}".to_owned())?)?;
+			}
+			let text = abort.render();
+			let fault = serde_json::value::to_raw_value(&CallOutcome::<
+				serde_json::Value,
+				serde_json::Value,
+			>::aborted(abort))?;
+			let prompt_parts =
+				serde_json::value::to_raw_value(&vec![ToolPart::Text { text }])?;
+			self.fail_projected(call.entry, fault, prompt_parts)?;
+		}
+		Ok(calls.len())
+	}
+
+	/// Returns the rewind target that re-opens the last turn's tool batch for
+	/// re-execution (pi `retry()` on an aborted tool tail): the entry after
+	/// which the batch's calls are all authorized but none has a result. `None`
+	/// when the last turn has no tool call.
+	#[must_use]
+	pub fn tool_tail_retry_target(&self) -> Option<EntryId> {
+		let dom = &self.dom;
+		let turn = dom.children(dom.body()).last().copied()?;
+		let mut target = None;
+		for child in dom.children(turn) {
+			let node = dom.get(*child)?;
+			if !matches!(node.tag, Tag::Custom(_)) {
+				continue;
+			}
+			let call = node
+				.prop(&PropKey::from(omp_dom::PropId::Cause))
+				.and_then(Value::as_str)
+				.and_then(|value| value.parse::<EntryId>().ok())?;
+			let index = *self.entry_index.get(&call)?;
+			// The latest authorization for this call: the `kernel=ready`
+			// update when arguments streamed, else the call entry itself.
+			let ready = self.entries[index..]
+				.iter()
+				.filter(|entry| entry.by == Some(call) && entry.kind.name.as_str() == "tool.update")
+				.find(|entry| entry.data.contains("\"kernel\":\"ready\""))
+				.map(|entry| entry.id);
+			let at = ready.unwrap_or(call);
+			if target.is_none_or(|current| at > current) {
+				target = Some(at);
+			}
+		}
+		target
 	}
 
 	/// Records switching away from this session without marking process exit.
@@ -654,7 +855,6 @@ impl Session {
 		let complete = [
 			omp_dom::KnownTag::Input,
 			omp_dom::KnownTag::Result,
-			omp_dom::KnownTag::Diag,
 			omp_dom::KnownTag::Usage,
 		]
 		.into_iter()
@@ -675,13 +875,7 @@ impl Session {
 		if let Some(text) = self.summaries.get(summary) {
 			return Ok(text.clone());
 		}
-		let root = self
-			.journal
-			.path()
-			.parent()
-			.unwrap_or_else(|| Path::new("."));
-		let store = omp_journal::blob::BlobStore::open(root)?;
-		let bytes = store.get(summary)?;
+		let bytes = self.blobs.get(summary)?;
 		let text =
 			std::str::from_utf8(&bytes).map_err(|source| SessionError::SummaryUtf8 { source })?;
 		let text = Str::new(text);

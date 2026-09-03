@@ -157,7 +157,7 @@ async fn output_frames_stream_onto_the_result_text_and_replay_byte_identical() {
 	// The stream closed before the terminal; the settled result now owns
 	// the text, and the journal carries the output exactly once — in the
 	// stream frames, never duplicated into the typed updates.
-	assert_eq!(result_text(&session, "frames"), "exit 0");
+	assert_eq!(result_text(&session, "frames"), "line 1\ncafé au lait\nline 3\n");
 	let journal = std::fs::read_to_string(&path).expect("journal reads");
 	assert_eq!(journal.matches("au lait").count(), 1, "{journal}");
 	assert!(!journal.contains("[108,105,110,101"), "typed updates drop the bytes: {journal}");
@@ -179,19 +179,21 @@ async fn output_stream_is_readable_mid_call_and_dedupes_stale_frames() {
 	let mut session = session(&directory.path().join("live.oms"));
 	let (entry, args) = call(&mut session, &identity, "live");
 	let cancellation = CancelTree::new().begin_turn().read_only_tool();
-	let dispatch = dispatcher.dispatch(
-		&mut session,
-		request(entry, identity, args, ToolCancellation::ReadOnly(cancellation.clone()), false),
-	);
-	tokio::pin!(dispatch);
-	tokio::select! {
-		result = &mut dispatch => panic!("dispatch settled early: {result:?}"),
-		() = tokio::time::sleep(Duration::from_millis(150)) => {},
-	}
-	// `dispatch` borrows the session mutably; cancel to release it, then
-	// inspect what the stream held when the call was torn down.
-	cancellation.cancel_tool();
-	let report = dispatch.await.expect("cancelled dispatch journals a terminal");
+	let report = {
+		let dispatch = dispatcher.dispatch(
+			&mut session,
+			request(entry, identity, args, ToolCancellation::ReadOnly(cancellation.clone()), false),
+		);
+		tokio::pin!(dispatch);
+		tokio::select! {
+			result = &mut dispatch => panic!("dispatch settled early: {result:?}"),
+			() = tokio::time::sleep(Duration::from_millis(150)) => {},
+		}
+		// `dispatch` borrows the session mutably; cancel to release it, then
+		// inspect what the stream held when the call was torn down.
+		cancellation.cancel_tool();
+		dispatch.await.expect("cancelled dispatch journals a terminal")
+	};
 	assert!(report.is_error);
 	// The close materialized the concatenation (each chunk once despite
 	// the duplicate frames); the abort's diag, not the result, carries the

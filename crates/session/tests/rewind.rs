@@ -120,6 +120,58 @@ fn rewind_is_a_dom_diff_that_lists_lifecycle_work() {
 }
 
 #[test]
+fn running_tool_calls_are_distinct_actionable_lifecycle_nodes() {
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let mut session =
+		Session::create(directory.path().join("tool-lifecycle.oms"), ComponentRegistry::default())
+			.expect("session creates");
+	let target = session.begin_turn().expect("turn starts");
+	for _ in 0..2 {
+		session
+			.call(
+				"read",
+				1,
+				"provider-reused-id",
+				None,
+				Some(
+					serde_json::value::to_raw_value(&serde_json::json!({}))
+						.expect("arguments serialize"),
+				),
+				None,
+			)
+			.expect("running call appends");
+	}
+
+	let work = session.rewind(target).expect("rewind succeeds");
+	assert_eq!(
+		work.terminate.len(),
+		2,
+		"journal causes keep duplicate provider call ids independently actionable"
+	);
+	assert!(work.spawn.is_empty());
+	assert!(work.retained.is_empty());
+
+	let without_calls = session.dom().snapshot();
+	session
+		.call(
+			"read",
+			1,
+			"provider-reused-id",
+			None,
+			Some(
+				serde_json::value::to_raw_value(&serde_json::json!({}))
+					.expect("arguments serialize"),
+			),
+			None,
+		)
+		.expect("replacement call appends");
+	let with_call = session.dom().snapshot();
+	let spawn = diff(&without_calls, &with_call);
+	assert_eq!(spawn.spawn.len(), 1);
+	assert!(spawn.terminate.is_empty());
+}
+
+#[test]
 fn lifecycle_diff_matches_durable_identity_across_different_handles() {
 	fn snapshot_with_job(floor: Option<u64>) -> omp_dom::Snapshot {
 		let cause = omp_journal::EntryId::from(omp_core::Ulid::generate());
