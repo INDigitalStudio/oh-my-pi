@@ -2444,7 +2444,8 @@ fn chat_request(
 			.and_then(|sampling| sampling.max_output_tokens),
 		top_logprobs: None,
 		safety: Arc::from([]),
-		negotiation: NegotiationPolicy::default(),
+				negotiation:       NegotiationPolicy::default(),
+		forced_call:       None,
 	})
 }
 

@@ -225,7 +225,6 @@ pub mod command {
 		pub occurrence:  usize,               // Which occurrence to substitute
 		pub print_flag:  bool,                // True if 'p' flag
 		pub ignore_case: bool,                // True if 'I' flag
-		pub execute:     bool,                // True if 'e' flag (GNU extension)
 		pub multiline:   bool,                // True if 'm' or 'M' flag (GNU extension)
 		pub write_file:  Option<Rc<RefCell<NamedWriter>>>, // Writer to file if 'w' flag is used
 	}
@@ -597,6 +596,8 @@ pub mod compiler {
 	const ERR_ADDRESS_0_USAGE: &str =
 		"address 0 can only be used with ~step, a second regular expression, or a read command";
 	const ERR_SANDBOX: &str = "command not allowed with --sandbox";
+	const ERR_EXECUTE_FLAG: &str =
+		"the 'e' substitute flag is not supported: sed runs in process without a host shell";
 
 	const ERR_UNKNOWN_OPTION_TO_S: &str = "unknown option to 's'";
 
@@ -1492,7 +1493,6 @@ pub mod compiler {
 		subst.occurrence = 1; // default
 		subst.print_flag = false;
 		subst.ignore_case = false;
-		subst.execute = false;
 		subst.multiline = false;
 		subst.write_file = None;
 
@@ -1537,16 +1537,11 @@ pub mod compiler {
 					line.advance();
 				},
 
+				// GNU's `e` flag hands the pattern space to `/bin/sh`; sed runs
+				// inside the in-process interpreter and never escapes to a host
+				// shell, so the flag is unsupported everywhere.
 				'e' => {
-					if posix || sandbox {
-						return compilation_error(
-							lines,
-							line,
-							"the 'e' substitute flag is not allowed with --posix or --sandbox",
-						);
-					}
-					subst.execute = true;
-					line.advance();
+					return compilation_error(lines, line, ERR_EXECUTE_FLAG);
 				},
 
 				_c @ '1'..='9' => {
@@ -2883,39 +2878,18 @@ pub mod compiler {
 			assert!(err.to_string().contains(ERR_SANDBOX));
 		}
 
+		/// ADR 0028: the `e` flag would exec a host shell, so it is rejected in
+		/// every mode, not only under `--posix`/`--sandbox`.
 		#[test]
-		fn test_compile_subst_flag_e() {
-			let (lines, mut chars) = make_providers("e");
-			let mut subst = Substitution::default();
-
-			compile_subst_flags(&lines, &mut chars, &mut subst, false, false, None).unwrap();
-			assert!(subst.execute);
-		}
-
-		#[test]
-		fn test_compile_subst_flag_e_rejected_under_posix() {
-			let (lines, mut chars) = make_providers("e");
-			let mut subst = Substitution::default();
-
-			let err =
-				compile_subst_flags(&lines, &mut chars, &mut subst, true, false, None).unwrap_err();
-			assert!(
-				err.to_string()
-					.contains("not allowed with --posix or --sandbox")
-			);
-		}
-
-		#[test]
-		fn test_compile_subst_flag_e_rejected_under_sandbox() {
-			let (lines, mut chars) = make_providers("e");
-			let mut subst = Substitution::default();
-
-			let err =
-				compile_subst_flags(&lines, &mut chars, &mut subst, false, true, None).unwrap_err();
-			assert!(
-				err.to_string()
-					.contains("not allowed with --posix or --sandbox")
-			);
+		fn test_compile_subst_flag_e_is_rejected_in_every_mode() {
+			for (posix, sandbox) in [(false, false), (true, false), (false, true)] {
+				let (lines, mut chars) = make_providers("e");
+				let mut subst = Substitution::default();
+				let err =
+					compile_subst_flags(&lines, &mut chars, &mut subst, posix, sandbox, None)
+						.unwrap_err();
+				assert!(err.to_string().contains(ERR_EXECUTE_FLAG), "{err}");
+			}
 		}
 
 		#[test]
@@ -7896,7 +7870,7 @@ pub mod processor {
 	// For the full copyright and license information, please view the LICENSE
 	// file that was distributed with this source code.
 
-	use std::{borrow::Cow, cell::RefCell, io, mem, path::PathBuf, process, rc::Rc};
+	use std::{borrow::Cow, cell::RefCell, io, mem, path::PathBuf, rc::Rc};
 
 	use crate::{
 		host::Host,
@@ -8078,37 +8052,12 @@ pub mod processor {
 		}
 	}
 
-	#[cfg(unix)]
-	fn shell_command(cmd: &str, host: &Host) -> process::Command {
-		let mut c = host.command("/bin/sh");
-		c.arg("-c").arg(cmd);
-		// run relative to the shell's cwd,
-		// not the host process cwd. `output()` already keeps the child's stdio
-		// away from the host's (stdin closed, stdout/stderr captured).
-		c
-	}
-
-	#[cfg(windows)]
-	fn shell_command(cmd: &str, host: &Host) -> process::Command {
-		let mut c = host.command("cmd.exe");
-		c.arg("/C").arg(cmd);
-		// see the unix variant above.
-		c
-	}
-
-	// Fallback if the target OS is neither Windows nor UNIX-like
-	#[cfg(not(any(unix, windows)))]
-	fn shell_command(_cmd: &str, _host: &Host) -> process::Command {
-		unimplemented!("the 'e' substitute flag requires a platform shell (/bin/sh or cmd.exe)");
-	}
-
 	/// Perform the specified RE replacement in the provided pattern space.
 	fn substitute(
 		pattern: &mut IOChunk,
 		command: &Command,
 		context: &mut ProcessingContext,
 		output: &mut OutputBuffer,
-		host: &mut Host,
 	) -> SedResult<()> {
 		let sub = extract_variant!(command, Substitution);
 
@@ -8213,29 +8162,6 @@ pub mod processor {
 			result.push_str(&text.unwrap()[last_end..]);
 
 			pattern.set_to_string(result, pattern.is_newline_terminated());
-
-			// Execute the pattern space as a shell command if the 'e' flag is set
-			if sub.execute {
-				let cmd_str = pattern.as_str()?.to_string();
-				let mut child = shell_command(&cmd_str, host);
-				let output_bytes = host.run_output(&mut child).map_err(|e| {
-					input_runtime_error::<()>(
-						&command.location,
-						context,
-						format!("failed to execute shell command: {e}"),
-					)
-					.unwrap_err()
-				})?;
-				let mut shell_out = String::from_utf8_lossy(&output_bytes.stdout).into_owned();
-				if shell_out.ends_with("\r\n") {
-					// On windows, both return carriage and newline characters are used
-					shell_out.truncate(shell_out.len() - 2);
-				} else if shell_out.ends_with('\n') {
-					// Strip the trailing newline, as GNU sed does
-					shell_out.pop();
-				}
-				pattern.set_to_string(shell_out, pattern.is_newline_terminated());
-			}
 
 			if sub.print_flag {
 				write_chunk(output, context, pattern)?;
@@ -8558,7 +8484,7 @@ pub mod processor {
 							.push(AppendElement::Path(path.clone()));
 					},
 					's' => {
-						substitute(&mut pattern, &command, context, output, host)?;
+						substitute(&mut pattern, &command, context, output)?;
 					},
 					't' if !context.substitution_made => { /* Do nothing. */ },
 					't' => {

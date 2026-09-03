@@ -12,6 +12,7 @@ description = "In-process command-line utility and process builtins for the OMP 
 workspace = true
 
 [dependencies]
+bytes.workspace = true
 argmax.workspace = true
 bigdecimal.workspace = true
 blake2.workspace = true

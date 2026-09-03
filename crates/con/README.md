@@ -14,11 +14,11 @@ administration all use one parser and one registry.
 - `SESSION` writes are projected into `<meta><con><var name value origin>` by
   `omp-session`. Replaying or rewinding the journal therefore reconstructs
   control state without a second settings database.
-- `INHERIT` values are copied from the parent's effective view at spawn, then
-  `subagent.cfg` and `<agent>.cfg` execute in that order.
+- Every declared value is copied from the parent's effective view at spawn, then
+  `subagent.cfg` and `<agent>.cfg` execute in that order; inheritance is not a flag.
 - `REPLICATED` values are authority-owned and locally immutable on replicas.
 - Persistence is a replayable command script, not a parallel serialization
-  format. `dump` includes only `ARCHIVE` diffs plus aliases and binds.
+  format. `dumpcfg` (`Ctx::dump`) includes only `ARCHIVE` diffs plus aliases and binds.
 
 The built-in names use subsystem prefixes (`ai_*`, `cl_*`, `sv_*`), including
 `sv_cheats`, `ai_model`, `ai_fastmode`, and `cl_resize_policy`.

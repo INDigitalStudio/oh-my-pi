@@ -23,8 +23,6 @@ pub struct VarFlags(u32);
 impl VarFlags {
 	/// Persisted by [`Ctx::dump`](crate::Ctx::dump) when diverging from default.
 	pub const ARCHIVE: Self = Self(1);
-	/// Included in the live-value seed of a newly spawned child.
-	pub const INHERIT: Self = Self(1 << 6);
 	/// No flags.
 	pub const NONE: Self = Self(0);
 	/// Every committed change is announced through the reply sink.

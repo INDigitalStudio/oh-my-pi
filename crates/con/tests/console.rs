@@ -171,7 +171,6 @@ fn starter_vars_are_declared_with_control_plane_flags() {
 		};
 		assert!(spec.flags.contains(VarFlags::ARCHIVE), "{name}");
 		assert!(spec.flags.contains(VarFlags::SESSION), "{name}");
-		assert!(spec.flags.contains(VarFlags::INHERIT), "{name}");
 	}
 	assert_eq!(ctx.get("ai_compact_threshold"), Some(Value::Float(0.8)));
 	assert_eq!(ctx.get("cl_resize_policy"), Some(Value::Enum(Str::new_static("rebuild"))));

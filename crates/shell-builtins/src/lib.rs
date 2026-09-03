@@ -11,6 +11,7 @@
 mod cksum;
 mod r#dyn;
 mod factory;
+pub mod graphics;
 mod host;
 mod proc_match;
 mod proc_snapshot;
@@ -86,6 +87,10 @@ mod timeout;
 mod top;
 
 pub use factory::{dyn_builtin, process_builtins, utility_builtins};
+pub use graphics::{
+	ImagePassthrough, encode_image_passthrough, extract_image_passthrough,
+	image_passthrough_ranges,
+};
 pub use host::{
 	DynDevice, DynFault, DynFuture, DynHost, DynOutput, DynSchema, panic_scope_active,
 	rayon_global_pool_available, set_rayon_global_pool_available,

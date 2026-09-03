@@ -2,7 +2,7 @@
 
 use omp_core::Str;
 
-use crate::{Role, ValueKind};
+use crate::{ChordError, Role, ValueKind};
 
 /// Result alias used across the console.
 pub type ConResult<T> = Result<T, ConError>;
@@ -155,4 +155,7 @@ pub enum ConError {
 	/// Script source failed to parse.
 	#[error(transparent)]
 	Parse(#[from] ParseError),
+	/// `bind`/`unbind` named a chord that has no canonical spelling.
+	#[error("invalid bind chord")]
+	Chord(#[source] ChordError),
 }

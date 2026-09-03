@@ -40,6 +40,7 @@ use std::{
 #[cfg(unix)]
 use std::{ffi::OsStr, os::fd};
 
+use bytes::Bytes;
 use im::HashMap;
 use omp_core::Str;
 use omp_shell_engine::{
@@ -53,6 +54,7 @@ use omp_shell_engine::{
 use omp_shell_engine::{OpenRequest, PathAccess, PathDenied};
 use parking_lot::Mutex;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 /// A boxed dynamic-device host operation.
 ///
@@ -82,12 +84,27 @@ pub struct DynSchema {
 }
 
 /// A successful dynamic operation result.
+///
+/// The builtin writes every variant to stdout: text verbatim, JSON compact,
+/// image blobs as terminal graphics passthrough
+/// ([`crate::graphics::encode_image_passthrough`]) and other blobs as raw
+/// bytes, so `dyn tts … > speech.mp3` and `dyn image_gen …` both compose with
+/// redirection.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DynOutput {
 	/// Plain text written directly to stdout.
 	Text(Str),
 	/// Structured output serialized as JSON on stdout.
 	Json(Value),
+	/// Binary media with its MIME type.
+	Blob {
+		/// MIME type of `bytes`.
+		mime:  Str,
+		/// Exact media bytes.
+		bytes: Bytes,
+	},
+	/// Several outputs written in order; text, JSON, and media may mix.
+	Parts(Vec<DynOutput>),
 }
 
 /// A host-reported operation fault rendered by the builtin.
@@ -116,8 +133,14 @@ pub trait DynHost: Send + Sync + 'static {
 	/// Returns the current schema for one exact live operation.
 	fn schema(&self, name: &str) -> DynFuture<'_, DynSchema>;
 
-	/// Invokes one operation with schema-shaped JSON arguments.
-	fn call(&self, name: &str, args: Value) -> DynFuture<'_, DynOutput>;
+	/// Invokes one operation with schema-shaped JSON arguments and the shell
+	/// command's cancellation token.
+	fn call(
+		&self,
+		name: &str,
+		args: Value,
+		cancel: CancellationToken,
+	) -> DynFuture<'_, DynOutput>;
 }
 
 /// A command-line utility implemented as a shell builtin.

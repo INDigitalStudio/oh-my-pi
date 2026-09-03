@@ -7,7 +7,7 @@ omp_con::var! {
 	/// Layer precedence target.
 	pub static LAYERED = test_layered: i32 {
 		default: 1,
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 }
 

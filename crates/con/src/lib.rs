@@ -45,6 +45,7 @@
 //! ```
 
 mod builtins;
+mod chord;
 mod complete;
 mod ctx;
 mod dump;
@@ -58,11 +59,11 @@ mod spec;
 mod value;
 
 pub use builtins::{
-	AI_COMPACT_THRESHOLD, AI_FASTMODE, AI_MODEL, AI_TASK_MODEL, AI_THINKING, CL_CHARSET,
+	AI_COMPACT_THRESHOLD, AI_FASTMODE, AI_MODEL, AI_TASK_MODEL, AI_THINKING, AI_VISION, CL_CHARSET,
 	CL_IME_SAFE_CURSOR, CL_RESIZE_POLICY, CL_SHOWTHINKING, CL_STATUS_COMPACT_THINKING, CL_THEME,
-	ResizePolicy,
-	SV_APPROVAL_MODE, SV_CHEATS, SV_TOOLS,
+	ResizePolicy, SV_APPROVAL_MODE, SV_CHEATS, SV_TOOLS, VisionMode,
 };
+pub use chord::{ChordError, normalize_chord};
 pub use complete::{CompleterFn, Suggestion};
 pub use ctx::{
 	Args, CfgLoader, CfgSaver, Ctx, CtxBuilder, DynamicCmdHandler, DynamicCmdSpec, DynamicVarSpec,

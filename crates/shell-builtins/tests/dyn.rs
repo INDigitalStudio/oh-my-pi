@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, fs, sync::Arc};
 use omp_core::Str;
 use omp_shell_builtins::{
 	DynDevice, DynFault, DynFuture, DynHost, DynOutput, DynSchema, dyn_builtin,
+	extract_image_passthrough,
 };
 use omp_shell_engine::{
 	ProfileLoadBehavior, RcLoadBehavior, Shell, SourceInfo, builtins::default_builtins,
@@ -12,6 +13,9 @@ use omp_shell_engine::{
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\nfixture-pixels";
 
 #[derive(Clone)]
 struct FakeHost {
@@ -58,7 +62,16 @@ impl FakeHost {
 			description: Some(Str::new_static("Always fails.")),
 			schema:      json!({ "type": "object", "properties": {} }),
 		};
-		let schemas = BTreeMap::from([(fixture.name.clone(), fixture), (fault.name.clone(), fault)]);
+		let image = DynSchema {
+			name:        Str::new_static("fixture/image"),
+			description: Some(Str::new_static("Returns a caption and an image.")),
+			schema:      json!({ "type": "object", "properties": {} }),
+		};
+		let schemas = BTreeMap::from([
+			(fixture.name.clone(), fixture),
+			(fault.name.clone(), fault),
+			(image.name.clone(), image),
+		]);
 		Self {
 			devices: Arc::from([
 				DynDevice {
@@ -94,12 +107,26 @@ impl DynHost for FakeHost {
 		)
 	}
 
-	fn call(&self, name: &str, args: Value) -> DynFuture<'_, DynOutput> {
+	fn call(
+		&self,
+		name: &str,
+		args: Value,
+		_cancel: CancellationToken,
+	) -> DynFuture<'_, DynOutput> {
 		let name = Str::new(name);
 		let calls = Arc::clone(&self.calls);
 		Box::pin(async move {
 			if name == "fixture/fault" {
 				return Err(DynFault::new("fixture rejected the request"));
+			}
+			if name == "fixture/image" {
+				return Ok(DynOutput::Parts(vec![
+					DynOutput::Text(Str::new_static("rendered")),
+					DynOutput::Blob {
+						mime:  Str::new_static("image/png"),
+						bytes: PNG.into(),
+					},
+				]));
 			}
 			calls.lock().push((name, args.clone()));
 			Ok(DynOutput::Json(args))
@@ -138,13 +165,49 @@ async fn dyn_help_is_synthesized_from_required_enum_and_nested_schema() {
 	assert!(stderr.is_empty());
 	assert_eq!(
 		stdout,
-		"fixture/run — Run the fixture operation.\n\nUsage:\n  dyn fixture/run [OPTIONS] [@FILE] \
-		 [-]\n\nOptions:\n  --mode {fast|safe}  Execution mode.  (required)\n  --count <INTEGER>  \
-		 Number of passes.\n  --settings.label <STRING>  Nested label.  (required)\n  \
-		 --settings.enabled / --no-settings.enabled\n  -j, --json <JSON>  Merge one raw JSON \
-		 object.\n  @FILE             Merge a JSON object from FILE.\n  -                 Merge a \
-		 JSON object from stdin.\n  -h, --help        Show this help.\n"
+		"fixture/run — Run the fixture operation.\n\nUsage:\n  dyn fixture/run <mode> [OPTIONS] \
+		 [@FILE] [-]\n\nArguments:\n  <mode> {fast|safe}  Execution mode.\n\nOptions:\n  --mode \
+		 {fast|safe}  Execution mode.  (required)\n  --count <INTEGER>  Number of passes.\n  \
+		 --settings.label <STRING>  Nested label.  (required)\n  --settings.enabled / \
+		 --no-settings.enabled\n  -j, --json <JSON>  Merge one raw JSON object.\n  @FILE          \
+		 \x20  Merge a JSON object from FILE, or bind its text to the next argument.\n  -          \
+		 \x20      Same as @FILE, read from stdin.\n  -h, --help        Show this help.\n"
 	);
+}
+
+#[tokio::test]
+async fn dyn_positional_literal_binds_the_first_required_scalar() {
+	let root = tempfile::tempdir().expect("tempdir");
+	let host = FakeHost::fixture();
+	let calls = Arc::clone(&host.calls);
+	let (exit, stdout, stderr) =
+		run(host, root.path(), "dyn fixture/run safe --settings.label lit").await;
+	assert_eq!(exit, 0);
+	assert!(stderr.is_empty());
+	assert_eq!(
+		serde_json::from_str::<Value>(stdout.trim()).expect("JSON stdout"),
+		json!({ "mode": "safe", "settings": { "label": "lit" } })
+	);
+	assert_eq!(calls.lock().len(), 1);
+
+	let (exit, stdout, stderr) =
+		run(FakeHost::fixture(), root.path(), "dyn fixture/run safe extra").await;
+	assert_eq!(exit, 2);
+	assert!(stdout.is_empty());
+	assert!(stderr.starts_with("dyn: unexpected argument `extra`"));
+}
+
+#[tokio::test]
+async fn dyn_image_output_is_graphics_passthrough_beside_text() {
+	let root = tempfile::tempdir().expect("tempdir");
+	let (exit, stdout, stderr) = run(FakeHost::fixture(), root.path(), "dyn fixture/image").await;
+	assert_eq!(exit, 0);
+	assert!(stderr.is_empty());
+	let (text, images) = extract_image_passthrough(stdout.as_bytes());
+	assert_eq!(text, b"rendered\n\n");
+	assert_eq!(images.len(), 1);
+	assert_eq!(images[0].mime.as_str(), "image/png");
+	assert_eq!(&images[0].bytes[..], PNG);
 }
 
 #[tokio::test]

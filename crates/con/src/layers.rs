@@ -3,7 +3,7 @@
 use omp_core::{FastHashMap, Str};
 use serde::{Deserialize, Serialize};
 
-use crate::Value;
+use crate::{DynamicVarSpec, Value};
 
 /// Stable identity of an engagement layer.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -49,17 +49,33 @@ pub struct SetReport {
 	pub shadowed_by:  Option<(LayerId, Str)>,
 }
 
-/// Values copied into a newly spawned child before cfg overrides.
+/// Dynamic declarations and values copied into a newly spawned child before
+/// cfg overrides.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Seed {
-	values: FastHashMap<Str, Value>,
+	dynamic_vars: Vec<DynamicVarSpec>,
+	values:       FastHashMap<Str, Value>,
 }
 
 impl Seed {
-	/// Creates a seed from effective values.
+	/// Creates a value-only seed.
 	#[must_use]
 	pub fn new(values: FastHashMap<Str, Value>) -> Self {
-		Self { values }
+		Self { dynamic_vars: Vec::new(), values }
+	}
+
+	/// Creates a seed which registers dynamic variables before applying values.
+	#[must_use]
+	pub fn with_dynamic_vars(
+		values: FastHashMap<Str, Value>,
+		dynamic_vars: Vec<DynamicVarSpec>,
+	) -> Self {
+		Self { dynamic_vars, values }
+	}
+
+	/// Iterates dynamic declarations in registration order.
+	pub fn dynamic_vars(&self) -> impl ExactSizeIterator<Item = &DynamicVarSpec> {
+		self.dynamic_vars.iter()
 	}
 
 	/// Iterates seeded name/value pairs.
@@ -77,6 +93,12 @@ impl Seed {
 	#[must_use]
 	pub fn into_values(self) -> FastHashMap<Str, Value> {
 		self.values
+	}
+
+	/// Consumes the seed into declarations and effective value overrides.
+	#[must_use]
+	pub fn into_parts(self) -> (Vec<DynamicVarSpec>, FastHashMap<Str, Value>) {
+		(self.dynamic_vars, self.values)
 	}
 }
 

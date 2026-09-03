@@ -133,6 +133,13 @@ pub struct ExecOutcome {
 	pub failed: usize,
 }
 
+impl std::ops::AddAssign for ExecOutcome {
+	fn add_assign(&mut self, rhs: Self) {
+		self.ran += rhs.ran;
+		self.failed += rhs.failed;
+	}
+}
+
 /// Reply sink: receives all console output.
 pub type SinkFn = dyn Fn(Severity, &str) + Send + Sync;
 /// Config source resolver for `exec`: name → script text.
@@ -145,6 +152,7 @@ pub type ObserverFn = dyn Fn(&str, &Value, &Value) + Send + Sync;
 pub type DynamicCmdHandler = fn(&Ctx, &str, &[Arg]) -> ConResult<()>;
 
 /// Owned descriptor for a dynamically registered variable.
+#[derive(Clone, Debug)]
 pub struct DynamicVarSpec {
 	/// Canonical console name.
 	pub name:    Str,
@@ -156,6 +164,16 @@ pub struct DynamicVarSpec {
 	pub flags:   VarFlags,
 	/// Registration-time default.
 	pub default: Value,
+}
+
+impl PartialEq for DynamicVarSpec {
+	fn eq(&self, other: &Self) -> bool {
+		self.name == other.name
+			&& self.desc == other.desc
+			&& std::ptr::eq(self.ty, other.ty)
+			&& self.flags == other.flags
+			&& self.default == other.default
+	}
 }
 
 /// Owned descriptor for a dynamically registered command.
@@ -306,6 +324,7 @@ impl CtxBuilder {
 			bind_baseline: RwLock::new(None),
 			completers:    RwLock::new(FastHashMap::default()),
 			observers:     RwLock::new(Vec::new()),
+			session_writes: RwLock::new(Vec::new()),
 			user:          RwLock::new(self.user.into_iter().collect()),
 			layers:        RwLock::new(Layers::default()),
 			depth:         AtomicU32::new(0),
@@ -342,6 +361,9 @@ pub struct Ctx {
 	bind_baseline:         RwLock<Option<FastHashMap<Str, Str>>>,
 	pub(crate) completers: RwLock<FastHashMap<Str, Box<crate::CompleterFn>>>,
 	observers:             RwLock<Vec<Box<ObserverFn>>>,
+	/// Journaling subscribers: every committed `SESSION` write in the session
+	/// layer (never an engagement value), as `(name, committed value)`.
+	session_writes:        RwLock<Vec<flume::Sender<(Str, Value)>>>,
 	user:                  RwLock<FastHashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
 	layers:                RwLock<Layers>,
 	depth:                 AtomicU32,
@@ -441,6 +463,25 @@ impl Ctx {
 		self.observers.write().push(Box::new(observer));
 	}
 
+	/// Subscribes to committed session-layer writes of `SESSION`-flagged
+	/// variables — the stream a session controller journals as
+	/// `<meta><con>` patches (ADR 0012: replay-honest values).
+	///
+	/// Each item is `(name, value committed to the session layer)`; a reset
+	/// to default delivers the default value. Engagement layers (Director
+	/// binds) never appear here: they derive from the `<directors>` subtree.
+	/// Dropped receivers are pruned on the next write.
+	pub fn subscribe_session_writes(&self) -> flume::Receiver<(Str, Value)> {
+		let (tx, rx) = flume::unbounded();
+		self.session_writes.write().push(tx);
+		rx
+	}
+
+	fn publish_session_write(&self, name: &Str, value: &Value) {
+		let mut subscribers = self.session_writes.write();
+		subscribers.retain(|tx| tx.send((name.clone(), value.clone())).is_ok());
+	}
+
 	/// Number of statically registered items.
 	pub(crate) fn item_count(&self) -> usize {
 		self.items.len()
@@ -473,6 +514,19 @@ impl Ctx {
 			return None;
 		}
 		self.items.get(idx as usize).map(|item| item.spec)
+	}
+
+	/// Returns an owned snapshot of one dynamic variable declaration.
+	#[must_use]
+	pub fn dynamic_var_spec(&self, name: &str) -> Option<DynamicVarSpec> {
+		let idx = self.lookup(name)?;
+		if idx & DYNAMIC_VAR == 0 {
+			return None;
+		}
+		self
+			.dynamic_vars
+			.get((idx & DYNAMIC_INDEX) as usize)
+			.map(|item| item.spec.clone())
 	}
 
 	fn lookup(&self, name: &str) -> Option<u32> {
@@ -612,23 +666,129 @@ impl Ctx {
 		}
 	}
 
-	/// Captures effective values of variables declared for child inheritance.
+	/// Replaces the whole engagement stack with `chain` (outermost first),
+	/// the projection of the live `<meta><directors>` chain: engage installs
+	/// nothing and exit restores nothing — values derive from the stack
+	/// (ADR 0015). Layers already present with the same owner and binds are
+	/// kept, so a no-op derivation touches no variable.
+	///
+	/// A bind naming an unregistered variable or carrying the wrong type
+	/// (an extension Director's declaration) is reported through the sink
+	/// and dropped; the rest of the chain still applies.
+	pub fn derive_layers(&self, chain: &[(Str, Vec<(Str, Value)>)]) {
+		let chain: Vec<(Str, Vec<(Str, Value)>)> = chain
+			.iter()
+			.map(|(owner, binds)| {
+				let binds = binds
+					.iter()
+					.filter_map(|(name, value)| {
+						let checked = self
+							.var(name.as_str())
+							.and_then(|var| self.check_value(&var, value.clone(), SetSource::Code));
+						match checked {
+							Ok(value) => Some((self.var(name.as_str()).ok()?.name.to_str(), value)),
+							Err(error) => {
+								self.reply_fmt(
+									Severity::Error,
+									format_args!("engagement `{owner}` bind `{name}` dropped: {error}"),
+								);
+								None
+							},
+						}
+					})
+					.collect();
+				(owner.clone(), binds)
+			})
+			.collect();
+		let touched = {
+			let mut layers = self.layers.write();
+			let unchanged = layers.engagements.len() == chain.len()
+				&& layers
+					.engagements
+					.iter()
+					.zip(&chain)
+					.all(|(layer, (owner, binds))| {
+						layer.owner == *owner
+							&& layer.values.len() == binds.len()
+							&& binds
+								.iter()
+								.all(|(name, value)| layer.values.get(name) == Some(value))
+					});
+			if unchanged {
+				return;
+			}
+			let mut touched: Vec<Str> = layers
+				.engagements
+				.iter()
+				.flat_map(|layer| layer.values.keys().cloned())
+				.collect();
+			layers.engagements.clear();
+			for (owner, binds) in &chain {
+				layers.push(owner.clone(), binds);
+				touched.extend(binds.iter().map(|(name, _)| name.clone()));
+			}
+			touched.sort_unstable();
+			touched.dedup();
+			touched
+		};
+		for name in &touched {
+			self.refresh(name.as_str(), SetSource::Code);
+		}
+	}
+
+	/// Owners of the active engagement layers, outermost first.
+	#[must_use]
+	pub fn layer_owners(&self) -> Vec<Str> {
+		self
+			.layers
+			.read()
+			.engagements
+			.iter()
+			.map(|layer| layer.owner.clone())
+			.collect()
+	}
+
+	/// Drops a variable's session-layer entry (a rewind re-deriving
+	/// `<meta><con>` from the live chain) without touching the archive layer
+	/// or publishing a session write; the effective value is refreshed.
+	pub fn clear_session_write(&self, name: &str) -> ConResult<()> {
+		let var = self.var(name)?;
+		let removed = self.layers.write().session.remove(var.name).is_some();
+		if removed {
+			self.refresh(var.name, SetSource::Code);
+		}
+		Ok(())
+	}
+
+	/// Captures the effective value of every variable that diverges from its
+	/// default — the parent's live picture a spawned child starts from (ADR
+	/// 0013: inheritance is not a flag; every convar seeds the child).
+	///
+	/// Values at their default are omitted so the child's own defaults (and
+	/// its `subagent.cfg`/class cfg) govern them without a redundant write.
 	#[must_use]
 	pub fn seed_child(&self) -> Seed {
 		let mut values = FastHashMap::default();
 		for item in self.items.iter() {
-			if let RegItem::Var(spec) = item.spec
-				&& spec.flags.contains(VarFlags::INHERIT)
-			{
-				values.insert(Str::new_static(spec.name), item.state.value());
+			if let RegItem::Var(spec) = item.spec {
+				let value = item.state.value();
+				if value != *item.state.default_value() {
+					values.insert(Str::new_static(spec.name), value);
+				}
 			}
 		}
 		for item in self.dynamic_vars.iter() {
-			if item.spec.flags.contains(VarFlags::INHERIT) {
-				values.insert(item.spec.name.clone(), item.state.value());
+			let value = item.state.value();
+			if value != *item.state.default_value() {
+				values.insert(item.spec.name.clone(), value);
 			}
 		}
-		Seed::new(values)
+		let dynamic_vars = self
+			.dynamic_vars
+			.iter()
+			.map(|item| item.spec.clone())
+			.collect();
+		Seed::with_dynamic_vars(values, dynamic_vars)
 	}
 
 	/// Returns a snapshot iterator of writes owned by the session layer.
@@ -694,7 +854,22 @@ impl Ctx {
 					layers.session.remove(name.as_str());
 					Origin::Default
 				},
-				Origin::Engagement(_) => Origin::Session,
+				Origin::Engagement(id) => {
+					match layers
+						.engagements
+						.iter_mut()
+						.find(|layer| layer.id == id)
+					{
+						Some(layer) => {
+							layer.values.insert(name.clone(), value);
+							Origin::Engagement(id)
+						},
+						None => {
+							layers.session.insert(name.clone(), value);
+							Origin::Session
+						},
+					}
+				},
 				Origin::Session | Origin::Script(_) | Origin::Host => {
 					layers.session.insert(name.clone(), value);
 					Origin::Session
@@ -709,6 +884,16 @@ impl Ctx {
 				.unwrap_or_else(|| var.state.default_value().clone());
 			(committed_to, shadowed_by, effective)
 		};
+		if var.flags.contains(VarFlags::SESSION) && source != SetSource::Replication {
+			let committed = match committed_to {
+				Origin::Session => self.layers.read().session.get(name.as_str()).cloned(),
+				Origin::Default => Some(var.state.default_value().clone()),
+				_ => None,
+			};
+			if let Some(committed) = committed {
+				self.publish_session_write(&name, &committed);
+			}
+		}
 		self.apply_effective(&var, effective, source);
 		Ok(SetReport { committed_to, shadowed_by })
 	}
@@ -805,28 +990,35 @@ impl Ctx {
 	/// skipped statements.
 	pub fn exec_configs(&self, loader: &dyn CfgLoader, agent: Option<&str>) -> ExecOutcome {
 		let mut total = ExecOutcome::default();
-		let mut run = |src: Str, source: Source| {
-			let outcome = self
-				.eval(&src, true, &source.origin())
-				.unwrap_or_else(|_| unreachable!("lenient eval never errors"));
-			total.ran += outcome.ran;
-			total.failed += outcome.failed;
-		};
 		if let Some(src) = loader.load("config.cfg") {
-			run(src, Source::Config(Str::new_static("config.cfg")));
+			total += self.run_lenient(&src, Source::Config(Str::new_static("config.cfg")));
 		}
 		if let Some(agent) = agent {
-			if let Some(src) = loader.load("subagent.cfg") {
-				run(src, Source::Subagent);
-			}
-			let mut name = StrMut::new(agent);
-			name.push_str(".cfg");
-			let name = name.freeze();
-			if let Some(src) = loader.load(name.as_str()) {
-				run(src, Source::Agent(agent.to_str()));
-			}
+			total += self.exec_spawn_configs(loader, agent);
 		}
 		total
+	}
+
+	/// Runs the spawn-time cfgs only — `subagent.cfg`, then `<agent>.cfg` —
+	/// on a child already seeded from its parent (ADR 0013 order). The main
+	/// session's `config.cfg` is not re-read.
+	pub fn exec_spawn_configs(&self, loader: &dyn CfgLoader, agent: &str) -> ExecOutcome {
+		let mut total = ExecOutcome::default();
+		if let Some(src) = loader.load("subagent.cfg") {
+			total += self.run_lenient(&src, Source::Subagent);
+		}
+		let mut name = StrMut::new(agent);
+		name.push_str(".cfg");
+		if let Some(src) = loader.load(name.as_str()) {
+			total += self.run_lenient(&src, Source::Agent(agent.to_str()));
+		}
+		total
+	}
+
+	fn run_lenient(&self, src: &Str, source: Source) -> ExecOutcome {
+		self
+			.eval(src, true, &source.origin())
+			.unwrap_or_else(|_| unreachable!("lenient eval never errors"))
 	}
 
 	/// Restores one `<meta><con><var>` value into the session layer.
@@ -1124,17 +1316,29 @@ impl Ctx {
 
 	// ── binds ───────────────────────────────────────────────────────────
 
-	/// Binds a key (case-insensitive, host-defined key names) to a script.
+	/// Binds a key chord (any spelling; stored canonically per
+	/// [`normalize_chord`](crate::normalize_chord)) to a script.
 	pub fn bind(&self, key: impl IntoStr, script: impl IntoStr) -> ConResult<()> {
+		let chord = crate::normalize_chord(&key.to_str()).map_err(ConError::Chord)?;
 		let script = script.to_str();
 		script::parse(&script)?;
-		self.binds.write().insert(fold_name(&key.to_str()), script);
+		self.binds.write().insert(chord, script);
 		Ok(())
 	}
 
-	/// Removes a bind; `true` when it existed.
+	/// Removes a bind; `true` when it existed. Malformed chords match nothing.
 	pub fn unbind(&self, key: &str) -> bool {
-		self.binds.write().remove(key).is_some()
+		let Ok(chord) = crate::normalize_chord(key) else {
+			return false;
+		};
+		self.binds.write().remove(chord.as_str()).is_some()
+	}
+
+	/// The script bound to a chord (any spelling), without cloning the table.
+	#[must_use]
+	pub fn bound(&self, key: &str) -> Option<Str> {
+		let chord = crate::normalize_chord(key).ok()?;
+		self.binds.read().get(chord.as_str()).cloned()
 	}
 
 	/// Removes every bind.
@@ -1189,19 +1393,8 @@ impl Ctx {
 	/// Feeds a key edge. Press executes the bound script; release executes
 	/// the `-` counterpart of every `+action` statement in it.
 	pub fn key(&self, key: &str, pressed: bool) -> ConResult<Vec<Output>> {
-		let script = {
-			let binds = self.binds.read();
-			match binds.get(key) {
-				Some(script) => script.clone(),
-				None if key.bytes().any(|byte| byte.is_ascii_uppercase()) => {
-					let lowered = key.to_ascii_lowercase();
-					match binds.get(lowered.as_str()) {
-						Some(script) => script.clone(),
-						None => return Ok(Vec::new()),
-					}
-				},
-				None => return Ok(Vec::new()),
-			}
+		let Some(script) = self.bound(key) else {
+			return Ok(Vec::new());
 		};
 		if pressed {
 			return self.exec(script.as_str(), Source::Console);

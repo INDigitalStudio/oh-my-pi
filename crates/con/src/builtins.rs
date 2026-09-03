@@ -34,6 +34,26 @@ pub enum ResizePolicy {
 
 crate::con_enum!(ResizePolicy);
 
+/// Whether image attachments reach the model (pi `/vision`,
+/// `inspect_image.mode`).
+#[derive(
+	Clone, Copy, Debug, Default, Eq, PartialEq, strum::EnumString, strum::IntoStaticStr,
+	strum::VariantNames,
+)]
+#[strum(serialize_all = "lowercase")]
+pub enum VisionMode {
+	/// Images flow when the route accepts image input, else they are
+	/// replaced by their descriptions.
+	#[default]
+	Auto,
+	/// Images always flow.
+	On,
+	/// Images are always replaced by their descriptions.
+	Off,
+}
+
+crate::con_enum!(VisionMode);
+
 static UNSAFE_SPEC: VarSpec = VarSpec::new(
 	UNSAFE_NAME,
 	" Enables writes to unsafe-gated variables. Replicated: only the authority decides whether \
@@ -54,71 +74,79 @@ crate::var! {
 	/// Selected model route.
 	pub static AI_MODEL = ai_model: Str {
 		default: Str::new_static(""),
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 	/// Model route for task subagents; empty inherits `ai_model`.
 	pub static AI_TASK_MODEL = ai_task_model: Str {
 		default: Str::new_static(""),
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
-	/// Selected model reasoning level.
+	/// Selected model reasoning level (`off`, `minimal`, `low`, `medium`,
+	/// `high`, `xhigh`, `max`). Default `high`, pi's `defaultThinkingLevel`;
+	/// routes that cannot honor a level clamp it (ADR 0017).
 	pub static AI_THINKING = ai_thinking: Str {
-		default: Str::new_static("off"),
-		flags: archive | session | inherit,
+		default: Str::new_static("high"),
+		flags: archive | session,
 	};
 	/// Enables the low-latency model path.
 	pub static AI_FASTMODE = ai_fastmode: bool {
 		default: false,
-		flags: archive | session | inherit,
+		flags: archive | session,
+	};
+	/// Image input policy: `auto` follows the route's image capability,
+	/// `on`/`off` force it for this session (pi `/vision`).
+	pub static AI_VISION = ai_vision: VisionMode {
+		default: VisionMode::Auto,
+		flags: archive | session,
 	};
 	/// Context-window fraction at which compaction begins.
 	pub static AI_COMPACT_THRESHOLD = ai_compact_threshold: f64 {
 		default: 0.80,
 		min: 0.0,
 		max: 1.0,
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 	/// Shows model thinking in transcript views.
 	pub static CL_SHOWTHINKING = cl_showthinking: bool {
 		default: true,
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 	/// Status band shows the thinking level as the model icon instead of a
 	/// ` · <level>` tail after the model name.
 	pub static CL_STATUS_COMPACT_THINKING = cl_status_compact_thinking: bool {
 		default: true,
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 	/// IME-safe composer layout: the caret row leaves its right chrome open
 	/// so terminal preedit never shifts the frame (pi `tui.imeSafeCursor`).
 	pub static CL_IME_SAFE_CURSOR = cl_ime_safe_cursor: bool {
 		default: false,
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 	/// Renderer character set.
 	pub static CL_CHARSET = cl_charset: Str {
 		default: Str::new_static("unicode"),
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 	/// Renderer theme name.
 	pub static CL_THEME = cl_theme: Str {
 		default: Str::new_static("default"),
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 	/// Terminal resize behavior.
 	pub static CL_RESIZE_POLICY = cl_resize_policy: ResizePolicy {
 		default: ResizePolicy::Rebuild,
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 	/// Host approval policy.
 	pub static SV_APPROVAL_MODE = sv_approval_mode: Str {
 		default: Str::new_static("on-request"),
-		flags: archive | session | inherit | replicated,
+		flags: archive | session | replicated,
 	};
 	/// Enables the built-in tool roster.
 	pub static SV_TOOLS = sv_tools: bool {
 		default: true,
-		flags: archive | session | inherit | replicated,
+		flags: archive | session | replicated,
 	};
 }
 
@@ -249,12 +277,13 @@ crate::cmd! {
 			},
 			1 => {
 				let key: Str = args.get(0)?;
-				match ctx.binds().iter().find(|(k, _)| *k == key) {
-					Some((_, script)) => {
-						ctx.reply_fmt(Severity::Info, format_args!("bind {key} = {script}"));
+				let chord = crate::normalize_chord(key.as_str()).map_err(ConError::Chord)?;
+				match ctx.bound(chord.as_str()) {
+					Some(script) => {
+						ctx.reply_fmt(Severity::Info, format_args!("bind {chord} = {script}"));
 						Ok(())
 					},
-					None => Err(ConError::Unknown { name: key }),
+					None => Err(ConError::Unknown { name: chord }),
 				}
 			},
 			_ => ctx.bind(args.atom(0)?, args.join(1)),
@@ -316,8 +345,9 @@ crate::cmd! {
 		ctx.set_value(spec.name, (spec.default)(), SetSource::Script)
 	};
 
-	/// Prints the persistence script (diff from defaults).
-	dump() = |ctx, _args| {
+	/// Prints the persistence script (diff from defaults) `writecfg` would
+	/// save. (`dump` itself is the product's transcript dump.)
+	dumpcfg() = |ctx, _args| {
 		ctx.reply(Severity::Info, ctx.dump().as_str());
 		Ok(())
 	};

@@ -12,6 +12,7 @@ description = "Typed command-stream control plane with layered convars, cfg scri
 workspace = true
 
 [dependencies]
+flume = { workspace = true }
 linkme = { workspace = true }
 omp-core = { workspace = true }
 parking_lot = { workspace = true }
