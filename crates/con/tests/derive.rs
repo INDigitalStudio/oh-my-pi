@@ -54,6 +54,49 @@ fn derive_layers_replaces_the_stack_from_the_director_chain() {
 	assert!(ctx.layer_owners().is_empty());
 }
 
+/// The built-in Directors bind the mode prompt, the model route, and the
+/// advertised tool roster (ADR 0015: binds are the engagement layer of real
+/// convars). Every one of those names must be a registered variable of the
+/// bound type, or `derive_layers` drops the bind with an error reply and the
+/// Director has no runtime effect.
+#[test]
+fn director_binds_name_registered_variables_and_derive_without_being_dropped() {
+	let log: std::sync::Arc<parking_lot::Mutex<Vec<String>>> = std::sync::Arc::default();
+	let sink = std::sync::Arc::clone(&log);
+	let ctx = Ctx::builder()
+		.sink(move |_, text| sink.lock().push(text.to_string()))
+		.build();
+	let roster = Value::List(vec![Value::Str(Str::new_static("read")), Value::Str(Str::new_static("todo"))]);
+	ctx.derive_layers(&[
+		(Str::new_static("plan#1"), vec![
+			(Str::new_static("ai_prompt_mode"), Value::Str(Str::new_static("plan"))),
+			(Str::new_static("ai_model"), Value::Str(Str::new_static("@plan"))),
+		]),
+		(Str::new_static("vibe#2"), vec![
+			(Str::new_static("ai_prompt_mode"), Value::Str(Str::new_static("vibe"))),
+			(Str::new_static("sv_tools"), roster.clone()),
+		]),
+	]);
+	assert!(log.lock().is_empty(), "binds were dropped: {:?}", log.lock());
+	assert_eq!(omp_con::AI_PROMPT_MODE.get(&ctx).as_str(), "vibe");
+	assert_eq!(omp_con::AI_MODEL.get(&ctx).as_str(), "@plan");
+	assert_eq!(ctx.get("sv_tools"), Some(roster));
+	assert_eq!(
+		omp_con::SV_TOOLS.get(&ctx),
+		vec![Str::new_static("read"), Str::new_static("todo")]
+	);
+	// The mode prompt derives from the live stack: popping the inner
+	// engagement restores the outer value, an empty chain the default.
+	ctx.derive_layers(&[(Str::new_static("plan#1"), vec![(
+		Str::new_static("ai_prompt_mode"),
+		Value::Str(Str::new_static("plan")),
+	)])]);
+	assert_eq!(omp_con::AI_PROMPT_MODE.get(&ctx).as_str(), "plan");
+	assert!(omp_con::SV_TOOLS.get(&ctx).is_empty());
+	ctx.derive_layers(&[]);
+	assert!(omp_con::AI_PROMPT_MODE.get(&ctx).is_empty());
+}
+
 #[test]
 fn derive_layers_is_a_no_op_for_an_unchanged_chain() {
 	let ctx = Ctx::new();

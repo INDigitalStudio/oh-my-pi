@@ -136,6 +136,20 @@ pub struct Payload {
 	pub result:    Option<Value>,
 	/// Content-addressed artifacts created by the operation.
 	pub artifacts: Vec<Str>,
+	/// Backend mode the tab runs under (`headless` or `window`); pi's
+	/// `describeBrowser` meta. Absent on payloads journaled before it existed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub browser:   Option<Str>,
+}
+
+/// Human name of a backend mode for [`Payload::browser`].
+#[must_use]
+pub fn mode_name(headless: bool) -> Str {
+	if headless {
+		Str::new_static("headless")
+	} else {
+		Str::new_static("window")
+	}
 }
 
 /// Browser daemon failure.
@@ -240,6 +254,7 @@ impl Tool for Browser {
 					title: None,
 					result: Some(json!({ "headless": headless })),
 					artifacts: Vec::new(),
+					browser: Some(mode_name(headless)),
 				});
 				yield Ev::Done(ToolTerminal::Done { result, useless: false });
 				return;
@@ -306,22 +321,19 @@ mod tests {
 			.map(String::as_str)
 			.collect::<Vec<_>>();
 		domain.sort_unstable();
-		assert_eq!(
-			domain,
-			[
-				"action",
-				"all",
-				"app",
-				"code",
-				"dialogs",
-				"kill",
-				"name",
-				"timeout",
-				"url",
-				"viewport",
-				"wait_until",
-			]
-		);
+		assert_eq!(domain, [
+			"action",
+			"all",
+			"app",
+			"code",
+			"dialogs",
+			"kill",
+			"name",
+			"timeout",
+			"url",
+			"viewport",
+			"wait_until",
+		]);
 		assert!(!properties.contains_key("operation"));
 		assert!(!properties.contains_key("selector"));
 		assert!(!properties.contains_key("full_page"));

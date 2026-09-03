@@ -249,10 +249,7 @@ fn freeform_spec<P: JsonSchema>(kind: FreeformKind, revision: u16) -> ToolSpec {
 		description:     Str::new_static(kind.description()),
 		schema:          omp_tool::schema::<P>(),
 		constraint:      if kind == FreeformKind::Patch {
-			Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			}
+			Constraint::Schema { priority: 100, on_unsupported: omp_tool::Fallback::Unspecified }
 		} else {
 			Constraint::Grammar {
 				priority:       100,
@@ -657,12 +654,12 @@ fn parse_operations(kind: FreeformKind, input: &str) -> Result<Vec<AuthoredOpera
 	match kind {
 		FreeformKind::PatchLegacy | FreeformKind::Patch | FreeformKind::ApplyPatch => {
 			parse_foreign_patch(input)
-			.map(|operations| {
-				operations
-					.into_iter()
-					.map(AuthoredOperation::Foreign)
-					.collect()
-			})
+				.map(|operations| {
+					operations
+						.into_iter()
+						.map(AuthoredOperation::Foreign)
+						.collect()
+				})
 				.map_err(|error| error.to_string())
 		},
 		FreeformKind::Sloppy => {
@@ -792,35 +789,32 @@ mod tests {
 	#[test]
 	fn structured_patch_renders_create_update_rename_and_delete_envelopes() {
 		let update = render_structured_patch(PatchParams {
-			path: "src/a.rs".into(),
+			path:  "src/a.rs".into(),
 			edits: vec![PatchEditEntry {
-				op: Some(PatchOp::Update),
+				op:     Some(PatchOp::Update),
 				rename: Some("src/b.rs".into()),
-				diff: Some("@@\n-old\n+new\n".into()),
+				diff:   Some("@@\n-old\n+new\n".into()),
 			}],
 		})
 		.expect("update");
 		assert_eq!(
 			update,
-			"*** Begin Patch\n*** Update File: src/a.rs\n*** Move to: src/b.rs\n@@\n-old\n+new\n*** End Patch\n"
+			"*** Begin Patch\n*** Update File: src/a.rs\n*** Move to: src/b.rs\n@@\n-old\n+new\n*** \
+			 End Patch\n"
 		);
 		let create = render_structured_patch(PatchParams {
-			path: "new.txt".into(),
+			path:  "new.txt".into(),
 			edits: vec![PatchEditEntry {
-				op: Some(PatchOp::Create),
+				op:     Some(PatchOp::Create),
 				rename: None,
-				diff: Some("one\ntwo\n".into()),
+				diff:   Some("one\ntwo\n".into()),
 			}],
 		})
 		.expect("create");
 		assert!(create.contains("*** Add File: new.txt\n+one\n+two\n"));
 		let delete = render_structured_patch(PatchParams {
-			path: "old.txt".into(),
-			edits: vec![PatchEditEntry {
-				op: Some(PatchOp::Delete),
-				rename: None,
-				diff: None,
-			}],
+			path:  "old.txt".into(),
+			edits: vec![PatchEditEntry { op: Some(PatchOp::Delete), rename: None, diff: None }],
 		})
 		.expect("delete");
 		assert!(delete.contains("*** Delete File: old.txt\n"));

@@ -391,7 +391,10 @@ mod tests {
 		assert_eq!(schema["additionalProperties"], false);
 		assert_eq!(schema["required"], serde_json::json!(["i", "report"]));
 		assert_eq!(
-			schema["properties"].as_object().expect("properties").keys()
+			schema["properties"]
+				.as_object()
+				.expect("properties")
+				.keys()
 				.map(String::as_str)
 				.collect::<std::collections::BTreeSet<_>>(),
 			["i", "notrunc", "report"].into_iter().collect()

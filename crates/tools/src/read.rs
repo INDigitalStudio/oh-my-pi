@@ -102,7 +102,7 @@ pub struct Params {
 		               supported.",
 		with = "String"
 	)]
-	pub path: Str,
+	pub path:     Str,
 	/// Optional question to answer from one materialized image. The active
 	/// inference route must accept image input.
 	#[schemars(
@@ -310,9 +310,9 @@ pub enum PayloadPart {
 	/// Durable binary media with a textual fallback.
 	Blob {
 		/// Stored media bytes.
-		blob: BlobRef,
+		blob:   BlobRef,
 		/// Model-facing fallback and media description.
-		alt:  Str,
+		alt:    Str,
 		/// Image question routed with this blob when the active model accepts
 		/// vision input.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -785,7 +785,10 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 	}
 
 	async fn execute(&self, authored: Str, question: Option<Str>) -> Result<Payload, Fault> {
-		if question.as_ref().is_some_and(|question| question.trim().is_empty()) {
+		if question
+			.as_ref()
+			.is_some_and(|question| question.trim().is_empty())
+		{
 			return Err(Fault::Invalid {
 				message: Str::new_static("Image question must not be empty."),
 			});
@@ -829,17 +832,15 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		Ok(Payload { parts })
 	}
 
-	fn attach_vision_question(
-		parts: &mut Vec<PayloadPart>,
-		question: &Str,
-	) -> Result<(), Fault> {
+	fn attach_vision_question(parts: &mut Vec<PayloadPart>, question: &Str) -> Result<(), Fault> {
 		let Some(blob_index) = parts
 			.iter()
 			.position(|part| matches!(part, PayloadPart::Blob { .. }))
 		else {
 			return Err(Fault::Unsupported {
 				message: Str::new_static(
-					"Image questions require a supported PNG, JPEG, GIF, WebP, or rasterized SVG/PDF image.",
+					"Image questions require a supported PNG, JPEG, GIF, WebP, or rasterized SVG/PDF \
+					 image.",
 				),
 			});
 		};
@@ -848,9 +849,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			.rev()
 			.find(|part| matches!(part, PayloadPart::Text { .. }))
 		{
-			*text = sf!(
-				"{text}\n\nImage question: {question}\nAnswer using the attached image."
-			);
+			*text = sf!("{text}\n\nImage question: {question}\nAnswer using the attached image.");
 		} else {
 			parts.insert(blob_index, PayloadPart::Text {
 				text: sf!("Image question: {question}\nAnswer using the attached image."),
@@ -1608,14 +1607,8 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		};
 
 		if placeholder_tag.is_some() && tag.is_none() {
-			formatted = format_read_projection(
-				stat,
-				text,
-				parsed,
-				None,
-				suffix_from,
-				self.policy.line_numbers,
-			);
+			formatted =
+				format_read_projection(stat, text, parsed, None, suffix_from, self.policy.line_numbers);
 			append_visible_conflict_warning(
 				&mut formatted,
 				text,

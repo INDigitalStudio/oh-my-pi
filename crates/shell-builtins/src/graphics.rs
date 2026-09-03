@@ -90,16 +90,12 @@ pub fn extract_image_passthrough(output: &[u8]) -> (Vec<u8>, Vec<ImagePassthroug
 /// byte ranges occupied by their framing. Ranges are ordered and disjoint so
 /// callers can remove framing from a segmented transcript without joining or
 /// truncating surrounding output.
-pub fn image_passthrough_ranges(
-	output: &[u8],
-) -> (Vec<ImagePassthrough>, Vec<Range<usize>>) {
+pub fn image_passthrough_ranges(output: &[u8]) -> (Vec<ImagePassthrough>, Vec<Range<usize>>) {
 	let (_, images, ranges) = extract_with_ranges(output);
 	(images, ranges)
 }
 
-fn extract_with_ranges(
-	output: &[u8],
-) -> (Vec<u8>, Vec<ImagePassthrough>, Vec<Range<usize>>) {
+fn extract_with_ranges(output: &[u8]) -> (Vec<u8>, Vec<ImagePassthrough>, Vec<Range<usize>>) {
 	let mut text = Vec::with_capacity(output.len());
 	let mut images = Vec::new();
 	let mut ranges = Vec::new();
@@ -124,21 +120,19 @@ fn extract_with_ranges(
 				pending_mime = Some(Str::new(mime));
 				true
 			},
-			Some(Apc::Chunk { first, more, payload }) => {
-				match base64::decode(payload).into_vec() {
-					Ok(decoded) => {
-						match image.as_mut() {
-							Some(buffer) if !first => buffer.extend_from_slice(&decoded),
-							_ => image = Some(decoded),
-						}
-						if !more && let Some(bytes) = image.take() {
-							let mime = pending_mime.take().unwrap_or_else(|| sniff_mime(&bytes));
-							images.push(ImagePassthrough { mime, bytes: Bytes::from(bytes) });
-						}
-						true
-					},
-					Err(_) => false,
-				}
+			Some(Apc::Chunk { first, more, payload }) => match base64::decode(payload).into_vec() {
+				Ok(decoded) => {
+					match image.as_mut() {
+						Some(buffer) if !first => buffer.extend_from_slice(&decoded),
+						_ => image = Some(decoded),
+					}
+					if !more && let Some(bytes) = image.take() {
+						let mime = pending_mime.take().unwrap_or_else(|| sniff_mime(&bytes));
+						images.push(ImagePassthrough { mime, bytes: Bytes::from(bytes) });
+					}
+					true
+				},
+				Err(_) => false,
 			},
 			None => false,
 		};
@@ -221,10 +215,7 @@ mod tests {
 
 		let (text, images) = extract_image_passthrough(&output);
 		assert_eq!(text, b"before\n\nafter\n");
-		assert_eq!(images, vec![ImagePassthrough {
-			mime:  "image/png".into(),
-			bytes: image.into(),
-		}]);
+		assert_eq!(images, vec![ImagePassthrough { mime: "image/png".into(), bytes: image.into() }]);
 	}
 
 	#[test]

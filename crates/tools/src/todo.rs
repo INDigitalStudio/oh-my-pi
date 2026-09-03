@@ -293,27 +293,22 @@ pub fn tool() -> Todo {
 	}
 }
 
-const DESCRIPTION: &str = "Tracks a phased task list. Tasks are verbatim content strings, NEVER \
-                           auto-generated IDs; pass content in `task`. After each successful \
-                           state-changing op: if nothing is `in_progress`, the earliest `pending` \
-                           task (phase order) auto-promotes to `in_progress`; if several are \
-                           `in_progress`, only the earliest stays. Blocked tasks NEVER \
-                           auto-promote: `unblock` first. Out-of-order completion may move the \
-                           pointer back to an earlier phase; completed tasks NEVER revert. \
-                           Read-only `view` and failed operations never normalize state.\n\n\
-                           Operations: `init` (`list: [{phase, items}]`, or flattened \
-                           `items` with optional `phase`) replaces the list; `start` (`task`) \
-                           marks in progress; `done`/`drop` (`task` or `phase`; omit both for \
-                           every task) mark completed/abandoned; `block` (`task` or `phase`, \
-                           optional `reason`) marks open tasks blocked; `unblock` (`task` or \
-                           `phase`) returns blocked tasks to pending; `rm` (optional `task` or \
-                           `phase`; omit both to clear) removes tasks; `append` (`phase`, \
-                           `items`) adds tasks and lazily creates the phase; `view` echoes the \
-                           list read-only.\n\nTask content: 5-10 words, what not how, unique. \
-                           Phase name: short unique noun phrase, never numbered. Keep introduced \
-                           `task`/`phase` strings stable; when the exact text is lost, `view` \
-                           echoes it. Batch todo calls with real work, never as a turn's only \
-                           call.";
+const DESCRIPTION: &str =
+	"Tracks a phased task list. Tasks are verbatim content strings, NEVER auto-generated IDs; pass \
+	 content in `task`. After each successful state-changing op: if nothing is `in_progress`, the \
+	 earliest `pending` task (phase order) auto-promotes to `in_progress`; if several are \
+	 `in_progress`, only the earliest stays. Blocked tasks NEVER auto-promote: `unblock` first. \
+	 Out-of-order completion may move the pointer back to an earlier phase; completed tasks NEVER \
+	 revert. Read-only `view` and failed operations never normalize state.\n\nOperations: `init` \
+	 (`list: [{phase, items}]`, or flattened `items` with optional `phase`) replaces the list; \
+	 `start` (`task`) marks in progress; `done`/`drop` (`task` or `phase`; omit both for every \
+	 task) mark completed/abandoned; `block` (`task` or `phase`, optional `reason`) marks open \
+	 tasks blocked; `unblock` (`task` or `phase`) returns blocked tasks to pending; `rm` (optional \
+	 `task` or `phase`; omit both to clear) removes tasks; `append` (`phase`, `items`) adds tasks \
+	 and lazily creates the phase; `view` echoes the list read-only.\n\nTask content: 5-10 words, \
+	 what not how, unique. Phase name: short unique noun phrase, never numbered. Keep introduced \
+	 `task`/`phase` strings stable; when the exact text is lost, `view` echoes it. Batch todo \
+	 calls with real work, never as a turn's only call.";
 
 /// Phase name for a flattened `init` that supplies `items` without `phase`.
 const DEFAULT_INIT_PHASE: &str = "Tasks";
@@ -403,8 +398,8 @@ struct LenientParams {
 /// shape is unambiguous: `list` → `init`; `items` + `phase` → `append`; bare
 /// `items` with nothing tracked → `init`.
 fn resolve_params(raw: serde_json::Value, has_existing_phases: bool) -> Result<Params, ArgIssue> {
-	let LenientParams { op, list, task, phase, items, reason } =
-		serde_json::from_value(raw).map_err(|_| ArgIssue {
+	let LenientParams { op, list, task, phase, items, reason } = serde_json::from_value(raw)
+		.map_err(|_| ArgIssue {
 			path:     Vec::new(),
 			expected: Str::new_static("todo arguments {op, list?, task?, phase?, items?, reason?}"),
 			kind:     ArgIssueKind::Malformed,
@@ -752,7 +747,11 @@ fn completion_transitions(previous: &[Phase], updated: &[Phase]) -> Vec<Completi
 pub fn summary(phases: &[Phase], read_only: bool) -> String {
 	let total: usize = phases.iter().map(|phase| phase.tasks.len()).sum();
 	if total == 0 {
-		return String::from(if read_only { "Todo list is empty." } else { "Todo list cleared." });
+		return String::from(if read_only {
+			"Todo list is empty."
+		} else {
+			"Todo list cleared."
+		});
 	}
 	let is_open = |task: &Task| matches!(task.status, Status::Pending | Status::InProgress);
 	let is_closed = |task: &Task| matches!(task.status, Status::Completed | Status::Abandoned);
@@ -822,7 +821,11 @@ pub fn summary(phases: &[Phase], read_only: bool) -> String {
 	for phase in phases {
 		let _ = write!(out, "\n  {}:", phase.name);
 		for task in &phase.tasks {
-			let checkbox = if task.status == Status::Completed { "[X]" } else { "[ ]" };
+			let checkbox = if task.status == Status::Completed {
+				"[X]"
+			} else {
+				"[ ]"
+			};
 			let _ = write!(out, "\n    - {checkbox} {}", task.content);
 			match task.status {
 				Status::InProgress => out.push_str(" (in progress)"),
@@ -992,7 +995,7 @@ fn parse_blocker(content: &str) -> (&str, Option<&str>) {
 /// carrying full task objects.
 #[derive(Deserialize)]
 struct Rev1Params {
-	op:     Op,
+	op:      Op,
 	#[serde(default)]
 	i:       Option<Str>,
 	#[serde(default)]
@@ -1000,13 +1003,13 @@ struct Rev1Params {
 	#[serde(default)]
 	list:    Option<Vec<Rev1Phase>>,
 	#[serde(default)]
-	phase:  Option<Str>,
+	phase:   Option<Str>,
 	#[serde(default)]
-	item:   Option<Str>,
+	item:    Option<Str>,
 	#[serde(default)]
-	items:  Option<Vec<Str>>,
+	items:   Option<Vec<Str>>,
 	#[serde(default)]
-	reason: Option<Str>,
+	reason:  Option<Str>,
 }
 
 /// `todo@1` phase: `phase`/`items` instead of `name`/`tasks`.
@@ -1055,14 +1058,12 @@ fn lift_rev1(from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
 	let outcome =
 		serde_json::from_slice::<CallOutcome<Rev1Payload, serde_json::Value>>(call.verdict).ok()?;
 	let verdict = match outcome {
-		CallOutcome::Ok(payload) => {
-			serde_json::to_vec(&CallOutcome::<Payload, Fault>::Ok(Payload {
-				op:              args.op,
-				phases:          payload.phases.into_iter().map(Rev1Phase::lift).collect(),
-				completed_tasks: Vec::new(),
-			}))
-			.ok()?
-		},
+		CallOutcome::Ok(payload) => serde_json::to_vec(&CallOutcome::<Payload, Fault>::Ok(Payload {
+			op:              args.op,
+			phases:          payload.phases.into_iter().map(Rev1Phase::lift).collect(),
+			completed_tasks: Vec::new(),
+		}))
+		.ok()?,
 		CallOutcome::Faulted(_) => return None,
 		CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. } => call.verdict.to_vec(),
 	};
@@ -1243,9 +1244,9 @@ mod tests {
 		assert_eq!(statuses(&payload.phases), vec![Status::InProgress, Status::Pending]);
 		assert_eq!(
 			summary(&payload.phases, false),
-			"Remaining items (2):\n  - status [in_progress] (Execution)\n  - diagnostics \
-			 [pending] (Execution)\nOverall: 0/2 done, 2 open.\nActive phase 1/1 \"Execution\" \
-			 (0/2).\n  Execution:\n    - [ ] status (in progress)\n    - [ ] diagnostics"
+			"Remaining items (2):\n  - status [in_progress] (Execution)\n  - diagnostics [pending] \
+			 (Execution)\nOverall: 0/2 done, 2 open.\nActive phase 1/1 \"Execution\" (0/2).\n  \
+			 Execution:\n    - [ ] status (in progress)\n    - [ ] diagnostics"
 		);
 	}
 
@@ -1327,8 +1328,7 @@ mod tests {
 	fn blocks_a_task_and_unblocks_it() {
 		let mut phases = Vec::new();
 		ok(&mut phases, r#"{"op":"init","list":[{"phase":"Work","items":["a","b"]}]}"#);
-		let blocked =
-			ok(&mut phases, r#"{"op":"block","task":"b","reason":"waiting on sign-off"}"#);
+		let blocked = ok(&mut phases, r#"{"op":"block","task":"b","reason":"waiting on sign-off"}"#);
 		let b = task(&blocked.phases, "b");
 		assert_eq!(b.status, Status::Blocked);
 		assert_eq!(b.blocker.as_deref(), Some("waiting on sign-off"));
@@ -1359,8 +1359,7 @@ mod tests {
 		ok(&mut phases, r#"{"op":"init","list":[{"phase":"Work","items":["a","b","c"]}]}"#);
 		ok(&mut phases, r#"{"op":"done","task":"a"}"#);
 		ok(&mut phases, r#"{"op":"drop","task":"c"}"#);
-		let payload =
-			ok(&mut phases, r#"{"op":"block","phase":"Work","reason":"waiting on infra"}"#);
+		let payload = ok(&mut phases, r#"{"op":"block","phase":"Work","reason":"waiting on infra"}"#);
 		assert_eq!(task(&payload.phases, "a").status, Status::Completed);
 		assert_eq!(task(&payload.phases, "c").status, Status::Abandoned);
 		assert_eq!(task(&payload.phases, "b").status, Status::Blocked);
@@ -1390,7 +1389,11 @@ mod tests {
 			Err(Fault::BlockRequiresTarget)
 		);
 		assert_eq!(phases, before);
-		assert!(statuses(&phases).iter().all(|status| *status != Status::Blocked));
+		assert!(
+			statuses(&phases)
+				.iter()
+				.all(|status| *status != Status::Blocked)
+		);
 		assert_eq!(
 			prompt_text(&tool(), Err(&Fault::BlockRequiresTarget)),
 			"Errors: block requires a task or phase target"
@@ -1428,7 +1431,13 @@ mod tests {
 			Some("waiting on user: line two indented three")
 		);
 		let markdown = render(&blocked.phases);
-		assert_eq!(markdown.lines().filter(|line| line.contains("- [!]")).count(), 1);
+		assert_eq!(
+			markdown
+				.lines()
+				.filter(|line| line.contains("- [!]"))
+				.count(),
+			1
+		);
 		let parsed = parse_markdown(&markdown).expect("round-trip");
 		assert_eq!(task(&parsed, "a").status, Status::Blocked);
 		assert_eq!(
@@ -1783,7 +1792,9 @@ mod tests {
 		assert!(markdown.contains("- [!] blocked <!-- blocker: waiting for owner -->"));
 		assert_eq!(parse_markdown(&markdown).expect("round-trip"), phases);
 		assert_eq!(
-			statuses(&parse_markdown("# Imported\n* \\[>\\] active\n+ [~] dropped\n").expect("aliases")),
+			statuses(
+				&parse_markdown("# Imported\n* \\[>\\] active\n+ [~] dropped\n").expect("aliases")
+			),
 			vec![Status::InProgress, Status::Abandoned]
 		);
 		assert_eq!(
@@ -1821,7 +1832,8 @@ mod tests {
 				{"content": "port", "status": "blocked", "blocker": "ci"},
 			]}]}})
 		);
-		let faulted = br#"{"kind":"faulted","value":{"kind":"missing","message":"phase not found: x"}}"#;
+		let faulted =
+			br#"{"kind":"faulted","value":{"kind":"missing","message":"phase not found: x"}}"#;
 		assert!(
 			todo
 				.lift(&from, RecordedCall { raw_args, verdict: faulted })

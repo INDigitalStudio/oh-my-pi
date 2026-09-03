@@ -17,10 +17,20 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::output_schema::{OutputStatus, SchemaMode};
 
-const DESCRIPTION: &str = "Runs one child or a concurrent batch. Each child is a job backed by its \
-                           own session journal and isolated workspace; the parent receives every \
-                           child's final text, structured output verdict, workspace disposition, \
-                           session path, and usage in request order.";
+const DESCRIPTION: &str = "Runs one child or a concurrent batch as detached jobs. Each child is \
+                           backed by its own session journal and isolated workspace. The call \
+                           returns immediately with job ids; each child's final text, structured \
+                           output verdict, workspace disposition, session path, and usage are \
+                           delivered to you as an async-result follow-up when it settles, and \
+                           `hub wait` can block on it.";
+
+/// Non-blocking advisory appended to every started batch so the model knows
+/// what it is waiting on (pi `task-async-contract.md`).
+pub const STARTED_ADVISORY: &str =
+	"No polling needed: each child's result auto-delivers as an async-result follow-up when it \
+	 settles, unless a settled `hub jobs`/`hub wait` snapshot consumes it first (no duplicate \
+	 delivery). Use `hub` to `send` a running child a message by id, `wait` on it, or `cancel` a \
+	 stuck one. `completed` means the child yielded; claimed artifacts are unverified.";
 
 /// Coarse per-child reasoning effort.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -151,9 +161,7 @@ impl Params {
 	#[must_use]
 	pub fn into_batch(self) -> BatchRequest {
 		match self {
-			Self::Single(child) => {
-				BatchRequest { context: Str::new_static(""), tasks: vec![child] }
-			},
+			Self::Single(child) => BatchRequest { context: Str::new_static(""), tasks: vec![child] },
 			Self::Batch(batch) => batch,
 		}
 	}
@@ -381,21 +389,22 @@ impl<S: SubagentSpawner> Tool for Task<S> {
 	fn prompt(&self, view: Result<&Payload, &Fault>, _caps: &PromptCaps) -> Vec<Part> {
 		match view {
 			Ok(Payload::Settled { children }) => children.iter().map(child_part).collect(),
-			Ok(Payload::Started { jobs }) => jobs
-				.iter()
-				.map(|job| Part::Text {
-					text: sf!(
-						"[{}] {} ({}) session={}",
-						job.id,
-						job.status,
-						job.agent,
-						job.session_path
-					),
-				})
-				.collect(),
+			Ok(Payload::Started { jobs }) => started_parts(jobs),
 			Err(fault) => vec![Part::Text { text: fault.message.clone() }],
 		}
 	}
+}
+
+/// Projects a started batch: one line per admitted job, then the delivery
+/// advisory.
+fn started_parts(jobs: &[StartedChild]) -> Vec<Part> {
+	jobs
+		.iter()
+		.map(|job| Part::Text {
+			text: sf!("[{}] {} ({}) session={}", job.id, job.status, job.agent, job.session_path),
+		})
+		.chain(std::iter::once(Part::Text { text: sf!(STARTED_ADVISORY) }))
+		.collect()
 }
 
 fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
@@ -445,7 +454,11 @@ fn child_part(child: &ChildResult) -> Part {
 			text.push_str(" branch=");
 			text.push_str(branch);
 		}
-		text.push_str(if workspace.applied { " applied" } else { " not applied" });
+		text.push_str(if workspace.applied {
+			" applied"
+		} else {
+			" not applied"
+		});
 		if !workspace.conflicts.is_empty() {
 			text.push_str(" conflicts=");
 			text.push_str(&workspace.conflicts.join(","));
@@ -487,7 +500,11 @@ fn protocol_issue(message: Str) -> ArgIssue {
 
 #[cfg(test)]
 mod tests {
-	use super::{Params, Payload, StartedChild, TaskEffort, spec};
+	use omp_tool::Part;
+
+	use super::{
+		DESCRIPTION, Params, Payload, STARTED_ADVISORY, StartedChild, TaskEffort, spec, started_parts,
+	};
 
 	#[test]
 	fn task_accepts_single_and_batch_wire_shapes() {
@@ -531,10 +548,8 @@ mod tests {
 			.is_err()
 		);
 		assert!(
-			serde_json::from_value::<Params>(
-				serde_json::json!({"task": "single", "detached": true})
-			)
-			.is_err()
+			serde_json::from_value::<Params>(serde_json::json!({"task": "single", "detached": true}))
+				.is_err()
 		);
 	}
 
@@ -542,16 +557,41 @@ mod tests {
 	fn started_payload_carries_real_job_identity_without_settled_placeholders() {
 		let payload = Payload::Started {
 			jobs: vec![StartedChild {
-				id: "child-1".into(),
-				agent: "task".into(),
+				id:           "child-1".into(),
+				agent:        "task".into(),
 				session_path: "/tmp/child-1.oms".into(),
-				status: "running".into(),
+				status:       "running".into(),
 			}],
 		};
 		let value = serde_json::to_value(payload).unwrap();
 		assert_eq!(value["jobs"][0]["id"], "child-1");
 		assert!(value.get("children").is_none());
 		assert!(value["jobs"][0].get("tokens_in").is_none());
+	}
+
+	#[test]
+	fn started_projection_states_async_delivery_contract() {
+		let parts = started_parts(&[StartedChild {
+			id:           "child-1".into(),
+			agent:        "task".into(),
+			session_path: "/tmp/child-1.oms".into(),
+			status:       "running".into(),
+		}]);
+		let texts = parts
+			.iter()
+			.map(|part| match part {
+				Part::Text { text } => text.as_str(),
+				_ => panic!("started projection is text only"),
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(texts, vec![
+			"[child-1] running (task) session=/tmp/child-1.oms",
+			STARTED_ADVISORY
+		]);
+		assert!(STARTED_ADVISORY.contains("async-result"));
+		assert!(STARTED_ADVISORY.contains("`hub wait`"));
+		assert!(DESCRIPTION.contains("returns immediately with job ids"));
+		assert!(DESCRIPTION.contains("async-result follow-up"));
 	}
 
 	#[test]

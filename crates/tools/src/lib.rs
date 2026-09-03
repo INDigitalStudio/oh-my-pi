@@ -76,11 +76,11 @@ pub mod checkpoint;
 pub mod computer;
 /// Workspace-confinement and selector path utilities.
 pub mod path;
+/// Additional literal pi tool-setting convars.
+pub mod pi_settings;
 mod render;
 /// Typed policy projection owned by file tools.
 pub mod settings;
-/// Additional literal pi tool-setting convars.
-pub mod pi_settings;
 /// Shared staged-proposal lifecycle for preview-producing tools.
 pub mod staging;
 
@@ -129,10 +129,10 @@ pub mod output_schema;
 pub mod read;
 /// Review finding parsing and priority normalization.
 pub mod review;
-/// Persistent-session shell execution.
-pub mod shell;
 /// Long-tail repository security scan device.
 pub mod security_scan;
+/// Persistent-session shell execution.
+pub mod shell;
 /// Pre-authorization guidance for shell intents served by dedicated tools.
 pub mod shell_intercept;
 /// Internal-resource URI scanner used before environment execution.

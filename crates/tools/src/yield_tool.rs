@@ -108,10 +108,10 @@ pub struct Yield {
 /// Creates unconstrained `yield@2`.
 pub fn tool() -> Yield {
 	Yield {
-		spec: yield_spec(loose_record_schema_value(), SchemaMode::Permissive)
+		spec:   yield_spec(loose_record_schema_value(), SchemaMode::Permissive)
 			.expect("the built-in loose yield schema is valid"),
 		schema: None,
-		mode: SchemaMode::Permissive,
+		mode:   SchemaMode::Permissive,
 	}
 }
 
@@ -119,10 +119,7 @@ pub fn tool() -> Yield {
 ///
 /// `null` selects the unconstrained contract. String schemas are parsed using
 /// the same normalization as task settlement.
-pub fn tool_for_schema(
-	raw_schema: &Value,
-	mode: SchemaMode,
-) -> Result<Yield, SchemaContractError> {
+pub fn tool_for_schema(raw_schema: &Value, mode: SchemaMode) -> Result<Yield, SchemaContractError> {
 	let schema = output_schema::normalize(raw_schema)?;
 	let data_schema = schema.clone().unwrap_or_else(loose_record_schema_value);
 	Ok(Yield { spec: yield_spec(data_schema, mode)?, schema, mode })
@@ -133,30 +130,27 @@ fn yield_spec(data_schema: Value, mode: SchemaMode) -> Result<ToolSpec, SchemaCo
 	let encoded = serde_json::to_vec(&schema)?;
 	let schema = omp_tool::inject_protocol_schema(&encoded)?;
 	Ok(ToolSpec {
-			name:            sf!("yield"),
-			rev:             Rev { family: Default::default(), n: 2 },
-			description:     sf!(
-				"Submits terminal or incremental subagent output. Structured success uses \
-				 `result.data`; failure uses `result.error`. A terminal typed yield may pass an \
-				 empty `result` object to use the last assistant turn.",
-			),
-			schema,
-			constraint:      if mode == SchemaMode::Strict {
-				Constraint::Schema {
-					priority: 100,
-					on_unsupported: omp_tool::Fallback::Unspecified,
-				}
-			} else {
-				Constraint::None
-			},
-			effects:         Effects::empty(),
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("yield_tool.rs"),
-			)
-			.into(),
-		})
+		name: sf!("yield"),
+		rev: Rev { family: Default::default(), n: 2 },
+		description: sf!(
+			"Submits terminal or incremental subagent output. Structured success uses `result.data`; \
+			 failure uses `result.error`. A terminal typed yield may pass an empty `result` object \
+			 to use the last assistant turn.",
+		),
+		schema,
+		constraint: if mode == SchemaMode::Strict {
+			Constraint::Schema { priority: 100, on_unsupported: omp_tool::Fallback::Unspecified }
+		} else {
+			Constraint::None
+		},
+		effects: Effects::empty(),
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("yield_tool.rs"),
+		)
+		.into(),
+	})
 }
 
 fn loose_record_schema_value() -> Value {
@@ -340,11 +334,13 @@ fn validate_terminal(
 		// unavailable in permissive mode and as a violation in strict mode by
 		// using one stable root diagnostic.
 		Err(_) if mode == SchemaMode::Permissive => Ok(Some(OutputStatus::Unavailable)),
-		Err(_) => Err(SchemaViolation {
-			pointer: Str::new_static(""),
-			reason:  Str::new_static("the installed output schema is not traversable"),
-		}
-		.into()),
+		Err(_) => Err(
+			SchemaViolation {
+				pointer: Str::new_static(""),
+				reason:  Str::new_static("the installed output schema is not traversable"),
+			}
+			.into(),
+		),
 	}
 }
 
@@ -436,9 +432,7 @@ mod tests {
 			"required": ["answer"],
 			"additionalProperties": false
 		});
-		let invalid = ResultEnvelope::Data {
-			data: serde_json::json!({"answer": "not-an-integer"}),
-		};
+		let invalid = ResultEnvelope::Data { data: serde_json::json!({"answer": "not-an-integer"}) };
 		let strict = validate_terminal(Some(&schema), SchemaMode::Strict, false, &invalid)
 			.expect_err("strict validation rejects");
 		assert!(matches!(strict, Fault::SchemaViolation(_)));

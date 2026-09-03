@@ -30,12 +30,10 @@ impl grep::WorkspaceSearch for FakeWorkspace {
 	) -> impl Future<Output = Result<grep::SearchResult, grep::Fault>> + Send + '_ {
 		let mut result = self.result.clone();
 		if let Ok(result) = &mut result {
-			let context_before =
-				usize::try_from(request.context_before).unwrap_or(usize::MAX);
+			let context_before = usize::try_from(request.context_before).unwrap_or(usize::MAX);
 			let context_after = usize::try_from(request.context_after).unwrap_or(usize::MAX);
 			for matched in &mut result.matches {
-				let first_before =
-					matched.context_before.len().saturating_sub(context_before);
+				let first_before = matched.context_before.len().saturating_sub(context_before);
 				matched.context_before.drain(..first_before);
 				matched.context_after.truncate(context_after);
 			}
@@ -99,19 +97,11 @@ struct Invocation {
 }
 
 fn fake(result: grep::SearchResult) -> FakeWorkspace {
-	FakeWorkspace {
-		result: Ok(result),
-		recorded: Arc::default(),
-		requests: Arc::default(),
-	}
+	FakeWorkspace { result: Ok(result), recorded: Arc::default(), requests: Arc::default() }
 }
 
 fn failed(fault: grep::Fault) -> FakeWorkspace {
-	FakeWorkspace {
-		result: Err(fault),
-		recorded: Arc::default(),
-		requests: Arc::default(),
-	}
+	FakeWorkspace { result: Err(fault), recorded: Arc::default(), requests: Arc::default() }
 }
 
 fn matched(path: &str, line_number: u32, line: &str, tag: Option<&str>) -> grep::SearchMatch {
@@ -144,11 +134,7 @@ fn invoke_with_context_and_blobs(
 		.register(
 			grep::tool(workspace.clone(), blobs, context_before, context_after),
 			Presentation::Slot,
-			Claims {
-				precedence: Precedence::CORE,
-				claimant:   sf!("omp/core"),
-				replaces:   None,
-			},
+			Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None },
 		)
 		.expect("grep schema and revision register");
 	let (feed, params) = IncomingParams::channel();
@@ -208,12 +194,7 @@ fn invoke_prompt(workspace: &FakeWorkspace, raw: &str) -> (String, bool) {
 
 #[test]
 fn schema_is_exactly_the_native_grep_schema() {
-	let tool = grep::tool(
-		fake(grep::SearchResult::default()),
-		RecordingBlobs::default(),
-		2,
-		2,
-	);
+	let tool = grep::tool(fake(grep::SearchResult::default()), RecordingBlobs::default(), 2, 2);
 	let actual: serde_json::Value =
 		serde_json::from_slice(&tool.spec().schema).expect("grep schema is JSON");
 	assert_eq!(
@@ -294,11 +275,8 @@ fn single_file_match_has_hashline_header_and_no_group_heading() {
 #[test]
 fn asymmetric_and_zero_context_are_request_scoped_and_preserve_source_order() {
 	let mut found = matched("src/context.rs", 4, "needle", Some("C0DE"));
-	found.context_before = vec![
-		context(1, "before 1"),
-		context(2, "before 2"),
-		context(3, "before 3"),
-	];
+	found.context_before =
+		vec![context(1, "before 1"), context(2, "before 2"), context(3, "before 3")];
 	found.context_after = vec![
 		context(5, "after 1"),
 		context(6, "after 2"),
@@ -330,10 +308,7 @@ fn asymmetric_and_zero_context_are_request_scoped_and_preserve_source_order() {
 		0,
 		RecordingBlobs::default(),
 	);
-	assert_eq!(
-		prompt(&workspace, &zero.outcome),
-		"[src/context.rs#C0DE]\n*4:needle"
-	);
+	assert_eq!(prompt(&workspace, &zero.outcome), "[src/context.rs#C0DE]\n*4:needle");
 
 	let requests = workspace.requests.lock();
 	assert_eq!(

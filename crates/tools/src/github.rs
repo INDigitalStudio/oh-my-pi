@@ -341,34 +341,31 @@ mod tests {
 			.map(String::as_str)
 			.collect::<Vec<_>>();
 		domain_properties.sort_unstable();
-		assert_eq!(
-			domain_properties,
-			[
-				"assignee",
-				"base",
-				"body",
-				"branch",
-				"dateField",
-				"draft",
-				"fill",
-				"force",
-				"forceWithLease",
-				"head",
-				"label",
-				"limit",
-				"op",
-				"path",
-				"pr",
-				"query",
-				"repo",
-				"reviewer",
-				"run",
-				"since",
-				"tail",
-				"title",
-				"until",
-			]
-		);
+		assert_eq!(domain_properties, [
+			"assignee",
+			"base",
+			"body",
+			"branch",
+			"dateField",
+			"draft",
+			"fill",
+			"force",
+			"forceWithLease",
+			"head",
+			"label",
+			"limit",
+			"op",
+			"path",
+			"pr",
+			"query",
+			"repo",
+			"reviewer",
+			"run",
+			"since",
+			"tail",
+			"title",
+			"until",
+		]);
 		assert_eq!(properties["fill"]["type"], "boolean");
 		assert_eq!(properties["reviewer"]["type"], "array");
 		assert_eq!(properties["assignee"]["type"], "array");
@@ -444,10 +441,7 @@ mod tests {
 			br#"{"i":"Reading repository","notrunc":true,"op":"repo_view","repo":"owner/repo"}"#;
 		let verdict = br#"{"kind":"ok","value":{"op":"repo_view","result":{},"rate_limit_remaining":null,"rate_limit_reset":null}}"#;
 		let lifted = tool
-			.lift(&Rev { family: Str::default(), n: 1 }, RecordedCall {
-				raw_args,
-				verdict,
-			})
+			.lift(&Rev { family: Str::default(), n: 1 }, RecordedCall { raw_args, verdict })
 			.expect("revision one lifts");
 		assert_eq!(lifted.raw_args.as_ref(), raw_args);
 		assert_eq!(lifted.verdict.as_ref(), verdict);
@@ -457,18 +451,17 @@ mod tests {
 			CallOutcome::Ok(_)
 		));
 		assert!(
-			tool.lift(&Rev { family: Str::default(), n: 2 }, RecordedCall {
-				raw_args,
-				verdict
-			})
-			.is_none()
+			tool
+				.lift(&Rev { family: Str::default(), n: 2 }, RecordedCall { raw_args, verdict })
+				.is_none()
 		);
 		assert!(
-			tool.lift(&Rev { family: Str::default(), n: 1 }, RecordedCall {
-				raw_args: br#"{"op":"repo_view","unknown":true}"#,
-				verdict,
-			})
-			.is_none()
+			tool
+				.lift(&Rev { family: Str::default(), n: 1 }, RecordedCall {
+					raw_args: br#"{"op":"repo_view","unknown":true}"#,
+					verdict,
+				})
+				.is_none()
 		);
 	}
 

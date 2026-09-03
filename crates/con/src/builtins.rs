@@ -99,6 +99,14 @@ crate::var! {
 		default: VisionMode::Auto,
 		flags: archive | session,
 	};
+	/// Mode prompt rendered into the system prompt while engaged: names
+	/// `prompts/modes/<name>.md` (`plan`, `vibe`, `autoresearch`); empty
+	/// renders none. Bound by Directors, so the value derives from the live
+	/// `<meta><directors>` stack (ADR 0015).
+	pub static AI_PROMPT_MODE = ai_prompt_mode: Str {
+		default: Str::new_static(""),
+		flags: session,
+	};
 	/// Context-window fraction at which compaction begins.
 	pub static AI_COMPACT_THRESHOLD = ai_compact_threshold: f64 {
 		default: 0.80,
@@ -143,9 +151,11 @@ crate::var! {
 		default: Str::new_static("on-request"),
 		flags: archive | session | replicated,
 	};
-	/// Enables the built-in tool roster.
-	pub static SV_TOOLS = sv_tools: bool {
-		default: true,
+	/// Advertised tool allowlist: stable tool names the model may see this
+	/// request (`--tools`, Director binds such as Vibe's `[read todo]`).
+	/// Empty advertises every registered tool.
+	pub static SV_TOOLS = sv_tools: Vec<Str> {
+		default: Vec::new(),
 		flags: archive | session | replicated,
 	};
 }

@@ -1399,18 +1399,17 @@ mod tests {
 			_request: RunRequest,
 		) -> Result<Self::Run, Fault> {
 			let mut events = std::collections::VecDeque::new();
-			events.push_back(RunEvent::Started {
-				cell_id: Bytes::from_static(b"streaming-test:cell-1"),
-			});
+			events
+				.push_back(RunEvent::Started { cell_id: Bytes::from_static(b"streaming-test:cell-1") });
 			events.extend(self.updates.iter().cloned().map(RunEvent::Output));
 			events.push_back(RunEvent::Completed(RunCompletion {
-				status: CellStatus {
-					outcome: CellOutcome::Complete,
-					exit_code: Some(0),
+				status:          CellStatus {
+					outcome:     CellOutcome::Complete,
+					exit_code:   Some(0),
 					duration_ms: 1,
-					exception: None,
+					exception:   None,
 				},
-				result: None,
+				result:          None,
 				display_outputs: Vec::new(),
 			}));
 			Ok(StreamingRun { events })
@@ -1430,8 +1429,8 @@ mod tests {
 			.chunks(64 * 1024)
 			.enumerate()
 			.map(|(sequence, chunk)| Update {
-				channel: OutputChannel::Stdout,
-				data: CowBytes::from(chunk.to_vec()),
+				channel:  OutputChannel::Stdout,
+				data:     CowBytes::from(chunk.to_vec()),
 				sequence: sequence as u64,
 			})
 			.collect();
@@ -1452,7 +1451,11 @@ mod tests {
 			}
 		}
 		assert_eq!(actual, expected);
-		assert!(!actual.windows(b"truncated".len()).any(|window| window == b"truncated"));
+		assert!(
+			!actual
+				.windows(b"truncated".len())
+				.any(|window| window == b"truncated")
+		);
 		let payload = payload.expect("terminal payload");
 		assert!(payload.had_output);
 		let encoded = serde_json::to_value(&payload).expect("payload serializes");
@@ -1462,10 +1465,10 @@ mod tests {
 
 		let caps = PromptCaps::for_tool(
 			omp_tool::CapsBase {
-				maximum_parts: u16::MAX,
+				maximum_parts:      u16::MAX,
 				maximum_text_bytes: u32::MAX,
-				media: true,
-				model_class: omp_tool::ModelClass::Standard,
+				media:              true,
+				model_class:        omp_tool::ModelClass::Standard,
 			},
 			&tool.spec().rev,
 		);

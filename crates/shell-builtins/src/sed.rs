@@ -2885,9 +2885,8 @@ pub mod compiler {
 			for (posix, sandbox) in [(false, false), (true, false), (false, true)] {
 				let (lines, mut chars) = make_providers("e");
 				let mut subst = Substitution::default();
-				let err =
-					compile_subst_flags(&lines, &mut chars, &mut subst, posix, sandbox, None)
-						.unwrap_err();
+				let err = compile_subst_flags(&lines, &mut chars, &mut subst, posix, sandbox, None)
+					.unwrap_err();
 				assert!(err.to_string().contains(ERR_EXECUTE_FLAG), "{err}");
 			}
 		}

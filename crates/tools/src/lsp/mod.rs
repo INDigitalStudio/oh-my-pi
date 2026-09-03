@@ -443,7 +443,10 @@ mod tests {
 		}
 		let properties = schema["properties"].as_object().expect("properties object");
 		assert_eq!(
-			properties.keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+			properties
+				.keys()
+				.map(String::as_str)
+				.collect::<std::collections::BTreeSet<_>>(),
 			[
 				"action", "apply", "file", "i", "line", "new_name", "notrunc", "payload", "query",
 				"symbol", "timeout",
@@ -470,10 +473,7 @@ mod tests {
 		feed.arg_text(raw.into()).expect("stream args");
 		feed.args_committed(raw.into()).expect("commit args");
 		let events = lsp.call(incoming).collect::<Vec<_>>().await;
-		assert!(matches!(
-			events.last(),
-			Some(Ev::Done(ToolTerminal::Done { result: Ok(_), .. }))
-		));
+		assert!(matches!(events.last(), Some(Ev::Done(ToolTerminal::Done { result: Ok(_), .. }))));
 		let recorded = control.0.lock().expect("recording control");
 		let params = recorded.as_ref().expect("request executed");
 		assert_eq!(params.query.as_deref(), Some("rust-analyzer/expandMacro"));

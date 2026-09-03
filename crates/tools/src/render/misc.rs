@@ -429,8 +429,8 @@ fn labeled_value(label: &'static str, value: &Value) -> El {
 
 #[derive(Default)]
 pub(super) struct ComputerState {
-	code:     Str,
-	summary:  Str,
+	code:    Str,
+	summary: Str,
 }
 
 pub(super) struct ComputerRenderer;
@@ -778,6 +778,7 @@ mod tests {
 				"return_value": true
 			})),
 			artifacts: vec![Str::new_static("artifact://browser/result")],
+			browser:   Some(Str::new_static("headless")),
 		};
 		let rendered = BrowserRenderer
 			.view(&state, Some(&CallOutcome::Ok(payload)))
@@ -795,6 +796,7 @@ mod tests {
 			title:     Some(Str::new_static("Documentation")),
 			result:    Some(serde_json::json!({"ready": true, "status": "<loaded>"})),
 			artifacts: Vec::new(),
+			browser:   None,
 		};
 		let rendered = BrowserRenderer
 			.view(&BrowserState::default(), Some(&CallOutcome::Ok(open)))

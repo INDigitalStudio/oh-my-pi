@@ -110,89 +110,89 @@ pub struct Ready {
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// Operation to perform.
-	pub op:                   Op,
+	pub op:          Op,
 	/// Peer recipient or `all`.
-	pub to:                   Option<Str>,
+	pub to:          Option<Str>,
 	/// Peer message body.
-	pub message:              Option<Str>,
+	pub message:     Option<Str>,
 	/// Prior peer message ID being answered.
 	#[serde(rename = "replyTo")]
-	pub reply_to:             Option<Str>,
+	pub reply_to:    Option<Str>,
 	/// Block for the recipient's threaded reply.
 	///
 	/// A terminal recipient turn without a matching reply settles promptly with
 	/// a stopped-without-replying note.
 	#[serde(rename = "await", default)]
-	pub await_reply:          bool,
+	pub await_reply: bool,
 	/// Only accept a peer message from this sender.
 	#[serde(rename = "from")]
-	pub from_peer:            Option<Str>,
+	pub from_peer:   Option<Str>,
 	/// Job IDs selected for wait or cancellation.
-	pub ids:                  Option<Vec<Str>>,
+	pub ids:         Option<Vec<Str>>,
 	/// Explicit timeout in milliseconds; zero means infinite.
 	#[serde(rename = "timeoutMs")]
-	pub timeout_ms:           Option<u64>,
+	pub timeout_ms:  Option<u64>,
 	/// Inspect inbox without consuming it.
 	#[serde(default)]
-	pub peek:                 bool,
+	pub peek:        bool,
 	/// Agent lifecycle filter for `list`; omitted means running plus idle.
-	pub status:               Option<ListStatus>,
+	pub status:      Option<ListStatus>,
 	/// Maximum peer rows returned by `list`.
-	pub limit:                Option<u16>,
+	pub limit:       Option<u16>,
 	/// Stable process name.
-	pub name:                 Option<Str>,
+	pub name:        Option<Str>,
 	/// Process executable.
-	pub application:          Option<Str>,
+	pub application: Option<Str>,
 	/// Process argv.
-	pub args:                 Option<Vec<Str>>,
+	pub args:        Option<Vec<Str>>,
 	/// Process environment.
-	pub env:                  Option<BTreeMap<Str, Str>>,
+	pub env:         Option<BTreeMap<Str, Str>>,
 	/// Process working directory.
-	pub cwd:                  Option<Str>,
+	pub cwd:         Option<Str>,
 	/// Allocate an interactive PTY.
-	pub pty:                  Option<bool>,
+	pub pty:         Option<bool>,
 	/// Readiness criteria.
-	pub ready:                Option<Ready>,
+	pub ready:       Option<Ready>,
 	/// Automatic restart policy.
-	pub restart:              Option<RestartPolicy>,
+	pub restart:     Option<RestartPolicy>,
 	/// Keep the process beyond the last session handle.
 	#[serde(default)]
-	pub persist:              bool,
+	pub persist:     bool,
 	/// Keep the process beyond environment shutdown; implies persist and
 	/// disables PTY.
 	#[serde(default)]
-	pub detached:             bool,
+	pub detached:    bool,
 	/// Log line limit.
-	pub lines:                Option<u16>,
+	pub lines:       Option<u16>,
 	/// Return logs from the beginning.
 	#[serde(default)]
-	pub head:                 bool,
+	pub head:        bool,
 	/// Regex log filter.
-	pub grep:                 Option<Str>,
+	pub grep:        Option<Str>,
 	/// Output sequence cursor.
-	pub cursor:               Option<u64>,
+	pub cursor:      Option<u64>,
 	/// Follow output after the current cursor.
 	#[serde(default)]
-	pub follow:               bool,
+	pub follow:      bool,
 	/// Process lifecycle target (`ready` or `exit`).
 	///
 	/// Each wait is fenced to the named process generation observed when the
 	/// call starts; a restart settles the wait instead of following the
 	/// replacement.
 	#[serde(rename = "for")]
-	pub wait_for:             Option<Str>,
+	pub wait_for:    Option<Str>,
 	/// Output regex taking precedence over lifecycle target.
-	pub pattern:              Option<Str>,
+	pub pattern:     Option<Str>,
 	/// Process stdin text.
-	pub text:                 Option<Str>,
+	pub text:        Option<Str>,
 	/// Append Enter after process stdin text.
-	pub enter:                Option<bool>,
+	pub enter:       Option<bool>,
 	/// Named control keys.
-	pub keys:                 Option<Vec<Str>>,
+	pub keys:        Option<Vec<Str>>,
 	/// OS process-group signal.
-	pub signal:               Option<Signal>,
+	pub signal:      Option<Signal>,
 	/// Process-operation timeout in seconds.
-	pub timeout:              Option<f64>,
+	pub timeout:     Option<f64>,
 }
 
 /// Validated hub request handed to the app-owned broker/process composition.
@@ -462,15 +462,22 @@ pub fn validate(mut params: Params, caller_id: &str) -> Result<Request, Fault> {
 				params.pty = Some(false);
 			}
 		},
-		Op::Wait if params.name.is_some() && params.ids.as_ref().is_some_and(|ids| !ids.is_empty()) => {
+		Op::Wait
+			if params.name.is_some() && params.ids.as_ref().is_some_and(|ids| !ids.is_empty()) =>
+		{
 			return Err(invalid("wait accepts a process `name` or job `ids`, not both"));
 		},
 		Op::Wait
-			if params.wait_for.as_deref().is_some_and(|target| target != "ready" && target != "exit") =>
+			if params
+				.wait_for
+				.as_deref()
+				.is_some_and(|target| target != "ready" && target != "exit") =>
 		{
 			return Err(invalid("wait `for` must be `ready` or `exit`"));
 		},
-		Op::Wait if params.name.is_none() && (params.wait_for.is_some() || params.pattern.is_some()) => {
+		Op::Wait
+			if params.name.is_none() && (params.wait_for.is_some() || params.pattern.is_some()) =>
+		{
 			return Err(invalid("process wait fields require `name`"));
 		},
 		Op::Logs | Op::Stop | Op::Restart | Op::Describe if params.name.is_none() => {
@@ -499,10 +506,7 @@ pub fn validate(mut params: Params, caller_id: &str) -> Result<Request, Fault> {
 	{
 		return Err(invalid("process timeout must be a positive finite number"));
 	}
-	if params
-		.grep
-		.as_deref()
-		.is_some_and(str::is_empty)
+	if params.grep.as_deref().is_some_and(str::is_empty)
 		|| params.pattern.as_deref().is_some_and(str::is_empty)
 	{
 		return Err(invalid("log and wait patterns must be non-empty"));

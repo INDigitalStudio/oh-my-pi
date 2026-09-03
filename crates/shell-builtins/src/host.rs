@@ -135,12 +135,7 @@ pub trait DynHost: Send + Sync + 'static {
 
 	/// Invokes one operation with schema-shaped JSON arguments and the shell
 	/// command's cancellation token.
-	fn call(
-		&self,
-		name: &str,
-		args: Value,
-		cancel: CancellationToken,
-	) -> DynFuture<'_, DynOutput>;
+	fn call(&self, name: &str, args: Value, cancel: CancellationToken) -> DynFuture<'_, DynOutput>;
 }
 
 /// A command-line utility implemented as a shell builtin.
@@ -460,17 +455,6 @@ impl Host {
 			let _ = self.stderr.write_all(&buf);
 		}
 		status
-	}
-
-	/// Runs a child with fully captured output while recording its ownership.
-	pub fn run_output(&self, command: &mut process::Command) -> io::Result<process::Output> {
-		command
-			.stdin(process::Stdio::null())
-			.stdout(process::Stdio::piped())
-			.stderr(process::Stdio::piped());
-		let child = command.spawn()?;
-		self.observe_spawn(child.id());
-		child.wait_with_output()
 	}
 }
 /// A destination-aware buffered writer for utility output.

@@ -799,7 +799,7 @@ mod tests {
 			let totals: Vec<usize> = [QrEc::L, QrEc::M, QrEc::Q, QrEc::H]
 				.into_iter()
 				.map(|level| {
-					let (ec, g1, g1_data, g2, g2_data) = blocks(version, level);
+					let (ec, g1, _, g2, _) = blocks(version, level);
 					data_codewords(version, level)
 						+ usize::from(ec) * (usize::from(g1) + usize::from(g2))
 				})

@@ -13,8 +13,7 @@ use crate::{
 	think::{Fault as ThinkFault, Payload as ThinkPayload, Update as ThinkUpdate},
 	todo::{
 		Fault as TodoFault, InitListEntry as TodoInitListEntry, Payload as TodoPayload,
-		Phase as TodoPhase, Status as TodoStatus, Task as TodoTask,
-		Update as TodoUpdate,
+		Phase as TodoPhase, Status as TodoStatus, Task as TodoTask, Update as TodoUpdate,
 	},
 	view,
 };
@@ -99,11 +98,7 @@ impl RenderFold for TodoRenderer {
 					tasks: phase
 						.items
 						.into_iter()
-						.map(|content| TodoTask {
-							content,
-							status: TodoStatus::Pending,
-							blocker: None,
-						})
+						.map(|content| TodoTask { content, status: TodoStatus::Pending, blocker: None })
 						.collect(),
 				})
 			}));
@@ -120,7 +115,7 @@ impl RenderFold for TodoRenderer {
 					.filter_map(|item| item.as_str())
 					.map(|content| TodoTask {
 						content: Str::new(content),
-						status: TodoStatus::Pending,
+						status:  TodoStatus::Pending,
 						blocker: None,
 					})
 					.collect(),

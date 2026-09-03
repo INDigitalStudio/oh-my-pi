@@ -506,6 +506,13 @@ impl Ctx {
 		self.items.iter().map(|item| item.spec)
 	}
 
+	/// All dynamically registered commands in registration order (the
+	/// long tail a host adds at runtime: prompt templates, extension
+	/// commands), as `(name, description)`.
+	pub fn dynamic_cmds(&self) -> impl Iterator<Item = (&Str, &Str)> + '_ {
+		self.dynamic_cmds.iter().map(|spec| (&spec.name, &spec.desc))
+	}
+
 	/// Resolves a static name to its registration.
 	#[must_use]
 	pub fn find(&self, name: &str) -> Option<RegItem> {

@@ -53,7 +53,8 @@ pub struct EditDialectRegistration {
 	pub dialect:  Dialect,
 }
 
-/// Every built-in edit revision retained for current selection or historical replay.
+/// Every built-in edit revision retained for current selection or historical
+/// replay.
 pub const EDIT_DIALECTS: &[EditDialectRegistration] = &[
 	EditDialectRegistration { family: "rep", revision: 1, dialect: Dialect::Replace },
 	EditDialectRegistration { family: "rep", revision: 2, dialect: Dialect::Replace },

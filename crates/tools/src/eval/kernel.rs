@@ -609,11 +609,7 @@ struct SinkShared {
 
 impl SinkShared {
 	fn new(session: Bytes, events: Sender<Result<RunEvent, Fault>>) -> Self {
-		Self {
-			session,
-			events,
-			state: Mutex::new(SinkState { open: true, sequence: 0 }),
-		}
+		Self { session, events, state: Mutex::new(SinkState { open: true, sequence: 0 }) }
 	}
 
 	/// Emits one ordered output event, or `None` once the cell is sealed.
@@ -2040,14 +2036,17 @@ mod tests {
 		let (updates, done) = run_to_completion(
 			&runtime,
 			&session,
-			"%%bash\ni=0\nwhile [ \"$i\" -lt 3001 ]; do\n  printf '%0350d\\n' 0\n  \
-			 i=$((i + 1))\ndone",
+			"%%bash\ni=0\nwhile [ \"$i\" -lt 3001 ]; do\n  printf '%0350d\\n' 0\n  i=$((i + 1))\ndone",
 			false,
 		)
 		.await;
 		assert_eq!(done.status.outcome, CellOutcome::Complete);
 		assert_eq!(done.result, None);
-		assert!(updates.iter().all(|update| update.data.len() <= OUTPUT_CHUNK_BYTES));
+		assert!(
+			updates
+				.iter()
+				.all(|update| update.data.len() <= OUTPUT_CHUNK_BYTES)
+		);
 		let stdout = updates
 			.into_iter()
 			.filter(|update| update.channel == OutputChannel::Stdout)

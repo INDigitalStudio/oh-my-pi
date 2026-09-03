@@ -93,12 +93,12 @@ trait ReplaceArguments: serde::de::DeserializeOwned + Serialize + Send + Sync + 
 impl ReplaceArguments for ReplaceParams {
 	fn into_operations(self) -> Vec<ReplaceOperation> {
 		vec![ReplaceOperation {
-			path: self.path,
-			old: self.old_string,
-			new: self.new_string,
+			path:        self.path,
+			old:         self.old_string,
+			new:         self.new_string,
 			replace_all: self.replace_all,
 			allow_fuzzy: true,
-			threshold: None,
+			threshold:   None,
 		}]
 	}
 }
@@ -109,12 +109,12 @@ impl ReplaceArguments for LegacyReplaceParams {
 			.edits
 			.into_iter()
 			.map(|operation| ReplaceOperation {
-				path: operation.path,
-				old: operation.old,
-				new: operation.new,
+				path:        operation.path,
+				old:         operation.old,
+				new:         operation.new,
 				replace_all: operation.replace_all,
 				allow_fuzzy: operation.allow_fuzzy,
-				threshold: operation.threshold,
+				threshold:   operation.threshold,
 			})
 			.collect()
 	}
@@ -178,14 +178,7 @@ fn replace_spec_for<P: JsonSchema>(revision: u16) -> ToolSpec {
 
 /// Constructs the current old-text/new-text replacement dialect.
 pub fn replace_tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy) -> ReplaceTool<D> {
-	replace_tool_with_observer(
-		documents,
-		format_policy,
-		EditObserver::default(),
-		true,
-		true,
-		false,
-	)
+	replace_tool_with_observer(documents, format_policy, EditObserver::default(), true, true, false)
 }
 
 /// Constructs the current replacement dialect with host policy.
@@ -635,15 +628,15 @@ mod tests {
 	#[test]
 	fn host_fuzzy_threshold_overrides_the_library_default() {
 		let make = || ReplaceTool::<()> {
-			documents: (),
-			format_policy: FormatPolicy::Disabled,
-			observer: EditObserver::default(),
+			documents:       (),
+			format_policy:   FormatPolicy::Disabled,
+			observer:        EditObserver::default(),
 			guard_generated: true,
-			allow_fuzzy: true,
+			allow_fuzzy:     true,
 			fuzzy_threshold: omp_hashline::replace::DEFAULT_FUZZY_THRESHOLD,
-			require_seen: false,
-			spec: replace_spec(),
-			params: PhantomData,
+			require_seen:    false,
+			spec:            replace_spec(),
+			params:          PhantomData,
 		};
 		assert_eq!(make().with_fuzzy_threshold(0.87).fuzzy_threshold, 0.87);
 		assert_eq!(make().with_fuzzy_threshold(2.0).fuzzy_threshold, 1.0);

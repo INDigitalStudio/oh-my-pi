@@ -178,8 +178,7 @@ impl ShellExec for FakeExec {
 				encode_image_passthrough("image/png", b"\x89PNG\r\n\x1a\npixels", &mut encoded);
 				encoded.extend_from_slice(b"\nafter\n");
 				let split = encoded.len() / 2;
-				for (sequence, data) in
-					[(1, encoded[..split].to_vec()), (2, encoded[split..].to_vec())]
+				for (sequence, data) in [(1, encoded[..split].to_vec()), (2, encoded[split..].to_vec())]
 				{
 					events.push_back(RunEvent::Output(Update {
 						channel: OutputChannel::Stdout,
@@ -537,10 +536,10 @@ fn shell_extracts_split_graphics_as_full_typed_attachments() {
 	let (name, rev) = registry.live_identity("bash").unwrap();
 	let caps = PromptCaps::for_tool(
 		CapsBase {
-			maximum_parts: 2,
+			maximum_parts:      2,
 			maximum_text_bytes: 1024,
-			media: true,
-			model_class: ModelClass::Standard,
+			media:              true,
+			model_class:        ModelClass::Standard,
 		},
 		rev,
 	);
@@ -548,7 +547,9 @@ fn shell_extracts_split_graphics_as_full_typed_attachments() {
 		.prompt(&ToolIdentity { name: name.clone(), rev: rev.clone() }, verdict, &caps)
 		.unwrap()
 		.unwrap();
-	assert!(matches!(parts.last(), Some(Part::Blob { blob, .. }) if blob.media_type == "image/png" && blob.byte_len == 14));
+	assert!(
+		matches!(parts.last(), Some(Part::Blob { blob, .. }) if blob.media_type == "image/png" && blob.byte_len == 14)
+	);
 }
 
 #[tokio::test]

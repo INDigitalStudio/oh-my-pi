@@ -366,7 +366,8 @@ pub fn format_text(
 		let entries =
 			build_line_entries_with_block_context(&lines, &selected_spans, options.block_context);
 		source_lines.extend(line_entry_sources(&entries));
-		output = format_line_entries_mode(&entries, options.line_numbers || options.snapshot.is_some());
+		output =
+			format_line_entries_mode(&entries, options.line_numbers || options.snapshot.is_some());
 		if options.snapshot.is_some() {
 			source_lines.insert(0, SmallVec::new());
 		}

@@ -12,8 +12,8 @@ use omp_tool::{CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool,
 use omp_tools::edit::{
 	self, CommitResult, CommittedSection, Conflict, EditAction, EditCommitError, EditDocuments,
 	EditPrepared, EditProposal, Fault, FormatPolicy, NoopResult, PrepareRequest, RejectionReason,
-	apply_patch_tool, legacy_replace_tool_with_observer,
-	observer::EditObserver, patch_tool, replace_tool, tool,
+	apply_patch_tool, legacy_replace_tool_with_observer, observer::EditObserver, patch_tool,
+	replace_tool, tool,
 };
 use parking_lot::Mutex;
 
@@ -234,29 +234,41 @@ fn generated_schema_is_semantically_the_pi_edit_schema() {
 			}
 		})
 	);
-	let replace_schema: serde_json::Value =
-		serde_json::from_slice(&replace_tool(Fake::with_files(&[]), FormatPolicy::BestEffort).spec().schema)
-			.expect("replace schema");
-	assert_eq!(replace_schema["required"], serde_json::json!(["i", "path", "old_string", "new_string"]));
+	let replace_schema: serde_json::Value = serde_json::from_slice(
+		&replace_tool(Fake::with_files(&[]), FormatPolicy::BestEffort)
+			.spec()
+			.schema,
+	)
+	.expect("replace schema");
 	assert_eq!(
-		replace_schema["properties"].as_object().expect("replace properties").keys()
+		replace_schema["required"],
+		serde_json::json!(["i", "path", "old_string", "new_string"])
+	);
+	assert_eq!(
+		replace_schema["properties"]
+			.as_object()
+			.expect("replace properties")
+			.keys()
 			.map(String::as_str)
 			.collect::<std::collections::BTreeSet<_>>(),
 		["i", "new_string", "notrunc", "old_string", "path", "replace_all"]
 			.into_iter()
 			.collect()
 	);
-	assert_eq!(
-		replace_schema["additionalProperties"],
-		serde_json::Value::Bool(false)
-	);
+	assert_eq!(replace_schema["additionalProperties"], serde_json::Value::Bool(false));
 
-	let patch_schema: serde_json::Value =
-		serde_json::from_slice(&patch_tool(Fake::with_files(&[]), FormatPolicy::BestEffort).spec().schema)
-			.expect("patch schema");
+	let patch_schema: serde_json::Value = serde_json::from_slice(
+		&patch_tool(Fake::with_files(&[]), FormatPolicy::BestEffort)
+			.spec()
+			.schema,
+	)
+	.expect("patch schema");
 	assert_eq!(patch_schema["required"], serde_json::json!(["i", "path", "edits"]));
 	assert_eq!(
-		patch_schema["properties"].as_object().expect("patch properties").keys()
+		patch_schema["properties"]
+			.as_object()
+			.expect("patch properties")
+			.keys()
 			.map(String::as_str)
 			.collect::<std::collections::BTreeSet<_>>(),
 		["edits", "i", "notrunc", "path"].into_iter().collect()
@@ -264,16 +276,19 @@ fn generated_schema_is_semantically_the_pi_edit_schema() {
 	let entry = &patch_schema["properties"]["edits"]["items"];
 	assert_eq!(entry["additionalProperties"], false);
 	assert_eq!(
-		entry["properties"].as_object().expect("entry properties").keys()
+		entry["properties"]
+			.as_object()
+			.expect("entry properties")
+			.keys()
 			.map(String::as_str)
 			.collect::<std::collections::BTreeSet<_>>(),
 		["diff", "op", "rename"].into_iter().collect()
 	);
 	for operation in ["create", "delete", "update"] {
 		assert!(
-			serde_json::from_value::<omp_tools::edit::PatchOp>(
-				serde_json::Value::String(operation.to_owned())
-			)
+			serde_json::from_value::<omp_tools::edit::PatchOp>(serde_json::Value::String(
+				operation.to_owned()
+			))
 			.is_ok()
 		);
 	}
@@ -296,8 +311,12 @@ async fn current_replace_and_patch_routes_apply_the_pi_argument_forms() {
 	let replace_raw =
 		r#"{"path":"a.txt","old_string":"alpha","new_string":"beta","replace_all":false}"#;
 	let (replace_feed, replace_incoming) = IncomingParams::channel();
-	replace_feed.arg_text(replace_raw.into()).expect("stream replace");
-	replace_feed.args_committed(replace_raw.into()).expect("commit replace");
+	replace_feed
+		.arg_text(replace_raw.into())
+		.expect("stream replace");
+	replace_feed
+		.args_committed(replace_raw.into())
+		.expect("commit replace");
 	let replace_events = replace.call(replace_incoming).collect::<Vec<_>>().await;
 	assert!(matches!(
 		replace_events.last(),
@@ -310,16 +329,14 @@ async fn current_replace_and_patch_routes_apply_the_pi_argument_forms() {
 
 	let patch_fake = Fake::with_files(&[("a.txt", b"alpha\n")]);
 	let patch = patch_tool(patch_fake.clone(), FormatPolicy::BestEffort);
-	let patch_raw =
-		r#"{"path":"a.txt","edits":[{"op":"update","diff":"@@\n-alpha\n+beta\n"}]}"#;
+	let patch_raw = r#"{"path":"a.txt","edits":[{"op":"update","diff":"@@\n-alpha\n+beta\n"}]}"#;
 	let (patch_feed, patch_incoming) = IncomingParams::channel();
 	patch_feed.arg_text(patch_raw.into()).expect("stream patch");
-	patch_feed.args_committed(patch_raw.into()).expect("commit patch");
+	patch_feed
+		.args_committed(patch_raw.into())
+		.expect("commit patch");
 	let patch_events = patch.call(patch_incoming).collect::<Vec<_>>().await;
-	assert!(matches!(
-		patch_events.last(),
-		Some(Ev::Done(ToolTerminal::Done { result: Ok(_), .. }))
-	));
+	assert!(matches!(patch_events.last(), Some(Ev::Done(ToolTerminal::Done { result: Ok(_), .. }))));
 	assert!(matches!(
 		&patch_fake.state.lock().commits[0].action,
 		EditAction::Write { content } if content.as_ref() == b"beta\n"
@@ -340,7 +357,9 @@ async fn host_edit_policy_overrides_legacy_fuzzy_request_and_requires_seen() {
 	let raw = r#"{"edits":[{"path":"a.txt","old":"function bar() {}","new":"replaced","allow_fuzzy":true,"threshold":0.7}]}"#;
 	let (feed, incoming) = IncomingParams::channel();
 	feed.arg_text(raw.into()).expect("stream denied fuzzy call");
-	feed.args_committed(raw.into()).expect("commit denied fuzzy call");
+	feed
+		.args_committed(raw.into())
+		.expect("commit denied fuzzy call");
 	let denied_events = denied.call(incoming).collect::<Vec<_>>().await;
 	assert!(matches!(
 		denied_events.last(),
@@ -359,8 +378,12 @@ async fn host_edit_policy_overrides_legacy_fuzzy_request_and_requires_seen() {
 		false,
 	);
 	let (feed, incoming) = IncomingParams::channel();
-	feed.arg_text(raw.into()).expect("stream allowed fuzzy call");
-	feed.args_committed(raw.into()).expect("commit allowed fuzzy call");
+	feed
+		.arg_text(raw.into())
+		.expect("stream allowed fuzzy call");
+	feed
+		.args_committed(raw.into())
+		.expect("commit allowed fuzzy call");
 	let allowed_events = allowed.call(incoming).collect::<Vec<_>>().await;
 	assert!(matches!(
 		allowed_events.last(),

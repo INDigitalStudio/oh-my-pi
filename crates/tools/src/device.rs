@@ -31,8 +31,8 @@ pub const PROMPT_GUIDANCE: &str =
 Dynamic devices are invoked through the `dyn` builtin inside the shell tool. Run `dyn` to list the \
 	 live device catalog (`dyn --q <text>` searches it), `dyn <device> --help` for exact usage and \
 	 schema, and `dyn <device> [args…]` to invoke one. Usage is derived from each device's schema: \
-	 required string/number/enum properties are positionals in declaration order, every property has a \
-	 `--flag` (`--no-flag` for booleans, repeated for arrays, dotted for nested keys), `dyn \
+	 required string/number/enum properties are positionals in declaration order, every property \
+	 has a `--flag` (`--no-flag` for booleans, repeated for arrays, dotted for nested keys), `dyn \
 	 <device> --json '<payload>'` passes raw JSON arguments, and `@FILE` or `-` (stdin) supply \
 	 either a JSON object or literal text for the next positional. Image results arrive as \
 	 attachments. Retry an empty or narrow search with different terms; absent devices are \
@@ -580,9 +580,10 @@ mod tests {
 		// The AutoQA command is schema-shaped: report_issue@1 requires
 		// `session_id`, `device`, `rev` (positionals, in that order) and the
 		// `verdict` object, which is never positional.
-		assert!(AUTO_QA_PROMPT_GUIDANCE.contains(
-			"`dyn report_issue <session-id> <device> <rev> --verdict '<JSON verdict>'`"
-		));
+		assert!(
+			AUTO_QA_PROMPT_GUIDANCE
+				.contains("`dyn report_issue <session-id> <device> <rev> --verdict '<JSON verdict>'`")
+		);
 		assert!(!AUTO_QA_PROMPT_GUIDANCE.contains("--rev"));
 		for guidance in [PROMPT_GUIDANCE, AUTO_QA_PROMPT_GUIDANCE] {
 			assert!(!guidance.contains("dyn://"));

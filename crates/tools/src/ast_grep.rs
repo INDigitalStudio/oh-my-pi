@@ -22,11 +22,11 @@ const PAGE_LIMIT: usize = 50;
 /// Agent-supplied structural search arguments.
 pub struct Params {
 	/// Ast-grep structural pattern, including any metavariables to bind.
-	pub pat:    Str,
+	pub pat:  Str,
 	#[serde(default)]
 	/// Semicolon-separated workspace-relative files, directories, or globs;
 	/// defaults to `"."`.
-	pub path:   Option<Str>,
+	pub path: Option<Str>,
 	#[serde(default)]
 	/// Matches to skip before the page starts; defaults to `0`.
 	pub skip: usize,
@@ -35,15 +35,15 @@ pub struct Params {
 /// `ast_grep@1` argument shape, retained only to lift historical calls.
 #[derive(Deserialize)]
 struct ParamsV1 {
-	pat:    Str,
+	pat:     Str,
 	#[serde(default)]
-	path:   Option<Str>,
+	path:    Option<Str>,
 	#[serde(default)]
-	cursor: usize,
+	cursor:  usize,
 	#[serde(default, rename = "limit")]
-	_limit: Option<usize>,
+	_limit:  Option<usize>,
 	#[serde(default)]
-	i:      Option<Str>,
+	i:       Option<Str>,
 	#[serde(default)]
 	notrunc: Option<bool>,
 }
@@ -80,14 +80,18 @@ pub struct Advisory {
 /// Paginated structural-search result returned to the agent.
 pub struct Payload {
 	/// Current page of matches in stable path and source order.
-	pub matches:     Vec<Match>,
+	pub matches:    Vec<Match>,
 	/// Per-file failures that did not prevent other targets from being searched.
-	pub advisories:  Vec<Advisory>,
+	pub advisories: Vec<Advisory>,
 	/// Number of matches across all targets before pagination.
-	pub total:       usize,
+	pub total:      usize,
 	/// `skip` value that resumes at the next page, or `None` when this is the
 	/// final page.
 	pub next_skip:  Option<usize>,
+	/// Files the search opened, including those that produced an advisory
+	/// (pi `filesSearched`); lifted `@1` calls did not record it.
+	#[serde(default)]
+	pub files_searched: usize,
 }
 
 /// `ast_grep@1` payload shape, retained only to lift historical verdicts.
@@ -175,6 +179,7 @@ impl Tool for AstGrep {
 			let files = match omp_ast::ops::collect_matched_files(&self.root, &targets) { Ok(v) => v, Err(e) => { yield done(Err(Fault { message: Str::new(e.to_string()) })); return; } };
 			let mut matches = Vec::new();
 			let mut advisories = Vec::new();
+			let files_searched = files.len();
 			for file in files {
 				let language = match omp_ast::ops::resolve_language(None, &file.absolute_path) { Ok(v) => v, Err(e) => { advisories.push(Advisory { path: file.relative_path, message: Str::new(e.to_string()) }); continue; } };
 				let patterns = match omp_ast::ops::compile_search_patterns(&params.pat, language) { Ok(v) => v, Err(e) => { advisories.push(Advisory { path: file.relative_path, message: Str::new(e.to_string()) }); continue; } };
@@ -188,7 +193,7 @@ impl Tool for AstGrep {
 			let start = params.skip.min(total);
 			let end = start.saturating_add(PAGE_LIMIT).min(total);
 			let page = matches.drain(start..end).collect();
-			yield done(Ok(Payload { matches: page, advisories, total, next_skip: (end < total).then_some(end) }));
+			yield done(Ok(Payload { matches: page, advisories, total, next_skip: (end < total).then_some(end), files_searched }));
 		}
 	}
 
@@ -262,6 +267,7 @@ fn lift_cursor_to_skip(from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall>
 			advisories: payload.advisories,
 			total:      payload.total,
 			next_skip:  payload.next_cursor,
+			files_searched: 0,
 		}))
 		.ok()?,
 		CallOutcome::Faulted(_) | CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. } => {
@@ -327,18 +333,27 @@ mod tests {
 	#[test]
 	fn skip_resumes_fixed_size_pagination_past_the_first_matches() {
 		let dir = tempfile::tempdir().expect("tempdir");
-		let source = (0..55).map(|index| format!("call{index}({index});\n")).collect::<String>();
+		let source = (0..55)
+			.map(|index| format!("call{index}({index});\n"))
+			.collect::<String>();
 		fs::write(dir.path().join("calls.ts"), source).expect("write calls.ts");
 
 		let first = search(dir.path().to_path_buf(), r#"{"pat":"$F($A)","path":"*.ts"}"#);
 		assert_eq!(first.total, 55);
 		assert_eq!(first.matches.len(), 50);
 		assert_eq!(first.next_skip, Some(50));
-		let first_texts = first.matches.iter().map(|m| m.text.as_str()).collect::<Vec<_>>();
+		let first_texts = first
+			.matches
+			.iter()
+			.map(|m| m.text.as_str())
+			.collect::<Vec<_>>();
 
-		let second =
-			search(dir.path().to_path_buf(), r#"{"pat":"$F($A)","path":"*.ts","skip":50}"#);
-		let second_texts = second.matches.iter().map(|m| m.text.as_str()).collect::<Vec<_>>();
+		let second = search(dir.path().to_path_buf(), r#"{"pat":"$F($A)","path":"*.ts","skip":50}"#);
+		let second_texts = second
+			.matches
+			.iter()
+			.map(|m| m.text.as_str())
+			.collect::<Vec<_>>();
 		assert_eq!(second.matches.len(), 5);
 		assert_eq!(second.next_skip, None);
 		for text in &first_texts {
@@ -365,14 +380,11 @@ mod tests {
 	#[test]
 	fn lifts_rev1_cursor_calls_onto_skip() {
 		let tool = tool(PathBuf::from("."));
-		let raw_args =
-			br#"{"i":"Finding calls","notrunc":true,"pat":"$F($A)","cursor":7,"limit":3}"#;
-		let verdict = br#"{"kind":"ok","value":{"matches":[],"advisories":[],"total":12,"next_cursor":10}}"#;
+		let raw_args = br#"{"i":"Finding calls","notrunc":true,"pat":"$F($A)","cursor":7,"limit":3}"#;
+		let verdict =
+			br#"{"kind":"ok","value":{"matches":[],"advisories":[],"total":12,"next_cursor":10}}"#;
 		let lifted = tool
-			.lift(&Rev { family: Default::default(), n: 1 }, RecordedCall {
-				raw_args,
-				verdict,
-			})
+			.lift(&Rev { family: Default::default(), n: 1 }, RecordedCall { raw_args, verdict })
 			.expect("rev 1 lifts to rev 2");
 		let params: Params = omp_tool::decode_params(
 			std::str::from_utf8(&lifted.raw_args).expect("lifted arguments are UTF-8"),
@@ -393,11 +405,9 @@ mod tests {
 		assert_eq!(payload.next_skip, Some(10));
 		assert_eq!(payload.total, 12);
 		assert!(
-			tool.lift(&Rev { family: Default::default(), n: 2 }, RecordedCall {
-				raw_args,
-				verdict
-			})
-			.is_none()
+			tool
+				.lift(&Rev { family: Default::default(), n: 2 }, RecordedCall { raw_args, verdict })
+				.is_none()
 		);
 	}
 }

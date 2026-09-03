@@ -11,8 +11,8 @@
 //!
 //! - **Positionals** are the root properties that are `required` and scalar
 //!   (`string`, `integer`, `number`, or any `enum`), in the schema's property
-//!   declaration order: the first such property is the first positional, and
-//!   so on. Bare arguments fill the next positional that no earlier flag,
+//!   declaration order: the first such property is the first positional, and so
+//!   on. Bare arguments fill the next positional that no earlier flag,
 //!   positional, or merged object has set. Booleans and objects are never
 //!   positional. `--` ends option parsing; everything after it is a bare
 //!   argument.
@@ -62,8 +62,8 @@ use crate::{
 const HELP: &str = "dyn — discover and invoke live dynamic devices\n\nUsage:\n  dyn\n  dyn --q \
                     <TEXT>\n  dyn <NAMESPACE>/<TOOL> --help\n  dyn <NAMESPACE>/<TOOL> [ARGS] \
                     [--FLAG VALUE ...] [@FILE] [-]\n\nPositionals, flags, and --help are derived \
-                    from each device's JSON schema. @FILE and - merge a JSON object from a file or \
-                    stdin, or bind other text to the next positional. Flags override merged \
+                    from each device's JSON schema. @FILE and - merge a JSON object from a file \
+                    or stdin, or bind other text to the next positional. Flags override merged \
                     values.\n";
 
 /// Builds the dynamic-device builtin around one environment-owned host.
@@ -174,7 +174,9 @@ async fn run<SE: ShellExtensions>(
 		parsed.insert("i".to_owned(), Value::String(format!("Invoking {first}")));
 	}
 
-	let cancel = context.cancel_token().unwrap_or_else(CancellationToken::new);
+	let cancel = context
+		.cancel_token()
+		.unwrap_or_else(CancellationToken::new);
 	match host.call(first, Value::Object(parsed), cancel).await {
 		Ok(output) => {
 			let mut stdout = context.stdout();
@@ -579,9 +581,7 @@ fn normalize_node(root: &Value, schema: &Value, resolving: &mut BTreeSet<String>
 					.map(|properties| {
 						properties
 							.iter()
-							.map(|(name, child)| {
-								(name.clone(), normalize_node(root, child, resolving))
-							})
+							.map(|(name, child)| (name.clone(), normalize_node(root, child, resolving)))
 							.collect()
 					})
 					.unwrap_or_default(),
@@ -648,10 +648,7 @@ fn combine_alternatives(alternatives: &[Value]) -> Map<String, Value> {
 						entry.insert(schema.clone());
 					},
 					serde_json::map::Entry::Occupied(mut entry) => {
-						let merged = combine_alternatives(&[
-							entry.get().clone(),
-							schema.clone(),
-						]);
+						let merged = combine_alternatives(&[entry.get().clone(), schema.clone()]);
 						entry.insert(Value::Object(merged));
 					},
 				}
@@ -667,7 +664,12 @@ fn combine_alternatives(alternatives: &[Value]) -> Map<String, Value> {
 				object
 					.get("required")
 					.and_then(Value::as_array)
-					.map(|values| values.iter().filter_map(Value::as_str).collect::<BTreeSet<_>>())
+					.map(|values| {
+						values
+							.iter()
+							.filter_map(Value::as_str)
+							.collect::<BTreeSet<_>>()
+					})
 					.unwrap_or_default()
 			})
 			.collect::<Vec<_>>();
@@ -777,7 +779,11 @@ fn value_usage(leaf: &SchemaLeaf<'_>) -> String {
 				.collect::<Vec<_>>()
 				.join("|")
 		);
-		return if leaf.repeatable { format!("{values}...") } else { values };
+		return if leaf.repeatable {
+			format!("{values}...")
+		} else {
+			values
+		};
 	}
 	let kind = match leaf.kind {
 		ScalarKind::String => "<STRING>",
@@ -962,9 +968,7 @@ fn next_positional<'l, 'a>(
 	overrides: &Map<String, Value>,
 ) -> Option<&'l SchemaLeaf<'a>> {
 	leaves.iter().find(|leaf| {
-		leaf.positional
-			&& !output.contains_key(leaf.path[0])
-			&& !overrides.contains_key(leaf.path[0])
+		leaf.positional && !output.contains_key(leaf.path[0]) && !overrides.contains_key(leaf.path[0])
 	})
 }
 
@@ -1255,11 +1259,7 @@ mod tests {
 		parse_args(schema, &args(argv), Path::new("/"), None, &mut stdin)
 	}
 
-	fn parse_in(
-		schema: &Value,
-		argv: &[&str],
-		cwd: &Path,
-	) -> Result<Map<String, Value>, ArgError> {
+	fn parse_in(schema: &Value, argv: &[&str], cwd: &Path) -> Result<Map<String, Value>, ArgError> {
 		parse_args(schema, &args(argv), cwd, None, &mut io::empty())
 	}
 
@@ -1298,8 +1298,8 @@ mod tests {
 
 	#[test]
 	fn bare_literal_binds_the_sole_required_string() {
-		let parsed = parse(&text_schema(), &["blueprint of a frog", "--loud"], "")
-			.expect("literal binds");
+		let parsed =
+			parse(&text_schema(), &["blueprint of a frog", "--loud"], "").expect("literal binds");
 		assert_eq!(Value::Object(parsed), json!({ "text": "blueprint of a frog", "loud": true }));
 	}
 
@@ -1326,8 +1326,8 @@ mod tests {
 		let parsed = parse(&text_schema(), &["-"], r#"{"text":"from json","voice":"a"}"#)
 			.expect("stdin object merges");
 		assert_eq!(Value::Object(parsed), json!({ "text": "from json", "voice": "a" }));
-		let error = parse(&text_schema(), &["--text", "set", "-"], "plain\n")
-			.expect_err("no target for text");
+		let error =
+			parse(&text_schema(), &["--text", "set", "-"], "plain\n").expect_err("no target for text");
 		assert!(matches!(error, ArgError::NoLiteralTarget { origin } if origin == "<stdin>"));
 	}
 
@@ -1491,11 +1491,8 @@ mod tests {
 				"enabled": true
 			})
 		);
-		let help = render_help(&DynSchema {
-			name: Str::new_static("browser"),
-			description: None,
-			schema,
-		});
+		let help =
+			render_help(&DynSchema { name: Str::new_static("browser"), description: None, schema });
 		assert!(help.contains("dyn browser <action>"));
 		assert!(help.contains("--app.cdp-url <STRING>"));
 		assert!(help.contains("--app.relay / --no-app.relay"));
@@ -1514,14 +1511,7 @@ mod tests {
 		.expect("write args");
 		let parsed = parse_in(
 			&report_issue_schema(),
-			&[
-				"--device",
-				"bash",
-				"--json",
-				"@args.json",
-				"--verdict",
-				"@verdict.json",
-			],
+			&["--device", "bash", "--json", "@args.json", "--verdict", "@verdict.json"],
 			root.path(),
 		)
 		.expect("file-backed flag values bind");
@@ -1556,10 +1546,13 @@ mod tests {
 	fn image_blobs_are_written_as_graphics_passthrough_and_other_media_raw() {
 		let png = Bytes::from_static(b"\x89PNG\r\n\x1a\nfake");
 		let mut stdout = Vec::new();
-		write_output(&mut stdout, &DynOutput::Parts(vec![
-			DynOutput::Text(Str::new_static("saved")),
-			DynOutput::Blob { mime: Str::new_static("image/png"), bytes: png.clone() },
-		]))
+		write_output(
+			&mut stdout,
+			&DynOutput::Parts(vec![DynOutput::Text(Str::new_static("saved")), DynOutput::Blob {
+				mime:  Str::new_static("image/png"),
+				bytes: png.clone(),
+			}]),
+		)
 		.expect("write parts");
 		let (text, images) = extract_image_passthrough(&stdout);
 		assert_eq!(text, b"saved\n\n");

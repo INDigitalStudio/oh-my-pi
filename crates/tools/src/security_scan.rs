@@ -102,71 +102,71 @@ pub enum AllHistory {
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// Operation discriminator.
-	pub action:                   Action,
+	pub action:                 Action,
 	/// Frozen plan identifier.
 	#[serde(default)]
-	pub plan_id:                  Option<Str>,
+	pub plan_id:                Option<Str>,
 	/// Running operation identifier.
 	#[serde(default)]
-	pub operation_id:             Option<Str>,
+	pub operation_id:           Option<Str>,
 	/// Repository slice kind.
 	#[serde(default)]
-	pub target_kind:              Option<TargetKind>,
+	pub target_kind:            Option<TargetKind>,
 	/// Included workspace-relative paths.
 	#[serde(default)]
-	pub include_paths:            Option<Vec<Str>>,
+	pub include_paths:          Option<Vec<Str>>,
 	/// Excluded workspace-relative paths.
 	#[serde(default)]
-	pub exclude_paths:            Option<Vec<Str>>,
+	pub exclude_paths:          Option<Vec<Str>>,
 	/// Base revision for a ref diff.
 	#[serde(default)]
-	pub base_revision:            Option<Str>,
+	pub base_revision:          Option<Str>,
 	/// Head revision for a ref diff.
 	#[serde(default)]
-	pub head_revision:            Option<Str>,
+	pub head_revision:          Option<Str>,
 	/// Additional knowledge-base paths.
 	#[serde(default)]
-	pub knowledge_base_paths:     Option<Vec<Str>>,
+	pub knowledge_base_paths:   Option<Vec<Str>>,
 	/// Optional output directory.
 	#[serde(default)]
-	pub output_root:              Option<Str>,
+	pub output_root:            Option<Str>,
 	/// Archive an existing output directory.
 	#[serde(default)]
-	pub archive_existing:         Option<bool>,
+	pub archive_existing:       Option<bool>,
 	/// Authentication-registry credential id.
 	#[serde(default)]
 	#[schemars(range(min = 1))]
-	pub credential_id:            Option<u64>,
+	pub credential_id:          Option<u64>,
 	/// Scan identifier containing a finding.
 	#[serde(default)]
-	pub scan_id:                  Option<Str>,
+	pub scan_id:                Option<Str>,
 	/// Finding identifier to validate.
 	#[serde(default)]
-	pub finding_id:               Option<Str>,
+	pub finding_id:             Option<Str>,
 	/// Finding validation verdict.
 	#[serde(default)]
-	pub validation_status:        Option<ValidationStatus>,
+	pub validation_status:      Option<ValidationStatus>,
 	/// Finding validation summary.
 	#[serde(default)]
-	pub validation_summary:       Option<Str>,
+	pub validation_summary:     Option<Str>,
 	/// Finding validation evidence.
 	#[serde(default)]
-	pub validation_evidence:      Option<Vec<ValidationEvidence>>,
+	pub validation_evidence:    Option<Vec<ValidationEvidence>>,
 	/// Cloud scan configuration id.
 	#[serde(default)]
-	pub cloud_configuration_id:   Option<Str>,
+	pub cloud_configuration_id: Option<Str>,
 	/// Cloud repository id.
 	#[serde(default)]
-	pub repository_id:            Option<Str>,
+	pub repository_id:          Option<Str>,
 	/// Cloud repository URL.
 	#[serde(default)]
-	pub repository_url:           Option<Str>,
+	pub repository_url:         Option<Str>,
 	/// Cloud environment id.
 	#[serde(default)]
-	pub environment_id:           Option<Str>,
+	pub environment_id:         Option<Str>,
 	/// Cloud lookback in days, or `all`.
 	#[serde(default)]
-	pub lookback_days:             Option<LookbackDays>,
+	pub lookback_days:          Option<LookbackDays>,
 }
 
 /// Durable security operation result.
@@ -205,10 +205,7 @@ pub enum Fault {
 /// Environment-owned security scan authority.
 pub trait SecurityScanControl: Clone + Send + Sync + 'static {
 	/// Executes one validated operation.
-	fn execute(
-		&self,
-		params: Params,
-	) -> impl Future<Output = Result<Payload, Fault>> + Send + '_;
+	fn execute(&self, params: Params) -> impl Future<Output = Result<Payload, Fault>> + Send + '_;
 }
 
 /// Frozen security device binding.
@@ -223,7 +220,8 @@ pub fn spec() -> ToolSpec {
 		name:            sf!("security_scan"),
 		rev:             Rev { family: Str::default(), n: 1 },
 		description:     sf!(
-			"Plan, run, inspect, cancel, and validate repository security scans; cloud operations are available only when configured."
+			"Plan, run, inspect, cancel, and validate repository security scans; cloud operations \
+			 are available only when configured."
 		),
 		schema:          omp_tool::schema::<Params>(),
 		constraint:      Constraint::Schema {
@@ -316,17 +314,20 @@ fn commit_event(error: CommitError) -> Ev<Update, Payload, Fault> {
 
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
-		path: Vec::new(),
+		path:     Vec::new(),
 		expected: sf!("one committed JSON argument object"),
-		kind: ArgIssueKind::Protocol,
-		example: None,
-		found: Some(message),
+		kind:     ArgIssueKind::Protocol,
+		example:  None,
+		found:    Some(message),
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use std::{future, sync::{Arc, Mutex}};
+	use std::{
+		future,
+		sync::{Arc, Mutex},
+	};
 
 	use futures::StreamExt as _;
 
@@ -344,7 +345,7 @@ mod tests {
 			future::ready(Ok(Payload {
 				action: params.action,
 				output: sf!("ok"),
-				data: serde_json::json!({}),
+				data:   serde_json::json!({}),
 			}))
 		}
 	}
@@ -355,15 +356,36 @@ mod tests {
 		assert_eq!(schema["additionalProperties"], false);
 		assert_eq!(schema["required"], serde_json::json!(["i", "action"]));
 		assert_eq!(
-			schema["properties"].as_object().expect("properties").keys()
+			schema["properties"]
+				.as_object()
+				.expect("properties")
+				.keys()
 				.map(String::as_str)
 				.collect::<std::collections::BTreeSet<_>>(),
 			[
-				"action", "archive_existing", "base_revision", "cloud_configuration_id",
-				"credential_id", "environment_id", "exclude_paths", "finding_id", "head_revision",
-				"i", "include_paths", "knowledge_base_paths", "lookback_days", "notrunc",
-				"operation_id", "output_root", "plan_id", "repository_id", "repository_url",
-				"scan_id", "target_kind", "validation_evidence", "validation_status",
+				"action",
+				"archive_existing",
+				"base_revision",
+				"cloud_configuration_id",
+				"credential_id",
+				"environment_id",
+				"exclude_paths",
+				"finding_id",
+				"head_revision",
+				"i",
+				"include_paths",
+				"knowledge_base_paths",
+				"lookback_days",
+				"notrunc",
+				"operation_id",
+				"output_root",
+				"plan_id",
+				"repository_id",
+				"repository_url",
+				"scan_id",
+				"target_kind",
+				"validation_evidence",
+				"validation_status",
 				"validation_summary",
 			]
 			.into_iter()
@@ -394,10 +416,7 @@ mod tests {
 		feed.arg_text(raw.into()).expect("stream args");
 		feed.args_committed(raw.into()).expect("commit args");
 		let events = security.call(incoming).collect::<Vec<_>>().await;
-		assert!(matches!(
-			events.last(),
-			Some(Ev::Done(ToolTerminal::Done { result: Ok(_), .. }))
-		));
+		assert!(matches!(events.last(), Some(Ev::Done(ToolTerminal::Done { result: Ok(_), .. }))));
 		assert_eq!(*control.0.lock().expect("recording"), Some(Action::Preflight));
 	}
 }

@@ -234,46 +234,6 @@ pub fn truncate_head(content: &str, options: TruncationOptions) -> TruncationRes
 	}
 }
 
-/// Appends the read continuation notice when `truncation` omitted content.
-pub fn append_head_truncation_notice(
-	output: &mut String,
-	truncation: &TruncationResult<'_>,
-	start_line: usize,
-	total_file_lines: Option<usize>,
-) {
-	if !truncation.truncated {
-		return;
-	}
-	let total_file_lines = total_file_lines.unwrap_or(truncation.total_lines);
-	let end_line = start_line
-		.saturating_add(truncation.shown_lines())
-		.saturating_sub(1);
-	let next_offset = end_line + 1;
-	let _ = write!(
-		output,
-		"\n\n[Showing lines {start_line}-{end_line} of {total_file_lines}. Use :{next_offset} to \
-		 continue]"
-	);
-}
-
-/// Appends the exact footer used after spilling the complete output to a
-/// session artifact.
-pub fn append_blob_truncation_notice(
-	output: &mut String,
-	truncation: &TruncationResult<'_>,
-	artifact_uri: &str,
-) {
-	if !truncation.truncated {
-		return;
-	}
-	append_blob_truncation_notice_counts(
-		output,
-		u64::try_from(truncation.shown_lines()).unwrap_or(u64::MAX),
-		u64::try_from(truncation.total_lines).unwrap_or(u64::MAX),
-		artifact_uri,
-	);
-}
-
 fn append_blob_truncation_notice_counts(
 	output: &mut String,
 	shown_lines: u64,

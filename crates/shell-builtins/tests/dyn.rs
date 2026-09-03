@@ -107,12 +107,7 @@ impl DynHost for FakeHost {
 		)
 	}
 
-	fn call(
-		&self,
-		name: &str,
-		args: Value,
-		_cancel: CancellationToken,
-	) -> DynFuture<'_, DynOutput> {
+	fn call(&self, name: &str, args: Value, _cancel: CancellationToken) -> DynFuture<'_, DynOutput> {
 		let name = Str::new(name);
 		let calls = Arc::clone(&self.calls);
 		Box::pin(async move {
@@ -122,10 +117,7 @@ impl DynHost for FakeHost {
 			if name == "fixture/image" {
 				return Ok(DynOutput::Parts(vec![
 					DynOutput::Text(Str::new_static("rendered")),
-					DynOutput::Blob {
-						mime:  Str::new_static("image/png"),
-						bytes: PNG.into(),
-					},
+					DynOutput::Blob { mime: Str::new_static("image/png"), bytes: PNG.into() },
 				]));
 			}
 			calls.lock().push((name, args.clone()));

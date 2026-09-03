@@ -505,19 +505,20 @@ fn generated_schema_exposes_optional_image_question_without_a_new_tool() {
 	}))
 	.expect("rev 1 verdict serializes");
 	let lifted = tool
-		.lift(
-			&Rev { family: Default::default(), n: 1 },
-			RecordedCall { raw_args: rev1_args, verdict: &rev1_verdict },
-		)
+		.lift(&Rev { family: Default::default(), n: 1 }, RecordedCall {
+			raw_args: rev1_args,
+			verdict:  &rev1_verdict,
+		})
 		.expect("read@1 lifts onto read@2");
 	assert_eq!(lifted.raw_args.as_ref(), rev1_args);
 	assert_eq!(lifted.verdict.as_ref(), rev1_verdict.as_slice());
 	assert!(
-		tool.lift(
-			&Rev { family: Default::default(), n: 2 },
-			RecordedCall { raw_args: rev1_args, verdict: &rev1_verdict },
-		)
-		.is_none()
+		tool
+			.lift(&Rev { family: Default::default(), n: 2 }, RecordedCall {
+				raw_args: rev1_args,
+				verdict:  &rev1_verdict,
+			},)
+			.is_none()
 	);
 
 	for legacy in [
@@ -1529,18 +1530,12 @@ async fn image_question_routes_question_and_blob_to_vision_or_reports_unavailabl
 	.await;
 	let [
 		read::PayloadPart::Text { text: payload_text },
-		read::PayloadPart::Blob {
-			vision: Some(read::VisionRequest { question }),
-			..
-		},
+		read::PayloadPart::Blob { vision: Some(read::VisionRequest { question }), .. },
 	] = result.parts.as_slice()
 	else {
 		panic!("image question must remain a typed vision request: {:?}", result.parts);
 	};
-	assert!(
-		payload_text.contains("Image question: What color is the pixel?"),
-		"{payload_text}"
-	);
+	assert!(payload_text.contains("Image question: What color is the pixel?"), "{payload_text}");
 	assert_eq!(question, "What color is the pixel?");
 
 	let vision_parts = project(
@@ -1553,10 +1548,7 @@ async fn image_question_routes_question_and_blob_to_vision_or_reports_unavailabl
 	let [Part::Text { text: vision_text }, Part::Blob { .. }] = vision_parts.as_slice() else {
 		panic!("vision route must receive question text and the image: {vision_parts:?}");
 	};
-	assert!(
-		vision_text.contains("Image question: What color is the pixel?"),
-		"{vision_text}"
-	);
+	assert!(vision_text.contains("Image question: What color is the pixel?"), "{vision_text}");
 
 	let unavailable_parts = project(
 		sources.clone(),
@@ -1565,12 +1557,12 @@ async fn image_question_routes_question_and_blob_to_vision_or_reports_unavailabl
 		false,
 	)
 	.await;
-	let [
-		Part::Text { text: unavailable_question },
-		Part::Text { text: unavailable },
-	] = unavailable_parts.as_slice()
+	let [Part::Text { text: unavailable_question }, Part::Text { text: unavailable }] =
+		unavailable_parts.as_slice()
 	else {
-		panic!("text-only route must receive a typed unavailability projection: {unavailable_parts:?}");
+		panic!(
+			"text-only route must receive a typed unavailability projection: {unavailable_parts:?}"
+		);
 	};
 	assert!(
 		unavailable_question.contains("Image question: What color is the pixel?"),
@@ -1583,11 +1575,7 @@ async fn image_question_routes_question_and_blob_to_vision_or_reports_unavailabl
 
 	sources.file("notes.txt", "plain text");
 	assert_eq!(
-		text(
-			sources,
-			r#"{"path":"notes.txt","question":"What is pictured?"}"#,
-		)
-		.await,
+		text(sources, r#"{"path":"notes.txt","question":"What is pictured?"}"#,).await,
 		"Image questions require a supported PNG, JPEG, GIF, WebP, or rasterized SVG/PDF image."
 	);
 }

@@ -1,14 +1,14 @@
 //! Structured child-output validation against a caller-provided JSON Schema.
 //!
-//! `task@1` accepts an invocation-specific `outputSchema`; the spawner validates
-//! every child's terminal `yield` data against it before the child result
-//! settles.  The validator covers the JSON Schema 2020-12 keywords providers
-//! and callers actually emit for tool output (`type`, `properties`, `required`,
-//! `additionalProperties`, `items`, `prefixItems`, `enum`, `const`, `anyOf`,
-//! `oneOf`, `allOf`, `not`, `minItems`, `maxItems`, `minLength`, `maxLength`,
-//! `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `pattern`,
-//! `$ref` to `#/$defs/…` or `#/definitions/…`, and boolean schemas).  Unknown
-//! keywords are ignored, matching the specification's open vocabulary.
+//! `task@1` accepts an invocation-specific `outputSchema`; the spawner
+//! validates every child's terminal `yield` data against it before the child
+//! result settles.  The validator covers the JSON Schema 2020-12 keywords
+//! providers and callers actually emit for tool output (`type`, `properties`,
+//! `required`, `additionalProperties`, `items`, `prefixItems`, `enum`, `const`,
+//! `anyOf`, `oneOf`, `allOf`, `not`, `minItems`, `maxItems`, `minLength`,
+//! `maxLength`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`,
+//! `pattern`, `$ref` to `#/$defs/…` or `#/definitions/…`, and boolean schemas).
+//! Unknown keywords are ignored, matching the specification's open vocabulary.
 
 use omp_core::{Str, sf};
 use serde_json::{Map, Value};
@@ -152,10 +152,7 @@ fn check(
 	if let Some(expected) = object.get("type")
 		&& !type_matches(expected, data)
 	{
-		return Ok(Err(violation(
-			path,
-			sf!("expected type {expected}, found {}", type_name(data)),
-		)));
+		return Ok(Err(violation(path, sf!("expected type {expected}, found {}", type_name(data)))));
 	}
 	if let Some(expected) = object.get("const")
 		&& expected != data
@@ -315,7 +312,11 @@ fn check_string(
 	Ok(Ok(()))
 }
 
-fn check_number(schema: &Map<String, Value>, value: f64, path: &str) -> Result<(), SchemaViolation> {
+fn check_number(
+	schema: &Map<String, Value>,
+	value: f64,
+	path: &str,
+) -> Result<(), SchemaViolation> {
 	if let Some(min) = schema.get("minimum").and_then(Value::as_f64)
 		&& value < min
 	{
@@ -469,9 +470,7 @@ mod tests {
 		let foreign = json!({"$ref": "https://example.invalid/schema.json"});
 		assert_eq!(
 			validate(&foreign, &json!({})),
-			Err(SchemaError::UnresolvedRef {
-				reference: sf!("https://example.invalid/schema.json")
-			})
+			Err(SchemaError::UnresolvedRef { reference: sf!("https://example.invalid/schema.json") })
 		);
 	}
 

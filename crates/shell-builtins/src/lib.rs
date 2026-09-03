@@ -88,8 +88,7 @@ mod top;
 
 pub use factory::{dyn_builtin, process_builtins, utility_builtins};
 pub use graphics::{
-	ImagePassthrough, encode_image_passthrough, extract_image_passthrough,
-	image_passthrough_ranges,
+	ImagePassthrough, encode_image_passthrough, extract_image_passthrough, image_passthrough_ranges,
 };
 pub use host::{
 	DynDevice, DynFault, DynFuture, DynHost, DynOutput, DynSchema, panic_scope_active,

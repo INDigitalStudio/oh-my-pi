@@ -20,8 +20,7 @@ use omp_proto::inference::v1::{
 use omp_shell_builtins::{ImagePassthrough, image_passthrough_ranges};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Effects, Ev, IncomingParams,
-	Interrupt, InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool,
-	ToolSpec, ToolTerminal,
+	Interrupt, InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1185,7 +1184,10 @@ fn extract_transcript_images(transcript: &mut [TranscriptFrame]) -> Vec<ImagePas
 		}
 		images.extend(found);
 		let mut channel_offset = 0;
-		for frame in transcript.iter_mut().filter(|frame| frame.channel == channel) {
+		for frame in transcript
+			.iter_mut()
+			.filter(|frame| frame.channel == channel)
+		{
 			let frame_start = channel_offset;
 			let frame_end = frame_start + frame.data.len();
 			channel_offset = frame_end;
@@ -1195,9 +1197,7 @@ fn extract_transcript_images(transcript: &mut [TranscriptFrame]) -> Vec<ImagePas
 				let removed_start = range.start.max(frame_start).min(frame_end);
 				let removed_end = range.end.max(frame_start).min(frame_end);
 				if removed_start < removed_end {
-					cleaned.extend_from_slice(
-						&joined[retained_from..removed_start],
-					);
+					cleaned.extend_from_slice(&joined[retained_from..removed_start]);
 					retained_from = removed_end;
 				}
 			}
@@ -1209,9 +1209,10 @@ fn extract_transcript_images(transcript: &mut [TranscriptFrame]) -> Vec<ImagePas
 }
 
 fn spilled_output_note(status: &ExecStatus) -> String {
-	status.spilled_output.as_ref().map_or_else(String::new, |blob| {
-		format!("; full output: artifact://sha256/{}", blob.hash)
-	})
+	status
+		.spilled_output
+		.as_ref()
+		.map_or_else(String::new, |blob| format!("; full output: artifact://sha256/{}", blob.hash))
 }
 
 fn attachment_parts(attachments: &[BlobRef], media: bool, limit: usize) -> Vec<Part> {
