@@ -7,11 +7,10 @@
 
 use std::{
 	borrow::Cow,
-	collections::{BTreeMap, VecDeque},
+	collections::BTreeMap,
 	fmt::Write as _,
 	future,
 	future::Future,
-	io::Write as _,
 	path::PathBuf,
 	sync::{
 		Arc,
@@ -302,8 +301,6 @@ fn standard_eval_description() -> Str {
 	task_description(TaskDescriptionSnapshot::standard())
 }
 
-const MAX_DISPLAY_TEXT_BYTES: usize = 8_000;
-const MAX_RETAINED_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_CELL_TIMEOUT: Duration = Duration::from_secs(3_600);
 
 /// Runtime accepted by this build of `eval@1`.
@@ -413,18 +410,6 @@ pub struct Update {
 	pub sequence: u64,
 }
 
-/// One retained output frame in the durable result.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct OutputFrame {
-	/// Stream that owns these bytes.
-	pub channel:  OutputChannel,
-	/// Exact bytes captured within this cell.
-	#[serde(with = "cow_bytes")]
-	pub data:     CowBytes<'static>,
-	/// Monotonic sequence within the cell.
-	pub sequence: u64,
-}
-
 /// Rich output captured from a Python cell.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -519,14 +504,6 @@ pub struct RunCompletion {
 	pub result:          Option<CellValue>,
 	/// Rich display values emitted during execution.
 	pub display_outputs: Vec<DisplayOutput>,
-	/// Whether retained text was truncated.
-	pub truncated:       bool,
-	/// Durable full-output blob when text was truncated.
-	pub spilled_output:  Option<BlobRef>,
-	/// Full output line count before truncation.
-	pub total_lines:     usize,
-	/// Full output byte count before truncation.
-	pub total_bytes:     usize,
 }
 
 /// Durable result of one eval call.
@@ -544,22 +521,14 @@ pub struct Payload {
 	pub code:            Str,
 	/// Whether the namespace was reset immediately before this cell.
 	pub reset:           bool,
-	/// Ordered retained stdout/stderr frames.
-	pub frames:          Vec<OutputFrame>,
+	/// Whether text was already delivered through ordered output updates.
+	pub had_output:      bool,
 	/// Final expression value.
 	pub result:          Option<CellValue>,
 	/// Rich display values.
 	pub display_outputs: Vec<DisplayOutput>,
 	/// Terminal status.
 	pub status:          CellStatus,
-	/// Whether retained output was truncated.
-	pub truncated:       bool,
-	/// Durable full-output blob when truncated.
-	pub spilled_output:  Option<BlobRef>,
-	/// Full output line count.
-	pub total_lines:     usize,
-	/// Full output byte count.
-	pub total_bytes:     usize,
 }
 
 /// Typed eval resource or validation failure.
@@ -719,144 +688,10 @@ fn format_display_json(outputs: &[DisplayOutput]) -> String {
 			continue;
 		};
 		index += 1;
-		let mut text = serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string());
-		if text.len() > MAX_DISPLAY_TEXT_BYTES {
-			let mut end = MAX_DISPLAY_TEXT_BYTES;
-			while !text.is_char_boundary(end) {
-				end -= 1;
-			}
-			let elided = text.len() - end;
-			text.truncate(end);
-			if !text.ends_with('\n') {
-				text.push('\n');
-			}
-			let _ = writeln!(text, "[…{elided}ch elided…]");
-		}
+		let text = serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string());
 		rendered.push(format!("display[{index}]:\n{text}"));
 	}
 	rendered.join("\n\n")
-}
-
-/// Bounded live view of an eval cell's ordered text output.
-///
-/// The first and most recent halves are retained. Once output crosses the
-/// bound, a stable truncation marker separates them; memory use never depends
-/// on the total amount produced by the cell.
-pub struct TailBuffer {
-	head:        Vec<u8>,
-	tail:        VecDeque<u8>,
-	total_bytes: usize,
-	max_bytes:   usize,
-}
-
-impl TailBuffer {
-	/// Creates a live buffer with a hard byte bound.
-	pub fn new(max_bytes: usize) -> Self {
-		Self {
-			head: Vec::with_capacity(max_bytes / 2),
-			tail: VecDeque::with_capacity(max_bytes.saturating_sub(max_bytes / 2)),
-			total_bytes: 0,
-			max_bytes,
-		}
-	}
-
-	/// Appends one ordered update and returns the current bounded snapshot.
-	pub fn push(&mut self, update: &Update) -> Update {
-		let head_limit = self.max_bytes / 2;
-		let tail_limit = self.max_bytes.saturating_sub(head_limit);
-		let data = update.data.as_ref();
-		self.total_bytes = self.total_bytes.saturating_add(data.len());
-
-		let head_remaining = head_limit.saturating_sub(self.head.len());
-		let head_len = head_remaining.min(data.len());
-		self.head.extend_from_slice(&data[..head_len]);
-		for byte in &data[head_len..] {
-			if tail_limit == 0 {
-				break;
-			}
-			if self.tail.len() == tail_limit {
-				self.tail.pop_front();
-			}
-			self.tail.push_back(*byte);
-		}
-
-		let mut snapshot = Vec::with_capacity(self.max_bytes.saturating_add(64));
-		snapshot.extend_from_slice(&self.head);
-		let retained = self.head.len().saturating_add(self.tail.len());
-		if self.total_bytes > retained {
-			let omitted = self.total_bytes - retained;
-			let _ = write!(snapshot, "\n[…{omitted} bytes truncated…]\n");
-		}
-		snapshot.extend(self.tail.iter());
-		Update {
-			channel:  update.channel,
-			data:     CowBytes::from(snapshot),
-			sequence: update.sequence,
-		}
-	}
-}
-
-struct OutputRetention {
-	head:       Vec<OutputFrame>,
-	tail:       VecDeque<OutputFrame>,
-	head_bytes: usize,
-	tail_bytes: usize,
-	truncated:  bool,
-}
-
-impl OutputRetention {
-	const HALF: usize = MAX_RETAINED_OUTPUT_BYTES / 2;
-
-	const fn new() -> Self {
-		Self {
-			head:       Vec::new(),
-			tail:       VecDeque::new(),
-			head_bytes: 0,
-			tail_bytes: 0,
-			truncated:  false,
-		}
-	}
-
-	fn push(&mut self, update: &Update) {
-		let data = update.data.as_ref();
-		if self.head_bytes < Self::HALF {
-			let retained = data.len().min(Self::HALF - self.head_bytes);
-			if retained > 0 {
-				self.head.push(OutputFrame {
-					channel:  update.channel,
-					data:     CowBytes::from(data[..retained].to_vec()),
-					sequence: update.sequence,
-				});
-				self.head_bytes += retained;
-			}
-			if retained == data.len() {
-				return;
-			}
-		}
-		self.truncated = true;
-		let retained = data.len().min(Self::HALF);
-		if retained == 0 {
-			return;
-		}
-		let tail = &data[data.len() - retained..];
-		self.tail.push_back(OutputFrame {
-			channel:  update.channel,
-			data:     CowBytes::from(tail.to_vec()),
-			sequence: update.sequence,
-		});
-		self.tail_bytes += retained;
-		while self.tail_bytes > Self::HALF {
-			let Some(front) = self.tail.pop_front() else {
-				break;
-			};
-			self.tail_bytes = self.tail_bytes.saturating_sub(front.data.as_ref().len());
-		}
-	}
-
-	fn finish(mut self) -> (Vec<OutputFrame>, bool) {
-		self.head.extend(self.tail);
-		(self.head, self.truncated)
-	}
 }
 
 /// Python-only `eval@1` implementation retaining one lazy session per owner.
@@ -1119,8 +954,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 			let mut auto_background = true;
 
 			let mut cell_id = Bytes::new();
-			let mut frames = OutputRetention::new();
-			let mut live_tail = TailBuffer::new(MAX_RETAINED_OUTPUT_BYTES);
+			let mut had_output = false;
 			let mut cancellation_reason: Option<Str> = None;
 			loop {
 				let event = if cancellation_reason.is_some() {
@@ -1190,15 +1024,14 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 				match event {
 					Ok(Some(RunEvent::Started { cell_id: id })) => cell_id = id,
 					Ok(Some(RunEvent::Output(update))) => {
-						frames.push(&update);
-						yield Ev::Update(live_tail.push(&update));
+						had_output |= !update.data.is_empty();
+						yield Ev::Update(update);
 					},
 					Ok(Some(RunEvent::Completed(done))) => {
 						if let Some(reason) = cancellation_reason {
 							yield Ev::Aborted(Abort::EffectsUnknown { reason });
 							return;
 						}
-						let (frames, retained_truncated) = frames.finish();
 						yield Ev::Done(ToolTerminal::Done {
 							result: Ok(Payload {
 								session_id: session.id,
@@ -1207,14 +1040,10 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 								title: args.title,
 								code: args.code,
 								reset,
-								frames,
+								had_output,
 								result: done.result,
 								display_outputs: done.display_outputs,
 								status: done.status,
-								truncated: done.truncated || retained_truncated,
-								spilled_output: done.spilled_output,
-								total_lines: done.total_lines,
-								total_bytes: done.total_bytes,
 							}),
 							useless: false,
 						});
@@ -1261,9 +1090,6 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 		};
 
 		let mut stdout = String::new();
-		for frame in &payload.frames {
-			stdout.push_str(&String::from_utf8_lossy(&frame.data));
-		}
 		if let Some(result) = &payload.result
 			&& !result.text.is_empty()
 		{
@@ -1331,6 +1157,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 			(false, false) => format!("{stdout}\n\n{visible_display}"),
 			(false, true) => stdout.to_owned(),
 			(true, false) => visible_display,
+			(true, true) if payload.had_output => String::new(),
 			(true, true) => "(no output)".to_owned(),
 		};
 
@@ -1352,27 +1179,6 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 				text.push_str("Command aborted");
 			},
 			CellOutcome::Complete | CellOutcome::Timeout | CellOutcome::Cancelled => {},
-		}
-
-		if payload.truncated {
-			let shown_lines = if text.is_empty() {
-				0
-			} else {
-				text.lines().count()
-			};
-			if let Some(blob) = &payload.spilled_output {
-				let _ = write!(
-					text,
-					"\n\n[truncated: {shown_lines} of {} lines shown; full output in blob {}]",
-					payload.total_lines, blob.hash
-				);
-			} else {
-				let _ = write!(
-					text,
-					"\n\n[truncated: {shown_lines} of {} lines shown]",
-					payload.total_lines
-				);
-			}
 		}
 
 		let Some(mut projection) = TextProjection::new(*caps) else {
@@ -1557,52 +1363,115 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn tail_buffer_emits_moving_bounded_snapshots() {
-		let mut tail = TailBuffer::new(12);
-		let first = tail.push(&Update {
-			channel:  OutputChannel::Stdout,
-			data:     CowBytes::from(b"abcdef".to_vec()),
-			sequence: 0,
-		});
-		assert_eq!(first.data.as_ref(), b"abcdef");
-
-		let second = tail.push(&Update {
-			channel:  OutputChannel::Stderr,
-			data:     CowBytes::from(b"ghijklmnop".to_vec()),
-			sequence: 1,
-		});
-		let rendered = String::from_utf8_lossy(second.data.as_ref());
-		assert!(rendered.starts_with("abcdef"));
-		assert!(rendered.contains("4 bytes truncated"));
-		assert!(rendered.ends_with("klmnop"));
-		assert_eq!(second.channel, OutputChannel::Stderr);
-		assert_eq!(second.sequence, 1);
-		assert!(second.data.as_ref().len() <= 64);
+	#[derive(Clone)]
+	struct StreamingExec {
+		updates: Arc<Vec<Update>>,
 	}
 
-	#[test]
-	fn output_retention_keeps_bounded_head_and_tail() {
-		let mut retention = OutputRetention::new();
-		for (sequence, byte) in [(0, b'a'), (1, b'b'), (2, b'c')] {
-			retention.push(&Update {
-				channel: OutputChannel::Stdout,
-				data: CowBytes::from(vec![byte; MAX_RETAINED_OUTPUT_BYTES]),
-				sequence,
-			});
+	struct StreamingRun {
+		events: std::collections::VecDeque<RunEvent>,
+	}
+
+	impl EvalRun for StreamingRun {
+		fn reset(&self) -> bool {
+			false
 		}
-		let (frames, truncated) = retention.finish();
-		assert!(truncated);
-		assert!(
-			frames
-				.iter()
-				.map(|frame| frame.data.as_ref().len())
-				.sum::<usize>()
-				<= MAX_RETAINED_OUTPUT_BYTES
-		);
-		assert_eq!(frames.first().and_then(|frame| frame.data.as_ref().first()), Some(&b'a'));
-		assert_eq!(frames.last().and_then(|frame| frame.data.as_ref().last()), Some(&b'c'));
+
+		async fn next_event(&mut self) -> Result<Option<RunEvent>, Fault> {
+			Ok(self.events.pop_front())
+		}
+
+		async fn cancel(&self) -> Result<(), Fault> {
+			Ok(())
+		}
 	}
+
+	impl EvalExec for StreamingExec {
+		type Run = StreamingRun;
+
+		async fn open_session(&self) -> Result<Session, Fault> {
+			Ok(Session { id: Bytes::from_static(b"streaming-test") })
+		}
+
+		async fn run<'a>(
+			&'a self,
+			_session: &'a Session,
+			_request: RunRequest,
+		) -> Result<Self::Run, Fault> {
+			let mut events = std::collections::VecDeque::new();
+			events.push_back(RunEvent::Started {
+				cell_id: Bytes::from_static(b"streaming-test:cell-1"),
+			});
+			events.extend(self.updates.iter().cloned().map(RunEvent::Output));
+			events.push_back(RunEvent::Completed(RunCompletion {
+				status: CellStatus {
+					outcome: CellOutcome::Complete,
+					exit_code: Some(0),
+					duration_ms: 1,
+					exception: None,
+				},
+				result: None,
+				display_outputs: Vec::new(),
+			}));
+			Ok(StreamingRun { events })
+		}
+	}
+
+	#[tokio::test]
+	async fn adapter_streams_output_beyond_legacy_limits_exactly_once() {
+		use futures::StreamExt as _;
+
+		let mut expected = Vec::new();
+		for line in 0..3_101 {
+			expected.extend_from_slice(format!("{line:04}:{}\n", "x".repeat(340)).as_bytes());
+		}
+		assert!(expected.len() > 1024 * 1024);
+		let updates = expected
+			.chunks(64 * 1024)
+			.enumerate()
+			.map(|(sequence, chunk)| Update {
+				channel: OutputChannel::Stdout,
+				data: CowBytes::from(chunk.to_vec()),
+				sequence: sequence as u64,
+			})
+			.collect();
+		let tool = eval(StreamingExec { updates: Arc::new(updates) });
+		let (feed, params) = IncomingParams::channel();
+		feed
+			.args_committed(Str::new_static(r#"{"language":"py","code":"emit()"}"#))
+			.expect("eval invocation remains live");
+
+		let events = tool.call(params).collect::<Vec<_>>().await;
+		let mut actual = Vec::new();
+		let mut payload = None;
+		for event in events {
+			match event {
+				Ev::Update(update) => actual.extend_from_slice(update.data.as_ref()),
+				Ev::Done(ToolTerminal::Done { result: Ok(done), .. }) => payload = Some(done),
+				other => panic!("unexpected eval event: {other:?}"),
+			}
+		}
+		assert_eq!(actual, expected);
+		assert!(!actual.windows(b"truncated".len()).any(|window| window == b"truncated"));
+		let payload = payload.expect("terminal payload");
+		assert!(payload.had_output);
+		let encoded = serde_json::to_value(&payload).expect("payload serializes");
+		assert!(encoded.get("frames").is_none());
+		assert!(encoded.get("truncated").is_none());
+		assert!(encoded.get("spilled_output").is_none());
+
+		let caps = PromptCaps::for_tool(
+			omp_tool::CapsBase {
+				maximum_parts: u16::MAX,
+				maximum_text_bytes: u32::MAX,
+				media: true,
+				model_class: omp_tool::ModelClass::Standard,
+			},
+			&tool.spec().rev,
+		);
+		assert!(tool.prompt(Ok(&payload), &caps).is_empty());
+	}
+
 	#[test]
 	fn local_control_increments_generation_and_disposes_synchronously() {
 		let disposals = Arc::new(AtomicU64::new(0));

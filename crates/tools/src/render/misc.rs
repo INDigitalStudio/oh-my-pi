@@ -12,10 +12,7 @@ use crate::{
 		Action as BrowserAction, Fault as BrowserFault, Payload as BrowserPayload,
 		Update as BrowserUpdate,
 	},
-	computer::{
-		Action as ComputerAction, Fault as ComputerFault, Payload as ComputerPayload,
-		Update as ComputerUpdate,
-	},
+	computer::{Fault as ComputerFault, Payload as ComputerPayload, Update as ComputerUpdate},
 	gallery::RendererGalleryFixture,
 	github::{
 		Fault as GithubFault, Operation as GithubOperation, Payload as GithubPayload,
@@ -432,8 +429,8 @@ fn labeled_value(label: &'static str, value: &Value) -> El {
 
 #[derive(Default)]
 pub(super) struct ComputerState {
-	action:  Option<ComputerAction>,
-	summary: Str,
+	code:     Str,
+	summary:  Str,
 }
 
 pub(super) struct ComputerRenderer;
@@ -448,9 +445,10 @@ impl RenderFold for ComputerRenderer {
 	}
 
 	fn fold_args(&self, state: &mut Self::State, args: &omp_slopjson::Value, _complete: bool) {
-		state.action = args
-			.get("action")
-			.and_then(|value| value.deserialize_into::<ComputerAction>().ok());
+		state.code = args
+			.get("code")
+			.and_then(omp_slopjson::Value::as_str)
+			.map_or_else(Str::default, Str::new);
 		state.summary = computer_arg_summary(args);
 	}
 
@@ -473,68 +471,24 @@ fn computer_arg_summary(args: &omp_slopjson::Value) -> Str {
 	{
 		summary.push_str("read-only");
 	}
-	let window = args.get("window").and_then(omp_slopjson::Value::as_str);
-	if let Some(window) = window {
-		push_summary_field(&mut summary, "window", window);
-	} else if matches!(
-		args
-			.get("action")
-			.and_then(|value| value.deserialize_into::<ComputerAction>().ok()),
-		Some(ComputerAction::Capture)
-	) {
-		push_summary_field(&mut summary, "", "primary display");
-	}
-	if let Some(reference) = args.get("reference").and_then(omp_slopjson::Value::as_str) {
-		push_summary_field(&mut summary, "ref", reference);
-	}
-	if let Some(value) = args.get("value").and_then(omp_slopjson::Value::as_str) {
-		push_summary_field(&mut summary, "value", value);
-	}
-	if let (Some(x), Some(y)) = (
-		args.get("x").and_then(omp_slopjson::Value::as_f64),
-		args.get("y").and_then(omp_slopjson::Value::as_f64),
-	) {
+	if let Some(timeout) = args.get("timeout").and_then(omp_slopjson::Value::as_f64) {
 		if !summary.is_empty() {
 			summary.push_str(" · ");
 		}
-		write!(summary, "at {x:.0},{y:.0}").expect("writing to String cannot fail");
+		write!(summary, "{timeout}s").expect("writing to String cannot fail");
 	}
-	if let (Some(dx), Some(dy)) = (
-		args.get("dx").and_then(omp_slopjson::Value::as_f64),
-		args.get("dy").and_then(omp_slopjson::Value::as_f64),
-	) {
-		if !summary.is_empty() {
-			summary.push_str(" · ");
-		}
-		write!(summary, "delta {dx:.0},{dy:.0}").expect("writing to String cannot fail");
-	}
-	if let Some(points) = args.get("points").and_then(omp_slopjson::Value::as_array) {
-		if !summary.is_empty() {
-			summary.push_str(" · ");
-		}
-		write!(summary, "{} points", points.len()).expect("writing to String cannot fail");
-	}
-	let width = args.get("max_width").and_then(omp_slopjson::Value::as_u64);
-	let height = args.get("max_height").and_then(omp_slopjson::Value::as_u64);
-	if width.is_some() || height.is_some() {
-		if !summary.is_empty() {
-			summary.push_str(" · ");
-		}
-		match (width, height) {
-			(Some(width), Some(height)) => {
-				write!(summary, "up to {width}×{height}").expect("writing to String cannot fail");
-			},
-			(Some(width), None) => {
-				write!(summary, "up to {width}px wide").expect("writing to String cannot fail");
-			},
-			(None, Some(height)) => {
-				write!(summary, "up to {height}px tall").expect("writing to String cannot fail");
-			},
-			(None, None) => {},
+	if let Some(code) = args.get("code").and_then(omp_slopjson::Value::as_str) {
+		let first_line = code.lines().next().unwrap_or_default().trim();
+		if !first_line.is_empty() {
+			let mut end = first_line.len().min(80);
+			while !first_line.is_char_boundary(end) {
+				end -= 1;
+			}
+			push_summary_field(&mut summary, "", &first_line[..end]);
 		}
 	}
 	if summary.is_empty() {
-		summary.push_str("desktop session");
+		summary.push_str("computer program");
 	}
 	Str::new(summary)
 }
@@ -551,13 +505,13 @@ fn push_summary_field(output: &mut String, label: &str, value: &str) {
 }
 
 fn render_computer_live(state: &ComputerState) -> El {
-	let Some(action) = state.action else {
-		return live_view("computer", "waiting for desktop access");
-	};
+	if state.code.is_empty() {
+		return live_view("Computer", "waiting for code");
+	}
 	view! {
 		<row gap=1>
 			<spinner/>
-			<text bold>{sf!("{action}")}</text>
+			<text bold>{"Computer"}</text>
 			<text fg=muted>{&state.summary}</text>
 		</row>
 	}
@@ -567,15 +521,15 @@ fn render_computer_payload(state: &ComputerState, payload: &ComputerPayload) -> 
 	view! {
 		<col gap=0>
 			<row gap=1>
-				<text bold>{sf!("{}", payload.action)}</text>
+				<text bold>{"Computer"}</text>
 				if !state.summary.is_empty() {
 					<text fg=muted>{&state.summary}</text>
 				}
 			</row>
-			if let Some(message) = payload.result.get("message").and_then(Value::as_str) {
-				<text fg=ok>{message}</text>
-			} else {
-				{json_view(&payload.result, 3, 6, 100)}
+			<text bold>{"Code"}</text>
+			<pre max-rows=16 overflow="lines">{&payload.code}</pre>
+			for (index, result) in payload.results.iter().enumerate() {
+				{labeled_value(if index == 0 { "result" } else { "next" }, result)}
 			}
 			for artifact in &payload.artifacts {
 				<fact label="Screenshot"><text fg=accent>{artifact}</text></fact>
@@ -585,14 +539,11 @@ fn render_computer_payload(state: &ComputerState, payload: &ComputerPayload) -> 
 }
 
 fn render_computer_fault(state: &ComputerState, fault: &ComputerFault) -> El {
-	let action = state
-		.action
-		.map_or_else(|| Str::new_static("Desktop action"), |action| sf!("{action}"));
 	view! {
 		<col gap=0>
 			<row gap=1>
-				<text bold fg=err>{action}</text>
-				if state.action.is_some() {
+				<text bold fg=err>{"Computer"}</text>
+				if !state.summary.is_empty() {
 					<text fg=muted>{&state.summary}</text>
 				}
 			</row>
@@ -635,10 +586,10 @@ pub(crate) fn gallery_fixtures(
 		},
 		RendererGalleryFixture {
 			identity: computer,
-			streaming_args: r#"{"action":"capture","read_only":true,"max_width":1440,"max_height":9"#,
-			args: r#"{"action":"capture","read_only":true,"max_width":1440,"max_height":900}"#,
+			streaming_args: r#"{"code":"const shot = await desktop.screenshot({\"maxWidth\":1440,\"maxHeight\":9"#,
+			args: r#"{"code":"const shot = await desktop.screenshot({\"maxWidth\":1440,\"maxHeight\":900});\nassert(shot.width > 0);","read_only":true,"timeout":30}"#,
 			progress_update: None,
-			success_outcome: br#"{"kind":"ok","value":{"action":"capture","result":{"message":"Captured 1440\u00d7900 screenshot","width":1440,"height":900,"bytes":482193},"artifacts":["artifact://sha256/8f9b0dd1e9c0a05d4f1d6d2ae9742d7a"]}}"#,
+			success_outcome: br#"{"kind":"ok","value":{"code":"const shot = await desktop.screenshot({\"maxWidth\":1440,\"maxHeight\":900});\nassert(shot.width > 0);","results":[{"message":"Captured 1440\u00d7900 screenshot","width":1440,"height":900,"bytes":482193},true],"artifacts":["artifact://sha256/8f9b0dd1e9c0a05d4f1d6d2ae9742d7a"]}}"#,
 			error_outcome: br#"{"kind":"faulted","value":{"code":"desktop_permission","message":"Screen Recording permission is required to capture the primary display"}}"#,
 		},
 	]
@@ -699,7 +650,7 @@ mod tests {
 			ComputerRenderer
 				.view(&computer_state, None)
 				.expect("streaming computer args render")
-				.contains("up to 1440")
+				.contains("desktop.screenshot")
 		);
 
 		serde_json::from_slice::<CallOutcome<GithubPayload, GithubFault>>(
@@ -858,14 +809,14 @@ mod tests {
 	#[test]
 	fn computer_structured_result_artifact_and_fault_are_semantic() {
 		let payload = ComputerPayload {
-			action:    ComputerAction::Capture,
-			result:    serde_json::json!({"width": 1440, "height": 900}),
+			code:      Str::new_static("await desktop.screenshot()"),
+			results:   vec![serde_json::json!({"width": 1440, "height": 900})],
 			artifacts: vec![Str::new_static("artifact://computer/screenshot")],
 		};
 		let rendered = ComputerRenderer
 			.view(&ComputerState::default(), Some(&CallOutcome::Ok(payload)))
 			.expect("computer result renders");
-		assert!(rendered.contains("<json max-depth=3 max-rows=6 max-chars=100>"));
+		assert!(rendered.contains("<json max-depth=4 max-rows=10 max-chars=100>"));
 		assert!(rendered.contains("<fact label=Screenshot>"));
 		assert!(rendered.contains("artifact://computer/screenshot"));
 

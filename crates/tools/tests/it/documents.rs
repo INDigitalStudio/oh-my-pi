@@ -308,7 +308,7 @@ async fn read_tool_routes_new_document_extensions_through_markit() {
 }
 
 #[tokio::test]
-async fn converted_document_truncation_spills_the_complete_numbered_markdown() {
+async fn oversized_converted_document_returns_the_complete_numbered_markdown() {
 	let mut document = String::from(
 		r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
 	);
@@ -328,28 +328,26 @@ async fn converted_document_truncation_spills_the_complete_numbered_markdown() {
 		.collect::<Vec<_>>()
 		.join("\n");
 	let full = numbered;
-	let total_lines = full.lines().count();
+	assert!(full.lines().count() > 3000, "fixture must exceed the former 3,000-line read cap");
 	let blobs = RecordingBlobs::default();
 
 	let output =
 		read_document_tool_text_with_blobs("large.docx", "large.docx", bytes, blobs.clone()).await;
+	assert!(!output.contains("[truncated:"), "read must not append its own notice: {output}");
+	let last_line_at = full
+		.find("Converted line 3200")
+		.expect("fixture renders its final converted line");
 	assert!(
-		output
-			.ends_with(&format!(" of {total_lines} lines shown; read artifact://1 for full output]")),
-		"{output}"
+		output.starts_with(&full[..last_line_at])
+			&& output
+				.get(last_line_at..)
+				.is_some_and(|tail| tail.starts_with("Converted line 3200")),
+		"converted output must be complete through its final line"
 	);
-	let visible = output
-		.split_once("\n\n[truncated: ")
-		.expect("converted output has the shared blob truncation footer")
-		.0;
-	assert_eq!(visible, &full[..visible.len()]);
-
-	let stored = blobs.stored.lock();
-	let [(stored_text, media_type)] = stored.as_slice() else {
-		panic!("converted output must spill exactly one blob: {stored:?}");
-	};
-	assert_eq!(stored_text.as_ref(), full.as_bytes());
-	assert_eq!(media_type.as_str(), "text/plain; charset=utf-8");
+	assert!(
+		blobs.stored.lock().is_empty(),
+		"read must not spill its own artifact; the dispatcher bounds output once"
+	);
 }
 
 #[tokio::test]

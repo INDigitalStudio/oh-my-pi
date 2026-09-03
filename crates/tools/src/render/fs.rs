@@ -490,10 +490,9 @@ mod tests {
 	fn read_success_shows_path_metadata_and_numbered_preview() {
 		let (registry, identities) = registry(identities());
 		let outcome = CallOutcome::<ReadPayload, ReadFault>::Ok(ReadPayload {
-			parts:     vec![PayloadPart::Text {
+			parts: vec![PayloadPart::Text {
 				text: sf!("[src/a.rs#ABCD]\n437:let x = <tag>;\n438:return x & 1;"),
 			}],
-			artifacts: Vec::new(),
 		});
 		let encoded = serde_json::to_vec(&outcome).expect("outcome serializes");
 		let read_identity = identities.read.as_ref().expect("read identity registered");
@@ -520,10 +519,9 @@ mod tests {
 	#[test]
 	fn grouped_file_read_settles_to_a_flush_one_liner() {
 		let payload = ReadPayload {
-			parts:     vec![PayloadPart::Text {
+			parts: vec![PayloadPart::Text {
 				text: sf!("[src/a.rs#ABCD]\n437:let x = <tag>;\n438:return x & 1;"),
 			}],
-			artifacts: Vec::new(),
 		};
 		let rendered = super::render_read_payload("src/a.rs:437-438", &payload).to_tml();
 		assert_eq!(
@@ -543,13 +541,12 @@ mod tests {
 	#[test]
 	fn overflow_pre_retains_the_full_semantic_body_without_manual_chrome() {
 		let payload = ReadPayload {
-			parts:     vec![PayloadPart::Text {
+			parts: vec![PayloadPart::Text {
 				text: sf!(
 					"[src/a.rs#ABCD]\n21:one\n22:two\n23:three\n24:four\n25:five\n26:six\n27:seven\n28:\
 					 eight\n29:nine\n30:ten"
 				),
 			}],
-			artifacts: Vec::new(),
 		};
 		let rendered = super::render_read_payload("agent://abc123", &payload);
 		let rendered = rendered.to_tml();
@@ -585,12 +582,11 @@ mod tests {
 			byte_len:   7,
 		};
 		let multipart = CallOutcome::<ReadPayload, ReadFault>::Ok(ReadPayload {
-			parts:     vec![
+			parts: vec![
 				PayloadPart::Text { text: sf!("[a#1]\n9:&") },
-				PayloadPart::Blob { blob: blob.clone(), alt: sf!("binary") },
+				PayloadPart::Blob { blob: blob.clone(), alt: sf!("binary"), vision: None },
 				PayloadPart::Text { text: sf!("[b#2]\n20:<") },
 			],
-			artifacts: Vec::new(),
 		});
 		let encoded = serde_json::to_vec(&multipart).expect("multipart outcome serializes");
 		assert_eq!(
@@ -604,8 +600,7 @@ mod tests {
 		);
 
 		let blob_only = CallOutcome::<ReadPayload, ReadFault>::Ok(ReadPayload {
-			parts:     vec![PayloadPart::Blob { blob, alt: sf!("binary") }],
-			artifacts: Vec::new(),
+			parts: vec![PayloadPart::Blob { blob, alt: sf!("binary"), vision: None }],
 		});
 		let encoded = serde_json::to_vec(&blob_only).expect("blob outcome serializes");
 		assert_eq!(

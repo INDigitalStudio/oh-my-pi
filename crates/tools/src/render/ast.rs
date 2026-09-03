@@ -178,8 +178,8 @@ fn render_ast_grep_payload(payload: &AstGrepPayload) -> El {
 					}
 				}
 			</col>
-			if let Some(cursor) = payload.next_cursor {
-				<fact label="Next cursor">{cursor.to_string()}</fact>
+			if let Some(skip) = payload.next_skip {
+				<fact label="Next skip">{skip.to_string()}</fact>
 			}
 			for advisory in &payload.advisories {
 				<callout kind="warn">{&advisory.path}{": "}{&advisory.message}</callout>
@@ -262,7 +262,7 @@ pub(crate) fn gallery_fixtures(
 			streaming_args: r#"{"pat":"console.$METHOD($AR"#,
 			args:           r#"{"pat":"console.$METHOD($ARG)","path":"packages/tui/src/**/*.ts"}"#,
 			progress_update: None,
-			success_outcome: br#"{"kind":"ok","value":{"matches":[{"path":"packages/tui/src/runtime/logger.ts","line":38,"column":2,"end_line":38,"end_column":48,"text":"console.warn(\"slow render\", durationMs)","bindings":"$ARG=durationMs, $METHOD=warn"},{"path":"packages/tui/src/runtime/session.ts","line":91,"column":3,"end_line":91,"end_column":37,"text":"console.error(\"session failed\", error)","bindings":"$ARG=error, $METHOD=error"},{"path":"packages/tui/src/views/DebugPanel.ts","line":24,"column":4,"end_line":24,"end_column":35,"text":"console.log(\"state\", nextState)","bindings":"$ARG=nextState, $METHOD=log"}],"advisories":[],"total":3,"next_cursor":null}}"#,
+			success_outcome: br#"{"kind":"ok","value":{"matches":[{"path":"packages/tui/src/runtime/logger.ts","line":38,"column":2,"end_line":38,"end_column":48,"text":"console.warn(\"slow render\", durationMs)","bindings":"$ARG=durationMs, $METHOD=warn"},{"path":"packages/tui/src/runtime/session.ts","line":91,"column":3,"end_line":91,"end_column":37,"text":"console.error(\"session failed\", error)","bindings":"$ARG=error, $METHOD=error"},{"path":"packages/tui/src/views/DebugPanel.ts","line":24,"column":4,"end_line":24,"end_column":35,"text":"console.log(\"state\", nextState)","bindings":"$ARG=nextState, $METHOD=log"}],"advisories":[],"total":3,"next_skip":null}}"#,
 			error_outcome: br#"{"kind":"faulted","value":{"message":"pattern parse error: expected a complete call expression after `console.`"}}"#,
 		},
 		RendererGalleryFixture {
@@ -320,7 +320,7 @@ mod tests {
 	#[test]
 	fn ast_grep_multiline_match_preserves_body_cursor_advisory_and_escaping() {
 		let payload: AstGrepPayload = serde_json::from_str(
-			r#"{"matches":[{"path":"src/<tree>.rs","line":7,"column":1,"end_line":9,"end_column":2,"text":"if (ready) {\n  run(<node> & value);\n}","bindings":"$A=<node>&"}],"advisories":[{"path":"src/<bad>.rs","message":"cannot parse <syntax> & input"}],"total":19,"next_cursor":12}"#,
+			r#"{"matches":[{"path":"src/<tree>.rs","line":7,"column":1,"end_line":9,"end_column":2,"text":"if (ready) {\n  run(<node> & value);\n}","bindings":"$A=<node>&"}],"advisories":[{"path":"src/<bad>.rs","message":"cannot parse <syntax> & input"}],"total":19,"next_skip":12}"#,
 		)
 		.unwrap();
 		let view = render_ast_grep_payload(&payload).to_tml();
@@ -332,7 +332,7 @@ mod tests {
 			)
 		);
 		assert!(view.contains("$A=&lt;node&gt;&amp;"));
-		assert!(view.contains("<fact label=\"Next cursor\">12</fact>"));
+		assert!(view.contains("<fact label=\"Next skip\">12</fact>"));
 		assert!(view.contains(
 			"<callout kind=warn>src/&lt;bad&gt;.rs: cannot parse &lt;syntax&gt; &amp; input</callout>"
 		));

@@ -3,7 +3,7 @@
 //! This crate owns only the typed tool contract.  Driver composition owns
 //! child kernels, convar seeding, cfg execution, journals and filesystem views.
 
-use std::future::Future;
+use std::borrow::Cow;
 
 use async_stream::stream;
 use futures::Stream;
@@ -12,12 +12,27 @@ use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, Constraint, Effects, Ev, IncomingParams, ParamError, Part,
 	PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
-const DESCRIPTION: &str = "Runs one or more child agents. Each child is a job backed by its own \
-                           session journal; the parent receives the final text, session path, and \
-                           usage.";
+pub use crate::output_schema::{OutputStatus, SchemaMode};
+
+const DESCRIPTION: &str = "Runs one child or a concurrent batch. Each child is a job backed by its \
+                           own session journal and isolated workspace; the parent receives every \
+                           child's final text, structured output verdict, workspace disposition, \
+                           session path, and usage in request order.";
+
+/// Coarse per-child reasoning effort.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskEffort {
+	/// Lowest reasoning level supported by the selected model.
+	Lo,
+	/// Middle reasoning level supported by the selected model.
+	Med,
+	/// Highest reasoning level supported by the selected model.
+	Hi,
+}
 
 /// One requested child run.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -29,22 +44,134 @@ pub struct ChildRequest {
 	pub name:          Option<Str>,
 	/// Agent class; omitted selects the configured default.
 	pub agent:         Option<Str>,
-	/// Invocation-specific JSON output schema.
+	/// Coarse reasoning effort for this child.
+	pub effort:        Option<TaskEffort>,
+	/// Invocation-specific JSON output schema; its presence overrides the
+	/// selected agent's schema.
 	#[serde(rename = "outputSchema")]
 	pub output_schema: Option<serde_json::Value>,
-	/// Schema failure mode (`permissive` or `strict`).
+	/// Validation behavior for a caller-provided or inherited output schema.
 	#[serde(rename = "schemaMode")]
-	pub schema_mode:   Option<Str>,
+	pub schema_mode:   Option<SchemaMode>,
+	/// Run this child in an isolated whole-workspace view; omitted selects the
+	/// configured default (`sv_task_isolation_mode`).
+	pub isolated:      Option<bool>,
 }
 
-/// Model arguments for `task@1`.
+/// One concurrent batch request.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Params {
+pub struct BatchRequest {
 	/// Shared goal, constraints, and interface contract for every child.
 	pub context: Str,
-	/// Independent child assignments. The driver may run these concurrently.
+	/// Independent child assignments. The driver runs these concurrently.
 	pub tasks:   Vec<ChildRequest>,
+}
+
+/// Model arguments for `task@2`.
+///
+/// The flat form preserves the established single-child contract. The batch
+/// form adds shared context without forcing simple callers to wrap one item.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum Params {
+	/// One child request.
+	Single(ChildRequest),
+	/// Concurrent child requests.
+	Batch(BatchRequest),
+}
+
+impl JsonSchema for Params {
+	fn inline_schema() -> bool {
+		true
+	}
+
+	fn schema_name() -> Cow<'static, str> {
+		"TaskParams".into()
+	}
+
+	fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+		json_schema!({
+			"type": "object",
+			"properties": {
+				"name": {"type": "string"},
+				"agent": {"type": "string"},
+				"task": {"type": "string"},
+				"effort": {"type": "string", "enum": ["lo", "med", "hi"]},
+				"outputSchema": {
+					"oneOf": [
+						{"type": "object"},
+						{"type": "boolean"},
+						{"type": "string"},
+						{"type": "null"}
+					]
+				},
+				"schemaMode": {"type": "string", "enum": ["permissive", "strict"]},
+				"isolated": {"type": "boolean"},
+				"context": {"type": "string"},
+				"tasks": {
+					"type": "array",
+					"items": {
+						"type": "object",
+						"properties": {
+							"name": {"type": "string"},
+							"agent": {"type": "string"},
+							"task": {"type": "string"},
+							"effort": {"type": "string", "enum": ["lo", "med", "hi"]},
+							"outputSchema": {
+								"oneOf": [
+									{"type": "object"},
+									{"type": "boolean"},
+									{"type": "string"},
+									{"type": "null"}
+								]
+							},
+							"schemaMode": {
+								"type": "string",
+								"enum": ["permissive", "strict"]
+							},
+							"isolated": {"type": "boolean"}
+						},
+						"required": ["task"],
+						"additionalProperties": false
+					}
+				}
+			},
+			"oneOf": [
+				{"required": ["task"]},
+				{"required": ["context", "tasks"]}
+			],
+			"additionalProperties": false
+		})
+	}
+}
+
+impl Params {
+	/// Normalizes either wire shape for the driver scheduler.
+	#[must_use]
+	pub fn into_batch(self) -> BatchRequest {
+		match self {
+			Self::Single(child) => {
+				BatchRequest { context: Str::new_static(""), tasks: vec![child] }
+			},
+			Self::Batch(batch) => batch,
+		}
+	}
+
+	/// Returns the number of requested children without allocating.
+	#[must_use]
+	pub fn len(&self) -> usize {
+		match self {
+			Self::Single(_) => 1,
+			Self::Batch(batch) => batch.tasks.len(),
+		}
+	}
+
+	/// Returns whether the batch form omitted every child.
+	#[must_use]
+	pub fn is_empty(&self) -> bool {
+		matches!(self, Self::Batch(batch) if batch.tasks.is_empty())
+	}
 }
 
 /// Progress emitted while a child job is live.
@@ -54,6 +181,35 @@ pub struct Update {
 	pub id:     Str,
 	/// Journal-derived lifecycle status.
 	pub status: Str,
+}
+
+/// Validated structured output of one child, present whenever an output
+/// schema was in effect.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct StructuredOutput {
+	/// Enforcement mode in effect.
+	pub mode:   SchemaMode,
+	/// Validation verdict.
+	pub status: OutputStatus,
+	/// Terminal `yield` data as submitted.
+	pub data:   Option<serde_json::Value>,
+	/// Violation or schema defect when `status` is not `valid`.
+	pub error:  Option<Str>,
+}
+
+/// Disposition of an isolated child workspace after the child settled.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct WorkspaceOutcome {
+	/// Environment worktree identity the child ran in.
+	pub worktree:  Str,
+	/// Content-addressed patch of the child's changes (`artifact://sha256/…`).
+	pub patch:     Option<Str>,
+	/// Branch the changes were published to, when the merge mode was `branch`.
+	pub branch:    Option<Str>,
+	/// Whether the changes were applied to the parent workspace.
+	pub applied:   bool,
+	/// Paths that conflicted with the parent while applying.
+	pub conflicts: Vec<Str>,
 }
 
 /// One settled child result.
@@ -71,13 +227,45 @@ pub struct ChildResult {
 	pub tokens_in:    u64,
 	/// Output tokens consumed by the child.
 	pub tokens_out:   u64,
+	/// Structured output verdict when an output schema was in effect.
+	pub output:       Option<StructuredOutput>,
+	/// Isolated workspace disposition when the child ran isolated.
+	pub workspace:    Option<WorkspaceOutcome>,
+	/// Child failure; `text` then carries the last assistant text, if any.
+	pub error:        Option<Str>,
 }
 
-/// Settled task payload.
+/// One child accepted by the runtime job authority.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-pub struct Payload {
-	/// Results in request order.
-	pub children: Vec<ChildResult>,
+pub struct StartedChild {
+	/// Stable job/child identity used by `hub wait`, `jobs`, and `cancel`.
+	pub id:           Str,
+	/// Agent class selected for the child.
+	pub agent:        Str,
+	/// Child `.oms` journal path.
+	pub session_path: Str,
+	/// Initial job lifecycle state.
+	pub status:       Str,
+}
+
+/// Task response.
+///
+/// Foreground backends may return settled children. The production session
+/// backend returns started jobs immediately and later delivers their retained
+/// `ChildResult` through the shared job authority.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum Payload {
+	/// Every child settled within this call.
+	Settled {
+		/// Results in request order.
+		children: Vec<ChildResult>,
+	},
+	/// Every child was admitted as a detached runtime job.
+	Started {
+		/// Job identities in request order.
+		jobs: Vec<StartedChild>,
+	},
 }
 
 /// Stable task-spawn failure.
@@ -110,13 +298,13 @@ pub struct Task<S> {
 	spec:    ToolSpec,
 }
 
-/// Returns the canonical `task@1` declaration shared by registry advertisement
+/// Returns the canonical `task@2` declaration shared by registry advertisement
 /// and session-owned execution.
 #[must_use]
 pub fn spec() -> ToolSpec {
 	ToolSpec {
 		name:            sf!("task"),
-		rev:             Rev { family: Default::default(), n: 1 },
+		rev:             Rev { family: Default::default(), n: 2 },
 		description:     sf!(DESCRIPTION),
 		schema:          omp_tool::schema::<Params>(),
 		constraint:      Constraint::Schema {
@@ -133,7 +321,7 @@ pub fn spec() -> ToolSpec {
 	}
 }
 
-/// Constructs `task@1`.
+/// Constructs `task@2`.
 #[must_use]
 pub fn tool<S: SubagentSpawner>(spawner: S) -> Task<S> {
 	Task { spawner, spec: spec() }
@@ -165,7 +353,7 @@ impl<S: SubagentSpawner> Tool for Task<S> {
 					return;
 				},
 			};
-			if request.tasks.is_empty() {
+			if request.is_empty() {
 				yield done(Err(Fault { message: sf!("task requires at least one child") }));
 				return;
 			}
@@ -192,10 +380,18 @@ impl<S: SubagentSpawner> Tool for Task<S> {
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, _caps: &PromptCaps) -> Vec<Part> {
 		match view {
-			Ok(payload) => payload
-				.children
+			Ok(Payload::Settled { children }) => children.iter().map(child_part).collect(),
+			Ok(Payload::Started { jobs }) => jobs
 				.iter()
-				.map(|child| Part::Text { text: child.text.clone() })
+				.map(|job| Part::Text {
+					text: sf!(
+						"[{}] {} ({}) session={}",
+						job.id,
+						job.status,
+						job.agent,
+						job.session_path
+					),
+				})
 				.collect(),
 			Err(fault) => vec![Part::Text { text: fault.message.clone() }],
 		}
@@ -204,6 +400,59 @@ impl<S: SubagentSpawner> Tool for Task<S> {
 
 fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
 	Ev::Done(ToolTerminal::Done { result, useless: false })
+}
+
+/// Projects one child result as the model-facing part: structured data wins
+/// over free text, and failures or schema violations are named explicitly.
+fn child_part(child: &ChildResult) -> Part {
+	let mut text = omp_core::StrMut::new("");
+	if let Some(error) = &child.error {
+		text.push_str("[");
+		text.push_str(&child.id);
+		text.push_str(" failed] ");
+		text.push_str(error);
+		if !child.text.is_empty() {
+			text.push_str("\n\n");
+		}
+	}
+	match child.output.as_ref() {
+		Some(StructuredOutput { status: OutputStatus::Valid, data: Some(data), .. }) => {
+			text.push_str(&serde_json::to_string_pretty(data).unwrap_or_default());
+		},
+		Some(StructuredOutput { status, error: Some(error), data, .. }) => {
+			text.push_str("[output ");
+			text.push_str(<&'static str>::from(status));
+			text.push_str("] ");
+			text.push_str(error);
+			if let Some(data) = data {
+				text.push_str("\n");
+				text.push_str(&serde_json::to_string_pretty(data).unwrap_or_default());
+			} else {
+				text.push_str("\n");
+				text.push_str(&child.text);
+			}
+		},
+		_ => text.push_str(&child.text),
+	}
+	if let Some(workspace) = &child.workspace {
+		text.push_str("\n[workspace ");
+		text.push_str(&workspace.worktree);
+		if let Some(patch) = &workspace.patch {
+			text.push_str(" patch=");
+			text.push_str(patch);
+		}
+		if let Some(branch) = &workspace.branch {
+			text.push_str(" branch=");
+			text.push_str(branch);
+		}
+		text.push_str(if workspace.applied { " applied" } else { " not applied" });
+		if !workspace.conflicts.is_empty() {
+			text.push_str(" conflicts=");
+			text.push_str(&workspace.conflicts.join(","));
+		}
+		text.push_str("]");
+	}
+	Part::Text { text: text.freeze() }
 }
 
 fn param_event(error: ParamError) -> Ev<Update, Payload, Fault> {
@@ -229,9 +478,84 @@ fn commit_event(error: omp_tool::CommitError) -> Ev<Update, Payload, Fault> {
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: sf!("one committed task@1 argument object"),
+		expected: sf!("one committed task@2 single-child or batch argument object"),
 		kind:     ArgIssueKind::Protocol,
 		example:  Some(sf!(r#"{{"context":"shared","tasks":[{{"task":"inspect"}}]}}"#)),
 		found:    Some(message),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{Params, Payload, StartedChild, TaskEffort, spec};
+
+	#[test]
+	fn task_accepts_single_and_batch_wire_shapes() {
+		let single: Params = serde_json::from_value(serde_json::json!({
+			"name": "one",
+			"agent": "task",
+			"task": "inspect",
+			"effort": "hi",
+			"outputSchema": {"type": "object"},
+			"schemaMode": "strict",
+			"isolated": true
+		}))
+		.expect("single task shape");
+		let single = single.into_batch();
+		assert!(single.context.is_empty());
+		assert_eq!(single.tasks.len(), 1);
+		assert_eq!(single.tasks[0].effort, Some(TaskEffort::Hi));
+
+		let batch: Params = serde_json::from_value(serde_json::json!({
+			"context": "shared",
+			"tasks": [
+				{"task": "first"},
+				{"task": "second", "effort": "lo"}
+			]
+		}))
+		.expect("batch task shape");
+		let batch = batch.into_batch();
+		assert_eq!(batch.context, "shared");
+		assert_eq!(batch.tasks.len(), 2);
+		assert_eq!(batch.tasks[1].effort, Some(TaskEffort::Lo));
+	}
+
+	#[test]
+	fn task_rejects_mixed_or_unknown_wire_shapes() {
+		assert!(
+			serde_json::from_value::<Params>(serde_json::json!({
+				"task": "single",
+				"context": "batch",
+				"tasks": [{"task": "nested"}]
+			}))
+			.is_err()
+		);
+		assert!(
+			serde_json::from_value::<Params>(
+				serde_json::json!({"task": "single", "detached": true})
+			)
+			.is_err()
+		);
+	}
+
+	#[test]
+	fn started_payload_carries_real_job_identity_without_settled_placeholders() {
+		let payload = Payload::Started {
+			jobs: vec![StartedChild {
+				id: "child-1".into(),
+				agent: "task".into(),
+				session_path: "/tmp/child-1.oms".into(),
+				status: "running".into(),
+			}],
+		};
+		let value = serde_json::to_value(payload).unwrap();
+		assert_eq!(value["jobs"][0]["id"], "child-1");
+		assert!(value.get("children").is_none());
+		assert!(value["jobs"][0].get("tokens_in").is_none());
+	}
+
+	#[test]
+	fn task_contract_revision_is_two() {
+		assert_eq!(spec().rev.n, 2);
 	}
 }

@@ -31,45 +31,58 @@ pub enum Action {
 	Close,
 }
 
-/// Typed operation available to `run` in addition to raw JavaScript.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize, strum::Display)]
+/// Browser application attachment or launch configuration.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct App {
+	/// Binary path to spawn.
+	pub path:    Option<Str>,
+	/// Existing Chrome DevTools Protocol endpoint.
+	pub cdp_url: Option<Str>,
+	/// Drive the user's own browser through the relay.
+	pub relay:   Option<bool>,
+	/// Extra application arguments.
+	pub args:    Option<Vec<Str>>,
+	/// Window title or URL substring used to select a target.
+	pub target:  Option<Str>,
+}
+
+/// Browser viewport configuration.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Viewport {
+	/// Width in CSS pixels.
+	pub width:  u32,
+	/// Height in CSS pixels.
+	pub height: u32,
+	/// Device scale factor.
+	pub scale:  Option<f64>,
+}
+
+/// Navigation completion condition.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, strum::Display)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum WaitUntil {
+	/// Window load event.
+	Load,
+	/// DOM content loaded event.
+	Domcontentloaded,
+	/// No active network requests.
+	Networkidle0,
+	/// At most two active network requests.
+	Networkidle2,
+}
+
+/// JavaScript dialog handling policy.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, strum::Display)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
-pub enum RunOperation {
-	/// Evaluate JavaScript and return its JSON result.
-	Evaluate,
-	/// Observe interactive DOM nodes with stable ids.
-	Observe,
-	/// Render an ARIA snapshot.
-	AriaSnapshot,
-	/// Capture a PNG screenshot.
-	Screenshot,
-	/// Extract visible text.
-	ExtractText,
-	/// Extract serialized HTML.
-	ExtractHtml,
-	/// Click an element.
-	Click,
-	/// Append text to an element.
-	Type,
-	/// Replace a form value.
-	Fill,
-	/// Select one or more option values.
-	Select,
-	/// Press a key on an element.
-	Press,
-	/// Scroll an element into view.
-	ScrollIntoView,
-	/// Drag one element to another.
-	Drag,
-	/// Upload local files through a file input.
-	Upload,
-	/// Wait for a selector.
-	WaitForSelector,
-	/// Wait for a URL substring.
-	WaitForUrl,
-	/// Wait for a fetch/XHR URL substring.
-	WaitForResponse,
+pub enum Dialogs {
+	/// Accept dialogs.
+	Accept,
+	/// Dismiss dialogs.
+	Dismiss,
 }
 
 /// Browser tool arguments.
@@ -82,32 +95,24 @@ pub struct Params {
 	pub name:                    Option<Str>,
 	/// Initial or navigated URL.
 	pub url:                     Option<Str>,
-	/// Typed operation for `run`; defaults to `evaluate` when `code` is present.
-	pub operation:               Option<RunOperation>,
-	/// JavaScript evaluated by `run`.
+	/// Browser process, CDP, or relay configuration for `open`.
+	pub app:                     Option<App>,
+	/// Viewport dimensions for `open`.
+	pub viewport:                Option<Viewport>,
+	/// Navigation completion condition.
+	pub wait_until:              Option<WaitUntil>,
+	/// Automatic JavaScript dialog handling.
+	pub dialogs:                 Option<Dialogs>,
+	/// JavaScript body evaluated by `run` against the persistent named tab.
 	pub code:                    Option<Str>,
-	/// Primary selector accepted by the embedded automation engine.
-	pub selector:                Option<Str>,
-	/// Drag destination selector.
-	pub target:                  Option<Str>,
-	/// Text/value/key/URL-pattern argument.
-	pub value:                   Option<Str>,
-	/// Multiple select values or upload paths.
-	pub values:                  Option<Vec<Str>>,
-	/// Viewport width in CSS pixels.
-	pub width:                   Option<u32>,
-	/// Viewport height in CSS pixels.
-	pub height:                  Option<u32>,
-	/// Device scale factor.
-	pub scale:                   Option<f64>,
 	/// Bounded operation timeout in seconds.
-	pub timeout:                 Option<u64>,
+	pub timeout:                 Option<f64>,
 	/// Close every managed tab.
 	#[serde(default)]
 	pub all:                     bool,
-	/// Capture the full page rather than the viewport.
+	/// Also terminate spawned browser processes while closing.
 	#[serde(default)]
-	pub full_page:               bool,
+	pub kill:                    bool,
 	/// Private host-control signal used by `/browser` after persisting a mode
 	/// change. This is intentionally absent from the model-facing schema.
 	#[serde(default)]
@@ -168,11 +173,11 @@ pub struct Browser {
 	spec: ToolSpec,
 }
 
-/// Builds the host-free `browser@1` declaration.
+/// Builds the host-free `browser@2` declaration.
 pub fn spec() -> ToolSpec {
 	ToolSpec {
 		name:            sf!("browser"),
-		rev:             Rev { family: Str::default(), n: 1 },
+		rev:             Rev { family: Str::default(), n: 2 },
 		description:     sf!(
 			"Controls named tabs through the supervised embedded browser daemon. Use open before run \
 			 and close when finished."
@@ -198,7 +203,7 @@ pub fn spec() -> ToolSpec {
 	}
 }
 
-/// Creates `browser@1`.
+/// Creates `browser@2`.
 pub fn tool(host: Arc<dyn BrowserHost>) -> Browser {
 	Browser { host, spec: spec() }
 }
@@ -282,5 +287,71 @@ fn protocol_issue(message: Str) -> ArgIssue {
 		kind:     ArgIssueKind::Protocol,
 		example:  None,
 		found:    Some(message),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use serde_json::{Value, json};
+
+	use super::{Action, Params, spec};
+
+	#[test]
+	fn browser_schema_keeps_only_open_run_close_code_surface() {
+		let schema: Value = serde_json::from_slice(&spec().schema).expect("browser schema");
+		let properties = schema["properties"].as_object().expect("object properties");
+		let mut domain = properties
+			.keys()
+			.filter(|name| !matches!(name.as_str(), "i" | "notrunc"))
+			.map(String::as_str)
+			.collect::<Vec<_>>();
+		domain.sort_unstable();
+		assert_eq!(
+			domain,
+			[
+				"action",
+				"all",
+				"app",
+				"code",
+				"dialogs",
+				"kill",
+				"name",
+				"timeout",
+				"url",
+				"viewport",
+				"wait_until",
+			]
+		);
+		assert!(!properties.contains_key("operation"));
+		assert!(!properties.contains_key("selector"));
+		assert!(!properties.contains_key("full_page"));
+		assert!(properties["action"].is_object());
+		for action in ["open", "run", "close"] {
+			assert!(serde_json::from_value::<Action>(json!(action)).is_ok());
+		}
+	}
+
+	#[test]
+	fn browser_code_schema_accepts_reference_oracle_arguments() {
+		let params: Params = serde_json::from_value(json!({
+			"action": "open",
+			"name": "main",
+			"url": "https://example.test",
+			"app": {
+				"path": "/Applications/Browser.app/Contents/MacOS/Browser",
+				"relay": false,
+				"args": ["--incognito"],
+				"target": "Example"
+			},
+			"viewport": { "width": 1280, "height": 800, "scale": 2.0 },
+			"wait_until": "networkidle2",
+			"dialogs": "dismiss",
+			"timeout": 10.5,
+			"all": false,
+			"kill": false
+		}))
+		.expect("reference browser arguments");
+		assert_eq!(params.action, Action::Open);
+		assert_eq!(params.viewport.expect("viewport").width, 1280);
 	}
 }

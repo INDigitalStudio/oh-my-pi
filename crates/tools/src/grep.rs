@@ -380,9 +380,11 @@ pub trait WorkspaceSearch: Send + Sync + 'static {
 /// Generic `grep@1` executor over environment-owned workspace and blob
 /// resources.
 pub struct Grep<W, B> {
-	workspace: W,
-	blobs:     B,
-	spec:      ToolSpec,
+	workspace:      W,
+	blobs:          B,
+	context_before: u32,
+	context_after:  u32,
+	spec:           ToolSpec,
 }
 
 /// Returns the host-free `grep@1` specification.
@@ -420,8 +422,13 @@ pub fn spec() -> ToolSpec {
 }
 
 /// Construct `grep@1` over `workspace` and the shared durable blob namespace.
-pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Grep<W, B> {
-	Grep { workspace, blobs, spec: spec() }
+pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(
+	workspace: W,
+	blobs: B,
+	context_before: u32,
+	context_after: u32,
+) -> Grep<W, B> {
+	Grep { workspace, blobs, context_before, context_after, spec: spec() }
 }
 
 impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Grep<W, B> {
@@ -489,7 +496,8 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Grep<W, B> {
 					return;
 				},
 			};
-			let request = build_request(arguments, &roots);
+			let request =
+				build_request(arguments, &roots, self.context_before, self.context_after);
 			let operation = async {
 				let result = self.workspace.search(request).await?;
 				prepare_payload(result, &roots, skip, &self.workspace, &self.blobs).await
@@ -527,7 +535,12 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Grep<W, B> {
 		projection.finish()
 	}
 }
-fn build_request(arguments: Params, roots: &[SearchRoot]) -> SearchRequest {
+fn build_request(
+	arguments: Params,
+	roots: &[SearchRoot],
+	context_before: u32,
+	context_after: u32,
+) -> SearchRequest {
 	let (single_file_max_count, multi_file_max_count, max_count) = fetch_budgets(roots);
 	SearchRequest {
 		multiline: arguments.pattern.contains('\n') || arguments.pattern.contains("\\n"),
@@ -539,8 +552,8 @@ fn build_request(arguments: Params, roots: &[SearchRoot]) -> SearchRequest {
 		max_count,
 		single_file_max_count,
 		multi_file_max_count,
-		context_before: 0,
-		context_after: 0,
+		context_before,
+		context_after,
 		max_columns: DEFAULT_MAX_COLUMN,
 		timeout_ms: SEARCH_GREP_TIMEOUT_MS,
 	}
@@ -1130,11 +1143,15 @@ mod tests {
 				skip:      None,
 			},
 			&roots,
+			1,
+			3,
 		);
 		assert!(request.ignore_case);
 		assert!(request.multiline);
 		assert!(!request.gitignore);
 		assert_eq!(request.roots, roots);
+		assert_eq!(request.context_before, 1);
+		assert_eq!(request.context_after, 3);
 
 		let default_case = build_request(
 			Params {
@@ -1145,6 +1162,8 @@ mod tests {
 				skip:      None,
 			},
 			&parse_roots(None).unwrap(),
+			0,
+			0,
 		);
 		assert!(!default_case.ignore_case);
 		assert!(default_case.gitignore);

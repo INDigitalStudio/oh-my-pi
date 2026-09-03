@@ -110,11 +110,26 @@ pub enum Fault {
 		/// Stable bridge failure explanation.
 		message: Str,
 	},
+	/// The user dismissed the dialog without answering (pi `ToolAbortError
+	/// "Ask tool was cancelled by the user"`).
+	Cancelled {
+		/// Stable cancellation explanation.
+		message: Str,
+	},
+}
+impl Fault {
+	/// The user-cancel fault every interactive presenter reports on Esc.
+	#[must_use]
+	pub fn cancelled() -> Self {
+		Self::Cancelled { message: Str::new_static("Ask tool was cancelled by the user") }
+	}
 }
 impl Display for Fault {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::Invalid { message } | Self::Presenter { message } => f.write_str(message),
+			Self::Invalid { message } | Self::Presenter { message } | Self::Cancelled { message } => {
+				f.write_str(message)
+			},
 		}
 	}
 }
@@ -128,9 +143,15 @@ impl error::Error for Fault {}
 /// parity.
 pub trait AskPresenter: Send + Sync + 'static {
 	/// Presents ordered questions and returns durable selections.
+	///
+	/// `invocation` is the kernel call identity of the asking tool element
+	/// (`<ask id>`), when the dispatcher supplied one: interactive hosts
+	/// answer that identity, so a presenter correlates by it rather than by
+	/// arrival order.
 	fn present<'p>(
 		&'p self,
 		questions: &'p [Question],
+		invocation: Option<&'p str>,
 	) -> Pin<Box<dyn Future<Output = Result<Presentation, Fault>> + Send + 'p>>;
 }
 
@@ -156,9 +177,10 @@ impl AskPresenter for PresenterSlot {
 	fn present<'p>(
 		&'p self,
 		questions: &'p [Question],
+		invocation: Option<&'p str>,
 	) -> Pin<Box<dyn Future<Output = Result<Presentation, Fault>> + Send + 'p>> {
 		let presenter = Arc::clone(&*self.inner.read());
-		Box::pin(async move { presenter.present(questions).await })
+		Box::pin(async move { presenter.present(questions, invocation).await })
 	}
 }
 /// Presenter result, preserving whether answers came from headless fallback.
@@ -195,6 +217,7 @@ impl AskPresenter for HeadlessPresenter {
 	fn present<'p>(
 		&'p self,
 		questions: &'p [Question],
+		_invocation: Option<&'p str>,
 	) -> Pin<Box<dyn Future<Output = Result<Presentation, Fault>> + Send + 'p>> {
 		Box::pin(future::ready(
 			questions
@@ -299,11 +322,27 @@ impl Tool for Ask {
 					},
 				}
 			}
-			let result = self.presenter.present(&arguments.questions).await.map(|presentation| Payload {
+			// The dialog waits on the user; an interrupt (Esc on the turn,
+			// Ctrl+C) must abort the wait rather than leave the call hanging
+			// until the dispatcher's grace forces it closed.
+			let invocation = params.invocation_id().cloned();
+			let presented = self.presenter.present(&arguments.questions, invocation.as_deref());
+			tokio::pin!(presented);
+			let result = tokio::select! {
+				result = &mut presented => result,
+				interrupt = params.next_interrupt() => {
+					if let Ok(interrupt) = interrupt {
+						yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason });
+					} else {
+						yield Ev::Aborted(Abort::InputDropped);
+					}
+					return;
+				},
+			};
+			yield done(result.map(|presentation| Payload {
 				answers: presentation.answers,
 				headless: presentation.headless,
-			});
-			yield done(result);
+			}));
 		}
 	}
 
@@ -472,6 +511,7 @@ mod tests {
 		fn present<'p>(
 			&'p self,
 			questions: &'p [Question],
+			_invocation: Option<&'p str>,
 		) -> Pin<Box<dyn Future<Output = Result<Presentation, Fault>> + Send + 'p>> {
 			Box::pin(async move {
 				time::sleep(Duration::from_millis(10)).await;

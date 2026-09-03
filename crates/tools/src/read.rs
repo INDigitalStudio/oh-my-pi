@@ -7,8 +7,9 @@ use bytes::Bytes;
 use futures::{FutureExt as _, Stream, pin_mut, select_biased};
 use omp_core::{Str, sf};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
-	IncomingParams, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, BlobRef, CallOutcome, CommitError, Constraint, DocEffects,
+	Effects, Ev, IncomingParams, LiftedCall, ParamError, Part, PromptCaps, RecordedCall, Rev, Tool,
+	ToolSpec, ToolTerminal,
 };
 use parking_lot::Mutex;
 use schemars::JsonSchema;
@@ -17,10 +18,7 @@ use tracing::Instrument as _;
 
 use crate::{
 	path::{HostPaths, normalize_target, tracing_path_metadata},
-	render::{
-		TextProjection,
-		truncate::{TruncationOptions, append_blob_truncation_notice, truncate_head},
-	},
+	render::TextProjection,
 };
 
 pub mod archive;
@@ -46,7 +44,7 @@ pub mod web;
 use resolver::ResolverTable;
 use web::types::WebError;
 
-const DESCRIPTION: &str = r"Read files, directories, archives, SQLite, images, documents, and web URLs via `path`.
+const DESCRIPTION: &str = r"Read files, directories, archives, SQLite, images, documents, and web URLs via `path`. For an image, optional `question` sends the materialized image and question through the active model's vision route without adding another tool.
 
 <instruction>
 - SHOULD parallelize independent reads.
@@ -76,6 +74,8 @@ const DESCRIPTION: &str = r"Read files, directories, archives, SQLite, images, d
 <critical>
 Summary footer names elided ranges? Re-issue ONLY those ranges. NEVER guess `..`/`…` content.
 </critical>";
+const VISION_UNAVAILABLE: &str =
+	"Image question unavailable: the active model route does not accept image input.";
 const MAX_SUMMARY_BYTES: u64 = 2 * 1024 * 1024;
 const REPEAT_READ_HINT_THRESHOLD: u32 = 3;
 const REPEAT_READ_TRACKER_CAP: usize = 64;
@@ -90,7 +90,7 @@ pub const SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// through [`is_probably_binary_header`] instead of reopening.
 pub const BINARY_SNIFF_BYTES: usize = 8192;
 
-/// Arguments accepted by `read@1`.
+/// Arguments accepted by `read@2`.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[schemars(description = "")]
 #[serde(deny_unknown_fields)]
@@ -103,6 +103,17 @@ pub struct Params {
 		with = "String"
 	)]
 	pub path: Str,
+	/// Optional question to answer from one materialized image. The active
+	/// inference route must accept image input.
+	#[schemars(
+		default,
+		skip_serializing_if = "Option::is_none",
+		description = "Optional question about one image. The active model vision route receives \
+		               the question and materialized image together.",
+		with = "String"
+	)]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub question: Option<Str>,
 }
 
 /// Ephemeral read progress.
@@ -280,13 +291,20 @@ pub struct StoredArtifact {
 	pub uri:  Str,
 }
 
+/// A question paired with an image for the active model's vision route.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VisionRequest {
+	/// Exact caller-authored question.
+	pub question: Str,
+}
+
 /// One deterministic read result part.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PayloadPart {
 	/// Model-visible UTF-8 text.
 	Text {
-		/// Exact text after read-level formatting and truncation.
+		/// Complete text after read-level formatting; never truncated here.
 		text: Str,
 	},
 	/// Durable binary media with a textual fallback.
@@ -295,17 +313,21 @@ pub enum PayloadPart {
 		blob: BlobRef,
 		/// Model-facing fallback and media description.
 		alt:  Str,
+		/// Image question routed with this blob when the active model accepts
+		/// vision input.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		vision: Option<VisionRequest>,
 	},
 }
 
 /// Durable, deterministic read truth.
+///
+/// Parts are complete. The dispatcher bounds the rendered result once and
+/// spills the full text to an artifact; Read never truncates its own output.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Payload {
 	/// Ordered text and blob parts.
-	pub parts:     Vec<PayloadPart>,
-	/// Complete text spills referenced by truncation footers.
-	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub artifacts: Vec<StoredArtifact>,
+	pub parts: Vec<PayloadPart>,
 }
 
 /// Typed read failure with an exact model-facing message.
@@ -382,6 +404,10 @@ pub struct ReadPolicy {
 	pub render_markdown:    bool,
 	/// Decode and resize images for model bounds.
 	pub auto_resize_images: bool,
+	/// Replace eligible whole-file source with a structural summary.
+	pub summarize:          bool,
+	/// Include source line numbers when no hashline snapshot is emitted.
+	pub line_numbers:       bool,
 	/// Record snapshots and expose hashline headers for editable local text.
 	pub hashline_headers:   bool,
 }
@@ -392,12 +418,14 @@ impl Default for ReadPolicy {
 			fetch_enabled:      true,
 			render_markdown:    true,
 			auto_resize_images: true,
+			summarize:          true,
+			line_numbers:       true,
 			hashline_headers:   true,
 		}
 	}
 }
 
-/// `read@1` executor over unboxed app resource adapters.
+/// `read@2` executor over unboxed app resource adapters.
 pub struct ReadTool<S, B, R = resolver::NoResolver> {
 	sources:      S,
 	blobs:        B,
@@ -502,21 +530,28 @@ impl Drop for InterruptSqliteOnDrop {
 	}
 }
 
-/// Returns the host-free `read@1` specification for a frozen projection policy.
+/// Returns the host-free `read@2` specification for a frozen projection policy.
 pub fn spec(policy: ReadPolicy) -> ToolSpec {
 	let description = if policy.hashline_headers {
 		sf!(DESCRIPTION)
 	} else {
+		let selector_description = if policy.line_numbers {
+			"- File + selector → numbered lines. This registry projection is read-only or has no \
+			 compatible hashline edit revision, so snapshot headers are suppressed."
+		} else {
+			"- File + selector → selected text without line prefixes. This registry projection is \
+			 read-only or has no compatible hashline edit revision, so snapshot headers are \
+			 suppressed."
+		};
 		Str::new(DESCRIPTION.replace(
 			"- File + selector → `[foo.ts#1A2B]` snapshot header + numbered lines. Copy \
 			 `[FILENAME#TAG]` for anchored edits; NEVER fabricate the tag.",
-			"- File + selector → numbered lines. This registry projection is read-only or has no \
-			 compatible hashline edit revision, so snapshot headers are suppressed.",
+			selector_description,
 		))
 	};
 	ToolSpec {
 		name: sf!("read"),
-		rev: Rev { family: Default::default(), n: 1 },
+		rev: Rev { family: Default::default(), n: 2 },
 		description,
 		schema: omp_tool::schema::<Params>(),
 		constraint: Constraint::Schema {
@@ -539,7 +574,7 @@ pub fn spec(policy: ReadPolicy) -> ToolSpec {
 	}
 }
 
-/// Constructs the `read@1` tool without internal URL resolvers.
+/// Constructs the `read@2` tool without internal URL resolvers.
 pub fn tool<S: ReadSources, B: ReadBlobs>(
 	sources: S,
 	blobs: B,
@@ -552,7 +587,7 @@ pub fn tool<S: ReadSources, B: ReadBlobs>(
 	)
 }
 
-/// Constructs `read@1` with concrete, constructor-owned internal URL
+/// Constructs `read@2` with concrete, constructor-owned internal URL
 /// resolvers.
 pub fn tool_with_resolvers<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 	sources: S,
@@ -567,7 +602,7 @@ pub fn tool_with_resolvers<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 	)
 }
 
-/// Constructs `read@1` with internal URL resolvers and the session conflict
+/// Constructs `read@2` with internal URL resolvers and the session conflict
 /// registry shared with its `conflict://` resolver and splice writer.
 pub fn tool_with_resolvers_and_conflicts<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 	sources: S,
@@ -578,7 +613,7 @@ pub fn tool_with_resolvers_and_conflicts<S: ReadSources, B: ReadBlobs, R: resolv
 	tool_with_policy(sources, blobs, resolvers, conflicts, ReadPolicy::default())
 }
 
-/// Constructs `read@1` with one frozen registry-projection policy.
+/// Constructs `read@2` with one frozen registry-projection policy.
 pub fn tool_with_policy<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 	sources: S,
 	blobs: B,
@@ -634,7 +669,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B,
 			}
 			let path = params.path;
 			span.record("path", tracing::field::display(tracing_path_metadata(&path)));
-			let work = self.execute(path.clone()).instrument(span.clone()).fuse();
+			let work = self.execute(path.clone(), params.question).instrument(span.clone()).fuse();
 			let cancel = incoming.next_interrupt().fuse();
 			pin_mut!(work, cancel);
 			let result = select_biased! {
@@ -681,8 +716,18 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B,
 						remaining_text -= end;
 					}
 				},
-				PayloadPart::Blob { blob, alt } if caps.media => {
+				PayloadPart::Blob { blob, alt, .. } if caps.media => {
 					output.push(Part::Blob { blob: blob.clone(), alt: Some(alt.clone()) });
+				},
+				PayloadPart::Blob { vision: Some(_), .. } if remaining_text != 0 => {
+					let mut end = VISION_UNAVAILABLE.len().min(remaining_text);
+					while end != 0 && !VISION_UNAVAILABLE.is_char_boundary(end) {
+						end -= 1;
+					}
+					if end != 0 {
+						output.push(Part::Text { text: Str::new(&VISION_UNAVAILABLE[..end]) });
+						remaining_text -= end;
+					}
 				},
 				PayloadPart::Blob { alt, .. } if remaining_text != 0 => {
 					let mut end = alt.len().min(remaining_text);
@@ -699,6 +744,24 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B,
 		}
 		output
 	}
+
+	fn lift(&self, from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
+		lift_rev1(from, call)
+	}
+}
+
+fn lift_rev1(from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
+	if !from.family.is_empty() || from.n != 1 {
+		return None;
+	}
+	let mut raw_args = serde_json::from_slice::<serde_json::Value>(call.raw_args).ok()?;
+	raw_args.as_object_mut()?.remove("i");
+	serde_json::from_value::<Params>(raw_args).ok()?;
+	serde_json::from_slice::<CallOutcome<Payload, Fault>>(call.verdict).ok()?;
+	Some(LiftedCall {
+		raw_args: Bytes::copy_from_slice(call.raw_args),
+		verdict:  Bytes::copy_from_slice(call.verdict),
+	})
 }
 
 impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
@@ -721,8 +784,18 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		);
 	}
 
-	async fn execute(&self, authored: Str) -> Result<Payload, Fault> {
+	async fn execute(&self, authored: Str, question: Option<Str>) -> Result<Payload, Fault> {
+		if question.as_ref().is_some_and(|question| question.trim().is_empty()) {
+			return Err(Fault::Invalid {
+				message: Str::new_static("Image question must not be empty."),
+			});
+		}
 		let targets = self.split_targets(&authored).await?;
+		if question.is_some() && targets.len() != 1 {
+			return Err(Fault::Invalid {
+				message: Str::new_static("An image question requires exactly one read target."),
+			});
+		}
 		let multiple = targets.len() > 1;
 		let mut parts = Vec::new();
 		if multiple {
@@ -737,7 +810,10 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		}
 		for target in &targets {
 			match self.execute_target(target).await {
-				Ok(section) => {
+				Ok(mut section) => {
+					if let Some(question) = &question {
+						Self::attach_vision_question(&mut section, question)?;
+					}
 					for part in section {
 						push_payload_part(&mut parts, part);
 					}
@@ -750,7 +826,45 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				Err(fault) => return Err(fault),
 			}
 		}
-		self.finalize_text_parts(parts).await
+		Ok(Payload { parts })
+	}
+
+	fn attach_vision_question(
+		parts: &mut Vec<PayloadPart>,
+		question: &Str,
+	) -> Result<(), Fault> {
+		let Some(blob_index) = parts
+			.iter()
+			.position(|part| matches!(part, PayloadPart::Blob { .. }))
+		else {
+			return Err(Fault::Unsupported {
+				message: Str::new_static(
+					"Image questions require a supported PNG, JPEG, GIF, WebP, or rasterized SVG/PDF image.",
+				),
+			});
+		};
+		if let Some(PayloadPart::Text { text }) = parts[..blob_index]
+			.iter_mut()
+			.rev()
+			.find(|part| matches!(part, PayloadPart::Text { .. }))
+		{
+			*text = sf!(
+				"{text}\n\nImage question: {question}\nAnswer using the attached image."
+			);
+		} else {
+			parts.insert(blob_index, PayloadPart::Text {
+				text: sf!("Image question: {question}\nAnswer using the attached image."),
+			});
+		}
+		let vision = VisionRequest { question: question.clone() };
+		let Some(PayloadPart::Blob { vision: request, .. }) = parts
+			.iter_mut()
+			.find(|part| matches!(part, PayloadPart::Blob { .. }))
+		else {
+			unreachable!("blob position was checked above");
+		};
+		*request = Some(vision);
+		Ok(())
 	}
 
 	async fn split_targets(&self, authored: &str) -> Result<Vec<Str>, Fault> {
@@ -864,7 +978,8 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 						svg_gzip_path(Path::new(uri.resource)).ok_or_else(svg_image_selector_fault)?;
 					return self.read_svg_image(bytes.into_bytes(), gzip).await;
 				}
-				if uri.scheme == resolver::Scheme::Local
+				if !uri.selector.is_raw()
+					&& image::sniff_metadata(&bytes[..bytes.len().min(256 * 1024)]).is_some()
 					&& let Some(loaded) = image::process_image_with_policy(
 						bytes.clone().into_bytes(),
 						self.policy.auto_resize_images,
@@ -877,7 +992,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 						.await?;
 					return Ok(vec![
 						PayloadPart::Text { text: loaded.description.clone() },
-						PayloadPart::Blob { blob, alt: loaded.description },
+						PayloadPart::Blob { blob, alt: loaded.description, vision: None },
 					]);
 				}
 				let text = str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
@@ -987,6 +1102,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 							raster.total_pages,
 							stat.display_path
 						),
+						vision: None,
 					},
 				]);
 			}
@@ -1162,6 +1278,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			},
 		};
 		if !raw
+			&& self.policy.summarize
 			&& matches!(parsed, selector::ParsedSelector::None)
 			&& stat.byte_len <= MAX_SUMMARY_BYTES
 			&& (MIN_SUMMARY_LINES..=MAX_SUMMARY_LINES).contains(&text.lines().count())
@@ -1221,7 +1338,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		};
 		if let Some(image) = fetched.image {
 			let blob = self.blobs.store(image.data, image.media_type).await?;
-			parts.push(PayloadPart::Blob { blob, alt: image.description });
+			parts.push(PayloadPart::Blob { blob, alt: image.description, vision: None });
 		}
 		Ok(parts)
 	}
@@ -1382,6 +1499,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		Ok(Some(vec![PayloadPart::Text { text: loaded.description.clone() }, PayloadPart::Blob {
 			blob,
 			alt: loaded.description,
+			vision: None,
 		}]))
 	}
 
@@ -1398,6 +1516,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		Ok(vec![PayloadPart::Text { text: loaded.description.clone() }, PayloadPart::Blob {
 			blob,
 			alt: loaded.description,
+			vision: None,
 		}])
 	}
 
@@ -1429,7 +1548,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			);
 			summary.source_lines.insert(0, format::SourceLines::new());
 		}
-		let seen = retained_source_lines(&summary.text, &summary.source_lines);
+		let seen = retained_source_lines(&summary.source_lines);
 		let tag = self.sources.record_snapshot(SnapshotRecord {
 			path:     path.clone(),
 			revision: revision.clone(),
@@ -1461,7 +1580,14 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 	) -> Result<Vec<PayloadPart>, Fault> {
 		let pinned = pinned.filter(|_| self.policy.hashline_headers);
 		let placeholder_tag = pinned.filter(|_| !parsed.is_raw()).map(|_| "0000");
-		let mut formatted = format_read_projection(stat, text, parsed, placeholder_tag, suffix_from);
+		let mut formatted = format_read_projection(
+			stat,
+			text,
+			parsed,
+			placeholder_tag,
+			suffix_from,
+			self.policy.line_numbers,
+		);
 		append_visible_conflict_warning(
 			&mut formatted,
 			text,
@@ -1469,8 +1595,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			parsed,
 			&self.conflicts,
 		);
-		let (candidate_text, candidate_sources) = formatted.projection();
-		let candidate_seen = retained_source_lines(candidate_text, candidate_sources);
+		let candidate_seen = retained_source_lines(&formatted.source_lines);
 		let tag = if let Some((path, revision, bytes)) = pinned {
 			self.sources.record_snapshot(SnapshotRecord {
 				path:     path.clone(),
@@ -1483,7 +1608,14 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		};
 
 		if placeholder_tag.is_some() && tag.is_none() {
-			formatted = format_read_projection(stat, text, parsed, None, suffix_from);
+			formatted = format_read_projection(
+				stat,
+				text,
+				parsed,
+				None,
+				suffix_from,
+				self.policy.line_numbers,
+			);
 			append_visible_conflict_warning(
 				&mut formatted,
 				text,
@@ -1492,7 +1624,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				&self.conflicts,
 			);
 		}
-		let (mut projection, _) = formatted.into_projection();
+		let mut projection = formatted.text;
 		if let Some(tag) = tag
 			&& placeholder_tag.is_some()
 		{
@@ -1509,42 +1641,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 	fn virtual_text_parts(text: &str, parsed: &selector::ParsedSelector) -> Vec<PayloadPart> {
 		let formatted =
 			format::format_text(text, parsed, format::TextFormatOptions::new("URL output"));
-		let (projection, _) = formatted.into_projection();
-		vec![PayloadPart::Text { text: Str::new(projection) }]
-	}
-
-	async fn finalize_text_parts(&self, parts: Vec<PayloadPart>) -> Result<Payload, Fault> {
-		let mut finalized = Vec::with_capacity(parts.len());
-		let mut artifacts = Vec::new();
-		for part in parts {
-			match part {
-				PayloadPart::Text { text } => {
-					let (text, artifact) = self.truncate_text(text).await?;
-					finalized.push(PayloadPart::Text { text });
-					artifacts.extend(artifact);
-				},
-				PayloadPart::Blob { blob, alt } => {
-					let (alt, artifact) = self.truncate_text(alt).await?;
-					finalized.push(PayloadPart::Blob { blob, alt });
-					artifacts.extend(artifact);
-				},
-			}
-		}
-		Ok(Payload { parts: finalized, artifacts })
-	}
-
-	async fn truncate_text(&self, text: Str) -> Result<(Str, Option<StoredArtifact>), Fault> {
-		let truncated = truncate_head(&text, TruncationOptions::default());
-		if !truncated.truncated {
-			return Ok((text, None));
-		}
-		let artifact = self
-			.blobs
-			.store_artifact(Bytes::copy_from_slice(text.as_bytes()), sf!("text/plain; charset=utf-8"))
-			.await?;
-		let mut visible = truncated.content.to_owned();
-		append_blob_truncation_notice(&mut visible, &truncated, &artifact.uri);
-		Ok((Str::new(visible), Some(artifact)))
+		vec![PayloadPart::Text { text: Str::new(formatted.text) }]
 	}
 }
 fn format_read_projection<'a>(
@@ -1553,11 +1650,13 @@ fn format_read_projection<'a>(
 	parsed: &selector::ParsedSelector,
 	tag: Option<&'a str>,
 	suffix_from: Option<&str>,
+	line_numbers: bool,
 ) -> format::FormattedText {
 	let mut options = format::TextFormatOptions::new("file");
 	options.block_context =
 		format::BlockContextSource { path: Some(&stat.display_path), language: None };
 	options.snapshot = tag.map(|tag| format::SnapshotHeader { anchor: &stat.display_path, tag });
+	options.line_numbers = line_numbers;
 	let mut formatted = format::format_text(text, parsed, options);
 	if let Some(from) = suffix_from {
 		formatted.prepend_suffix_resolution_notice(from, &stat.display_path);
@@ -1565,16 +1664,10 @@ fn format_read_projection<'a>(
 	formatted
 }
 
-fn retained_source_lines(text: &str, source_lines: &[format::SourceLines]) -> Vec<usize> {
-	let truncation = truncate_head(text, TruncationOptions::default());
-	debug_assert_eq!(
-		source_lines.len(),
-		truncation.total_lines,
-		"rendered source map must cover every projected line"
-	);
+/// Every source line exposed by a complete projection, sorted and deduplicated.
+fn retained_source_lines(source_lines: &[format::SourceLines]) -> Vec<usize> {
 	let mut retained = source_lines
 		.iter()
-		.take(truncation.shown_lines())
 		.flat_map(|lines| lines.iter().copied())
 		.collect::<Vec<_>>();
 	retained.sort_unstable();
@@ -1592,8 +1685,7 @@ fn append_visible_conflict_warning(
 	if parsed.is_raw() {
 		return;
 	}
-	let (projection, source_map) = formatted.projection();
-	let retained = retained_source_lines(projection, source_map);
+	let retained = retained_source_lines(&formatted.source_lines);
 	if retained.is_empty() {
 		return;
 	}
@@ -1831,7 +1923,7 @@ const fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
 const fn args_issue() -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: sf!("read@1 arguments"),
+		expected: sf!("read@2 arguments"),
 		kind:     ArgIssueKind::Malformed,
 		example:  None,
 		found:    None,

@@ -1,20 +1,21 @@
 //! Multi-target structural search with stable pagination and hashline
 //! locations.
 
-use std::{error, fmt, fmt::Display, fs, path::PathBuf, sync::Arc};
+use std::{fs, path::PathBuf, sync::Arc};
 
 use async_stream::stream;
+use bytes::Bytes;
 use futures::Stream;
 use omp_core::{Str, sf};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, DocEffects, Effects, Ev, IncomingParams,
-	ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, CallOutcome, CommitError, Constraint, DocEffects, Effects, Ev,
+	IncomingParams, LiftedCall, ParamError, Part, PromptCaps, RecordedCall, Rev, Tool, ToolSpec,
+	ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_LIMIT: usize = 100;
-const MAX_LIMIT: usize = 500;
+const PAGE_LIMIT: usize = 50;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -27,11 +28,24 @@ pub struct Params {
 	/// defaults to `"."`.
 	pub path:   Option<Str>,
 	#[serde(default)]
-	/// Zero-based result offset at which to start the page; defaults to `0`.
-	pub cursor: usize,
+	/// Matches to skip before the page starts; defaults to `0`.
+	pub skip: usize,
+}
+
+/// `ast_grep@1` argument shape, retained only to lift historical calls.
+#[derive(Deserialize)]
+struct ParamsV1 {
+	pat:    Str,
 	#[serde(default)]
-	/// Maximum matches in the page; defaults to 100 and is clamped to 1–500.
-	pub limit:  Option<usize>,
+	path:   Option<Str>,
+	#[serde(default)]
+	cursor: usize,
+	#[serde(default, rename = "limit")]
+	_limit: Option<usize>,
+	#[serde(default)]
+	i:      Option<Str>,
+	#[serde(default)]
+	notrunc: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -71,26 +85,30 @@ pub struct Payload {
 	pub advisories:  Vec<Advisory>,
 	/// Number of matches across all targets before pagination.
 	pub total:       usize,
-	/// Zero-based offset for the next page, or `None` when this is the final
-	/// page.
-	pub next_cursor: Option<usize>,
+	/// `skip` value that resumes at the next page, or `None` when this is the
+	/// final page.
+	pub next_skip:  Option<usize>,
+}
+
+/// `ast_grep@1` payload shape, retained only to lift historical verdicts.
+#[derive(Deserialize)]
+struct PayloadV1 {
+	matches:     Vec<Match>,
+	advisories:  Vec<Advisory>,
+	total:       usize,
+	next_cursor: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 /// Empty update type because structural search emits only a terminal result.
 pub enum Update {}
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, thiserror::Error)]
+#[error("{message}")]
 /// Terminal argument, target-discovery, or search failure.
 pub struct Fault {
 	message: Str,
 }
-impl Display for Fault {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.write_str(&self.message)
-	}
-}
-impl error::Error for Fault {}
 
 /// Workspace-scoped structural-search tool exposed as `ast_grep`.
 pub struct AstGrep {
@@ -98,15 +116,15 @@ pub struct AstGrep {
 	spec: ToolSpec,
 }
 
-/// Returns the host-free `ast_grep@1` specification.
+/// Returns the host-free `ast_grep@2` specification.
 pub fn spec() -> ToolSpec {
 	ToolSpec {
 		name:            sf!("ast_grep"),
-		rev:             Rev { family: Default::default(), n: 1 },
+		rev:             Rev { family: Default::default(), n: 2 },
 		description:     sf!(
 			"Searches multiple files structurally with ast-grep metavariables. `path` accepts \
 			 semicolon-separated files, directories, and globs. Results use stable path/source \
-			 ordering; `cursor` resumes pagination."
+			 ordering; `skip` resumes pagination past that many matches."
 		),
 		schema:          omp_tool::schema::<Params>(),
 		constraint:      Constraint::Schema {
@@ -167,12 +185,15 @@ impl Tool for AstGrep {
 			}
 			matches.sort_unstable_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)).then(a.column.cmp(&b.column)));
 			let total = matches.len();
-			let start = params.cursor.min(total);
-			let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-			let end = start.saturating_add(limit).min(total);
+			let start = params.skip.min(total);
+			let end = start.saturating_add(PAGE_LIMIT).min(total);
 			let page = matches.drain(start..end).collect();
-			yield done(Ok(Payload { matches: page, advisories, total, next_cursor: (end < total).then_some(end) }));
+			yield done(Ok(Payload { matches: page, advisories, total, next_skip: (end < total).then_some(end) }));
 		}
+	}
+
+	fn lift(&self, from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
+		lift_cursor_to_skip(from, call)
 	}
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, _: &PromptCaps) -> Vec<Part> {
@@ -192,9 +213,9 @@ impl Tool for AstGrep {
 					use std::fmt::Write as _;
 					let _ = writeln!(out, "[advisory {}] {}", advisory.path, advisory.message);
 				}
-				if let Some(cursor) = payload.next_cursor {
+				if let Some(skip) = payload.next_skip {
 					use std::fmt::Write as _;
-					let _ = writeln!(out, "[next cursor: {cursor}; total: {}]", payload.total);
+					let _ = writeln!(out, "[next skip: {skip}; total: {}]", payload.total);
 				}
 				Str::new(out)
 			},
@@ -217,8 +238,41 @@ fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
 		result,
 	})
 }
+/// Lifts an `ast_grep@1` call (`cursor`/`limit` and `next_cursor`) to the
+/// fixed-page `@2` wire (`skip`/`next_skip`); the resume offset is identical.
+fn lift_cursor_to_skip(from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
+	if !from.family.is_empty() || from.n != 1 {
+		return None;
+	}
+	let old = serde_json::from_slice::<ParamsV1>(call.raw_args).ok()?;
+	let mut raw_args =
+		serde_json::to_value(&Params { pat: old.pat, path: old.path, skip: old.cursor }).ok()?;
+	if let Some(object) = raw_args.as_object_mut() {
+		if let Some(intent) = old.i {
+			object.insert("i".to_owned(), serde_json::Value::String(intent.to_string()));
+		}
+		if let Some(notrunc) = old.notrunc {
+			object.insert("notrunc".to_owned(), serde_json::Value::Bool(notrunc));
+		}
+	}
+	let raw_args = serde_json::to_vec(&raw_args).ok()?;
+	let verdict = match serde_json::from_slice::<CallOutcome<PayloadV1, Fault>>(call.verdict).ok()? {
+		CallOutcome::Ok(payload) => serde_json::to_vec(&CallOutcome::<Payload, Fault>::Ok(Payload {
+			matches:    payload.matches,
+			advisories: payload.advisories,
+			total:      payload.total,
+			next_skip:  payload.next_cursor,
+		}))
+		.ok()?,
+		CallOutcome::Faulted(_) | CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. } => {
+			call.verdict.to_vec()
+		},
+	};
+	Some(LiftedCall { raw_args: Bytes::from(raw_args), verdict: Bytes::from(verdict) })
+}
 #[cfg(test)]
 mod tests {
+	use futures::{StreamExt as _, executor::block_on};
 	use omp_ast::ops::AstBinding;
 
 	use super::*;
@@ -230,6 +284,121 @@ mod tests {
 			value: sf!("42"),
 		}];
 		assert_eq!(render_bindings(&bindings), "$NAME=answer, $VALUE=42");
+	}
+
+	#[test]
+	fn revision_two_schema_is_the_skip_wire_contract() {
+		let spec = spec();
+		assert_eq!(spec.rev, Rev { family: Str::default(), n: 2 });
+		let schema: serde_json::Value =
+			serde_json::from_slice(&spec.schema).expect("ast_grep schema is JSON");
+		let mut domain_properties = schema["properties"]
+			.as_object()
+			.expect("object properties")
+			.keys()
+			.filter(|name| !matches!(name.as_str(), "i" | "notrunc"))
+			.map(String::as_str)
+			.collect::<Vec<_>>();
+		domain_properties.sort_unstable();
+		assert_eq!(domain_properties, ["pat", "path", "skip"]);
+		assert_eq!(schema["properties"]["skip"]["type"], "integer");
+		assert_eq!(schema["properties"]["skip"]["default"], 0);
+		assert!(schema["properties"].get("cursor").is_none());
+		assert!(schema["properties"].get("limit").is_none());
+		let required = schema["required"].as_array().expect("required fields");
+		assert!(required.iter().any(|value| value == "i"));
+		assert!(required.iter().any(|value| value == "pat"));
+		assert!(!required.iter().any(|value| value == "skip"));
+	}
+
+	fn search(root: PathBuf, raw: &str) -> Payload {
+		let tool = tool(root);
+		let (feed, params) = IncomingParams::channel();
+		feed
+			.args_committed(Str::new(raw))
+			.expect("invocation consumer remains live");
+		let events = block_on(tool.call(params).collect::<Vec<_>>());
+		let [Ev::Done(ToolTerminal::Done { result: Ok(payload), .. })] = events.as_slice() else {
+			panic!("expected one successful ast_grep outcome: {events:?}");
+		};
+		payload.clone()
+	}
+
+	#[test]
+	fn skip_resumes_fixed_size_pagination_past_the_first_matches() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let source = (0..55).map(|index| format!("call{index}({index});\n")).collect::<String>();
+		fs::write(dir.path().join("calls.ts"), source).expect("write calls.ts");
+
+		let first = search(dir.path().to_path_buf(), r#"{"pat":"$F($A)","path":"*.ts"}"#);
+		assert_eq!(first.total, 55);
+		assert_eq!(first.matches.len(), 50);
+		assert_eq!(first.next_skip, Some(50));
+		let first_texts = first.matches.iter().map(|m| m.text.as_str()).collect::<Vec<_>>();
+
+		let second =
+			search(dir.path().to_path_buf(), r#"{"pat":"$F($A)","path":"*.ts","skip":50}"#);
+		let second_texts = second.matches.iter().map(|m| m.text.as_str()).collect::<Vec<_>>();
+		assert_eq!(second.matches.len(), 5);
+		assert_eq!(second.next_skip, None);
+		for text in &first_texts {
+			assert!(!second_texts.contains(text), "{text} reappeared on the second page");
+		}
+	}
+
+	#[test]
+	fn revision_one_cursor_and_limit_are_not_accepted_wire_fields() {
+		for raw in [r#"{"pat":"$F($A)","cursor":2}"#, r#"{"pat":"$F($A)","limit":2}"#] {
+			let tool = tool(PathBuf::from("."));
+			let (feed, params) = IncomingParams::channel();
+			feed
+				.args_committed(Str::new(raw))
+				.expect("invocation consumer remains live");
+			let events = block_on(tool.call(params).collect::<Vec<_>>());
+			assert!(
+				matches!(events.as_slice(), [Ev::Args(_)]),
+				"revision one pagination field must be rejected: {events:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn lifts_rev1_cursor_calls_onto_skip() {
+		let tool = tool(PathBuf::from("."));
+		let raw_args =
+			br#"{"i":"Finding calls","notrunc":true,"pat":"$F($A)","cursor":7,"limit":3}"#;
+		let verdict = br#"{"kind":"ok","value":{"matches":[],"advisories":[],"total":12,"next_cursor":10}}"#;
+		let lifted = tool
+			.lift(&Rev { family: Default::default(), n: 1 }, RecordedCall {
+				raw_args,
+				verdict,
+			})
+			.expect("rev 1 lifts to rev 2");
+		let params: Params = omp_tool::decode_params(
+			std::str::from_utf8(&lifted.raw_args).expect("lifted arguments are UTF-8"),
+		)
+		.expect("lifted params");
+		assert_eq!(params.skip, 7);
+		let lifted_args: serde_json::Value =
+			serde_json::from_slice(&lifted.raw_args).expect("lifted arguments are JSON");
+		assert_eq!(lifted_args["i"], "Finding calls");
+		assert_eq!(lifted_args["notrunc"], true);
+		assert!(lifted_args.get("limit").is_none());
+		let payload = match serde_json::from_slice::<CallOutcome<Payload, Fault>>(&lifted.verdict)
+			.expect("lifted verdict")
+		{
+			CallOutcome::Ok(payload) => payload,
+			other => panic!("expected ok verdict: {other:?}"),
+		};
+		assert_eq!(payload.next_skip, Some(10));
+		assert_eq!(payload.total, 12);
+		assert!(
+			tool.lift(&Rev { family: Default::default(), n: 2 }, RecordedCall {
+				raw_args,
+				verdict
+			})
+			.is_none()
+		);
 	}
 }
 fn param_event(error: ParamError) -> Ev<Update, Payload, Fault> {

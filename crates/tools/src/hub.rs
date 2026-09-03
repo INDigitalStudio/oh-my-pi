@@ -174,9 +174,6 @@ pub struct Params {
 	/// Follow output after the current cursor.
 	#[serde(default)]
 	pub follow:               bool,
-	/// Reconstruct PTY output as terminal screen rows instead of raw log bytes.
-	#[serde(rename = "renderTerminalRows", default)]
-	pub render_terminal_rows: bool,
 	/// Process lifecycle target (`ready` or `exit`).
 	///
 	/// Each wait is fenced to the named process generation observed when the
@@ -313,13 +310,13 @@ pub struct Hub<B> {
 	spec:    ToolSpec,
 }
 
-/// Returns the canonical `hub@1` declaration shared by registry advertisement
+/// Returns the canonical `hub@2` declaration shared by registry advertisement
 /// and session-owned execution.
 #[must_use]
 pub fn spec() -> ToolSpec {
 	ToolSpec {
 		name:            sf!("hub"),
-		rev:             Rev { family: Default::default(), n: 1 },
+		rev:             Rev { family: Default::default(), n: 2 },
 		description:     sf!(DESCRIPTION),
 		schema:          omp_tool::schema::<Params>(),
 		constraint:      Constraint::Schema {
@@ -336,7 +333,7 @@ pub fn spec() -> ToolSpec {
 	}
 }
 
-/// Constructs `hub@1` over the per-agent broker/process composition.
+/// Constructs `hub@2` over the per-agent broker/process composition.
 pub fn tool<B: HubBackend>(backend: B) -> Hub<B> {
 	Hub { backend, spec: spec() }
 }
@@ -465,6 +462,17 @@ pub fn validate(mut params: Params, caller_id: &str) -> Result<Request, Fault> {
 				params.pty = Some(false);
 			}
 		},
+		Op::Wait if params.name.is_some() && params.ids.as_ref().is_some_and(|ids| !ids.is_empty()) => {
+			return Err(invalid("wait accepts a process `name` or job `ids`, not both"));
+		},
+		Op::Wait
+			if params.wait_for.as_deref().is_some_and(|target| target != "ready" && target != "exit") =>
+		{
+			return Err(invalid("wait `for` must be `ready` or `exit`"));
+		},
+		Op::Wait if params.name.is_none() && (params.wait_for.is_some() || params.pattern.is_some()) => {
+			return Err(invalid("process wait fields require `name`"));
+		},
 		Op::Logs | Op::Stop | Op::Restart | Op::Describe if params.name.is_none() => {
 			return Err(invalid("process operation requires `name`"));
 		},
@@ -490,6 +498,14 @@ pub fn validate(mut params: Params, caller_id: &str) -> Result<Request, Fault> {
 		.is_some_and(|timeout| !timeout.is_finite() || timeout <= 0.0)
 	{
 		return Err(invalid("process timeout must be a positive finite number"));
+	}
+	if params
+		.grep
+		.as_deref()
+		.is_some_and(str::is_empty)
+		|| params.pattern.as_deref().is_some_and(str::is_empty)
+	{
+		return Err(invalid("log and wait patterns must be non-empty"));
 	}
 	Ok(Request { params })
 }
@@ -528,7 +544,7 @@ fn commit_event(error: omp_tool::CommitError) -> Ev<Response, Response, Fault> {
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: sf!("one committed hub@1 argument object"),
+		expected: sf!("one committed hub@2 argument object"),
 		kind:     ArgIssueKind::Protocol,
 		example:  Some(sf!(r#"{{"op":"list"}}"#)),
 		found:    Some(message),
@@ -569,7 +585,6 @@ mod tests {
 			grep: None,
 			cursor: None,
 			follow: false,
-			render_terminal_rows: false,
 			wait_for: None,
 			pattern: None,
 			text: None,
@@ -626,5 +641,55 @@ mod tests {
 		assert!(validate(list.clone(), "main").is_ok());
 		list.limit = Some(101);
 		assert!(validate(list, "main").is_err());
+	}
+
+	#[test]
+	fn every_hub_operation_has_a_valid_branch() {
+		let mut send_peer = params(Op::Send);
+		send_peer.to = Some("peer".into());
+		send_peer.message = Some("hello".into());
+		assert!(validate(send_peer, "main").is_ok());
+
+		let mut send_process = params(Op::Send);
+		send_process.name = Some("proc".into());
+		send_process.text = Some("status".into());
+		assert!(validate(send_process, "main").is_ok());
+
+		assert!(validate(params(Op::Wait), "main").is_ok());
+		assert!(validate(params(Op::Inbox), "main").is_ok());
+		assert!(validate(params(Op::List), "main").is_ok());
+		assert!(validate(params(Op::Jobs), "main").is_ok());
+		let mut cancel = params(Op::Cancel);
+		cancel.ids = Some(vec!["job-1".into()]);
+		assert!(validate(cancel, "main").is_ok());
+
+		let mut start = params(Op::Start);
+		start.name = Some("proc".into());
+		start.application = Some("echo".into());
+		assert!(validate(start, "main").is_ok());
+		assert!(validate(params(Op::Ps), "main").is_ok());
+		for op in [Op::Logs, Op::Stop, Op::Restart, Op::Describe] {
+			let mut request = params(op);
+			request.name = Some("proc".into());
+			assert!(validate(request, "main").is_ok());
+		}
+	}
+
+	#[test]
+	fn process_wait_contract_rejects_shadowed_routes() {
+		let mut mixed = params(Op::Wait);
+		mixed.name = Some("proc".into());
+		mixed.ids = Some(vec!["job-1".into()]);
+		assert!(validate(mixed, "main").is_err());
+
+		let mut bad_target = params(Op::Wait);
+		bad_target.name = Some("proc".into());
+		bad_target.wait_for = Some("running".into());
+		assert!(validate(bad_target, "main").is_err());
+
+		let mut valid = params(Op::Wait);
+		valid.name = Some("proc".into());
+		valid.wait_for = Some("ready".into());
+		assert!(validate(valid, "main").is_ok());
 	}
 }

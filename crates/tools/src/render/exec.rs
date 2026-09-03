@@ -143,7 +143,7 @@ impl RenderFold for EvalRenderer {
 	fn view(&self, state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
 		match outcome {
 			None => Some(render_eval_live(state).into()),
-			Some(CallOutcome::Ok(payload)) => Some(render_eval_payload(payload).into()),
+			Some(CallOutcome::Ok(payload)) => Some(render_eval_payload(payload, state).into()),
 			Some(CallOutcome::Faulted(fault)) => Some(render_fault("eval", &eval_fault(fault)).into()),
 			Some(CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. }) => None,
 		}
@@ -391,9 +391,10 @@ fn eval_status_tone(outcome: CellOutcome) -> Tone {
 	}
 }
 
-fn render_eval_payload(payload: &EvalPayload) -> El {
+fn render_eval_payload(payload: &EvalPayload, state: &StreamState) -> El {
 	let status = eval_state_status(payload.status.outcome);
 	let status_tone = eval_status_tone(payload.status.outcome);
+	let streamed = String::from_utf8_lossy(&state.tail);
 	view! {
 		<col gap=0>
 			<row gap=1>
@@ -410,6 +411,9 @@ fn render_eval_payload(payload: &EvalPayload) -> El {
 			</row>
 			<pre fg=accent max-rows=12 overflow="code">{&payload.code}</pre>
 			<hr label="Output"/>
+			if !state.tail.is_empty() {
+				<pre max-rows=20 overflow="output">{streamed.as_ref()}</pre>
+			}
 			if let Some(exception) = &payload.status.exception {
 				<pre fg=err max-rows=20 overflow="traceback">
 					for (index, line) in exception.traceback.iter().enumerate() {
@@ -422,19 +426,13 @@ fn render_eval_payload(payload: &EvalPayload) -> El {
 						{": "}{&exception.message}
 					}
 				</pre>
-			} else if payload.frames.is_empty()
+			} else if state.tail.is_empty()
+				&& !payload.had_output
 				&& payload.result.is_none()
 				&& payload.display_outputs.is_empty()
 			{
 				<text fg=muted>{"(no output)"}</text>
 			} else {
-				if !payload.frames.is_empty() {
-					<pre max-rows=20 overflow="output">
-						for frame in &payload.frames {
-							{String::from_utf8_lossy(frame.data.as_ref()).into_owned()}
-						}
-					</pre>
-				}
 				if let Some(result) = &payload.result {
 					<pre fg=info max-rows=20 overflow="result">{&result.text}</pre>
 				}
@@ -457,12 +455,6 @@ fn render_eval_payload(payload: &EvalPayload) -> El {
 						},
 					}
 				}
-			}
-			if payload.truncated {
-				<callout kind="warn">{"Output was truncated."}</callout>
-			}
-			if payload.spilled_output.is_some() {
-				<fact label="output">{"full output stored as blob"}</fact>
 			}
 		</col>
 	}
@@ -491,8 +483,8 @@ pub(crate) fn gallery_fixtures(
 			progress_update: Some(
 				br#"{"channel":"stdout","data":[64,111,104,45,109,121,45,112,105,47,99,111,100,105,110,103,45,97,103,101,110,116,32,118,48,46,52,50,46,48,10],"sequence":1}"#,
 			),
-			success_outcome: br#"{"kind":"ok","value":{"session_id":[1],"cell_id":[1],"language":"py","title":"load config","code":"import json\nfrom pathlib import Path\n\ndata = json.loads(Path(\"package.json\").read_text())\ndeps = data.get(\"dependencies\", {})\nprint(f\"{data['name']} v{data['version']}\")\nprint(f\"{len(deps)} dependencies\")\ndisplay(sorted(deps)[:3])","reset":false,"frames":[{"channel":"stdout","data":[64,111,104,45,109,121,45,112,105,47,99,111,100,105,110,103,45,97,103,101,110,116,32,118,48,46,52,50,46,48,10,51,55,32,100,101,112,101,110,100,101,110,99,105,101,115,10],"sequence":1}],"result":null,"display_outputs":[{"type":"json","data":["@ai-sdk/anthropic","@oh-my-pi/pi-ai","@oh-my-pi/pi-tui"]}],"status":{"outcome":"complete","exit_code":0,"duration_ms":64,"exception":null},"truncated":false,"spilled_output":null,"total_lines":2,"total_bytes":48}}"#,
-			error_outcome: br#"{"kind":"ok","value":{"session_id":[1],"cell_id":[2],"language":"py","title":"load config","code":"import json\nfrom pathlib import Path\n\ndata = json.loads(Path(\"package.json\").read_text())\ndeps = data.get(\"dependencies\", {})\nprint(f\"{data['name']} v{data['version']}\")","reset":false,"frames":[],"result":null,"display_outputs":[],"status":{"outcome":"error","exit_code":1,"duration_ms":41,"exception":{"name":"json.decoder.JSONDecodeError","message":"Expecting ',' delimiter: line 12 column 3 (char 318)","traceback":["Traceback (most recent call last):","  File \"<cell 0>\", line 4, in <module>","    data = json.loads(Path(\"package.json\").read_text())","          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"]}},"truncated":false,"spilled_output":null,"total_lines":5,"total_bytes":318}}"#,
+			success_outcome: br#"{"kind":"ok","value":{"session_id":[1],"cell_id":[1],"language":"py","title":"load config","code":"import json\nfrom pathlib import Path\n\ndata = json.loads(Path(\"package.json\").read_text())\ndeps = data.get(\"dependencies\", {})\nprint(f\"{data['name']} v{data['version']}\")\nprint(f\"{len(deps)} dependencies\")\ndisplay(sorted(deps)[:3])","reset":false,"had_output":true,"result":null,"display_outputs":[{"type":"json","data":["@ai-sdk/anthropic","@oh-my-pi/pi-ai","@oh-my-pi/pi-tui"]}],"status":{"outcome":"complete","exit_code":0,"duration_ms":64,"exception":null}}}"#,
+			error_outcome: br#"{"kind":"ok","value":{"session_id":[1],"cell_id":[2],"language":"py","title":"load config","code":"import json\nfrom pathlib import Path\n\ndata = json.loads(Path(\"package.json\").read_text())\ndeps = data.get(\"dependencies\", {})\nprint(f\"{data['name']} v{data['version']}\")","reset":false,"had_output":false,"result":null,"display_outputs":[],"status":{"outcome":"error","exit_code":1,"duration_ms":41,"exception":{"name":"json.decoder.JSONDecodeError","message":"Expecting ',' delimiter: line 12 column 3 (char 318)","traceback":["Traceback (most recent call last):","  File \"<cell 0>\", line 4, in <module>","    data = json.loads(Path(\"package.json\").read_text())","          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"]}}}}"#,
 		},
 	]
 }
@@ -610,7 +602,7 @@ mod tests {
 		let success = eval_renderer.view(&eval_state, Some(&eval_ok)).unwrap();
 		assert!(success.contains("load config"));
 		assert!(success.contains("json.loads"));
-		assert!(success.contains("@oh-my-pi/coding-agent v0.42.0"));
+		assert_eq!(success.matches("@oh-my-pi/coding-agent v0.42.0").count(), 1);
 		assert!(success.contains("@ai-sdk/anthropic"));
 		assert!(success.contains("<json max-depth=3 max-rows=12 max-chars=80>"));
 		assert!(success.contains("<time ms=64 kind=duration/>"));

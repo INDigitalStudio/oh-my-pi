@@ -1,18 +1,16 @@
 //! Direct GitHub API device with isolated worktree mutation operations.
 
-use std::{
-	error,
-	fmt::{self, Display},
-	sync::Arc,
-};
+use std::sync::Arc;
 
 use async_stream::stream;
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::Stream;
 use omp_core::{Str, sf};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Effects, Ev, ExecEffects,
-	IncomingParams, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, CallOutcome, CommitError, Constraint, Effects, Ev, ExecEffects,
+	IncomingParams, LiftedCall, ParamError, Part, PromptCaps, RecordedCall, Rev, Tool, ToolSpec,
+	ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -120,6 +118,22 @@ pub struct Params {
 	/// Force-with-lease a PR push.
 	#[serde(default)]
 	pub force_with_lease: bool,
+	/// Derive the pull request title and body from the head commits; mutually
+	/// exclusive with `title` and `body`.
+	#[serde(default)]
+	pub fill:             bool,
+	/// Reviewers to request on the created pull request; `org/team` requests a
+	/// team review.
+	#[serde(default)]
+	pub reviewer:         Vec<Str>,
+	/// Users to assign to the created pull request.
+	#[serde(default)]
+	pub assignee:         Vec<Str>,
+	/// Labels to apply to the created pull request.
+	#[serde(default)]
+	pub label:            Vec<Str>,
+	/// Log lines retained per failed Actions job; defaults to 15, capped at 200.
+	pub tail:             Option<u32>,
 }
 
 impl Params {
@@ -143,19 +157,14 @@ pub struct Payload {
 }
 
 /// GitHub service failure.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, thiserror::Error)]
+#[error("{message}")]
 pub struct Fault {
 	/// Stable failure category.
 	pub code:    Str,
 	/// Secret-free diagnostic.
 	pub message: Str,
 }
-impl Display for Fault {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(&self.message)
-	}
-}
-impl error::Error for Fault {}
 
 /// GitHub operations currently settle as one bounded result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -178,17 +187,19 @@ pub struct Github {
 	spec: ToolSpec,
 }
 
-/// Creates `github@1`.
+/// Creates `github@2`.
 pub fn tool(host: Arc<dyn GithubHost>) -> Github {
 	Github {
 		host,
 		spec: ToolSpec {
 			name:            sf!("github"),
-			rev:             Rev { family: Str::default(), n: 1 },
+			rev:             Rev { family: Str::default(), n: 2 },
 			description:     sf!(
 				"Uses GitHub's direct API for repository, file, search, pull-request worktree, push, \
 				 and Actions operations. Repository identities are [host/]owner/repo; name the host \
-				 for GitHub Enterprise. No gh process or commit automation is used."
+				 for GitHub Enterprise. `pr_create` accepts `fill`, `reviewer`, `assignee`, and \
+				 `label`; `run_watch` returns the last `tail` log lines of each failed job. No gh \
+				 process or commit automation is used."
 			),
 			schema:          omp_tool::schema::<Params>(),
 			constraint:      Constraint::Schema {
@@ -258,6 +269,28 @@ impl Tool for Github {
 			},
 		}]
 	}
+
+	fn lift(&self, from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
+		lift_rev1(from, call)
+	}
+}
+
+/// Lifts `github@1` calls onto `github@2`. Revision two only adds optional
+/// arguments, so valid arguments and verdicts retain their exact bytes.
+fn lift_rev1(from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
+	if !from.family.is_empty() || from.n != 1 {
+		return None;
+	}
+	let mut raw_args = serde_json::from_slice::<Value>(call.raw_args).ok()?;
+	let object = raw_args.as_object_mut()?;
+	object.remove("i");
+	object.remove("notrunc");
+	serde_json::from_value::<Params>(raw_args).ok()?;
+	serde_json::from_slice::<CallOutcome<Payload, Fault>>(call.verdict).ok()?;
+	Some(LiftedCall {
+		raw_args: Bytes::copy_from_slice(call.raw_args),
+		verdict:  Bytes::copy_from_slice(call.verdict),
+	})
 }
 
 fn param_event(error: ParamError) -> Ev<Update, Payload, Fault> {
@@ -289,7 +322,75 @@ fn protocol_issue(message: Str) -> ArgIssue {
 }
 #[cfg(test)]
 mod tests {
-	use super::{DateField, Params, PrSelector};
+	use omp_core::Str;
+	use omp_tool::{CallOutcome, RecordedCall, Rev, Tool as _};
+	use serde_json::json;
+
+	use super::{DateField, Params, Payload, PrSelector, tool};
+
+	#[test]
+	fn revision_two_schema_is_the_github_wire_contract() {
+		let tool = tool(std::sync::Arc::new(PanicHost));
+		assert_eq!(tool.spec().rev, Rev { family: Str::default(), n: 2 });
+		let schema: serde_json::Value =
+			serde_json::from_slice(&tool.spec().schema).expect("GitHub schema is JSON");
+		let properties = schema["properties"].as_object().expect("object properties");
+		let mut domain_properties = properties
+			.keys()
+			.filter(|name| !matches!(name.as_str(), "i" | "notrunc"))
+			.map(String::as_str)
+			.collect::<Vec<_>>();
+		domain_properties.sort_unstable();
+		assert_eq!(
+			domain_properties,
+			[
+				"assignee",
+				"base",
+				"body",
+				"branch",
+				"dateField",
+				"draft",
+				"fill",
+				"force",
+				"forceWithLease",
+				"head",
+				"label",
+				"limit",
+				"op",
+				"path",
+				"pr",
+				"query",
+				"repo",
+				"reviewer",
+				"run",
+				"since",
+				"tail",
+				"title",
+				"until",
+			]
+		);
+		assert_eq!(properties["fill"]["type"], "boolean");
+		assert_eq!(properties["reviewer"]["type"], "array");
+		assert_eq!(properties["assignee"]["type"], "array");
+		assert_eq!(properties["label"]["type"], "array");
+		assert_eq!(properties["tail"]["type"], json!(["integer", "null"]));
+		let required = schema["required"].as_array().expect("required fields");
+		assert!(required.iter().any(|value| value == "i"));
+		assert!(required.iter().any(|value| value == "op"));
+	}
+
+	struct PanicHost;
+
+	#[async_trait::async_trait]
+	impl super::GithubHost for PanicHost {
+		async fn execute(
+			&self,
+			_: Params,
+			_: tokio_util::sync::CancellationToken,
+		) -> Result<Payload, super::Fault> {
+			panic!("schema test never executes the host")
+		}
+	}
 
 	#[test]
 	fn pr_selector_accepts_scalar_and_list_forms() {
@@ -308,6 +409,66 @@ mod tests {
 		assert!(
 			matches!(list.pr, Some(PrSelector::Many(values)) if values.len() == 2),
 			"selector arrays must remain batch inputs",
+		);
+	}
+
+	#[test]
+	fn pr_metadata_and_tail_fields_deserialize() {
+		let create: Params = serde_json::from_value(serde_json::json!({
+			"op": "pr_create",
+			"head": "feature/foo",
+			"fill": true,
+			"reviewer": ["alice", "org/team"],
+			"assignee": ["bob"],
+			"label": ["bug", "p1"],
+		}))
+		.expect("pr metadata fields");
+		assert!(create.fill);
+		assert_eq!(create.reviewer, ["alice", "org/team"]);
+		assert_eq!(create.assignee, ["bob"]);
+		assert_eq!(create.label, ["bug", "p1"]);
+		assert_eq!(create.tail, None);
+
+		let watch: Params =
+			serde_json::from_value(serde_json::json!({ "op": "run_watch", "run": "42", "tail": 40 }))
+				.expect("tail field");
+		assert_eq!(watch.tail, Some(40));
+		assert!(!watch.fill);
+		assert!(watch.reviewer.is_empty() && watch.assignee.is_empty() && watch.label.is_empty());
+	}
+
+	#[test]
+	fn revision_one_calls_lift_without_rewriting_their_wire_bytes() {
+		let tool = tool(std::sync::Arc::new(PanicHost));
+		let raw_args =
+			br#"{"i":"Reading repository","notrunc":true,"op":"repo_view","repo":"owner/repo"}"#;
+		let verdict = br#"{"kind":"ok","value":{"op":"repo_view","result":{},"rate_limit_remaining":null,"rate_limit_reset":null}}"#;
+		let lifted = tool
+			.lift(&Rev { family: Str::default(), n: 1 }, RecordedCall {
+				raw_args,
+				verdict,
+			})
+			.expect("revision one lifts");
+		assert_eq!(lifted.raw_args.as_ref(), raw_args);
+		assert_eq!(lifted.verdict.as_ref(), verdict);
+		assert!(matches!(
+			serde_json::from_slice::<CallOutcome<Payload, super::Fault>>(&lifted.verdict)
+				.expect("lifted verdict"),
+			CallOutcome::Ok(_)
+		));
+		assert!(
+			tool.lift(&Rev { family: Str::default(), n: 2 }, RecordedCall {
+				raw_args,
+				verdict
+			})
+			.is_none()
+		);
+		assert!(
+			tool.lift(&Rev { family: Str::default(), n: 1 }, RecordedCall {
+				raw_args: br#"{"op":"repo_view","unknown":true}"#,
+				verdict,
+			})
+			.is_none()
 		);
 	}
 

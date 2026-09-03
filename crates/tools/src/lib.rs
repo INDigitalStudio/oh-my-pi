@@ -51,6 +51,7 @@ const BUILTIN_TOOL_IDENTITIES: &[BuiltinToolIdentity] = &[
 	BuiltinToolIdentity { name: "learn", hidden: true },
 	BuiltinToolIdentity { name: "manage_skill", hidden: true },
 	BuiltinToolIdentity { name: "computer", hidden: false },
+	BuiltinToolIdentity { name: "security_scan", hidden: false },
 ];
 
 /// Returns the stable native builtin and hidden identity set.
@@ -78,6 +79,8 @@ pub mod path;
 mod render;
 /// Typed policy projection owned by file tools.
 pub mod settings;
+/// Additional literal pi tool-setting convars.
+pub mod pi_settings;
 /// Shared staged-proposal lifecycle for preview-producing tools.
 pub mod staging;
 
@@ -120,12 +123,16 @@ pub mod manage_skill;
 pub mod memory;
 /// Typed Mnemopi mutation tool.
 pub mod memory_edit;
+/// Structured child-output validation against caller-provided JSON Schemas.
+pub mod output_schema;
 /// Reads across local and special sources.
 pub mod read;
 /// Review finding parsing and priority normalization.
 pub mod review;
 /// Persistent-session shell execution.
 pub mod shell;
+/// Long-tail repository security scan device.
+pub mod security_scan;
 /// Pre-authorization guidance for shell intents served by dedicated tools.
 pub mod shell_intercept;
 /// Internal-resource URI scanner used before environment execution.

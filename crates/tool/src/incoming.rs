@@ -144,6 +144,7 @@ fn repaired_value_eq(streamed: &Value, committed: &Value) -> bool {
 
 struct DirectFeed {
 	state:     Mutex<DirectFeedState>,
+	finalized: Mutex<Option<FinalizedArgs>>,
 	producers: AtomicUsize,
 }
 
@@ -193,6 +194,16 @@ impl Drop for InvocationFeed {
 }
 
 impl InvocationFeed {
+	/// Takes the canonical finalization receipt produced by the tool-side
+	/// argument decoder.
+	///
+	/// The invocation owner uses this single-consumer observation seam to
+	/// journal repair metadata without changing the authoritative
+	/// [`InvocationEvent::ArgsCommitted`] payload.
+	pub fn take_finalized_args(&self) -> Option<FinalizedArgs> {
+		self.direct.finalized.lock().take()
+	}
+
 	/// Relays one raw argument text fragment verbatim.
 	pub fn arg_text(&self, fragment: Str) -> Result<(), InvocationSendError> {
 		if self.tx.is_disconnected() {
@@ -753,6 +764,7 @@ fn canonicalize(
 pub struct IncomingParams<'c> {
 	events:        Receiver<InvocationEvent>,
 	owner:         Option<Str>,
+	invocation:    Option<Str>,
 	direct:        Option<Arc<DirectFeed>>,
 	feed:          Option<IncomingFeed>,
 	doc:           Option<IncomingDoc>,
@@ -770,15 +782,18 @@ pub struct IncomingParams<'c> {
 impl IncomingParams<'static> {
 	/// Creates the producer and consumer sides of one invocation.
 	pub fn channel() -> (InvocationFeed, Self) {
-		Self::channel_for_owner(None)
+		Self::channel_for(None, None)
 	}
 
 	/// Creates an invocation scoped to one authenticated kernel owner.
 	pub fn owned_channel(owner: Str) -> (InvocationFeed, Self) {
-		Self::channel_for_owner(Some(owner))
+		Self::channel_for(Some(owner), None)
 	}
 
-	fn channel_for_owner(owner: Option<Str>) -> (InvocationFeed, Self) {
+	/// Creates an invocation carrying the kernel's stable call identity, so a
+	/// tool that hands work to a host surface (an `ask` dialog) can be
+	/// answered by that identity.
+	pub fn channel_for(owner: Option<Str>, invocation: Option<Str>) -> (InvocationFeed, Self) {
 		let (tx, events) = flume::unbounded();
 		let (parser, doc) = IncomingDoc::channel();
 		let direct = Arc::new(DirectFeed {
@@ -789,11 +804,13 @@ impl IncomingParams<'static> {
 				committed: false,
 				protocol:  None,
 			}),
+			finalized: Mutex::new(None),
 			producers: AtomicUsize::new(1),
 		});
 		(InvocationFeed { tx, direct: Arc::clone(&direct) }, Self {
 			events,
 			owner,
+			invocation,
 			direct: Some(direct),
 			feed: None,
 			arg_specs: None,
@@ -817,6 +834,7 @@ impl<'c> IncomingParams<'c> {
 		Self {
 			events,
 			owner: None,
+			invocation: None,
 			direct: None,
 			feed: Some(feed),
 			arg_specs: None,
@@ -835,6 +853,12 @@ impl<'c> IncomingParams<'c> {
 	/// Authenticated owner of the persistent resources used by this invocation.
 	pub const fn owner(&self) -> Option<&Str> {
 		self.owner.as_ref()
+	}
+
+	/// Kernel call identity of this invocation (the `<tool id>` in the
+	/// session tree), when the dispatcher supplied one.
+	pub const fn invocation_id(&self) -> Option<&Str> {
+		self.invocation.as_ref()
 	}
 
 	/// Binds argument pulls to the immutable declarations for the invoked
@@ -1016,6 +1040,9 @@ impl<'c> IncomingParams<'c> {
 				.expect("the root argument object cannot be elided");
 			let effective_json = Str::new(effective.to_string());
 			self.finalized = Some(FinalizedArgs { raw, effective, effective_json, repairs });
+			if let (Some(direct), Some(finalized)) = (&self.direct, &self.finalized) {
+				*direct.finalized.lock() = Some(finalized.clone());
+			}
 		}
 		Ok(self
 			.finalized
@@ -1439,6 +1466,15 @@ mod tests {
 			ArgPath::Key(sf!("extra"))
 		],);
 		assert_eq!(finalized.repairs()[0].kind, RepairKind::Elision);
+		let receipt = feed
+			.take_finalized_args()
+			.expect("the invocation owner observes tool-side finalization");
+		assert_eq!(receipt.effective_json(), r#"{"args":{"label":"ok"}}"#);
+		assert_eq!(receipt.repairs(), finalized.repairs());
+		assert!(
+			feed.take_finalized_args().is_none(),
+			"the finalization receipt is consumed exactly once",
+		);
 	}
 
 	#[test]

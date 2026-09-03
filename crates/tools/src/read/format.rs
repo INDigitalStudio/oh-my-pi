@@ -15,15 +15,7 @@ use omp_hashline::{format_hashline_header, format_numbered_line, split_addressab
 use smallvec::{SmallVec, smallvec};
 
 use super::selector::{LineRange as SelectorLineRange, ParsedSelector};
-use crate::render::truncate::{
-	DEFAULT_MAX_BYTES, TruncationOptions, append_head_truncation_notice, truncate_head,
-	truncate_head_bytes,
-};
 
-/// Default maximum number of source lines returned by an unconstrained read.
-pub const DEFAULT_READ_LINES: usize = 3000;
-/// Default maximum number of source bytes returned by a text read.
-pub const DEFAULT_READ_BYTES: usize = 50 * 1024;
 /// Source lines added before a range whose start was explicitly constrained.
 pub const RANGE_LEADING_CONTEXT_LINES: usize = 1;
 /// Source lines added after a range whose end was explicitly constrained.
@@ -84,6 +76,8 @@ pub struct TextFormatOptions<'a> {
 	pub snapshot:      Option<SnapshotHeader<'a>>,
 	/// Path/language hints for bracket-context enrichment.
 	pub block_context: BlockContextSource<'a>,
+	/// Include one-based source line prefixes when no snapshot requires them.
+	pub line_numbers:  bool,
 }
 
 impl<'a> TextFormatOptions<'a> {
@@ -94,33 +88,29 @@ impl<'a> TextFormatOptions<'a> {
 			entity_label,
 			snapshot: None,
 			block_context: BlockContextSource { path: None, language: None },
+			line_numbers: true,
 		}
 	}
 }
 
 /// Deterministic output and source-line bookkeeping from [`format_text`].
+///
+/// The text is complete: read-level formatting never caps lines or bytes.
+/// Bounding happens exactly once, in the dispatcher's central spill gate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FormattedText {
 	/// Complete model-facing text, including headers and continuation notices.
-	pub text:              String,
-	/// Complete formatted projection before the standard cap, only when `text`
-	/// omits source content. It includes snapshot framing but not the
-	/// truncation continuation notice.
-	pub full_text:         Option<String>,
+	pub text:           String,
 	/// Exact source-line provenance for every line in `text`.
-	pub source_lines:      SourceLineMap,
-	/// Exact source-line provenance for every line in `full_text`.
-	pub full_source_lines: Option<SourceLineMap>,
+	pub source_lines:   SourceLineMap,
 	/// Number of addressable lines in the source under the requested raw mode.
-	pub total_lines:       usize,
+	pub total_lines:    usize,
 	/// Lines actually exposed, including off-window block-boundary context.
-	pub seen_lines:        Box<[usize]>,
+	pub seen_lines:     Box<[usize]>,
 	/// Complete source spans selected before block-boundary enrichment.
-	pub selected_spans:    Box<[LineSpan]>,
-	/// Whether the standard line or byte budget omitted source content.
-	pub truncated:         bool,
+	pub selected_spans: Box<[LineSpan]>,
 	/// Snapshot tag associated with the output, when one was supplied.
-	pub snapshot_tag:      Option<Str>,
+	pub snapshot_tag:   Option<Str>,
 }
 
 impl FormattedText {
@@ -130,13 +120,6 @@ impl FormattedText {
 		self.text = prepend_suffix_resolution_notice(&self.text, resolution);
 		prepend_unmapped_line(&mut self.source_lines);
 		normalize_map_to_text(&self.text, &mut self.source_lines);
-		if let Some(full_text) = &mut self.full_text {
-			*full_text = prepend_suffix_resolution_notice(full_text, resolution);
-			if let Some(source_lines) = &mut self.full_source_lines {
-				prepend_unmapped_line(source_lines);
-				normalize_map_to_text(full_text, source_lines);
-			}
-		}
 	}
 
 	/// Append a pre-rendered normal-read conflict warning verbatim.
@@ -146,27 +129,6 @@ impl FormattedText {
 	/// state.
 	pub fn append_conflict_warning(&mut self, warning: &str) {
 		append_unmapped_text(&mut self.text, &mut self.source_lines, warning);
-		if let Some(full_text) = &mut self.full_text
-			&& let Some(source_lines) = &mut self.full_source_lines
-		{
-			append_unmapped_text(full_text, source_lines, warning);
-		}
-	}
-
-	/// Borrow the projection that must enter the final shared truncation pass.
-	pub fn projection(&self) -> (&str, &SourceLineMap) {
-		match (&self.full_text, &self.full_source_lines) {
-			(Some(text), Some(source_lines)) => (text, source_lines),
-			_ => (&self.text, &self.source_lines),
-		}
-	}
-
-	/// Consume the projection that must enter the final shared truncation pass.
-	pub fn into_projection(self) -> (String, SourceLineMap) {
-		match (self.full_text, self.full_source_lines) {
-			(Some(text), Some(source_lines)) => (text, source_lines),
-			_ => (self.text, self.source_lines),
-		}
 	}
 }
 
@@ -365,13 +327,10 @@ pub fn format_text(
 				requested_start + 1,
 				options.entity_label,
 			),
-			full_text: None,
 			source_lines: Box::new([SmallVec::new()]),
-			full_source_lines: None,
 			total_lines,
 			seen_lines: Box::new([]),
 			selected_spans: Box::new([]),
-			truncated: false,
 			snapshot_tag,
 		};
 	}
@@ -393,74 +352,34 @@ pub fn format_text(
 	} else {
 		requested_end
 	};
-	let selected = lines[start..end].join("\n");
-	let truncation = truncate_head(&selected, TruncationOptions {
-		max_lines: DEFAULT_READ_LINES,
-		max_bytes: DEFAULT_READ_BYTES,
-	});
 	let start_line = start + 1;
 	let mut selected_spans = Vec::new();
-	let full_projection = truncation
-		.truncated
-		.then(|| format_full_projection(&lines, start, end, raw, finite_limit, options));
-	let (full_text, full_source_lines) =
-		full_projection.map_or((None, None), |(text, source_lines)| (Some(text), Some(source_lines)));
+	if end > start {
+		selected_spans.push(LineSpan { start_line, end_line: end });
+	}
 	let mut source_lines = Vec::new();
 	let mut output;
-
-	if truncation.first_line_exceeds_limit {
-		let first_line = lines[start];
-		let snippet = truncate_head_bytes(first_line, DEFAULT_MAX_BYTES);
-		if raw {
-			output = snippet.text.to_owned();
-			if snippet.text.is_empty() {
-				output = format!(
-					"[Line {start_line} is {}, exceeds {} limit. Unable to display a valid UTF-8 \
-					 snippet.]",
-					format_bytes(first_line.len() as u64),
-					format_bytes(DEFAULT_MAX_BYTES as u64),
-				);
-			}
-		} else {
-			output = format!(
-				"[Line {start_line} is {}, exceeds {} limit. Hashline output requires full lines; \
-				 cannot emit an editable numbered preview for a truncated line.]",
-				format_bytes(first_line.len() as u64),
-				format_bytes(DEFAULT_MAX_BYTES as u64),
-			);
-		}
-		append_head_truncation_notice(&mut output, &truncation, start_line, Some(total_lines));
+	if raw {
+		output = lines[start..end].join("\n");
+		source_lines.extend((start_line..=end).map(single_source_line));
 	} else {
-		let shown_count = truncation.shown_lines();
-		let shown_end = start.saturating_add(shown_count).min(end);
-		if shown_end > start {
-			selected_spans.push(LineSpan { start_line, end_line: shown_end });
+		let entries =
+			build_line_entries_with_block_context(&lines, &selected_spans, options.block_context);
+		source_lines.extend(line_entry_sources(&entries));
+		output = format_line_entries_mode(&entries, options.line_numbers || options.snapshot.is_some());
+		if options.snapshot.is_some() {
+			source_lines.insert(0, SmallVec::new());
 		}
-		if raw {
-			output = truncation.content.to_owned();
-			source_lines.extend((start_line..=shown_end).map(single_source_line));
-		} else {
-			let entries =
-				build_line_entries_with_block_context(&lines, &selected_spans, options.block_context);
-			source_lines.extend(line_entry_sources(&entries));
-			output = format_line_entries(&entries);
-			if options.snapshot.is_some() {
-				source_lines.insert(0, SmallVec::new());
-			}
-			prepend_snapshot_header(&mut output, options.snapshot);
-		}
-
-		if truncation.truncated {
-			append_head_truncation_notice(&mut output, &truncation, start_line, Some(total_lines));
-		} else if !raw && finite_limit.is_some() && end < total_lines {
-			let remaining = total_lines - end;
-			let next_offset = end + 1;
-			let _ = write!(
-				output,
-				"\n\n[{remaining} more lines in {}. Use :{next_offset} to continue]",
-				options.entity_label,
-			);
-		}
+		prepend_snapshot_header(&mut output, options.snapshot);
+	}
+	if !raw && finite_limit.is_some() && end < total_lines {
+		let remaining = total_lines - end;
+		let next_offset = end + 1;
+		let _ = write!(
+			output,
+			"\n\n[{remaining} more lines in {}. Use :{next_offset} to continue]",
+			options.entity_label,
+		);
 	}
 	pad_unmapped_to_text(&output, &mut source_lines);
 	let seen_lines = source_lines
@@ -470,57 +389,12 @@ pub fn format_text(
 
 	FormattedText {
 		text: output,
-		full_text,
 		source_lines: source_lines.into_boxed_slice(),
-		full_source_lines,
 		total_lines,
 		seen_lines: seen_lines.into_boxed_slice(),
 		selected_spans: selected_spans.into_boxed_slice(),
-		truncated: truncation.truncated,
 		snapshot_tag,
 	}
-}
-
-fn format_full_projection(
-	lines: &[&str],
-	start: usize,
-	end: usize,
-	raw: bool,
-	finite_limit: Option<u64>,
-	options: TextFormatOptions<'_>,
-) -> (String, SourceLineMap) {
-	let (mut output, mut source_lines) = if raw {
-		(
-			lines[start..end].join("\n"),
-			(start + 1..=end)
-				.map(single_source_line)
-				.collect::<Vec<_>>(),
-		)
-	} else {
-		let entries = build_line_entries_with_block_context(
-			lines,
-			&[LineSpan { start_line: start + 1, end_line: end }],
-			options.block_context,
-		);
-		let mut source_lines = line_entry_sources(&entries);
-		let mut formatted = format_line_entries(&entries);
-		if options.snapshot.is_some() {
-			source_lines.insert(0, SmallVec::new());
-		}
-		prepend_snapshot_header(&mut formatted, options.snapshot);
-		(formatted, source_lines)
-	};
-	if !raw && finite_limit.is_some() && end < lines.len() {
-		let remaining = lines.len() - end;
-		let next_offset = end + 1;
-		let _ = write!(
-			output,
-			"\n\n[{remaining} more lines in {}. Use :{next_offset} to continue]",
-			options.entity_label,
-		);
-	}
-	pad_unmapped_to_text(&output, &mut source_lines);
-	(output, source_lines.into_boxed_slice())
 }
 
 fn format_multiple_ranges(
@@ -568,7 +442,8 @@ fn format_multiple_ranges(
 		let entries =
 			build_line_entries_with_block_context(lines, &visible_spans, options.block_context);
 		source_lines.extend(line_entry_sources(&entries));
-		let mut formatted = format_line_entries(&entries);
+		let mut formatted =
+			format_line_entries_mode(&entries, options.line_numbers || options.snapshot.is_some());
 		if options.snapshot.is_some() {
 			source_lines.insert(0, SmallVec::new());
 		}
@@ -596,13 +471,10 @@ fn format_multiple_ranges(
 		.collect::<Vec<_>>();
 	FormattedText {
 		text: output,
-		full_text: None,
 		source_lines: source_lines.into_boxed_slice(),
-		full_source_lines: None,
 		total_lines,
 		seen_lines: seen_lines.into_boxed_slice(),
 		selected_spans: visible_spans.into_boxed_slice(),
-		truncated: false,
 		snapshot_tag,
 	}
 }
@@ -640,15 +512,20 @@ pub fn build_line_entries_with_block_context<'a>(
 
 /// Render bracket-enriched entries as hashline-compatible numbered text.
 pub fn format_line_entries(entries: &[LineEntry<'_>]) -> String {
+	format_line_entries_mode(entries, true)
+}
+
+fn format_line_entries_mode(entries: &[LineEntry<'_>], line_numbers: bool) -> String {
 	let mut output = String::new();
 	for (index, entry) in entries.iter().enumerate() {
 		if index > 0 {
 			output.push('\n');
 		}
 		match entry {
-			LineEntry::Line { line_number, text, .. } => {
+			LineEntry::Line { line_number, text, .. } if line_numbers => {
 				output.push_str(format_numbered_line(*line_number, text).as_ref());
 			},
+			LineEntry::Line { text, .. } => output.push_str(text),
 			LineEntry::Ellipsis => output.push_str(BRACKET_CONTEXT_ELLIPSIS),
 		}
 	}

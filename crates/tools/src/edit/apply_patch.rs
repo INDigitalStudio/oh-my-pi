@@ -1,6 +1,6 @@
 //! Apply-patch, patch, and sloppy edit revisions over `EditDocuments`.
 
-use std::path::Path;
+use std::{fmt::Write as _, marker::PhantomData, path::Path};
 
 use async_stream::stream;
 use bytes::Bytes;
@@ -43,8 +43,137 @@ pub struct FreeformEditParams {
 	pub input: Str,
 }
 
+/// Current structured `edit@patch.2` arguments.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchParams {
+	/// Workspace-relative path targeted by every entry.
+	pub path:  Str,
+	/// Ordered edits against that path.
+	pub edits: Vec<PatchEditEntry>,
+}
+
+/// One structured patch entry.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchEditEntry {
+	/// File operation; omitted means update.
+	#[serde(default)]
+	pub op:     Option<PatchOp>,
+	/// Destination path for an update-and-rename.
+	#[serde(default)]
+	pub rename: Option<Str>,
+	/// Create body or update hunk.
+	#[serde(default)]
+	pub diff:   Option<Str>,
+}
+
+/// Structured patch file operation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchOp {
+	/// Create the target file.
+	Create,
+	/// Delete the target file.
+	Delete,
+	/// Update the target file.
+	Update,
+}
+
+trait EditInputParams: serde::de::DeserializeOwned + Serialize + Send + Sync + 'static {
+	fn into_input(self) -> Result<Str, Str>;
+}
+
+impl EditInputParams for FreeformEditParams {
+	fn into_input(self) -> Result<Str, Str> {
+		Ok(self.input)
+	}
+}
+
+impl EditInputParams for PatchParams {
+	fn into_input(self) -> Result<Str, Str> {
+		render_structured_patch(self)
+	}
+}
+
+fn render_structured_patch(params: PatchParams) -> Result<Str, Str> {
+	if params.path.trim().is_empty() || params.path.contains('\n') || params.path.contains('\r') {
+		return Err(sf!("patch path must be one non-empty line"));
+	}
+	let Some(first) = params.edits.first() else {
+		return Err(sf!("No structured patch entries found."));
+	};
+	let operation = first.op.unwrap_or(PatchOp::Update);
+	if params
+		.edits
+		.iter()
+		.any(|entry| entry.op.unwrap_or(PatchOp::Update) != operation)
+	{
+		return Err(sf!("structured patch entries for one path must use the same operation"));
+	}
+	let mut input = String::from("*** Begin Patch\n");
+	match operation {
+		PatchOp::Create => {
+			if params.edits.iter().any(|entry| entry.rename.is_some()) {
+				return Err(sf!("create entries cannot rename the target"));
+			}
+			let _ = writeln!(input, "*** Add File: {}", params.path);
+			for entry in params.edits {
+				let diff = entry
+					.diff
+					.ok_or_else(|| sf!("create entries require diff content"))?;
+				for line in diff.lines() {
+					let _ = writeln!(input, "+{line}");
+				}
+			}
+		},
+		PatchOp::Delete => {
+			if params
+				.edits
+				.iter()
+				.any(|entry| entry.rename.is_some() || entry.diff.is_some())
+			{
+				return Err(sf!("delete entries cannot carry rename or diff"));
+			}
+			let _ = writeln!(input, "*** Delete File: {}", params.path);
+		},
+		PatchOp::Update => {
+			let mut rename = None;
+			let _ = writeln!(input, "*** Update File: {}", params.path);
+			for entry in &params.edits {
+				if let Some(destination) = &entry.rename {
+					if destination.trim().is_empty()
+						|| destination.contains('\n')
+						|| destination.contains('\r')
+					{
+						return Err(sf!("patch rename must be one non-empty line"));
+					}
+					if rename.replace(destination).is_some() {
+						return Err(sf!("structured patch accepts at most one rename"));
+					}
+				}
+			}
+			if let Some(destination) = rename {
+				let _ = writeln!(input, "*** Move to: {destination}");
+			}
+			for entry in params.edits {
+				let diff = entry
+					.diff
+					.ok_or_else(|| sf!("update entries require diff content"))?;
+				input.push_str(&diff);
+				if !diff.ends_with('\n') {
+					input.push('\n');
+				}
+			}
+		},
+	}
+	input.push_str("*** End Patch\n");
+	Ok(input.into())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FreeformKind {
+	PatchLegacy,
 	Patch,
 	ApplyPatch,
 	Sloppy,
@@ -53,7 +182,7 @@ enum FreeformKind {
 impl FreeformKind {
 	const fn family(self) -> &'static str {
 		match self {
-			Self::Patch => "patch",
+			Self::PatchLegacy | Self::Patch => "patch",
 			Self::ApplyPatch => "apply_patch",
 			Self::Sloppy => "sloppy",
 		}
@@ -61,7 +190,7 @@ impl FreeformKind {
 
 	const fn dialect(self) -> Dialect {
 		match self {
-			Self::Patch => Dialect::Patch,
+			Self::PatchLegacy | Self::Patch => Dialect::Patch,
 			Self::ApplyPatch => Dialect::ApplyPatch,
 			Self::Sloppy => Dialect::Sloppy,
 		}
@@ -69,7 +198,10 @@ impl FreeformKind {
 
 	const fn description(self) -> &'static str {
 		match self {
-			Self::Patch => "Apply a Codex begin/add/update/move/delete patch envelope atomically.",
+			Self::PatchLegacy => {
+				"Apply a Codex begin/add/update/move/delete patch envelope atomically."
+			},
+			Self::Patch => "Apply structured create/update/move/delete edits atomically.",
 			Self::ApplyPatch => {
 				"Apply a Codex begin/add/update/move/delete patch envelope atomically."
 			},
@@ -78,46 +210,60 @@ impl FreeformKind {
 	}
 }
 
-/// A freeform edit revision.
-pub struct FreeformEditTool<D> {
+/// A freeform or structured patch edit revision.
+pub struct FreeformEditTool<D, P = FreeformEditParams> {
 	documents:       D,
 	format_policy:   FormatPolicy,
 	kind:            FreeformKind,
 	observer:        EditObserver,
 	guard_generated: bool,
+	require_seen:    bool,
 	spec:            ToolSpec,
+	params:          PhantomData<fn() -> P>,
 }
 
-/// Returns the host-free `edit@patch.1` specification.
+/// Returns the host-free current `edit@patch.2` specification.
 pub fn patch_spec() -> ToolSpec {
-	freeform_spec(FreeformKind::Patch)
+	freeform_spec::<PatchParams>(FreeformKind::Patch, 2)
+}
+
+/// Returns the historical `edit@patch.1` specification.
+pub fn legacy_patch_spec() -> ToolSpec {
+	freeform_spec::<FreeformEditParams>(FreeformKind::PatchLegacy, 1)
 }
 
 /// Returns the host-free `edit@apply_patch.1` specification.
 pub fn apply_patch_spec() -> ToolSpec {
-	freeform_spec(FreeformKind::ApplyPatch)
+	freeform_spec::<FreeformEditParams>(FreeformKind::ApplyPatch, 1)
 }
 
 /// Returns the host-free `edit@sloppy.1` specification.
 pub fn sloppy_spec() -> ToolSpec {
-	freeform_spec(FreeformKind::Sloppy)
+	freeform_spec::<FreeformEditParams>(FreeformKind::Sloppy, 1)
 }
 
-fn freeform_spec(kind: FreeformKind) -> ToolSpec {
+fn freeform_spec<P: JsonSchema>(kind: FreeformKind, revision: u16) -> ToolSpec {
 	ToolSpec {
 		name:            sf!("edit"),
-		rev:             Rev { family: Str::new_static(kind.family()), n: 1 },
+		rev:             Rev { family: Str::new_static(kind.family()), n: revision },
 		description:     Str::new_static(kind.description()),
-		schema:          omp_tool::schema::<FreeformEditParams>(),
-		constraint:      Constraint::Grammar {
-			priority:       100,
-			syntax:         omp_tool::GrammarSyntax::Lark,
-			definition:     Str::new_static(match kind.dialect() {
-				Dialect::Patch | Dialect::ApplyPatch => omp_hashline::grammars::APPLY_PATCH,
-				Dialect::Sloppy => omp_hashline::grammars::SLOPPY,
-				Dialect::Hashline | Dialect::Replace | Dialect::Native => "",
-			}),
-			on_unsupported: omp_tool::Fallback::Unspecified,
+		schema:          omp_tool::schema::<P>(),
+		constraint:      if kind == FreeformKind::Patch {
+			Constraint::Schema {
+				priority:       100,
+				on_unsupported: omp_tool::Fallback::Unspecified,
+			}
+		} else {
+			Constraint::Grammar {
+				priority:       100,
+				syntax:         omp_tool::GrammarSyntax::Lark,
+				definition:     Str::new_static(match kind.dialect() {
+					Dialect::Patch | Dialect::ApplyPatch => omp_hashline::grammars::APPLY_PATCH,
+					Dialect::Sloppy => omp_hashline::grammars::SLOPPY,
+					Dialect::Hashline | Dialect::Replace | Dialect::Native => "",
+				}),
+				on_unsupported: omp_tool::Fallback::Unspecified,
+			}
 		},
 		effects:         Effects {
 			documents: Some(DocEffects {
@@ -138,22 +284,50 @@ fn freeform_spec(kind: FreeformKind) -> ToolSpec {
 	}
 }
 
-/// Constructs `edit@patch.1`.
+/// Constructs current `edit@patch.2`.
 pub fn patch_tool<D: EditDocuments>(
 	documents: D,
 	format_policy: FormatPolicy,
-) -> FreeformEditTool<D> {
-	patch_tool_with_observer(documents, format_policy, EditObserver::default(), true)
+) -> FreeformEditTool<D, PatchParams> {
+	patch_tool_with_observer(documents, format_policy, EditObserver::default(), true, false)
 }
 
-/// Constructs `edit@patch.1` with syntax observation.
+/// Constructs current `edit@patch.2` with host policy.
 pub fn patch_tool_with_observer<D: EditDocuments>(
 	documents: D,
 	format_policy: FormatPolicy,
 	observer: EditObserver,
 	guard_generated: bool,
+	require_seen: bool,
+) -> FreeformEditTool<D, PatchParams> {
+	new_tool(
+		documents,
+		format_policy,
+		FreeformKind::Patch,
+		observer,
+		guard_generated,
+		require_seen,
+		patch_spec(),
+	)
+}
+
+/// Constructs historical `edit@patch.1` for durable replay.
+pub fn legacy_patch_tool_with_observer<D: EditDocuments>(
+	documents: D,
+	format_policy: FormatPolicy,
+	observer: EditObserver,
+	guard_generated: bool,
+	require_seen: bool,
 ) -> FreeformEditTool<D> {
-	new_tool(documents, format_policy, FreeformKind::Patch, observer, guard_generated)
+	new_tool(
+		documents,
+		format_policy,
+		FreeformKind::PatchLegacy,
+		observer,
+		guard_generated,
+		require_seen,
+		legacy_patch_spec(),
+	)
 }
 
 /// Constructs `edit@apply_patch.1`.
@@ -161,7 +335,7 @@ pub fn apply_patch_tool<D: EditDocuments>(
 	documents: D,
 	format_policy: FormatPolicy,
 ) -> FreeformEditTool<D> {
-	apply_patch_tool_with_observer(documents, format_policy, EditObserver::default(), true)
+	apply_patch_tool_with_observer(documents, format_policy, EditObserver::default(), true, false)
 }
 
 /// Constructs `edit@apply_patch.1` with syntax observation.
@@ -170,8 +344,17 @@ pub fn apply_patch_tool_with_observer<D: EditDocuments>(
 	format_policy: FormatPolicy,
 	observer: EditObserver,
 	guard_generated: bool,
+	require_seen: bool,
 ) -> FreeformEditTool<D> {
-	new_tool(documents, format_policy, FreeformKind::ApplyPatch, observer, guard_generated)
+	new_tool(
+		documents,
+		format_policy,
+		FreeformKind::ApplyPatch,
+		observer,
+		guard_generated,
+		require_seen,
+		apply_patch_spec(),
+	)
 }
 
 /// Constructs `edit@sloppy.1`.
@@ -179,7 +362,7 @@ pub fn sloppy_tool<D: EditDocuments>(
 	documents: D,
 	format_policy: FormatPolicy,
 ) -> FreeformEditTool<D> {
-	sloppy_tool_with_observer(documents, format_policy, EditObserver::default(), true)
+	sloppy_tool_with_observer(documents, format_policy, EditObserver::default(), true, false)
 }
 
 /// Constructs `edit@sloppy.1` with syntax observation.
@@ -188,28 +371,37 @@ pub fn sloppy_tool_with_observer<D: EditDocuments>(
 	format_policy: FormatPolicy,
 	observer: EditObserver,
 	guard_generated: bool,
+	require_seen: bool,
 ) -> FreeformEditTool<D> {
-	new_tool(documents, format_policy, FreeformKind::Sloppy, observer, guard_generated)
+	new_tool(
+		documents,
+		format_policy,
+		FreeformKind::Sloppy,
+		observer,
+		guard_generated,
+		require_seen,
+		sloppy_spec(),
+	)
 }
 
-fn new_tool<D: EditDocuments>(
+fn new_tool<D: EditDocuments, P>(
 	documents: D,
 	format_policy: FormatPolicy,
 	kind: FreeformKind,
 	observer: EditObserver,
 	guard_generated: bool,
-) -> FreeformEditTool<D> {
+	require_seen: bool,
+	spec: ToolSpec,
+) -> FreeformEditTool<D, P> {
 	FreeformEditTool {
 		documents,
 		format_policy,
 		kind,
 		observer,
 		guard_generated,
-		spec: match kind {
-			FreeformKind::Patch => patch_spec(),
-			FreeformKind::ApplyPatch => apply_patch_spec(),
-			FreeformKind::Sloppy => sloppy_spec(),
-		},
+		require_seen,
+		spec,
+		params: PhantomData,
 	}
 }
 
@@ -241,9 +433,9 @@ struct Projection {
 	warnings:  Vec<Str>,
 }
 
-impl<D: EditDocuments> Tool for FreeformEditTool<D> {
+impl<D: EditDocuments, P: EditInputParams> Tool for FreeformEditTool<D, P> {
 	type Fault = Fault;
-	type Params = FreeformEditParams;
+	type Params = P;
 	type Payload = Payload;
 	type Update = EditUpdate;
 
@@ -257,14 +449,19 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 	) -> impl Stream<Item = Ev<EditUpdate, Payload, Fault>> + Send + 'c {
 		let span = tracing::debug_span!(
 			"edit_execution",
-			revision = self.kind.family(),
+			revision = %self.spec.rev,
 			path_count = tracing::field::Empty,
 			path = tracing::field::Empty,
 		);
 		stream! {
-			let FreeformEditParams { input } = match params.whole::<FreeformEditParams>().await {
+			let authored_params = match params.whole::<P>().await {
 				Ok(params) => params,
 				Err(error) => { yield param_event(error); return; },
+			};
+			let observer_args = serde_json::to_value(&authored_params).unwrap_or_default();
+			let input = match authored_params.into_input() {
+				Ok(input) => input,
+				Err(error) => { yield done_fault(Fault::invalid(error)); return; },
 			};
 			let operations = match parse_operations(self.kind, &input) {
 				Ok(operations) if !operations.is_empty() => operations,
@@ -288,7 +485,7 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 					path: Str::new(op.path()),
 					file_hash: None,
 					anchor_lines: Vec::new(),
-					allow_unpinned: true,
+					allow_unpinned: !self.require_seen,
 					allow_missing: matches!(
 						op,
 						AuthoredOperation::Foreign(ForeignPatchFile::Add { .. })
@@ -308,8 +505,6 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 			let mut proposals = Vec::with_capacity(works.len());
 			let mut projections = Vec::with_capacity(works.len());
 			let mut pending_blackbox = Vec::<Option<PendingBlackbox>>::with_capacity(works.len());
-			let observer_args = serde_json::to_value(FreeformEditParams { input: input.clone() })
-				.unwrap_or_default();
 			for work in &works {
 				let source = match std::str::from_utf8(work.prepared.authored_bytes()) {
 					Ok(source) => source,
@@ -460,14 +655,16 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 
 fn parse_operations(kind: FreeformKind, input: &str) -> Result<Vec<AuthoredOperation>, String> {
 	match kind {
-		FreeformKind::Patch | FreeformKind::ApplyPatch => parse_foreign_patch(input)
+		FreeformKind::PatchLegacy | FreeformKind::Patch | FreeformKind::ApplyPatch => {
+			parse_foreign_patch(input)
 			.map(|operations| {
 				operations
 					.into_iter()
 					.map(AuthoredOperation::Foreign)
 					.collect()
 			})
-			.map_err(|error| error.to_string()),
+				.map_err(|error| error.to_string())
+		},
 		FreeformKind::Sloppy => {
 			let mut merged = Vec::<AuthoredOperation>::new();
 			for section in split_sloppy_sections(input).map_err(|error| error.to_string())? {
@@ -590,6 +787,43 @@ mod tests {
 		let params: FreeformEditParams =
 			serde_json::from_str(r#"{"input":"x","provider_cache":true}"#).expect("extras ignored");
 		assert_eq!(params.input, "x");
+	}
+
+	#[test]
+	fn structured_patch_renders_create_update_rename_and_delete_envelopes() {
+		let update = render_structured_patch(PatchParams {
+			path: "src/a.rs".into(),
+			edits: vec![PatchEditEntry {
+				op: Some(PatchOp::Update),
+				rename: Some("src/b.rs".into()),
+				diff: Some("@@\n-old\n+new\n".into()),
+			}],
+		})
+		.expect("update");
+		assert_eq!(
+			update,
+			"*** Begin Patch\n*** Update File: src/a.rs\n*** Move to: src/b.rs\n@@\n-old\n+new\n*** End Patch\n"
+		);
+		let create = render_structured_patch(PatchParams {
+			path: "new.txt".into(),
+			edits: vec![PatchEditEntry {
+				op: Some(PatchOp::Create),
+				rename: None,
+				diff: Some("one\ntwo\n".into()),
+			}],
+		})
+		.expect("create");
+		assert!(create.contains("*** Add File: new.txt\n+one\n+two\n"));
+		let delete = render_structured_patch(PatchParams {
+			path: "old.txt".into(),
+			edits: vec![PatchEditEntry {
+				op: Some(PatchOp::Delete),
+				rename: None,
+				diff: None,
+			}],
+		})
+		.expect("delete");
+		assert!(delete.contains("*** Delete File: old.txt\n"));
 	}
 
 	#[test]

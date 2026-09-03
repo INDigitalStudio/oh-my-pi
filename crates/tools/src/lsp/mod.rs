@@ -79,7 +79,7 @@ impl Action {
 	}
 }
 
-/// Arguments for `lsp@1`.
+/// Arguments for `lsp@2`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Params {
@@ -94,29 +94,23 @@ pub struct Params {
 	/// Identifier or `identifier#N` occurrence target.
 	#[serde(default)]
 	pub symbol:   Option<Str>,
-	/// Workspace symbol query, code-action selector, or rename destination path.
+	/// Workspace symbol query, code-action selector, or raw request method.
 	#[serde(default)]
 	pub query:    Option<Str>,
-	/// New identifier for rename.
+	/// New identifier for rename, or destination path for `rename_file`.
 	#[serde(default)]
 	pub new_name: Option<Str>,
 	/// Apply a rename/code action; false requests a dry-run.
 	#[serde(default)]
 	pub apply:    Option<bool>,
-	/// Optional native binding name.
-	#[serde(default)]
-	pub server:   Option<Str>,
-	/// Raw request method for `request`.
-	#[serde(default)]
-	pub method:   Option<Str>,
-	/// Raw JSON parameters for `request`; textDocument and position are
-	/// auto-filled when omitted.
-	#[serde(default)]
-	pub params:   Option<Value>,
 	/// Wall-clock timeout in seconds, clamped to 5–300 and the configured
 	/// maximum.
 	#[serde(default)]
 	pub timeout:  Option<u64>,
+	/// Raw JSON parameters for `request`. When omitted, textDocument and
+	/// position are derived from `file`, `line`, and `symbol`.
+	#[serde(default)]
+	pub payload:  Option<Str>,
 }
 
 /// Durable typed result independent of the interactive renderer.
@@ -281,11 +275,11 @@ pub struct LspTool<C> {
 	spec:    ToolSpec,
 }
 
-/// Returns the host-free `lsp@1` specification.
+/// Returns the host-free `lsp@2` specification.
 pub fn spec() -> ToolSpec {
 	ToolSpec {
 		name:            sf!("lsp"),
-		rev:             Rev { family: Str::default(), n: 1 },
+		rev:             Rev { family: Str::default(), n: 2 },
 		description:     sf!(
 			"Queries and transactionally applies project language-server diagnostics, navigation, \
 			 symbols, refactors, code actions, raw requests, status, and reloads."
@@ -314,7 +308,7 @@ pub fn spec() -> ToolSpec {
 	}
 }
 
-/// Creates discoverable `lsp@1` with an environment-configured timeout ceiling.
+/// Creates discoverable `lsp@2` with an environment-configured timeout ceiling.
 pub fn tool<C: LspControl>(control: C, maximum: Duration) -> LspTool<C> {
 	LspTool {
 		control,
@@ -350,7 +344,7 @@ impl<C: LspControl> Tool for LspTool<C> {
 				yield commit_event(error);
 				return;
 			}
-			let timeout = Duration::from_secs(params.timeout.unwrap_or(30).clamp(5, 300)).min(self.maximum);
+			let timeout = Duration::from_secs(params.timeout.unwrap_or(20).clamp(5, 300)).min(self.maximum);
 			let cancel = CancellationToken::new();
 			match tokio::time::timeout(timeout, self.control.execute(params, timeout, cancel.clone())).await {
 				Ok(Ok(payload)) => {
@@ -380,9 +374,9 @@ fn valid(params: &Params) -> bool {
 	match params.action {
 		Action::Diagnostics | Action::Status | Action::Capabilities | Action::Reload => true,
 		Action::Request => params
-			.method
+			.query
 			.as_ref()
-			.is_some_and(|method| !method.is_empty()),
+			.is_some_and(|method| !method.trim().is_empty()),
 		Action::Symbols => params.file.is_some() || params.query.is_some(),
 		Action::Rename => {
 			params.file.is_some()
@@ -390,14 +384,101 @@ fn valid(params: &Params) -> bool {
 				&& params.symbol.is_some()
 				&& params.new_name.is_some()
 		},
-		Action::RenameFile => params.file.is_some() && params.query.is_some(),
+		Action::RenameFile => params.file.is_some() && params.new_name.is_some(),
 		_ => params.file.is_some() && params.line.is_some(),
 	}
 }
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Mutex;
+
+	use futures::StreamExt as _;
+
 	use super::*;
+
+	#[derive(Clone, Default)]
+	struct RecordingControl(Arc<Mutex<Option<Params>>>);
+
+	impl LspControl for RecordingControl {
+		fn execute(
+			&self,
+			params: Params,
+			_: Duration,
+			_: CancellationToken,
+		) -> impl Future<Output = Result<Payload, Fault>> + Send + '_ {
+			self.0.lock().expect("recording control").replace(params);
+			std::future::ready(Ok(Payload {
+				action:  Action::Request,
+				servers: vec![sf!("rust-analyzer")],
+				output:  sf!("ok"),
+				data:    serde_json::json!({"ok": true}),
+			}))
+		}
+	}
+
+	#[test]
+	fn schema_matches_the_current_pi_lsp_contract() {
+		let schema: Value = serde_json::from_slice(&spec().schema).expect("LSP schema JSON");
+		assert_eq!(schema["additionalProperties"], false);
+		assert_eq!(schema["required"], serde_json::json!(["i", "action"]));
+		assert!(schema["properties"]["action"].is_object());
+		for action in [
+			"diagnostics",
+			"definition",
+			"type_definition",
+			"implementation",
+			"references",
+			"hover",
+			"symbols",
+			"rename",
+			"rename_file",
+			"code_actions",
+			"request",
+			"capabilities",
+			"status",
+			"reload",
+		] {
+			assert!(serde_json::from_value::<Action>(serde_json::json!(action)).is_ok());
+		}
+		let properties = schema["properties"].as_object().expect("properties object");
+		assert_eq!(
+			properties.keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+			[
+				"action", "apply", "file", "i", "line", "new_name", "notrunc", "payload", "query",
+				"symbol", "timeout",
+			]
+			.into_iter()
+			.collect()
+		);
+		assert_eq!(schema["properties"]["payload"]["type"], serde_json::json!(["string", "null"]));
+		assert_eq!(
+			schema["properties"]["notrunc"],
+			serde_json::json!({
+				"type": "boolean",
+				"description": "Return complete output inline without central truncation."
+			})
+		);
+	}
+
+	#[tokio::test]
+	async fn request_route_forwards_query_and_string_payload() {
+		let control = RecordingControl::default();
+		let lsp = tool(control.clone(), Duration::from_secs(300));
+		let raw = r#"{"action":"request","query":"rust-analyzer/expandMacro","payload":"{\"x\":1}"}"#;
+		let (feed, incoming) = IncomingParams::channel();
+		feed.arg_text(raw.into()).expect("stream args");
+		feed.args_committed(raw.into()).expect("commit args");
+		let events = lsp.call(incoming).collect::<Vec<_>>().await;
+		assert!(matches!(
+			events.last(),
+			Some(Ev::Done(ToolTerminal::Done { result: Ok(_), .. }))
+		));
+		let recorded = control.0.lock().expect("recording control");
+		let params = recorded.as_ref().expect("request executed");
+		assert_eq!(params.query.as_deref(), Some("rust-analyzer/expandMacro"));
+		assert_eq!(params.payload.as_deref(), Some(r#"{"x":1}"#));
+	}
 
 	#[test]
 	fn workspace_symbols_keep_results_and_server_failures() {

@@ -1,4 +1,4 @@
-//! Model-facing behavioral contracts for `read@1`.
+//! Model-facing behavioral contracts for `read@2`.
 
 use std::{
 	collections::VecDeque,
@@ -21,8 +21,8 @@ use futures::StreamExt as _;
 use omp_ar::zip;
 use omp_core::{CowBytes, Str, sf};
 use omp_tool::{
-	Abort, ArtifactLifetime, BlobRef, CapsBase, Ev, IncomingParams, Interrupt, ModelClass, Part,
-	PromptCaps, Tool, ToolTerminal,
+	Abort, ArtifactLifetime, BlobRef, CallOutcome, CapsBase, Ev, IncomingParams, Interrupt,
+	ModelClass, Part, PromptCaps, RecordedCall, Rev, Tool, ToolTerminal,
 };
 use omp_tools::read::{
 	self, DirectoryEntry, DirectorySource, Fault, ReadBlobs, ReadLease, ReadSources, SnapshotRecord,
@@ -363,7 +363,23 @@ impl Sources {
 }
 
 async fn project(sources: Sources, blobs: Blobs, raw: &str, media: bool) -> Vec<Part> {
-	let tool = read::tool(sources, blobs);
+	project_with_policy(sources, blobs, raw, media, read::ReadPolicy::default()).await
+}
+
+async fn project_with_policy(
+	sources: Sources,
+	blobs: Blobs,
+	raw: &str,
+	media: bool,
+	policy: read::ReadPolicy,
+) -> Vec<Part> {
+	let tool = read::tool_with_policy(
+		sources,
+		blobs,
+		Arc::new(ResolverTable::<read::resolver::NoResolver>::default()),
+		Arc::new(read::conflicts::ConflictRegistry::default()),
+		policy,
+	);
 	let (feed, params) = IncomingParams::channel();
 	feed
 		.args_committed(Str::new(raw))
@@ -406,44 +422,21 @@ async fn payload(sources: Sources, blobs: Blobs, raw: &str) -> read::Payload {
 	payload.clone()
 }
 
-async fn assert_truncated_text_spill(sources: Sources, raw: &str, expected: &str) {
+/// Asserts that an oversized read returns its complete text with no
+/// read-level truncation notice and no private artifact spill (ADR 0009:
+/// bounding happens once, in the dispatcher).
+async fn assert_complete_text(sources: Sources, raw: &str, expected: &str) {
 	let blobs = Blobs::default();
 	let parts = project(sources, blobs.clone(), raw, false).await;
 	let [Part::Text { text }] = parts.as_slice() else {
-		panic!("expected one truncated text projection: {parts:?}");
+		panic!("expected one complete text projection: {parts:?}");
 	};
-	let marker = "\n\n[truncated: ";
-	let (visible, footer) = text
-		.rsplit_once(marker)
-		.unwrap_or_else(|| panic!("missing truthful truncation footer: {text}"));
-	let shown_lines = if visible.is_empty() {
-		0
-	} else {
-		visible.bytes().filter(|byte| *byte == b'\n').count() + 1
-	};
-	let total_lines = expected.bytes().filter(|byte| *byte == b'\n').count() + 1;
-	assert_eq!(
-		format!("[truncated: {footer}"),
-		format!(
-			"[truncated: {shown_lines} of {total_lines} lines shown; read artifact://1 for full \
-			 output]"
-		)
+	assert!(!text.contains("[truncated:"), "read must not append its own truncation notice");
+	assert_eq!(text.as_str(), expected, "read must return every projected byte");
+	assert!(
+		blobs.stored.lock().is_empty(),
+		"read must not spill its own artifact; the dispatcher owns the spill gate"
 	);
-	assert_eq!(
-		visible,
-		expected
-			.lines()
-			.take(shown_lines)
-			.collect::<Vec<_>>()
-			.join("\n"),
-		"the visible prefix must contain only complete output lines"
-	);
-	let stored = blobs.stored.lock();
-	let [(bytes, media_type)] = stored.as_slice() else {
-		panic!("truncated text must spill exactly one blob: {stored:?}");
-	};
-	assert_eq!(bytes.as_ref(), expected.as_bytes());
-	assert_eq!(media_type.as_str(), "text/plain; charset=utf-8");
 }
 
 fn numbered_lines(count: usize) -> String {
@@ -470,10 +463,11 @@ async fn protocol_intent_is_not_deserialized_as_a_read_parameter() {
 }
 
 #[test]
-fn generated_schema_is_semantically_the_pi_read_schema() {
+fn generated_schema_exposes_optional_image_question_without_a_new_tool() {
 	let tool = read::tool(Sources::default(), Blobs::default());
 	let actual: serde_json::Value =
 		serde_json::from_slice(&tool.spec().schema).expect("schema JSON");
+	assert_eq!(tool.spec().rev, Rev { family: Default::default(), n: 2 });
 	assert_eq!(
 		tool.spec().schema.as_ref(),
 		omp_tool::schema::<read::Params>().as_ref(),
@@ -490,6 +484,14 @@ fn generated_schema_is_semantically_the_pi_read_schema() {
 					"type": "string",
 					"description": "Local path, internal URI (e.g. skill://), or URL. Inline selectors are supported."
 				},
+				"question": {
+					"type": "string",
+					"description": "Optional question about one image. The active model vision route receives the question and materialized image together."
+				},
+				"notrunc": {
+					"type": "boolean",
+					"description": "Return complete output inline without central truncation."
+				},
 				"i": {
 					"type": "string",
 					"description": "Short present-participle intent for this call."
@@ -497,6 +499,27 @@ fn generated_schema_is_semantically_the_pi_read_schema() {
 			}
 		})
 	);
+	let rev1_args = br#"{"path":"src/lib.rs"}"#;
+	let rev1_verdict = serde_json::to_vec(&CallOutcome::<read::Payload, Fault>::Ok(read::Payload {
+		parts: vec![read::PayloadPart::Text { text: sf!("complete") }],
+	}))
+	.expect("rev 1 verdict serializes");
+	let lifted = tool
+		.lift(
+			&Rev { family: Default::default(), n: 1 },
+			RecordedCall { raw_args: rev1_args, verdict: &rev1_verdict },
+		)
+		.expect("read@1 lifts onto read@2");
+	assert_eq!(lifted.raw_args.as_ref(), rev1_args);
+	assert_eq!(lifted.verdict.as_ref(), rev1_verdict.as_slice());
+	assert!(
+		tool.lift(
+			&Rev { family: Default::default(), n: 2 },
+			RecordedCall { raw_args: rev1_args, verdict: &rev1_verdict },
+		)
+		.is_none()
+	);
+
 	for legacy in [
 		json!({"path": "src/lib.rs", "ranges": [[1, 2]]}),
 		json!({"path": "src/lib.rs", "structural": true}),
@@ -630,7 +653,7 @@ async fn directory_listing_is_depth_two_and_elides_nested_children() {
 }
 
 #[tokio::test]
-async fn oversized_directory_listing_spills_the_complete_rendered_tree() {
+async fn oversized_directory_listing_returns_the_complete_rendered_tree() {
 	let sources = Sources::default();
 	let mut entries = Vec::with_capacity(4_000);
 	let mut expected = String::from(".");
@@ -646,7 +669,7 @@ async fn oversized_directory_listing_spills_the_complete_rendered_tree() {
 	}
 	sources.directory("large-tree", entries);
 
-	assert_truncated_text_spill(sources, r#"{"path":"large-tree"}"#, &expected).await;
+	assert_complete_text(sources, r#"{"path":"large-tree"}"#, &expected).await;
 }
 
 #[tokio::test]
@@ -761,15 +784,16 @@ async fn binary_content_is_refused_before_decoding_and_raw_stays_the_escape_hatc
 	assert_eq!(text(sources, r#"{"path":"garbage.txt:raw"}"#).await, "ok\u{fffd}\u{fffd}not text");
 }
 #[tokio::test]
-async fn truncated_payload_retains_resolver_valid_artifact_reference() {
+async fn oversized_payload_is_one_complete_text_part_without_artifact_spill() {
 	let sources = Sources::default();
 	sources.file("large.txt", numbered_lines(4000));
-	let payload = payload(sources, Blobs::default(), r#"{"path":"large.txt"}"#).await;
-	let [artifact] = payload.artifacts.as_slice() else {
-		panic!("one complete text spill must be retained: {:?}", payload.artifacts);
+	let blobs = Blobs::default();
+	let payload = payload(sources, blobs.clone(), r#"{"path":"large.txt"}"#).await;
+	let [read::PayloadPart::Text { text }] = payload.parts.as_slice() else {
+		panic!("expected one complete text part: {:?}", payload.parts);
 	};
-	assert_eq!(artifact.uri, "artifact://1");
-	assert_eq!(artifact.blob.hash, "blob-hash");
+	assert!(text.ends_with("\n4000:line 4000"), "{text}");
+	assert!(blobs.stored.lock().is_empty(), "read must not store its own spill artifact");
 }
 
 #[tokio::test]
@@ -802,15 +826,10 @@ async fn multibyte_sequence_split_at_the_sniff_boundary_reads_as_text() {
 }
 
 #[tokio::test]
-async fn standard_text_truncation_spills_the_complete_numbered_projection() {
+async fn oversized_numbered_projection_is_complete_without_a_notice() {
+	// 4,000 lines exceeds the former 3,000-line read cap.
 	let sources = Sources::default();
 	sources.file("large.txt", numbered_lines(4000));
-	let blobs = Blobs::default();
-	let parts = project(sources, blobs.clone(), r#"{"path":"large.txt"}"#, false).await;
-	let [Part::Text { text }] = parts.as_slice() else {
-		panic!("expected one truncated text projection: {parts:?}");
-	};
-
 	let mut full = String::from("[large.txt#A1B2]\n");
 	for line in 1..=4000 {
 		if line > 1 {
@@ -818,24 +837,38 @@ async fn standard_text_truncation_spills_the_complete_numbered_projection() {
 		}
 		write!(full, "{line}:line {line}").expect("writing to string");
 	}
-	let visible = full.lines().take(3000).collect::<Vec<_>>().join("\n");
-	assert_eq!(
-		text.as_str(),
-		format!(
-			"{visible}\n\n[truncated: 3000 of 4001 lines shown; read artifact://1 for full output]"
-		)
-	);
+	assert_complete_text(sources, r#"{"path":"large.txt"}"#, &full).await;
+}
 
-	let stored = blobs.stored.lock();
-	let [(bytes, media_type)] = stored.as_slice() else {
-		panic!("truncated text must spill exactly one blob: {stored:?}");
-	};
-	assert_eq!(bytes.as_ref(), full.as_bytes());
-	assert_eq!(media_type.as_str(), "text/plain; charset=utf-8");
+/// Lines wide enough that 3,500 of them exceed the former 50 KiB byte cap.
+fn wide_numbered_lines(count: usize) -> String {
+	(1..=count)
+		.map(|line| format!("line {line} {}", "x".repeat(40)))
+		.collect::<Vec<_>>()
+		.join("\n")
 }
 
 #[tokio::test]
-async fn final_projection_only_authorizes_source_lines_that_survive_the_shared_cap() {
+async fn raw_selector_on_oversized_file_yields_every_byte_without_a_notice() {
+	let body = wide_numbered_lines(4000);
+	assert!(body.len() > 50 * 1024 && body.lines().count() > 3000);
+	let sources = Sources::default();
+	sources.file("wide.txt", body.clone());
+	assert_complete_text(sources, r#"{"path":"wide.txt:raw"}"#, &body).await;
+}
+
+#[tokio::test]
+async fn range_selector_on_oversized_file_yields_every_selected_byte_without_a_notice() {
+	let body = wide_numbered_lines(4000);
+	let sources = Sources::default();
+	sources.file("wide.txt", body.clone());
+	let expected = body.lines().take(3500).collect::<Vec<_>>().join("\n");
+	assert!(expected.len() > 50 * 1024 && expected.lines().count() > 3000);
+	assert_complete_text(sources, r#"{"path":"wide.txt:raw:1-3500"}"#, &expected).await;
+}
+
+#[tokio::test]
+async fn final_projection_authorizes_every_source_line() {
 	let sources = Sources::default();
 	sources.file("large.txt", numbered_lines(4000));
 	let _ = project(sources.clone(), Blobs::default(), r#"{"path":"large.txt"}"#, false).await;
@@ -849,8 +882,8 @@ async fn final_projection_only_authorizes_source_lines_that_survive_the_shared_c
 			.iter()
 			.map(|span| (span.start_line, span.end_line))
 			.collect::<Vec<_>>(),
-		vec![(1, 2999)],
-		"the header consumes one of the 3000 retained projection lines"
+		vec![(1, 4000)],
+		"every projected line is editable because read no longer caps the projection"
 	);
 }
 
@@ -871,6 +904,56 @@ async fn structural_summary_has_a_concrete_recovery_footer() {
 			"[…120ln elided; re-read needed ranges with big.rs:2-121]",
 		)
 	);
+}
+
+#[tokio::test]
+async fn read_policy_controls_structural_summaries_and_plain_line_numbers() {
+	let sources = Sources::default();
+	let mut body = String::from("pub fn giant() {\n");
+	for line in 0..120 {
+		writeln!(body, "    let value_{line} = {line};").expect("writing to string");
+	}
+	body.push_str("}\n");
+	sources.file("big.rs", body);
+
+	let without_summary = project_with_policy(
+		sources.clone(),
+		Blobs::default(),
+		r#"{"path":"big.rs"}"#,
+		false,
+		read::ReadPolicy {
+			summarize: false,
+			line_numbers: false,
+			hashline_headers: false,
+			..read::ReadPolicy::default()
+		},
+	)
+	.await;
+	let [Part::Text { text: plain }] = without_summary.as_slice() else {
+		panic!("plain read must produce text: {without_summary:?}");
+	};
+	assert!(plain.starts_with("pub fn giant() {\n    let value_0 = 0;"), "{plain}");
+	assert!(plain.contains("let value_119 = 119;"), "{plain}");
+	assert!(!plain.contains("ln elided"), "{plain}");
+	assert!(!plain.starts_with("1:"), "{plain}");
+
+	let numbered = project_with_policy(
+		sources,
+		Blobs::default(),
+		r#"{"path":"big.rs:1-2"}"#,
+		false,
+		read::ReadPolicy {
+			summarize: false,
+			line_numbers: true,
+			hashline_headers: false,
+			..read::ReadPolicy::default()
+		},
+	)
+	.await;
+	let [Part::Text { text: numbered }] = numbered.as_slice() else {
+		panic!("numbered read must produce text: {numbered:?}");
+	};
+	assert!(numbered.starts_with("1:pub fn giant() {\n2:    let value_0 = 0;"), "{numbered}");
 }
 
 #[tokio::test]
@@ -954,7 +1037,7 @@ async fn sqlite_root_table_key_where_and_forbidden_where_are_model_text() {
 }
 
 #[tokio::test]
-async fn oversized_sqlite_output_spills_the_complete_rendered_table() {
+async fn oversized_sqlite_output_returns_the_complete_rendered_table() {
 	let db = sqlite_fixture();
 	{
 		let mut connection = rusqlite::Connection::open(&db.0).expect("open SQLite spill fixture");
@@ -984,7 +1067,7 @@ async fn oversized_sqlite_output_spills_the_complete_rendered_table() {
 		"wide.sqlite",
 		fs::read(&db.0).expect("read oversized SQLite fixture bytes"),
 	);
-	assert_truncated_text_spill(
+	assert_complete_text(
 		sources,
 		r#"{"path":"wide.sqlite?q=SELECT%20id,alpha,beta%20FROM%20wide%20ORDER%20BY%20id"}"#,
 		&expected,
@@ -1149,7 +1232,7 @@ async fn asar_root_subdirectory_and_packed_member_use_archive_routing() {
 }
 
 #[tokio::test]
-async fn oversized_archive_listing_spills_every_complete_entry_line() {
+async fn oversized_archive_listing_returns_every_entry_line() {
 	let mut writer = zip::Writer::new(Vec::new());
 	let mut expected_lines = Vec::with_capacity(read::archive::DEFAULT_ARCHIVE_LIST_LIMIT);
 	for index in 0..read::archive::DEFAULT_ARCHIVE_LIST_LIMIT {
@@ -1165,7 +1248,7 @@ async fn oversized_archive_listing_spills_every_complete_entry_line() {
 
 	let sources = Sources::default();
 	sources.file("large-listing.zip", archive);
-	assert_truncated_text_spill(sources, r#"{"path":"large-listing.zip"}"#, &expected).await;
+	assert_complete_text(sources, r#"{"path":"large-listing.zip"}"#, &expected).await;
 }
 
 #[tokio::test]
@@ -1361,7 +1444,7 @@ async fn conflict_selector_is_a_compact_index_and_normal_read_appends_warning() 
 }
 
 #[tokio::test]
-async fn oversized_conflict_index_spills_every_complete_summary_line() {
+async fn oversized_conflict_index_returns_every_complete_summary_line() {
 	let mut source = String::new();
 	for index in 1..=3_100 {
 		writeln!(source, "<<<<<<< HEAD\nours {index}\n=======\ntheirs {index}\n>>>>>>> feature")
@@ -1373,8 +1456,7 @@ async fn oversized_conflict_index_spills_every_complete_summary_line() {
 
 	let sources = Sources::default();
 	sources.file("many-conflicts.txt", source);
-	assert_truncated_text_spill(sources, r#"{"path":"many-conflicts.txt:conflicts"}"#, &expected)
-		.await;
+	assert_complete_text(sources, r#"{"path":"many-conflicts.txt:conflicts"}"#, &expected).await;
 }
 
 #[tokio::test]
@@ -1430,6 +1512,83 @@ async fn image_read_emits_description_and_blob_and_rejects_over_twenty_mibibytes
 	assert_eq!(
 		text(sources, r#"{"path":"huge.png"}"#).await,
 		"Image file too large: 20.0MB exceeds 20.0MB limit."
+	);
+}
+
+#[tokio::test]
+async fn image_question_routes_question_and_blob_to_vision_or_reports_unavailable() {
+	let sources = Sources::default();
+	sources.file("pixel.png", png_fixture());
+	let blobs = Blobs::default();
+
+	let result = payload(
+		sources.clone(),
+		blobs.clone(),
+		r#"{"path":"pixel.png","question":"What color is the pixel?"}"#,
+	)
+	.await;
+	let [
+		read::PayloadPart::Text { text: payload_text },
+		read::PayloadPart::Blob {
+			vision: Some(read::VisionRequest { question }),
+			..
+		},
+	] = result.parts.as_slice()
+	else {
+		panic!("image question must remain a typed vision request: {:?}", result.parts);
+	};
+	assert!(
+		payload_text.contains("Image question: What color is the pixel?"),
+		"{payload_text}"
+	);
+	assert_eq!(question, "What color is the pixel?");
+
+	let vision_parts = project(
+		sources.clone(),
+		blobs.clone(),
+		r#"{"path":"pixel.png","question":"What color is the pixel?"}"#,
+		true,
+	)
+	.await;
+	let [Part::Text { text: vision_text }, Part::Blob { .. }] = vision_parts.as_slice() else {
+		panic!("vision route must receive question text and the image: {vision_parts:?}");
+	};
+	assert!(
+		vision_text.contains("Image question: What color is the pixel?"),
+		"{vision_text}"
+	);
+
+	let unavailable_parts = project(
+		sources.clone(),
+		blobs,
+		r#"{"path":"pixel.png","question":"What color is the pixel?"}"#,
+		false,
+	)
+	.await;
+	let [
+		Part::Text { text: unavailable_question },
+		Part::Text { text: unavailable },
+	] = unavailable_parts.as_slice()
+	else {
+		panic!("text-only route must receive a typed unavailability projection: {unavailable_parts:?}");
+	};
+	assert!(
+		unavailable_question.contains("Image question: What color is the pixel?"),
+		"{unavailable_question}"
+	);
+	assert_eq!(
+		unavailable,
+		"Image question unavailable: the active model route does not accept image input."
+	);
+
+	sources.file("notes.txt", "plain text");
+	assert_eq!(
+		text(
+			sources,
+			r#"{"path":"notes.txt","question":"What is pictured?"}"#,
+		)
+		.await,
+		"Image questions require a supported PNG, JPEG, GIF, WebP, or rasterized SVG/PDF image."
 	);
 }
 

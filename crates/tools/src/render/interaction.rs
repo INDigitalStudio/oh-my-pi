@@ -12,8 +12,9 @@ use crate::{
 	gallery::RendererGalleryFixture,
 	think::{Fault as ThinkFault, Payload as ThinkPayload, Update as ThinkUpdate},
 	todo::{
-		Fault as TodoFault, Item as TodoItem, Payload as TodoPayload, Phase as TodoPhase,
-		Status as TodoStatus, Update as TodoUpdate,
+		Fault as TodoFault, InitListEntry as TodoInitListEntry, Payload as TodoPayload,
+		Phase as TodoPhase, Status as TodoStatus, Task as TodoTask,
+		Update as TodoUpdate,
 	},
 	view,
 };
@@ -57,7 +58,9 @@ impl RenderFold for AskRenderer {
 			},
 			Some(CallOutcome::Faulted(fault)) => {
 				let message = match fault {
-					AskFault::Invalid { message } | AskFault::Presenter { message } => message,
+					AskFault::Invalid { message }
+					| AskFault::Presenter { message }
+					| AskFault::Cancelled { message } => message,
 				};
 				Some(render_fault(message).into())
 			},
@@ -89,11 +92,21 @@ impl RenderFold for TodoRenderer {
 		}
 		if let Some(phases) = args.get("list").and_then(|value| value.as_array()) {
 			state.phases.clear();
-			state.phases.extend(
-				phases
-					.iter()
-					.filter_map(|phase| phase.deserialize_into::<TodoPhase>().ok()),
-			);
+			state.phases.extend(phases.iter().filter_map(|phase| {
+				let phase = phase.deserialize_into::<TodoInitListEntry>().ok()?;
+				Some(TodoPhase {
+					name:  phase.phase,
+					tasks: phase
+						.items
+						.into_iter()
+						.map(|content| TodoTask {
+							content,
+							status: TodoStatus::Pending,
+							blocker: None,
+						})
+						.collect(),
+				})
+			}));
 		} else if let Some(items) = args.get("items").and_then(|value| value.as_array()) {
 			let phase = args
 				.get("phase")
@@ -101,14 +114,14 @@ impl RenderFold for TodoRenderer {
 				.unwrap_or("Todos");
 			state.phases.clear();
 			state.phases.push(TodoPhase {
-				phase: Str::new(phase),
-				items: items
+				name:  Str::new(phase),
+				tasks: items
 					.iter()
 					.filter_map(|item| item.as_str())
-					.map(|text| TodoItem {
-						text:   Str::new(text),
+					.map(|content| TodoTask {
+						content: Str::new(content),
 						status: TodoStatus::Pending,
-						reason: None,
+						blocker: None,
 					})
 					.collect(),
 			});
@@ -216,9 +229,9 @@ fn render_todo_phases(phases: &[TodoPhase]) -> El {
 	view! {
 		<todo guides="round" numbering="roman">
 			for phase in phases {
-				<task label={&phase.phase}>
-					for item in &phase.items {
-						{render_todo_item(item)}
+				<task label={&phase.name}>
+					for task in &phase.tasks {
+						{render_todo_task(task)}
 					}
 				</task>
 			}
@@ -226,16 +239,16 @@ fn render_todo_phases(phases: &[TodoPhase]) -> El {
 	}
 }
 
-fn render_todo_item(item: &TodoItem) -> El {
-	if item.status == TodoStatus::Blocked
-		&& let Some(reason) = item.reason.as_deref()
+fn render_todo_task(task: &TodoTask) -> El {
+	if task.status == TodoStatus::Blocked
+		&& let Some(blocker) = task.blocker.as_deref()
 	{
 		view! {
-			<task status={item.status.as_ref()} desc={reason}>{&item.text}</task>
+			<task status={task.status.as_ref()} desc={blocker}>{&task.content}</task>
 		}
 	} else {
 		view! {
-			<task status={item.status.as_ref()}>{&item.text}</task>
+			<task status={task.status.as_ref()}>{&task.content}</task>
 		}
 	}
 }
@@ -253,7 +266,7 @@ fn render_todo_live(op: Option<&str>) -> El {
 }
 
 fn render_todo_fault(fault: &TodoFault) -> El {
-	render_fault(fault.message())
+	render_fault(&fault.to_string())
 }
 
 fn render_fault(message: &str) -> El {
@@ -281,11 +294,11 @@ pub(crate) fn gallery_fixtures(
 		},
 		RendererGalleryFixture {
 			identity: todo,
-			streaming_args: r#"{"op":"init","list":[{"phase":"Foundation","items":[{"text":"Scaffold crate"},{"text":"Wire workspace"}]},{"phase":"Au"#,
-			args: r#"{"op":"init","list":[{"phase":"Foundation","items":[{"text":"Scaffold crate"},{"text":"Wire workspace"}]},{"phase":"Auth","items":[{"text":"Port credential store"},{"text":"Wire OAuth providers"}]}]}"#,
+			streaming_args: r#"{"op":"init","list":[{"phase":"Foundation","items":["Scaffold crate","Wire workspace"]},{"phase":"Au"#,
+			args: r#"{"op":"init","list":[{"phase":"Foundation","items":["Scaffold crate","Wire workspace"]},{"phase":"Auth","items":["Port credential store","Wire OAuth providers"]}]}"#,
 			progress_update: None,
-			success_outcome: br##"{"kind":"ok","value":{"phases":[{"phase":"Foundation","items":[{"text":"Scaffold crate","status":"completed","reason":null},{"text":"Wire workspace","status":"in_progress","reason":null}]},{"phase":"Auth","items":[{"text":"Port credential store","status":"pending","reason":null},{"text":"Wire OAuth providers","status":"pending","reason":null}]}],"rendered":"# Foundation\n- [x] Scaffold crate\n- [/] Wire workspace\n\n# Auth\n- [ ] Port credential store\n- [ ] Wire OAuth providers\n"}}"##,
-			error_outcome: br#"{"kind":"faulted","value":{"kind":"missing","message":"Unknown phase 'Auth' - initialize the list first"}}"#,
+			success_outcome: br#"{"kind":"ok","value":{"op":"init","phases":[{"name":"Foundation","tasks":[{"content":"Scaffold crate","status":"completed"},{"content":"Wire workspace","status":"in_progress"}]},{"name":"Auth","tasks":[{"content":"Port credential store","status":"pending"},{"content":"Wire OAuth providers","status":"pending"}]}],"completed_tasks":[{"phase":"Foundation","content":"Scaffold crate"}]}}"#,
+			error_outcome: br#"{"kind":"faulted","value":{"kind":"phase_not_found","name":"Auth"}}"#,
 		},
 		RendererGalleryFixture {
 			identity: think,
@@ -374,7 +387,7 @@ mod tests {
 				.view(&todo_state, Some(&todo_fault))
 				.expect("todo fault renders")
 				.as_str(),
-			"<callout kind=error>Unknown phase 'Auth' - initialize the list first</callout>",
+			"<callout kind=error>Phase \"Auth\" not found</callout>",
 		);
 
 		let think_outcome = serde_json::from_slice::<CallOutcome<ThinkPayload, ThinkFault>>(
@@ -416,15 +429,16 @@ mod tests {
 		);
 
 		let todo = TodoPayload {
-			phases:   vec![crate::todo::Phase {
-				phase: Str::new("Build \"core\""),
-				items: vec![crate::todo::Item {
-					text:   Str::new("<compile>"),
-					status: TodoStatus::Blocked,
-					reason: Some(Str::new("CI & review")),
+			op:              crate::todo::Op::View,
+			phases:          vec![crate::todo::Phase {
+				name:  Str::new("Build \"core\""),
+				tasks: vec![crate::todo::Task {
+					content: Str::new("<compile>"),
+					status:  TodoStatus::Blocked,
+					blocker: Some(Str::new("CI & review")),
 				}],
 			}],
-			rendered: Str::new("unused"),
+			completed_tasks: Vec::new(),
 		};
 		let rendered = render_todo(&todo).to_tml();
 		assert!(rendered.contains("label=\"Build &quot;core&quot;\""));

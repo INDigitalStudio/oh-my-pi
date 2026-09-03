@@ -59,10 +59,24 @@ pub enum Action {
 	AxAttributes,
 }
 
-/// Desktop device arguments.
+/// Model-facing persistent computer program.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Params {
+	/// JavaScript executed in the persistent computer session. Top-level
+	/// `await` is accepted and `desktop`, `wait`, and `assert` are in scope.
+	pub code:      Str,
+	/// Prohibit input, focus, and clipboard mutation.
+	#[serde(default)]
+	pub read_only: bool,
+	/// Whole-program run budget in seconds.
+	pub timeout:   Option<f64>,
+}
+
+/// One native desktop operation available only behind the code surface.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeParams {
 	/// Operation to perform.
 	pub action:     Action,
 	/// Explicitly prohibit input/focus mutation for this call.
@@ -94,7 +108,7 @@ pub struct Params {
 	pub limit:      Option<u32>,
 }
 
-impl Params {
+impl NativeParams {
 	/// Exact desktop authority required by this invocation.
 	pub const fn required_effects(&self) -> DesktopEffects {
 		match self.action {
@@ -125,11 +139,11 @@ impl Params {
 /// Desktop operation result.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Payload {
-	/// Completed action.
-	pub action:    Action,
-	/// Structured native result.
-	pub result:    Value,
-	/// Content-addressed screenshots.
+	/// Exact executed program.
+	pub code:      Str,
+	/// Structured results of the program's desktop operations, in order.
+	pub results:   Vec<Value>,
+	/// Content-addressed screenshots produced during the program.
 	pub artifacts: Vec<Str>,
 }
 
@@ -156,7 +170,8 @@ pub enum Update {}
 /// Harness-owned persistent desktop session contract.
 #[async_trait]
 pub trait ComputerHost: Send + Sync + 'static {
-	/// Execute one admission-approved desktop operation.
+	/// Execute one admission-approved program against the persistent desktop
+	/// session.
 	async fn execute(&self, params: Params) -> Result<Payload, Fault>;
 }
 
@@ -166,14 +181,14 @@ pub struct Computer {
 	spec: ToolSpec,
 }
 
-/// Builds the host-free `computer@1` declaration.
+/// Builds the host-free `computer@2` declaration.
 pub fn spec() -> ToolSpec {
 	ToolSpec {
 		name:            sf!("computer"),
-		rev:             Rev { family: Str::default(), n: 1 },
+		rev:             Rev { family: Str::default(), n: 2 },
 		description:     sf!(
-			"Captures and controls the native desktop through a persistent supervised session. Set \
-			 read_only for inspection-only calls."
+			"Runs JavaScript in a persistent native desktop session with `desktop`, `wait`, and \
+			 `assert` in scope. Set read_only for inspection-only calls."
 		),
 		schema:          omp_tool::schema::<Params>(),
 		constraint:      Constraint::Schema {
@@ -200,7 +215,7 @@ pub fn spec() -> ToolSpec {
 	}
 }
 
-/// Creates `computer@1`.
+/// Creates `computer@2`.
 pub fn tool(host: Arc<dyn ComputerHost>) -> Computer {
 	Computer { host, spec: spec() }
 }
@@ -224,13 +239,6 @@ impl Tool for Computer {
 				Ok(params) => params,
 				Err(error) => { yield param_event(error); return; },
 			};
-			if params.read_only && params.required_effects().input {
-				yield Ev::Done(ToolTerminal::Done {
-					result: Err(Fault { code: sf!("desktop_read_only"), message: sf!("read_only calls cannot perform desktop input or focus mutation") }),
-					useless: false,
-				});
-				return;
-			}
 			if let Err(error) = incoming.interruptable().committed().await {
 				yield commit_event(error);
 				return;
@@ -278,5 +286,45 @@ fn protocol_issue(message: Str) -> ArgIssue {
 		kind:     ArgIssueKind::Protocol,
 		example:  None,
 		found:    Some(message),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use serde_json::{Value, json};
+
+	use super::{Params, spec};
+
+	#[test]
+	fn computer_schema_is_the_persistent_code_surface() {
+		let schema: Value = serde_json::from_slice(&spec().schema).expect("computer schema");
+		let properties = schema["properties"].as_object().expect("object properties");
+		let mut domain = properties
+			.keys()
+			.filter(|name| !matches!(name.as_str(), "i" | "notrunc"))
+			.map(String::as_str)
+			.collect::<Vec<_>>();
+		domain.sort_unstable();
+		assert_eq!(domain, ["code", "read_only", "timeout"]);
+		assert_eq!(schema["required"], json!(["i", "code"]));
+		let description = properties["code"]["description"]
+			.as_str()
+			.expect("code description");
+		for binding in ["desktop", "wait", "assert"] {
+			assert!(description.contains(binding));
+		}
+	}
+
+	#[test]
+	fn computer_code_schema_accepts_reference_oracle_arguments() {
+		let params: Params = serde_json::from_value(json!({
+			"code": "const windows = await desktop.windows();\nassert(windows.length > 0);",
+			"read_only": true,
+			"timeout": 12.5
+		}))
+		.expect("reference computer arguments");
+		assert!(params.read_only);
+		assert_eq!(params.timeout, Some(12.5));
+		assert!(params.code.contains("desktop.windows"));
 	}
 }

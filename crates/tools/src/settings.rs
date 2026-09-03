@@ -156,51 +156,51 @@ omp_con::var! {
 	/// Allow read to fetch HTTP(S) resources.
 	pub static SV_FETCH_ENABLED = sv_fetch_enabled: bool {
 		default: true,
-		flags: archive | inherit | replicated,
+		flags: archive | replicated,
 	};
 	/// Resize oversized images before model delivery.
 	pub static SV_IMAGES_AUTO_RESIZE = sv_images_auto_resize: bool {
 		default: true,
-		flags: archive | session | inherit | replicated,
+		flags: archive | session | replicated,
 	};
 	/// Present Markdown reads as rendered Markdown.
 	pub static CL_READ_RENDER_MARKDOWN = cl_read_render_markdown: bool {
 		default: false,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Format supported documents after a whole-file write.
 	pub static SV_LSP_FORMAT_ON_WRITE = sv_lsp_format_on_write: bool {
 		default: false,
-		flags: archive | inherit | replicated,
+		flags: archive | replicated,
 	};
 	/// Return diagnostics bound to the committed write revision.
 	pub static SV_LSP_DIAGNOSTICS_ON_WRITE = sv_lsp_diagnostics_on_write: bool {
 		default: true,
-		flags: archive | inherit | replicated,
+		flags: archive | replicated,
 	};
 	/// Return diagnostics bound to the committed edit revision.
 	pub static SV_LSP_DIAGNOSTICS_ON_EDIT = sv_lsp_diagnostics_on_edit: bool {
 		default: false,
-		flags: archive | inherit | replicated,
+		flags: archive | replicated,
 	};
 	/// Suppress diagnostics already surfaced for the same file.
 	pub static SV_LSP_DIAGNOSTICS_DEDUPLICATE = sv_lsp_diagnostics_deduplicate: bool {
 		default: true,
-		flags: archive | inherit | replicated,
+		flags: archive | replicated,
 	};
 	/// Bound the per-runtime diagnostic identity history.
 	pub static SV_LSP_DIAGNOSTICS_HISTORY_CAPACITY = sv_lsp_diagnostics_history_capacity: u32 {
 		default: DEFAULT_DIAGNOSTIC_HISTORY_CAPACITY as u32,
 		min: 1,
 		max: MAX_DIAGNOSTIC_HISTORY_CAPACITY as u32,
-		flags: archive | inherit | replicated,
+		flags: archive | replicated,
 	};
 	/// Bound diagnostics attached to one committed revision.
 	pub static SV_LSP_MAX_DIAGNOSTICS_PER_BATCH = sv_lsp_max_diagnostics_per_batch: u32 {
 		default: DEFAULT_DIAGNOSTICS_PER_BATCH as u32,
 		min: 1,
 		max: MAX_DIAGNOSTICS_PER_BATCH as u32,
-		flags: archive | inherit | replicated,
+		flags: archive | replicated,
 	};
 }
 

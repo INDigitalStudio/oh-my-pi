@@ -20,14 +20,27 @@ use serde_json::json;
 struct FakeWorkspace {
 	result:   Result<grep::SearchResult, grep::Fault>,
 	recorded: Arc<Mutex<Vec<grep::SnapshotRecord>>>,
+	requests: Arc<Mutex<Vec<grep::SearchRequest>>>,
 }
 
 impl grep::WorkspaceSearch for FakeWorkspace {
 	fn search(
 		&self,
-		_request: grep::SearchRequest,
+		request: grep::SearchRequest,
 	) -> impl Future<Output = Result<grep::SearchResult, grep::Fault>> + Send + '_ {
-		let result = self.result.clone();
+		let mut result = self.result.clone();
+		if let Ok(result) = &mut result {
+			let context_before =
+				usize::try_from(request.context_before).unwrap_or(usize::MAX);
+			let context_after = usize::try_from(request.context_after).unwrap_or(usize::MAX);
+			for matched in &mut result.matches {
+				let first_before =
+					matched.context_before.len().saturating_sub(context_before);
+				matched.context_before.drain(..first_before);
+				matched.context_after.truncate(context_after);
+			}
+		}
+		self.requests.lock().push(request);
 		async move { result }
 	}
 
@@ -86,11 +99,19 @@ struct Invocation {
 }
 
 fn fake(result: grep::SearchResult) -> FakeWorkspace {
-	FakeWorkspace { result: Ok(result), recorded: Arc::default() }
+	FakeWorkspace {
+		result: Ok(result),
+		recorded: Arc::default(),
+		requests: Arc::default(),
+	}
 }
 
 fn failed(fault: grep::Fault) -> FakeWorkspace {
-	FakeWorkspace { result: Err(fault), recorded: Arc::default() }
+	FakeWorkspace {
+		result: Err(fault),
+		recorded: Arc::default(),
+		requests: Arc::default(),
+	}
 }
 
 fn matched(path: &str, line_number: u32, line: &str, tag: Option<&str>) -> grep::SearchMatch {
@@ -107,14 +128,28 @@ fn matched(path: &str, line_number: u32, line: &str, tag: Option<&str>) -> grep:
 	}
 }
 
-fn invoke_with_blobs(workspace: &FakeWorkspace, raw: &str, blobs: RecordingBlobs) -> Invocation {
+fn context(line_number: u32, line: &str) -> grep::ContextLine {
+	grep::ContextLine { line_number, line: Str::new(line) }
+}
+
+fn invoke_with_context_and_blobs(
+	workspace: &FakeWorkspace,
+	raw: &str,
+	context_before: u32,
+	context_after: u32,
+	blobs: RecordingBlobs,
+) -> Invocation {
 	let mut registry = Registry::new();
 	registry
-		.register(grep::tool(workspace.clone(), blobs), Presentation::Slot, Claims {
-			precedence: Precedence::CORE,
-			claimant:   sf!("omp/core"),
-			replaces:   None,
-		})
+		.register(
+			grep::tool(workspace.clone(), blobs, context_before, context_after),
+			Presentation::Slot,
+			Claims {
+				precedence: Precedence::CORE,
+				claimant:   sf!("omp/core"),
+				replaces:   None,
+			},
+		)
 		.expect("grep schema and revision register");
 	let (feed, params) = IncomingParams::channel();
 	feed
@@ -136,12 +171,16 @@ fn invoke_with_blobs(workspace: &FakeWorkspace, raw: &str, blobs: RecordingBlobs
 	}
 }
 
+fn invoke_with_blobs(workspace: &FakeWorkspace, raw: &str, blobs: RecordingBlobs) -> Invocation {
+	invoke_with_context_and_blobs(workspace, raw, 2, 2, blobs)
+}
+
 fn invoke(workspace: &FakeWorkspace, raw: &str) -> Invocation {
 	invoke_with_blobs(workspace, raw, RecordingBlobs::default())
 }
 
 fn prompt(workspace: &FakeWorkspace, outcome: &CallOutcome<grep::Payload, grep::Fault>) -> String {
-	let tool = grep::tool(workspace.clone(), RecordingBlobs::default());
+	let tool = grep::tool(workspace.clone(), RecordingBlobs::default(), 2, 2);
 	let caps = PromptCaps::for_tool(
 		CapsBase {
 			maximum_parts:      1,
@@ -168,8 +207,13 @@ fn invoke_prompt(workspace: &FakeWorkspace, raw: &str) -> (String, bool) {
 }
 
 #[test]
-fn schema_is_exactly_the_pi_grep_schema() {
-	let tool = grep::tool(fake(grep::SearchResult::default()), RecordingBlobs::default());
+fn schema_is_exactly_the_native_grep_schema() {
+	let tool = grep::tool(
+		fake(grep::SearchResult::default()),
+		RecordingBlobs::default(),
+		2,
+		2,
+	);
 	let actual: serde_json::Value =
 		serde_json::from_slice(&tool.spec().schema).expect("grep schema is JSON");
 	assert_eq!(
@@ -198,6 +242,10 @@ fn schema_is_exactly_the_pi_grep_schema() {
 				"i": {
 					"type": "string",
 					"description": "Short present-participle intent for this call."
+				},
+				"notrunc": {
+					"type": "boolean",
+					"description": "Return complete output inline without central truncation."
 				}
 			}
 		})
@@ -241,6 +289,60 @@ fn single_file_match_has_hashline_header_and_no_group_heading() {
 	let (text, useless) = invoke_prompt(&workspace, r#"{"pattern":"needle","path":"src/one.rs"}"#);
 	assert_eq!(text, "[src/one.rs#BEEF]\n*4:needle();");
 	assert!(!useless);
+}
+
+#[test]
+fn asymmetric_and_zero_context_are_request_scoped_and_preserve_source_order() {
+	let mut found = matched("src/context.rs", 4, "needle", Some("C0DE"));
+	found.context_before = vec![
+		context(1, "before 1"),
+		context(2, "before 2"),
+		context(3, "before 3"),
+	];
+	found.context_after = vec![
+		context(5, "after 1"),
+		context(6, "after 2"),
+		context(7, "after 3"),
+		context(8, "after 4"),
+	];
+	let workspace = fake(grep::SearchResult {
+		matches: vec![found],
+		multi_scope: false,
+		..grep::SearchResult::default()
+	});
+
+	let asymmetric = invoke_with_context_and_blobs(
+		&workspace,
+		r#"{"pattern":"needle","path":"src/context.rs"}"#,
+		1,
+		3,
+		RecordingBlobs::default(),
+	);
+	assert_eq!(
+		prompt(&workspace, &asymmetric.outcome),
+		"[src/context.rs#C0DE]\n 3:before 3\n*4:needle\n 5:after 1\n 6:after 2\n 7:after 3"
+	);
+
+	let zero = invoke_with_context_and_blobs(
+		&workspace,
+		r#"{"pattern":"needle","path":"src/context.rs"}"#,
+		0,
+		0,
+		RecordingBlobs::default(),
+	);
+	assert_eq!(
+		prompt(&workspace, &zero.outcome),
+		"[src/context.rs#C0DE]\n*4:needle"
+	);
+
+	let requests = workspace.requests.lock();
+	assert_eq!(
+		requests
+			.iter()
+			.map(|request| (request.context_before, request.context_after))
+			.collect::<Vec<_>>(),
+		vec![(1, 3), (0, 0)]
+	);
 }
 
 #[test]
@@ -410,7 +512,7 @@ fn oversized_projection_spills_complete_output_with_truthful_footer() {
 	);
 	assert!(text.ends_with(expected_footer.as_str()));
 
-	let zero_tool = grep::tool(workspace, RecordingBlobs::default());
+	let zero_tool = grep::tool(workspace, RecordingBlobs::default(), 2, 2);
 	let zero = zero_tool.prompt(
 		Ok(payload),
 		&PromptCaps::for_tool(

@@ -51,10 +51,75 @@ pub use spec_generated::{
 };
 use thiserror::Error;
 
+/// Failure while adding protocol-owned fields to a model-facing tool schema.
+#[derive(Debug, Error)]
+pub enum ProtocolSchemaError {
+	/// The schema bytes were not valid JSON.
+	#[error("tool parameter schema is invalid JSON")]
+	Json(#[from] serde_json::Error),
+	/// Tool parameters must be described by an object schema.
+	#[error("tool parameter schema must have `type: \"object\"`")]
+	Object,
+	/// The schema's `properties` keyword was present with the wrong shape.
+	#[error("tool parameter schema `properties` must be an object")]
+	Properties,
+	/// The schema's `required` keyword was present with the wrong shape.
+	#[error("tool parameter schema `required` must be an array of strings")]
+	Required,
+}
+
+/// Injects the caller-owned fields shared by every model-facing tool schema.
+///
+/// `i` is always the first required property. `notrunc` is always optional;
+/// omitting it retains central output bounding.
+pub fn inject_protocol_schema(schema: &[u8]) -> Result<Bytes, ProtocolSchemaError> {
+	let mut value = serde_json::from_slice(schema)?;
+	inject_protocol_fields(&mut value)?;
+	Ok(Bytes::from(serde_json::to_vec(&value)?))
+}
+
+fn inject_protocol_fields(value: &mut serde_json::Value) -> Result<(), ProtocolSchemaError> {
+	let object = value.as_object_mut().ok_or(ProtocolSchemaError::Object)?;
+	if object.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+		return Err(ProtocolSchemaError::Object);
+	}
+	let properties = object
+		.entry("properties")
+		.or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+		.as_object_mut()
+		.ok_or(ProtocolSchemaError::Properties)?;
+	properties.insert(
+		"i".to_owned(),
+		serde_json::json!({
+			"type": "string",
+			"description": "Short present-participle intent for this call."
+		}),
+	);
+	properties.insert(
+		"notrunc".to_owned(),
+		serde_json::json!({
+			"type": "boolean",
+			"description": "Return complete output inline without central truncation."
+		}),
+	);
+	let required = object
+		.entry("required")
+		.or_insert_with(|| serde_json::Value::Array(Vec::new()))
+		.as_array_mut()
+		.ok_or(ProtocolSchemaError::Required)?;
+	if required.iter().any(|name| !name.is_string()) {
+		return Err(ProtocolSchemaError::Required);
+	}
+	required.retain(|name| !matches!(name.as_str(), Some("i" | "notrunc")));
+	required.insert(0, serde_json::Value::String("i".to_owned()));
+	Ok(())
+}
+
 /// Generates the compact, deterministic JSON Schema exposed to models for `T`.
 ///
 /// Subschemas are inlined and generator metadata is omitted. Schemas describe
-/// deserialization, matching how tool parameters are consumed.
+/// deserialization, matching how tool parameters are consumed, then receive
+/// the shared required `i` and optional `notrunc` protocol fields.
 pub fn schema<T: schemars::JsonSchema>() -> Bytes {
 	let generator = SchemaSettings::draft2020_12()
 		.with(|settings| {
@@ -68,44 +133,24 @@ pub fn schema<T: schemars::JsonSchema>() -> Bytes {
 	root.remove("title");
 	let mut value =
 		serde_json::to_value(root.as_value()).expect("schemars-generated JSON Schema must serialize");
-	let object = value
-		.as_object_mut()
-		.expect("tool parameter schemas must describe an object");
-	let properties = object
-		.entry("properties")
-		.or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-		.as_object_mut()
-		.expect("tool parameter schema properties must be an object");
-	properties.insert(
-		"i".to_owned(),
-		serde_json::json!({
-			"type": "string",
-			"description": "Short present-participle intent for this call."
-		}),
-	);
-	let required = object
-		.entry("required")
-		.or_insert_with(|| serde_json::Value::Array(Vec::new()))
-		.as_array_mut()
-		.expect("tool parameter schema required must be an array");
-	if !required.iter().any(|name| name.as_str() == Some("i")) {
-		required.insert(0, serde_json::Value::String("i".to_owned()));
-	}
+	inject_protocol_fields(&mut value)
+		.expect("schemars-generated tool parameter schemas must describe an object");
 	Bytes::from(
 		serde_json::to_vec(&value)
 			.expect("schemars-generated JSON Schema must serialize to compact JSON"),
 	)
 }
 
-/// Deserializes a tool's parameters after removing the protocol-owned `i`
-/// intent field.
+/// Deserializes a tool's parameters after removing the protocol-owned fields.
 ///
-/// `i` is journal and presentation metadata shared by every tool, not a field
-/// each executor must duplicate in its domain-specific parameter type.
+/// `i` and `notrunc` remain in the canonical invocation arguments for
+/// journaling and dispatch policy, but are not fields each executor must
+/// duplicate in its domain-specific parameter type.
 pub fn decode_params<T: DeserializeOwned>(json: &str) -> Result<T, serde_json::Error> {
 	let mut value = serde_json::from_str::<serde_json::Value>(json)?;
 	if let Some(object) = value.as_object_mut() {
 		object.remove("i");
+		object.remove("notrunc");
 	}
 	serde_json::from_value(value)
 }
@@ -1293,7 +1338,7 @@ pub struct ArgSpec {
 	pub additional_properties: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RevArgSpecs {
 	path_ids: BTreeMap<SmallVec<ArgPath, 4>, u32>,
 	specs:    SparseMap<u32, ArgSpec>,
@@ -1304,7 +1349,7 @@ struct RevArgSpecs {
 /// Canonical paths and final-key aliases intern to the same dense identifier.
 /// Once sealed, the table serves borrowed lock-free index lookups and rejects
 /// every later mutation.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ArgSpecRegistry {
 	revisions: BTreeMap<Rev, RevArgSpecs>,
 	sealed:    bool,

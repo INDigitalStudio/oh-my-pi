@@ -17,9 +17,10 @@ use omp_proto::inference::v1::{
 	InvokeInput,
 	invoke_input::{self, chunk},
 };
+use omp_shell_builtins::{ImagePassthrough, image_passthrough_ranges};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Effects, Ev, ExecEffects,
-	IncomingParams, Interrupt, InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool,
+	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, Effects, Ev, IncomingParams,
+	Interrupt, InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool,
 	ToolSpec, ToolTerminal,
 };
 use schemars::JsonSchema;
@@ -47,7 +48,7 @@ pub fn command_segments(
 	omp_shell_engine::parser::flat_shell_segments(command)
 }
 
-/// Complete arguments for `bash@1`.
+/// Complete arguments for `bash@2`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[schemars(description = "")]
 #[serde(deny_unknown_fields)]
@@ -200,11 +201,15 @@ pub struct Payload {
 	pub exec_id:     Bytes,
 	/// Exact submitted script after a leading `cd &&` was extracted.
 	pub command:     Str,
-	/// Ordered output retained whole in the durable call outcome.
+	/// Host-bounded ordered output projected live for this call.
 	///
-	/// The central call-outcome spill gate moves a large serialized outcome to a
-	/// [`BlobRef`]; this executor never clips durable output.
+	/// When raw output exceeds the host transport bound, the complete bytes are
+	/// retained at [`ExecStatus::spilled_output`] and this transcript is its
+	/// bounded inline projection. The tool never applies another text bound.
 	pub transcript:  Vec<TranscriptFrame>,
+	/// Durable images extracted from terminal graphics passthrough.
+	#[serde(default)]
+	pub attachments: Vec<BlobRef>,
 	/// Execution adjustments retained as journal receipts.
 	pub adjustments: Vec<AdjustmentReceipt>,
 	/// Terminal host status, preserved without reinterpretation.
@@ -364,6 +369,14 @@ pub trait ShellExec: Clone + Send + Sync + 'static {
 		&self,
 		request: DetachRequest,
 	) -> impl Future<Output = Result<DetachedJob, Fault>> + Send + '_;
+
+	/// Stores one complete shell image attachment in the environment blob
+	/// namespace.
+	fn store_attachment(
+		&self,
+		bytes: Bytes,
+		media_type: Str,
+	) -> impl Future<Output = Result<BlobRef, Fault>> + Send + '_;
 }
 
 /// Bounds enforced by the execution placement for finite shell deadlines.
@@ -379,23 +392,19 @@ pub struct TimeoutBounds {
 
 impl Default for TimeoutBounds {
 	fn default() -> Self {
-		Self { default_ms: 300_000, floor_ms: 1_000, ceiling_ms: 1_800_000 }
+		Self { default_ms: 300_000, floor_ms: 1_000, ceiling_ms: 3_600_000 }
 	}
 }
 
-/// Immutable live-composition facts projected into the `bash@1` prompt.
+/// Immutable live-composition facts projected into the `bash@2` prompt.
 #[derive(Clone, Debug)]
 pub struct ShellPromptSnapshot {
 	/// Active sibling tools which can replace common shell intents.
 	pub sibling_tools:       Arc<[Str]>,
 	/// Environment operating-system platform.
 	pub platform:            Str,
-	/// Requested shell profile name.
-	pub profile:             Str,
 	/// Whether a command wrapper prefix is configured.
 	pub command_prefix:      bool,
-	/// Whether shell output minimization is configured.
-	pub minimizer_enabled:   bool,
 	/// Whether embedded shell builtins are enabled.
 	pub embedded_builtins:   bool,
 	/// Whether the `dyn` dynamic-device builtin is installed.
@@ -418,8 +427,9 @@ impl ShellPromptSnapshot {
 		);
 		let _ = write!(
 			description,
-			" Environment platform: {}; shell profile: {}.",
-			self.platform, self.profile,
+			" Environment platform: {}; the shell is an in-process bash interpreter with builtin \
+			 coreutils.",
+			self.platform,
 		);
 		if self.sibling_tools.is_empty() {
 			description.push_str(" No dedicated sibling tools are active.");
@@ -435,17 +445,11 @@ impl ShellPromptSnapshot {
 		}
 		let _ = write!(
 			description,
-			" Command prefix: {}; minimizer: {}; embedded builtins: {}; intent interceptor: {}; ACP \
-			 routing: {}.",
+			" Command prefix: {}; embedded builtins: {}; intent interceptor: {}; ACP routing: {}.",
 			if self.command_prefix {
 				"configured"
 			} else {
 				"none"
-			},
-			if self.minimizer_enabled {
-				"enabled"
-			} else {
-				"disabled"
 			},
 			if self.embedded_builtins {
 				"enabled"
@@ -471,7 +475,7 @@ impl ShellPromptSnapshot {
 	}
 }
 
-/// Builds the host-free `bash@1` declaration from immutable prompt facts.
+/// Builds the host-free `bash@2` declaration from immutable prompt facts.
 pub fn spec(snapshot: &ShellPromptSnapshot) -> ToolSpec {
 	spec_described(snapshot.description())
 }
@@ -479,23 +483,17 @@ pub fn spec(snapshot: &ShellPromptSnapshot) -> ToolSpec {
 fn spec_described(description: Str) -> ToolSpec {
 	ToolSpec {
 		name: sf!("bash"),
-		rev: Rev { family: Str::default(), n: 1 },
+		rev: Rev { family: Str::default(), n: 2 },
 		description,
 		schema: omp_tool::schema::<Params>(),
 		constraint: Constraint::Schema {
 			priority:       100,
 			on_unsupported: omp_tool::Fallback::Unspecified,
 		},
-		effects: Effects {
-			documents: None,
-			exec:      Some(ExecEffects {
-				commands: [sf!("*")].into_iter().collect(),
-				network:  true,
-			}),
-			inference: None,
-			desktop:   None,
-			subagents: 0,
-		},
+		// The shell string is not an approval capability. The environment host
+		// admits exact filesystem, spawn, and network effects as interpretation
+		// reaches those boundaries.
+		effects: Effects::empty(),
 		projection_code: omp_tool::native_projection_code(
 			env!("CARGO_PKG_NAME"),
 			env!("CARGO_PKG_VERSION"),
@@ -505,7 +503,7 @@ fn spec_described(description: Str) -> ToolSpec {
 	}
 }
 
-/// Generic `bash@1` implementation retaining one lazy persistent session.
+/// Generic `bash@2` implementation retaining one lazy persistent session.
 pub struct ShellTool<E: ShellExec> {
 	exec: E,
 	session: Mutex<Option<Session>>,
@@ -520,7 +518,7 @@ pub struct ShellTool<E: ShellExec> {
 	spec: ToolSpec,
 }
 
-/// Constructs the native `bash@1` executor over an environment resource.
+/// Constructs the native `bash@2` executor over an environment resource.
 pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 	shell_with_spec(
 		exec,
@@ -548,7 +546,7 @@ fn shell_with_spec<E: ShellExec>(exec: E, spec: ToolSpec) -> ShellTool<E> {
 		spec,
 	}
 }
-/// Constructs `bash@1` from immutable live registry, capability, and settings
+/// Constructs `bash@2` from immutable live registry, capability, and settings
 /// facts.
 pub fn shell_with_snapshot_and_timeout_bounds<E: ShellExec>(
 	exec: E,
@@ -922,11 +920,26 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 							&& status.signal.is_none()
 							&& !status.aborted
 							&& !status.effects_unknown;
+						let images = extract_transcript_images(&mut transcript);
+						let mut attachments = Vec::with_capacity(images.len());
+						for image in images {
+							match self.exec.store_attachment(image.bytes, image.mime).await {
+								Ok(blob) => attachments.push(blob),
+								Err(fault) => {
+									yield Ev::Done(ToolTerminal::Done {
+										result: Err(fault),
+										useless: false,
+									});
+									return;
+								},
+							}
+						}
 						let payload = Payload {
 							session_id,
 							exec_id,
 							command,
 							transcript,
+							attachments,
 							adjustments,
 							status,
 						};
@@ -963,8 +976,13 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 	}
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, caps: &PromptCaps) -> Vec<Part> {
+		let attachments = match view {
+			Ok(payload) => payload.attachments.as_slice(),
+			Err(Fault::CommandFailed { payload }) => payload.attachments.as_slice(),
+			Err(_) => &[],
+		};
 		let Some(mut projection) = TextProjection::new(*caps) else {
-			return Vec::new();
+			return attachment_parts(attachments, caps.media, usize::from(caps.maximum_parts));
 		};
 		match view {
 			Ok(payload) => {
@@ -974,11 +992,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 					payload.status.exit_code,
 					payload.status.signal,
 					payload.status.wall_clock_ms,
-					if payload.status.spilled_output.is_some() {
-						"; output blob attached"
-					} else {
-						""
-					},
+					spilled_output_note(&payload.status),
 				);
 				if projection.push(&status) {
 					for adjustment in &payload.adjustments {
@@ -989,23 +1003,37 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 							break;
 						}
 					}
-					push_transcript_head_tail(&mut projection, &payload.transcript);
+					push_transcript(&mut projection, &payload.transcript);
+					if !caps.media {
+						push_attachment_fallbacks(&mut projection, attachments);
+					}
 				}
 			},
 			Err(Fault::CommandFailed { payload }) => {
 				let status = format!(
-					"bash command failed: status={:?}, exit={:?}, signal={:?}\n",
-					payload.status.outcome, payload.status.exit_code, payload.status.signal
+					"bash command failed: status={:?}, exit={:?}, signal={:?}{}\n",
+					payload.status.outcome,
+					payload.status.exit_code,
+					payload.status.signal,
+					spilled_output_note(&payload.status),
 				);
 				if projection.push(&status) {
-					push_transcript_head_tail(&mut projection, &payload.transcript);
+					push_transcript(&mut projection, &payload.transcript);
+					if !caps.media {
+						push_attachment_fallbacks(&mut projection, attachments);
+					}
 				}
 			},
 			Err(fault) => {
 				projection.push(&fault.message());
 			},
 		}
-		projection.finish()
+		let mut parts = projection.finish();
+		if caps.media {
+			let remaining = usize::from(caps.maximum_parts).saturating_sub(parts.len());
+			parts.extend(attachment_parts(attachments, true, remaining));
+		}
+		parts
 	}
 
 	fn invoke_input(&self, update: &Update, invocation_id: &str) -> Option<InvokeInput> {
@@ -1139,65 +1167,88 @@ fn shell_word(bytes: &[u8], start: usize) -> Option<(String, usize)> {
 	(cursor != start).then(|| (String::from_utf8_lossy(&bytes[start..cursor]).into_owned(), cursor))
 }
 
-fn push_transcript_head_tail(projection: &mut TextProjection, transcript: &[TranscriptFrame]) {
-	const FRAMES: usize = 8;
-	let bytes = transcript
-		.iter()
-		.flat_map(|frame| frame.data.as_ref().iter().copied())
-		.collect::<Vec<_>>();
-	let split_frame = transcript.len().min(FRAMES);
-	let mut head_end = transcript[..split_frame]
-		.iter()
-		.map(|frame| frame.data.len())
-		.sum::<usize>();
-	let tail_frame = transcript.len().saturating_sub(FRAMES).max(split_frame);
-	let mut tail_start = transcript[..tail_frame]
-		.iter()
-		.map(|frame| frame.data.len())
-		.sum::<usize>();
-	if transcript.len() > FRAMES * 2 {
-		(head_end, tail_start) = sixel_safe_gap(&bytes, head_end, tail_start);
+fn extract_transcript_images(transcript: &mut [TranscriptFrame]) -> Vec<ImagePassthrough> {
+	let mut images = Vec::new();
+	for channel in [OutputChannel::Stdout, OutputChannel::Stderr, OutputChannel::Pty] {
+		let byte_len = transcript
+			.iter()
+			.filter(|frame| frame.channel == channel)
+			.map(|frame| frame.data.len())
+			.sum();
+		let mut joined = Vec::with_capacity(byte_len);
+		for frame in transcript.iter().filter(|frame| frame.channel == channel) {
+			joined.extend_from_slice(frame.data.as_ref());
+		}
+		let (found, ranges) = image_passthrough_ranges(&joined);
+		if ranges.is_empty() {
+			continue;
+		}
+		images.extend(found);
+		let mut channel_offset = 0;
+		for frame in transcript.iter_mut().filter(|frame| frame.channel == channel) {
+			let frame_start = channel_offset;
+			let frame_end = frame_start + frame.data.len();
+			channel_offset = frame_end;
+			let mut cleaned = Vec::with_capacity(frame.data.len());
+			let mut retained_from = frame_start;
+			for range in &ranges {
+				let removed_start = range.start.max(frame_start).min(frame_end);
+				let removed_end = range.end.max(frame_start).min(frame_end);
+				if removed_start < removed_end {
+					cleaned.extend_from_slice(
+						&joined[retained_from..removed_start],
+					);
+					retained_from = removed_end;
+				}
+			}
+			cleaned.extend_from_slice(&joined[retained_from..frame_end]);
+			frame.data = CowBytes::owned(Bytes::from(cleaned));
+		}
 	}
-	if !projection.push(&String::from_utf8_lossy(&bytes[..head_end])) {
-		return;
+	images
+}
+
+fn spilled_output_note(status: &ExecStatus) -> String {
+	status.spilled_output.as_ref().map_or_else(String::new, |blob| {
+		format!("; full output: artifact://sha256/{}", blob.hash)
+	})
+}
+
+fn attachment_parts(attachments: &[BlobRef], media: bool, limit: usize) -> Vec<Part> {
+	if !media {
+		return Vec::new();
 	}
-	if tail_start > head_end && !projection.push("\n[output middle omitted from projection]\n") {
-		return;
-	}
-	if tail_start < bytes.len() {
-		projection.push(&String::from_utf8_lossy(&bytes[tail_start..]));
+	attachments
+		.iter()
+		.take(limit)
+		.map(|blob| Part::Blob {
+			blob: blob.clone(),
+			alt:  Some(sf!(
+				"Image attachment from shell output ({}, {} bytes).",
+				blob.media_type,
+				blob.byte_len
+			)),
+		})
+		.collect()
+}
+
+fn push_attachment_fallbacks(projection: &mut TextProjection, attachments: &[BlobRef]) {
+	for blob in attachments {
+		if !projection.push(&format!(
+			"[image attachment: {}, {} bytes, artifact://sha256/{}]\n",
+			blob.media_type, blob.byte_len, blob.hash
+		)) {
+			break;
+		}
 	}
 }
 
-fn sixel_safe_gap(bytes: &[u8], mut head_end: usize, mut tail_start: usize) -> (usize, usize) {
-	let mut cursor = 0;
-	while cursor + 2 < bytes.len() {
-		let Some(relative) = bytes[cursor..]
-			.windows(2)
-			.position(|window| window == b"\x1bP")
-		else {
+fn push_transcript(projection: &mut TextProjection, transcript: &[TranscriptFrame]) {
+	for frame in transcript {
+		if !projection.push(&String::from_utf8_lossy(frame.data.as_ref())) {
 			break;
-		};
-		let start = cursor + relative;
-		let Some(end_relative) = bytes[start + 2..]
-			.windows(2)
-			.position(|window| window == b"\x1b\\")
-		else {
-			if start < head_end {
-				head_end = start;
-			}
-			break;
-		};
-		let end = start + 2 + end_relative + 2;
-		if start < head_end && head_end < end {
-			head_end = start;
 		}
-		if start < tail_start && tail_start < end {
-			tail_start = end;
-		}
-		cursor = end;
 	}
-	(head_end, tail_start.max(head_end))
 }
 
 fn param_event<U, P>(error: ParamError) -> Ev<U, P, Fault> {
@@ -1223,7 +1274,7 @@ fn commit_event<U, P>(error: CommitError) -> Ev<U, P, Fault> {
 fn protocol_issue(reason: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: sf!("one complete bash@1 argument object"),
+		expected: sf!("one complete bash@2 argument object"),
 		kind:     ArgIssueKind::Protocol,
 		example:  Some(sf!(r#"{{"command":"printf hello"}}"#)),
 		found:    Some(reason),
@@ -1255,9 +1306,7 @@ mod tests {
 		ShellPromptSnapshot {
 			sibling_tools: Arc::default(),
 			platform: Str::new("linux"),
-			profile: Str::new("brush"),
 			command_prefix: false,
-			minimizer_enabled: false,
 			embedded_builtins: true,
 			devices,
 			interceptor_enabled: false,
@@ -1295,6 +1344,20 @@ mod tests {
 		let disabled = prompt_snapshot(false).description();
 		assert!(!disabled.contains("`dyn`"));
 	}
+
+	#[test]
+	fn bash_declares_no_whole_script_capability() {
+		assert!(spec(&prompt_snapshot(false)).effects.is_empty());
+	}
+
+	#[test]
+	fn default_timeout_bounds_cover_one_through_3600_seconds() {
+		let bounds = TimeoutBounds::default();
+		assert_eq!(bounds.default_ms, 300_000);
+		assert_eq!(bounds.floor_ms, 1_000);
+		assert_eq!(bounds.ceiling_ms, 3_600_000);
+	}
+
 	#[test]
 	fn params_schema_stays_strict_and_allocates_async_jobs_internally() {
 		use omp_inference::recovery::tools::{

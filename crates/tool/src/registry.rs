@@ -360,6 +360,8 @@ pub struct DeviceTarget<'a> {
 	pub claimant: &'a Str,
 	/// Execution placement selected by the declaration.
 	pub route:    &'a ToolRoute,
+	/// Maximum effect envelope of the exact selected claimant and revision.
+	pub effects:  &'a Effects,
 }
 
 impl DeviceTarget<'_> {
@@ -1363,6 +1365,7 @@ impl ErasedTool for HostTool {
 	}
 }
 
+#[derive(Clone)]
 struct HostToolRoster {
 	revision: u64,
 	executor: Arc<dyn HostToolExecutor>,
@@ -1617,6 +1620,7 @@ impl<T: Tool> ErasedTool for Registered<T> {
 	}
 }
 
+#[derive(Clone)]
 struct RegistryEntry {
 	tool:         Arc<dyn ErasedTool>,
 	presentation: Presentation,
@@ -1650,6 +1654,84 @@ impl Registry {
 	/// Creates an empty registry.
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// Projects this registry onto an explicit stable-name allow-list (pi
+	/// `options.toolNames`): the returned registry knows only the named
+	/// tools, so a kernel built on it neither advertises nor dispatches any
+	/// other native or host tool. Unknown names are ignored; the caller
+	/// validates them against [`Self::live_identities`] first when a typo
+	/// must be an error.
+	///
+	/// Revision history, arg specs, and the projection cache travel with the
+	/// retained names so historical lifts keep working for them.
+	#[must_use]
+	pub fn restrict<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Self {
+		let names = names.into_iter().map(Str::new).collect::<BTreeSet<Str>>();
+		let keep = |name: &Str| names.contains(name);
+		let host_tools = {
+			let state = self.host_tools.read();
+			HostToolState {
+				rosters: state
+					.rosters
+					.iter()
+					.map(|(claimant, roster)| {
+						(claimant.clone(), HostToolRoster {
+							revision: roster.revision,
+							executor: Arc::clone(&roster.executor),
+							entries:  roster
+								.entries
+								.iter()
+								.filter(|(name, _)| keep(name))
+								.map(|(name, entry)| (name.clone(), entry.clone()))
+								.collect(),
+						})
+					})
+					.collect(),
+				live:    state
+					.live
+					.iter()
+					.filter(|(name, _)| keep(name))
+					.map(|(name, claimant)| (name.clone(), claimant.clone()))
+					.collect(),
+				history: state
+					.history
+					.iter()
+					.filter(|(identity, _)| keep(&identity.name))
+					.map(|(identity, tool)| (identity.clone(), Arc::clone(tool)))
+					.collect(),
+			}
+		};
+		Self {
+			versions:         self
+				.versions
+				.iter()
+				.filter(|(name, _)| keep(name))
+				.map(|(name, revisions)| (name.clone(), revisions.clone()))
+				.collect(),
+			live:             self
+				.live
+				.iter()
+				.filter(|(name, _)| keep(name))
+				.map(|(name, claim)| (name.clone(), claim.clone()))
+				.collect(),
+			device_metadata:  self
+				.device_metadata
+				.iter()
+				.filter(|((name, _), _)| keep(name))
+				.map(|(key, metadata)| (key.clone(), metadata.clone()))
+				.collect(),
+			protected_core:   self
+				.protected_core
+				.iter()
+				.filter(|name| keep(name))
+				.cloned()
+				.collect(),
+			arg_specs:        self.arg_specs.clone(),
+			projection_cache: Arc::clone(&self.projection_cache),
+			host_tools:       RwLock::new(host_tools),
+			unmounted:        RwLock::new(self.unmounted.read().clone()),
+		}
 	}
 
 	/// Retains authenticated mount provenance for one exact device claimant.
@@ -2374,6 +2456,7 @@ impl Registry {
 			rev: selected.rev,
 			claimant: selected.claimant,
 			route: entry.tool.route(),
+			effects: &entry.tool.spec().effects,
 		})
 	}
 
@@ -3396,7 +3479,7 @@ fn dropped(name: &Str, feature: &str, reason: &'static str) -> Adjustment {
 mod tests {
 
 	use super::*;
-	use crate::{Dialect, Effects, Ev, ModelClass, ToolSpec};
+	use crate::{Dialect, Effects, Ev, ExecEffects, ModelClass, ToolSpec};
 
 	struct LiftTool {
 		spec: ToolSpec,
@@ -3507,6 +3590,41 @@ mod tests {
 		let hit = cache.get(0, &key).expect("matching key hits");
 		assert!(Arc::ptr_eq(&hit, &cache.get(0, &key).expect("second matching key hits")));
 		assert!(cache.get(0, &different).is_none());
+	}
+
+	#[test]
+	fn claimant_qualified_device_retains_exact_selected_effects() {
+		let mut registry = Registry::new();
+		let low = tool(1);
+		registry
+			.register(low, Presentation::Device, Claims {
+				precedence: Precedence::DEFAULT,
+				claimant:   sf!("test/low"),
+				replaces:   None,
+			})
+			.expect("low claimant");
+		let mut high = tool(2);
+		high.spec.effects = Effects {
+			exec: Some(ExecEffects { commands: Arc::from([sf!("*")]), network: true }),
+			..Effects::empty()
+		};
+		registry
+			.register(high, Presentation::Device, Claims {
+				precedence: Precedence::ENHANCEMENT,
+				claimant:   sf!("test/high"),
+				replaces:   None,
+			})
+			.expect("high claimant");
+
+		let live = registry
+			.resolve_device(&DevicePath::parse("lift").expect("live path"))
+			.expect("live target");
+		assert!(!live.effects.is_empty());
+		let shadow = registry
+			.resolve_device(&DevicePath::parse("lift@test/low").expect("shadow path"))
+			.expect("shadow target");
+		assert!(shadow.effects.is_empty());
+		assert_eq!(shadow.claimant, "test/low");
 	}
 
 	#[test]
@@ -3694,5 +3812,71 @@ mod tests {
 			registry.replace_host_tools(sf!("rpc/client"), 2, Vec::new(), Arc::new(HostExecutor),),
 			Err(RegistryError::StaleHostRoster { .. })
 		));
+	}
+
+	/// pi `options.toolNames`: an allow-list bounds both what the model sees
+	/// and what can execute, for native and host tools alike.
+	#[test]
+	fn restrict_keeps_only_the_named_native_and_host_tools() {
+		let mut registry = Registry::new();
+		registry
+			.register(tool(1), Presentation::Slot, Claims {
+				precedence: Precedence::DEFAULT,
+				claimant:   sf!("test/native"),
+				replaces:   None,
+			})
+			.expect("native tool registers");
+		let mut other = tool(1);
+		other.spec.name = sf!("other");
+		registry
+			.register(other, Presentation::Slot, Claims {
+				precedence: Precedence::DEFAULT,
+				claimant:   sf!("test/native"),
+				replaces:   None,
+			})
+			.expect("second native tool registers");
+		registry
+			.replace_host_tools(
+				sf!("rpc/client"),
+				1,
+				vec![
+					HostToolSpec {
+						name:        sf!("alpha"),
+						description: sf!("alpha host tool"),
+						parameters:  serde_json::json!({"type": "object"}),
+					},
+					HostToolSpec {
+						name:        sf!("beta"),
+						description: sf!("beta host tool"),
+						parameters:  serde_json::json!({"type": "object"}),
+					},
+				],
+				Arc::new(HostExecutor),
+			)
+			.expect("host roster installs");
+
+		let restricted = registry.restrict(["lift", "beta", "missing"]);
+		let advertised = restricted
+			.advertise(LoweringCaps {
+				strict_schema:  false,
+				grammar:        GrammarBits::empty(),
+				maximum_tools:  None,
+				maximum_strict: None,
+			})
+			.expect("restricted registry advertises")
+			.into_iter()
+			.map(|tool| tool.definition.name)
+			.collect::<Vec<_>>();
+		assert_eq!(advertised, vec![sf!("beta"), sf!("lift")]);
+		assert!(restricted.resolved_identity("other").is_none());
+		assert!(restricted.resolved_identity("alpha").is_none());
+		assert!(matches!(restricted.live_spec("other"), Err(RegistryError::UnknownTool(_))));
+		let (_feed, params) = IncomingParams::channel();
+		assert!(matches!(
+			restricted.invoke("other", params),
+			Err(RegistryError::UnknownTool(_))
+		));
+		assert_eq!(restricted.host_tool_revision("rpc/client"), Some(1));
+		assert!(registry.resolved_identity("other").is_some(), "the source is untouched");
 	}
 }

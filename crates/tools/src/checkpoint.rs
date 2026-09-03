@@ -25,10 +25,9 @@ pub trait CheckpointControl: Clone + Send + Sync + 'static {
 		goal: Str,
 	) -> impl Future<Output = Result<CheckpointAck, CheckpointFault>> + Send;
 
-	/// Validates and schedules a rewind after the active tool batch settles.
+	/// Schedules rewind of the active checkpoint after the tool batch settles.
 	fn schedule_rewind(
 		&self,
-		token: Str,
 		report: Str,
 	) -> impl Future<Output = Result<RewindAck, CheckpointFault>> + Send;
 }
@@ -68,13 +67,11 @@ pub struct CheckpointParams {
 	pub goal: Str,
 }
 
-/// Rewind scheduling arguments.
+/// Rewind scheduling arguments for `rewind@2`.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RewindParams {
-	/// Opaque token returned by `checkpoint`.
-	pub token:  Str,
-	/// Findings retained after the exploration branch is discarded.
+	/// Findings retained after the active exploration branch is discarded.
 	pub report: Str,
 }
 
@@ -159,24 +156,31 @@ pub fn tools<C: CheckpointControl>(control: C) -> (Checkpoint<C>, Rewind<C>) {
 			"Creates a durable exploration checkpoint with a stated goal and returns its opaque \
 			 session token.",
 			omp_tool::schema::<CheckpointParams>(),
+			1,
 		),
 	};
 	let rewind = Rewind {
 		control,
 		spec: spec(
 			"rewind",
-			"Schedules rewind to a checkpoint at the next turn boundary, retaining the exploration \
-			 findings report.",
+			"Schedules rewind to the active checkpoint at the next turn boundary, retaining the \
+			 exploration findings report.",
 			omp_tool::schema::<RewindParams>(),
+			2,
 		),
 	};
 	(checkpoint, rewind)
 }
 
-fn spec(name: &'static str, description: &'static str, schema: bytes::Bytes) -> ToolSpec {
+fn spec(
+	name: &'static str,
+	description: &'static str,
+	schema: bytes::Bytes,
+	revision: u16,
+) -> ToolSpec {
 	ToolSpec {
 		name: sf!(name),
-		rev: Rev { family: Default::default(), n: 1 },
+		rev: Rev { family: Default::default(), n: revision },
 		description: sf!(description),
 		schema,
 		constraint: Constraint::Schema {
@@ -256,7 +260,7 @@ impl<C: CheckpointControl> Tool for Rewind<C> {
 			}
 			if let Err(error) = incoming.interruptable().committed().await { yield commit_rewind(error); return; }
 			let report = params.report;
-			let result = self.control.schedule_rewind(params.token, report.clone()).await
+			let result = self.control.schedule_rewind(report.clone()).await
 				.map(|ack| RewindPayload { token: ack.token, report, receipt: ack.receipt, scheduled: true })
 				.map_err(|fault| Fault { code: fault.code, message: fault.message });
 			yield done_rewind(result);
@@ -324,7 +328,12 @@ fn protocol_issue(message: Str) -> ArgIssue {
 
 #[cfg(test)]
 mod tests {
-	use std::future;
+	use std::{
+		future,
+		sync::{Arc, Mutex},
+	};
+
+	use futures::StreamExt as _;
 
 	use super::*;
 
@@ -340,10 +349,29 @@ mod tests {
 
 		fn schedule_rewind(
 			&self,
-			token: Str,
 			_: Str,
 		) -> impl Future<Output = Result<RewindAck, CheckpointFault>> + Send {
-			future::ready(Ok(RewindAck { token, receipt: sf!("rewind-1") }))
+			future::ready(Ok(RewindAck { token: sf!("opaque"), receipt: sf!("rewind-1") }))
+		}
+	}
+
+	#[derive(Clone, Default)]
+	struct RecordingControl(Arc<Mutex<Option<Str>>>);
+
+	impl CheckpointControl for RecordingControl {
+		fn checkpoint(
+			&self,
+			_: Str,
+		) -> impl Future<Output = Result<CheckpointAck, CheckpointFault>> + Send {
+			future::ready(Ok(CheckpointAck { token: sf!("opaque"), started_at: 42 }))
+		}
+
+		fn schedule_rewind(
+			&self,
+			report: Str,
+		) -> impl Future<Output = Result<RewindAck, CheckpointFault>> + Send {
+			self.0.lock().expect("recording control").replace(report);
+			future::ready(Ok(RewindAck { token: sf!("opaque"), receipt: sf!("rewind-1") }))
 		}
 	}
 
@@ -352,6 +380,43 @@ mod tests {
 		let (checkpoint, rewind) = tools(Control);
 		assert_eq!(checkpoint.spec().name, "checkpoint");
 		assert_eq!(rewind.spec().name, "rewind");
+		assert_eq!(rewind.spec().rev.n, 2);
+	}
+
+	#[test]
+	fn rewind_schema_is_exactly_report_only() {
+		let (_, rewind) = tools(Control);
+		let schema: serde_json::Value =
+			serde_json::from_slice(&rewind.spec().schema).expect("rewind schema");
+		assert_eq!(schema["additionalProperties"], false);
+		assert_eq!(schema["required"], serde_json::json!(["i", "report"]));
+		assert_eq!(
+			schema["properties"].as_object().expect("properties").keys()
+				.map(String::as_str)
+				.collect::<std::collections::BTreeSet<_>>(),
+			["i", "notrunc", "report"].into_iter().collect()
+		);
+		assert_eq!(schema["properties"]["report"]["type"], "string");
+	}
+
+	#[tokio::test]
+	async fn rewind_routes_report_to_the_active_checkpoint_control() {
+		let control = RecordingControl::default();
+		let (_, rewind) = tools(control.clone());
+		let raw = r#"{"report":"keep this finding"}"#;
+		let (feed, incoming) = IncomingParams::channel();
+		feed.arg_text(raw.into()).expect("stream args");
+		feed.args_committed(raw.into()).expect("commit args");
+		let events = rewind.call(incoming).collect::<Vec<_>>().await;
+		assert!(matches!(
+			events.last(),
+			Some(Ev::Done(ToolTerminal::Done { result: Ok(payload), .. }))
+				if payload.token == "opaque" && payload.report == "keep this finding"
+		));
+		assert_eq!(
+			control.0.lock().expect("recording control").as_deref(),
+			Some("keep this finding")
+		);
 	}
 
 	#[test]
@@ -366,7 +431,10 @@ mod tests {
 			serde_json::from_value::<RewindParams>(
 				serde_json::json!({"token":"opaque","report":"finding"})
 			)
-			.is_ok()
+			.is_err()
+		);
+		assert!(
+			serde_json::from_value::<RewindParams>(serde_json::json!({"report":"finding"})).is_ok()
 		);
 	}
 }

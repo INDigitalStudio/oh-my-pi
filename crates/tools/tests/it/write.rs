@@ -186,6 +186,10 @@ fn generated_schema_definition_and_revision_are_exact() {
 				"i": {
 					"type": "string",
 					"description": "Short present-participle intent for this call."
+				},
+				"notrunc": {
+					"type": "boolean",
+					"description": "Return complete output inline without central truncation."
 				}
 			}
 		})

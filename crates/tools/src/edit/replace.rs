@@ -1,6 +1,6 @@
 //! The historical replacement dialect and its lossless lift data.
 
-use std::{fmt, path::Path, str};
+use std::{fmt, marker::PhantomData, path::Path, str};
 
 use async_stream::stream;
 use bytes::Bytes;
@@ -33,18 +33,33 @@ const DESCRIPTION: &str = "Replace exact or uniquely recoverable text in a file.
                            preserves BOM and line endings, adapts uniform indentation, and \
                            rejects ambiguous matches with previews.";
 
-/// Arguments emitted by the `edit@rep.1` dialect.
+/// Arguments emitted by the current `edit@rep.2` dialect.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplaceParams {
-	/// One replacement per document snapshot.
-	pub edits: Vec<ReplaceOperation>,
+	/// Workspace-relative document path.
+	pub path:        Str,
+	/// Exact or uniquely recoverable text to replace.
+	pub old_string:  Str,
+	/// Replacement text.
+	pub new_string:  Str,
+	/// Replace every independently safe occurrence.
+	#[serde(default)]
+	pub replace_all: bool,
 }
 
-/// One old-text/new-text edit against an exact document snapshot.
+/// Historical batch arguments retained only for durable `edit@rep.1` replay.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ReplaceOperation {
+pub struct LegacyReplaceParams {
+	/// One replacement per document snapshot.
+	pub edits: Vec<LegacyReplaceOperation>,
+}
+
+/// Historical `edit@rep.1` operation.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyReplaceOperation {
 	/// Workspace-relative document path.
 	pub path:        Str,
 	/// Text to locate using the progressive fallback ladder.
@@ -54,34 +69,90 @@ pub struct ReplaceOperation {
 	/// Replace every independently safe occurrence.
 	#[serde(default)]
 	pub replace_all: bool,
-	/// Disable fuzzy fallback after the exact normalization passes.
+	/// Request fuzzy fallback after exact normalization.
 	#[serde(default = "default_allow_fuzzy")]
 	pub allow_fuzzy: bool,
-	/// Fuzzy similarity threshold, when deliberately overridden.
+	/// Historical fuzzy similarity threshold override.
 	pub threshold:   Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct ReplaceOperation {
+	path:        Str,
+	old:         Str,
+	new:         Str,
+	replace_all: bool,
+	allow_fuzzy: bool,
+	threshold:   Option<f64>,
+}
+
+trait ReplaceArguments: serde::de::DeserializeOwned + Serialize + Send + Sync + 'static {
+	fn into_operations(self) -> Vec<ReplaceOperation>;
+}
+
+impl ReplaceArguments for ReplaceParams {
+	fn into_operations(self) -> Vec<ReplaceOperation> {
+		vec![ReplaceOperation {
+			path: self.path,
+			old: self.old_string,
+			new: self.new_string,
+			replace_all: self.replace_all,
+			allow_fuzzy: true,
+			threshold: None,
+		}]
+	}
+}
+
+impl ReplaceArguments for LegacyReplaceParams {
+	fn into_operations(self) -> Vec<ReplaceOperation> {
+		self
+			.edits
+			.into_iter()
+			.map(|operation| ReplaceOperation {
+				path: operation.path,
+				old: operation.old,
+				new: operation.new,
+				replace_all: operation.replace_all,
+				allow_fuzzy: operation.allow_fuzzy,
+				threshold: operation.threshold,
+			})
+			.collect()
+	}
 }
 
 const fn default_allow_fuzzy() -> bool {
 	true
 }
 
-/// `edit@rep.1` executor retained for small-model dialect selection and as the
-/// source side of the `rep.1 -> hl.1` lift.
-pub struct ReplaceTool<D> {
+/// Current replacement executor. `P` is historical only for durable replay.
+pub struct ReplaceTool<D, P = ReplaceParams> {
 	documents:       D,
 	format_policy:   FormatPolicy,
 	observer:        EditObserver,
 	guard_generated: bool,
+	allow_fuzzy:     bool,
+	fuzzy_threshold: f64,
+	require_seen:    bool,
 	spec:            ToolSpec,
+	params:          PhantomData<fn() -> P>,
 }
 
-/// Returns the host-free `edit@rep.1` specification.
+/// Returns the host-free `edit@rep.2` specification.
 pub fn replace_spec() -> ToolSpec {
+	replace_spec_for::<ReplaceParams>(2)
+}
+
+/// Returns the historical `edit@rep.1` specification.
+pub fn legacy_replace_spec() -> ToolSpec {
+	replace_spec_for::<LegacyReplaceParams>(1)
+}
+
+fn replace_spec_for<P: JsonSchema>(revision: u16) -> ToolSpec {
 	ToolSpec {
 		name:            sf!("edit"),
-		rev:             Rev { family: sf!("rep"), n: 1 },
+		rev:             Rev { family: sf!("rep"), n: revision },
 		description:     sf!(DESCRIPTION),
-		schema:          omp_tool::schema::<ReplaceParams>(),
+		schema:          omp_tool::schema::<P>(),
 		constraint:      Constraint::Schema {
 			priority:       100,
 			on_unsupported: omp_tool::Fallback::Unspecified,
@@ -105,19 +176,70 @@ pub fn replace_spec() -> ToolSpec {
 	}
 }
 
-/// Constructs the old-text/new-text replacement dialect.
+/// Constructs the current old-text/new-text replacement dialect.
 pub fn replace_tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy) -> ReplaceTool<D> {
-	replace_tool_with_observer(documents, format_policy, EditObserver::default(), true)
+	replace_tool_with_observer(
+		documents,
+		format_policy,
+		EditObserver::default(),
+		true,
+		true,
+		false,
+	)
 }
 
-/// Constructs the replacement dialect with syntax observation.
+/// Constructs the current replacement dialect with host policy.
 pub fn replace_tool_with_observer<D: EditDocuments>(
 	documents: D,
 	format_policy: FormatPolicy,
 	observer: EditObserver,
 	guard_generated: bool,
+	allow_fuzzy: bool,
+	require_seen: bool,
 ) -> ReplaceTool<D> {
-	ReplaceTool { documents, format_policy, observer, guard_generated, spec: replace_spec() }
+	ReplaceTool {
+		documents,
+		format_policy,
+		observer,
+		guard_generated,
+		allow_fuzzy,
+		fuzzy_threshold: omp_hashline::replace::DEFAULT_FUZZY_THRESHOLD,
+		require_seen,
+		spec: replace_spec(),
+		params: PhantomData,
+	}
+}
+
+/// Constructs the historical replacement revision for durable replay.
+pub fn legacy_replace_tool_with_observer<D: EditDocuments>(
+	documents: D,
+	format_policy: FormatPolicy,
+	observer: EditObserver,
+	guard_generated: bool,
+	allow_fuzzy: bool,
+	require_seen: bool,
+) -> ReplaceTool<D, LegacyReplaceParams> {
+	ReplaceTool {
+		documents,
+		format_policy,
+		observer,
+		guard_generated,
+		allow_fuzzy,
+		fuzzy_threshold: omp_hashline::replace::DEFAULT_FUZZY_THRESHOLD,
+		require_seen,
+		spec: legacy_replace_spec(),
+		params: PhantomData,
+	}
+}
+
+impl<D, P> ReplaceTool<D, P> {
+	/// Overrides the host-wide fuzzy similarity threshold used when a call
+	/// does not carry a historical per-operation override.
+	#[must_use]
+	pub fn with_fuzzy_threshold(mut self, threshold: f64) -> Self {
+		self.fuzzy_threshold = threshold.clamp(0.0, 1.0);
+		self
+	}
 }
 
 struct Work<P> {
@@ -131,9 +253,9 @@ struct Projection {
 	warnings: Vec<Str>,
 }
 
-impl<D: EditDocuments> Tool for ReplaceTool<D> {
+impl<D: EditDocuments, P: ReplaceArguments> Tool for ReplaceTool<D, P> {
 	type Fault = Fault;
-	type Params = ReplaceParams;
+	type Params = P;
 	type Payload = Payload;
 	type Update = EditUpdate;
 
@@ -147,32 +269,33 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 	) -> impl Stream<Item = Ev<EditUpdate, Payload, Fault>> + Send + 'c {
 		let span = tracing::debug_span!(
 			"edit_execution",
-			revision = "rep.1",
+			revision = %self.spec.rev,
 			path_count = tracing::field::Empty,
 			path = tracing::field::Empty,
 		);
 		stream! {
-			let replace_params = match params.whole::<ReplaceParams>().await {
+			let replace_params = match params.whole::<P>().await {
 				Ok(params) => params,
 				Err(error) => { yield param_event(error); return; },
 			};
-			if replace_params.edits.is_empty() {
+			let observer_args = serde_json::to_value(&replace_params).unwrap_or_default();
+			let journal_input = if let Ok(input) = serde_json::to_vec(&replace_params) { Bytes::from(input) } else { yield done_fault(Fault::invalid("Replacement arguments could not be journaled.")); return; };
+			let operations = replace_params.into_operations();
+			if operations.is_empty() {
 				yield done_fault(Fault::invalid("No replacement operations found in edits."));
 				return;
 			}
-			span.record("path_count", replace_params.edits.len());
-			if let Some(operation) = replace_params.edits.first() {
+			span.record("path_count", operations.len());
+			if let Some(operation) = operations.first() {
 				span.record("path", tracing::field::display(&operation.path));
 			}
-			let observer_args = serde_json::to_value(&replace_params).unwrap_or_default();
-			let journal_input = if let Ok(input) = serde_json::to_vec(&replace_params) { Bytes::from(input) } else { yield done_fault(Fault::invalid("Replacement arguments could not be journaled.")); return; };
-			let mut works = Vec::with_capacity(replace_params.edits.len());
-			for op in replace_params.edits {
+			let mut works = Vec::with_capacity(operations.len());
+			for op in operations {
 				let prepared = match self.documents.prepare(PrepareRequest {
 					path: op.path.clone(),
 					file_hash: None,
 					anchor_lines: Vec::new(),
-					allow_unpinned: true,
+					allow_unpinned: !self.require_seen,
 					allow_missing: false,
 					guard_generated: self.guard_generated,
 				}).instrument(span.clone()).await {
@@ -192,8 +315,8 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 			for work in &works {
 				let result = apply_replace(work.prepared.authored_bytes(), &work.op.old, &work.op.new, ReplaceOptions {
 					replace_all: work.op.replace_all,
-					allow_fuzzy: work.op.allow_fuzzy,
-					threshold: work.op.threshold.unwrap_or(omp_hashline::replace::DEFAULT_FUZZY_THRESHOLD),
+					allow_fuzzy: self.allow_fuzzy && work.op.allow_fuzzy,
+					threshold: work.op.threshold.unwrap_or(self.fuzzy_threshold),
 				});
 				let (after, resolved, recovery_edits) = match result {
 					Ok(result) => {
@@ -507,6 +630,23 @@ mod tests {
 			omp_hashline::replace::adjust_indentation("foo\nbar", "    foo\n    bar", "foo\nbaz\nbar",),
 			"    foo\n    baz\n    bar"
 		);
+	}
+
+	#[test]
+	fn host_fuzzy_threshold_overrides_the_library_default() {
+		let make = || ReplaceTool::<()> {
+			documents: (),
+			format_policy: FormatPolicy::Disabled,
+			observer: EditObserver::default(),
+			guard_generated: true,
+			allow_fuzzy: true,
+			fuzzy_threshold: omp_hashline::replace::DEFAULT_FUZZY_THRESHOLD,
+			require_seen: false,
+			spec: replace_spec(),
+			params: PhantomData,
+		};
+		assert_eq!(make().with_fuzzy_threshold(0.87).fuzzy_threshold, 0.87);
+		assert_eq!(make().with_fuzzy_threshold(2.0).fuzzy_threshold, 1.0);
 	}
 
 	#[test]

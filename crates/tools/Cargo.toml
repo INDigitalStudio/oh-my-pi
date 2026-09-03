@@ -38,6 +38,7 @@ omp-hashline.workspace = true
 omp-memory.workspace = true
 omp-proto.workspace = true
 omp-py.workspace = true
+omp-shell-builtins.workspace = true
 omp-shell-engine.workspace = true
 omp-tool.workspace = true
 omp-macros.workspace = true

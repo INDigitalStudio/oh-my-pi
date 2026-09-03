@@ -30,8 +30,12 @@ pub const PROMPT_GUIDANCE: &str =
 	"\
 Dynamic devices are invoked through the `dyn` builtin inside the shell tool. Run `dyn` to list the \
 	 live device catalog (`dyn --q <text>` searches it), `dyn <device> --help` for exact usage and \
-	 schema, and `dyn <device> [args…]` to invoke one (`dyn <device> --json '<payload>'` passes \
-	 raw JSON arguments). Retry an empty or narrow search with different terms; absent devices are \
+	 schema, and `dyn <device> [args…]` to invoke one. Usage is derived from each device's schema: \
+	 required string/number/enum properties are positionals in declaration order, every property has a \
+	 `--flag` (`--no-flag` for booleans, repeated for arrays, dotted for nested keys), `dyn \
+	 <device> --json '<payload>'` passes raw JSON arguments, and `@FILE` or `-` (stdin) supply \
+	 either a JSON object or literal text for the next positional. Image results arrive as \
+	 attachments. Retry an empty or narrow search with different terms; absent devices are \
 	 unavailable and MUST NOT be advertised or guessed.";
 
 /// Conditional model-facing guidance for the mounted AutoQA recorder.
@@ -39,8 +43,9 @@ pub const AUTO_QA_PROMPT_GUIDANCE: &str =
 	"\
 Automated QA reporting is available through the live `report_issue` device. When a tool or device \
 	 result contradicts its documented behavior for the supplied parameters, run `dyn report_issue \
-	 \"<session-id>\" \"<device>\" --rev \"<revision>\" --verdict '<JSON verdict>'` in the shell. \
-	 False positives are acceptable.";
+	 <session-id> <device> <rev> --verdict '<JSON verdict>'` in the shell (the device's `name@rev` \
+	 identity split into its two positionals, then a JSON object describing the observed and \
+	 expected behavior). False positives are acceptable.";
 
 /// How much dynamic-device documentation is inlined into a prompt.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -570,7 +575,15 @@ mod tests {
 	fn prompt_guidance_names_dyn_help_without_inventing_urls() {
 		assert!(PROMPT_GUIDANCE.contains("`dyn`"));
 		assert!(PROMPT_GUIDANCE.contains("--help"));
+		assert!(PROMPT_GUIDANCE.contains("positionals"));
 		assert!(AUTO_QA_PROMPT_GUIDANCE.contains("report_issue"));
+		// The AutoQA command is schema-shaped: report_issue@1 requires
+		// `session_id`, `device`, `rev` (positionals, in that order) and the
+		// `verdict` object, which is never positional.
+		assert!(AUTO_QA_PROMPT_GUIDANCE.contains(
+			"`dyn report_issue <session-id> <device> <rev> --verdict '<JSON verdict>'`"
+		));
+		assert!(!AUTO_QA_PROMPT_GUIDANCE.contains("--rev"));
 		for guidance in [PROMPT_GUIDANCE, AUTO_QA_PROMPT_GUIDANCE] {
 			assert!(!guidance.contains("dyn://"));
 			assert!(!guidance.contains("dyn:"));

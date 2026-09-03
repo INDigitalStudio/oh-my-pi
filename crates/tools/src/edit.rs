@@ -8,8 +8,9 @@ pub mod replace;
 use std::{fmt::Write as _, future, future::Future, ops, path::Path};
 
 pub use apply_patch::{
-	FreeformEditParams, FreeformEditTool, apply_patch_tool, apply_patch_tool_with_observer,
-	patch_tool, patch_tool_with_observer, sloppy_tool, sloppy_tool_with_observer,
+	FreeformEditParams, FreeformEditTool, PatchEditEntry, PatchOp, PatchParams, apply_patch_tool,
+	apply_patch_tool_with_observer, legacy_patch_tool_with_observer, patch_tool,
+	patch_tool_with_observer, sloppy_tool, sloppy_tool_with_observer,
 };
 use async_stream::stream;
 use bytes::Bytes;
@@ -28,7 +29,10 @@ use omp_tool::{
 	DocEffects, Effects, Ev, IncomingParams, InterruptWaitError, LiftedCall, ParamError, Part,
 	PromptCaps, RecordedCall, Rev, Tool, ToolSpec, ToolTerminal,
 };
-pub use replace::{ReplaceParams, ReplaceTool, replace_tool, replace_tool_with_observer};
+pub use replace::{
+	LegacyReplaceOperation, LegacyReplaceParams, ReplaceParams, ReplaceTool,
+	legacy_replace_tool_with_observer, replace_tool, replace_tool_with_observer,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
@@ -49,11 +53,13 @@ pub struct EditDialectRegistration {
 	pub dialect:  Dialect,
 }
 
-/// Every built-in edit revision which may be selected or lifted.
+/// Every built-in edit revision retained for current selection or historical replay.
 pub const EDIT_DIALECTS: &[EditDialectRegistration] = &[
 	EditDialectRegistration { family: "rep", revision: 1, dialect: Dialect::Replace },
+	EditDialectRegistration { family: "rep", revision: 2, dialect: Dialect::Replace },
 	EditDialectRegistration { family: "hl", revision: 1, dialect: Dialect::Hashline },
 	EditDialectRegistration { family: "patch", revision: 1, dialect: Dialect::Patch },
+	EditDialectRegistration { family: "patch", revision: 2, dialect: Dialect::Patch },
 	EditDialectRegistration { family: "apply_patch", revision: 1, dialect: Dialect::ApplyPatch },
 	EditDialectRegistration { family: "sloppy", revision: 1, dialect: Dialect::Sloppy },
 ];
@@ -82,7 +88,7 @@ pub enum EditRevisionSource {
 /// records its precedence without coupling edit behavior to model names.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EditRevisionCandidates<'a> {
-	/// Catalog-selected revision such as `rep.1`.
+	/// Catalog-selected revision such as `rep.2`.
 	pub model_rule:     Option<&'a Rev>,
 	/// Optional `OMP_EDIT_DIALECT` value.
 	pub environment:    Option<&'a str>,
@@ -131,13 +137,13 @@ pub fn resolve_edit_revision(
 	] {
 		let Some(value) = value else { continue };
 		match value.parse::<Rev>() {
-			Ok(revision) if is_registered_edit_revision(&revision) => {
+			Ok(revision) if is_selectable_edit_revision(&revision) => {
 				return Ok(ResolvedEditRevision { revision, source });
 			},
 			_ if candidates.strict => {
 				return Err(
 					format!(
-						"unknown edit revision {value:?}; use hl.1, rep.1, patch.1, apply_patch.1, or \
+						"unknown edit revision {value:?}; use hl.1, rep.2, patch.2, apply_patch.1, or \
 						 sloppy.1"
 					)
 					.into(),
@@ -158,11 +164,16 @@ fn registered_revision(
 	revision: &Rev,
 	source: EditRevisionSource,
 ) -> Result<ResolvedEditRevision, Str> {
-	if is_registered_edit_revision(revision) {
+	if is_selectable_edit_revision(revision) {
 		Ok(ResolvedEditRevision { revision: revision.clone(), source })
 	} else {
-		Err(format!("unregistered edit revision {revision}").into())
+		Err(format!("edit revision {revision} is historical and cannot be selected").into())
 	}
+}
+
+fn is_selectable_edit_revision(revision: &Rev) -> bool {
+	is_registered_edit_revision(revision)
+		&& !matches!((revision.family.as_str(), revision.n), ("rep" | "patch", 1))
 }
 
 fn is_registered_edit_revision(revision: &Rev) -> bool {
@@ -1143,13 +1154,17 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 }
 
 fn lift_replace_to_hashline(from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
-	if from.family.as_str() != "rep" || from.n != 1 {
+	if from.family.as_str() != "rep" || !matches!(from.n, 1 | 2) {
 		return None;
 	}
-	// Decode the historical arguments to prove the source dialect. Anchors
-	// come from the dialect-neutral resolved outcome, never from old search
-	// strings, which may have matched fuzzily.
-	serde_json::from_slice::<ReplaceParams>(call.raw_args).ok()?;
+	// Decode the source revision to prove the dialect. Anchors come from the
+	// dialect-neutral resolved outcome, never from old search strings, which
+	// may have matched fuzzily.
+	if from.n == 1 {
+		serde_json::from_slice::<LegacyReplaceParams>(call.raw_args).ok()?;
+	} else {
+		serde_json::from_slice::<ReplaceParams>(call.raw_args).ok()?;
+	}
 	let outcome = serde_json::from_slice::<CallOutcome<Payload, Fault>>(call.verdict).ok()?;
 	let input = match outcome {
 		CallOutcome::Ok(payload) => payload
@@ -1473,12 +1488,12 @@ mod tests {
 
 	#[test]
 	fn revision_cascade_is_registered_and_caps_derived() {
-		let model = Rev { family: "rep".into(), n: 1 };
+		let model = Rev { family: "rep".into(), n: 2 };
 		let pinned = Rev { family: "hl".into(), n: 1 };
 		let resolved = resolve_edit_revision(EditRevisionCandidates {
 			model_rule:     Some(&model),
 			environment:    Some("hl.1"),
-			setting:        Some("rep.1"),
+			setting:        Some("rep.2"),
 			pin:            Some(&pinned),
 			force_hashline: false,
 			strict:         true,
@@ -1507,7 +1522,7 @@ mod tests {
 		);
 		assert_eq!(
 			resolve_edit_revision(EditRevisionCandidates {
-				environment: Some("rep.1"),
+				environment: Some("rep.2"),
 				setting: Some("hl.1"),
 				..EditRevisionCandidates::default()
 			})
@@ -1517,7 +1532,7 @@ mod tests {
 		);
 		assert_eq!(
 			resolve_edit_revision(EditRevisionCandidates {
-				setting: Some("rep.1"),
+				setting: Some("rep.2"),
 				..EditRevisionCandidates::default()
 			})
 			.expect("setting revision")
@@ -1541,7 +1556,7 @@ mod tests {
 				..EditRevisionCandidates::default()
 			}),
 			Err(
-				"unknown edit revision \"unknown.7\"; use hl.1, rep.1, patch.1, apply_patch.1, or \
+				"unknown edit revision \"unknown.7\"; use hl.1, rep.2, patch.2, apply_patch.1, or \
 				 sloppy.1"
 					.into()
 			)
@@ -1587,8 +1602,8 @@ mod tests {
 				diagnostics_complete: true,
 			}],
 		};
-		let args = ReplaceParams {
-			edits: vec![replace::ReplaceOperation {
+		let args = LegacyReplaceParams {
+			edits: vec![LegacyReplaceOperation {
 				path:        "a.txt".into(),
 				old:         "two".into(),
 				new:         "TWO".into(),
@@ -1682,7 +1697,14 @@ mod tests {
 		let mut registry = Registry::new();
 		registry
 			.register(
-				replace_tool(NoDocuments, FormatPolicy::BestEffort),
+				legacy_replace_tool_with_observer(
+					NoDocuments,
+					FormatPolicy::BestEffort,
+					EditObserver::default(),
+					true,
+					true,
+					false,
+				),
 				Presentation::Slot,
 				claims.clone(),
 			)
@@ -1690,7 +1712,7 @@ mod tests {
 		registry
 			.register(tool(NoDocuments, FormatPolicy::BestEffort), Presentation::Slot, claims)
 			.expect("register live hashline destination");
-		let source_args = serde_json::to_vec(&ReplaceParams { edits: Vec::new() })
+		let source_args = serde_json::to_vec(&LegacyReplaceParams { edits: Vec::new() })
 			.expect("serialize replacement source args");
 		let source_verdict =
 			serde_json::to_vec(&CallOutcome::<Payload, Fault>::Faulted(Fault::invalid("no match")))

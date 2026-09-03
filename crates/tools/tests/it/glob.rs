@@ -183,6 +183,10 @@ fn schema_and_defaults_are_exact() {
 				"i": {
 					"type": "string",
 					"description": "Short present-participle intent for this call."
+				},
+				"notrunc": {
+					"type": "boolean",
+					"description": "Return complete output inline without central truncation."
 				}
 			}
 		})
