@@ -501,6 +501,9 @@ pub enum PropId {
 	TtftMs,
 	/// Milliseconds from request start to completion.
 	DurationMs,
+	/// Provider premium-request units billed for one request, in millionths
+	/// (`1_000_000` = one request).
+	PremiumRequests,
 	/// Compaction boundary.
 	Boundary,
 	/// Content-addressed summary.
