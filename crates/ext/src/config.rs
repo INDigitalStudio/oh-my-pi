@@ -1186,6 +1186,15 @@ pub enum SettingType {
 	Enum,
 }
 
+/// Returns the canonical control-plane name for one extension setting.
+///
+/// Extension identities remain visible in the name so independently admitted
+/// manifests cannot collide.
+#[must_use]
+pub fn extension_setting_convar_name(extension: &str, key: &str) -> Str {
+	sf!("ext::{extension}::{key}")
+}
+
 /// One manifest-declared extension setting.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct SettingSchema {
@@ -1510,6 +1519,37 @@ fn parse_override_value(
 	};
 	validate_setting_value(extension, key, schema, &value)?;
 	Ok(value)
+}
+
+/// Applies invocation overrides to an already resolved extension setting map.
+///
+/// Overrides targeting another extension are inert. Values targeting this
+/// extension are parsed and validated against the authenticated schema before
+/// replacing the resolved JSON scalar.
+pub fn apply_resolved_setting_overrides(
+	extension: &str,
+	schemas: &BTreeMap<Str, SettingSchema>,
+	resolved: &mut serde_json::Map<String, serde_json::Value>,
+	overrides: &[CliSettingOverride],
+) -> Result<(), ExtensionError> {
+	for value in overrides
+		.iter()
+		.filter(|value| value.extension == extension)
+	{
+		let schema = schemas.get(&value.key).ok_or_else(|| {
+			ExtensionError::new(
+				ExtensionCode::EManifestParse,
+				format!("extension {extension} has no setting named {}", value.key),
+			)
+		})?;
+		let parsed = parse_override_value(extension, &value.key, schema, &value.value)?;
+		validate_setting_value(extension, &value.key, schema, &parsed)?;
+		let parsed = serde_json::to_value(parsed).map_err(|source| {
+			ExtensionError::new(ExtensionCode::EManifestParse, source.to_string())
+		})?;
+		resolved.insert(value.key.to_string(), parsed);
+	}
+	Ok(())
 }
 
 /// Resolves defaults, user/project configuration, then command-line overrides
@@ -2520,6 +2560,75 @@ skills = []
 		);
 		assert!(StaticDeclarations::from_properties(&properties).is_err());
 	}
+	#[test]
+	fn extension_setting_convar_names_are_owner_qualified() {
+		assert_eq!(
+			extension_setting_convar_name("dev.example.lint", "severity"),
+			"ext::dev.example.lint::severity",
+		);
+	}
+
+	#[test]
+	fn resolved_setting_overrides_are_typed_filtered_and_strict() {
+		let manifest = DeploymentManifest::parse(
+			r#"
+id = "demo"
+
+[settings.verbose]
+type = "boolean"
+default = false
+
+[settings.limit]
+type = "number"
+default = 1
+min = 1
+max = 10
+
+[settings.mode]
+type = "enum"
+values = ["safe", "fast"]
+default = "safe"
+"#,
+		)
+		.expect("settings manifest");
+		let mut resolved =
+			resolve_extension_settings(&manifest, &BTreeMap::new(), &[]).expect("defaults");
+		let overrides = [
+			CliSettingOverride::parse("other.verbose=true").expect("other override"),
+			CliSettingOverride::parse("demo.verbose=true").expect("boolean override"),
+			CliSettingOverride::parse("demo.limit=8.5").expect("number override"),
+			CliSettingOverride::parse("demo.mode=fast").expect("enum override"),
+		];
+		apply_resolved_setting_overrides(
+			"demo",
+			&manifest.settings,
+			&mut resolved,
+			&overrides,
+		)
+		.expect("typed overrides");
+		assert_eq!(resolved["verbose"], serde_json::json!(true));
+		assert_eq!(resolved["limit"], serde_json::json!(8.5));
+		assert_eq!(resolved["mode"], serde_json::json!("fast"));
+
+		let error = apply_resolved_setting_overrides(
+			"demo",
+			&manifest.settings,
+			&mut resolved,
+			&[CliSettingOverride::parse("demo.unknown=true").expect("unknown override")],
+		)
+		.expect_err("unknown setting");
+		assert!(error.to_string().contains("demo"));
+		assert!(error.to_string().contains("unknown"));
+
+		assert!(apply_resolved_setting_overrides(
+			"demo",
+			&manifest.settings,
+			&mut resolved,
+			&[CliSettingOverride::parse("demo.mode=invalid").expect("invalid enum")],
+		)
+		.is_err());
+	}
+
 	#[test]
 	fn cli_setting_override_wins_and_invalid_keys_name_the_extension() {
 		let manifest = DeploymentManifest::parse(

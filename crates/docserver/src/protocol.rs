@@ -1614,10 +1614,12 @@ async fn lsp_status(
 	let servers = supervisor
 		.status()
 		.into_iter()
-		.map(|server| proto::LspServerStatus {
-			server_id:  registry
-				.binding_id(server.name.as_str())
-				.map(binding_id_bytes)
+		.map(|server| {
+			let binding_id = registry.binding_id(server.name.as_str());
+			proto::LspServerStatus {
+			server_id:  binding_id.map(binding_id_bytes).unwrap_or_default(),
+			capabilities_json: binding_id
+				.and_then(|binding_id| registry.binding_capabilities(binding_id).ok())
 				.unwrap_or_default(),
 			name:       server.name.to_string(),
 			stage:      match server.state {
@@ -1633,6 +1635,7 @@ async fn lsp_status(
 				.map(|detail| detail.to_string())
 				.unwrap_or_default(),
 			source:     server.source.to_owned(),
+			}
 		})
 		.collect();
 	proto::LspStatusResponse { servers }

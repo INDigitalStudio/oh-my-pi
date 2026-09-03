@@ -800,6 +800,14 @@ impl LspRegistry {
 		}
 	}
 
+	/// Returns exact initialize capabilities for one installed binding.
+	pub fn binding_capabilities(
+		&self,
+		binding_id: LspBindingId,
+	) -> Result<Bytes, LspRegistryError> {
+		Ok(self.binding(binding_id)?.server.capabilities_json())
+	}
+
 	/// Returns current activity for one binding.
 	pub fn binding_activity(
 		&self,
