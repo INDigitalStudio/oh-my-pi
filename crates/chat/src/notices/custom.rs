@@ -176,9 +176,11 @@ mod tests {
 		// Extension messages never fold.
 		let custom = rows(custom_message_card(CustomKind::Custom, &node, false), 30);
 		assert!(custom.iter().any(|row| row.contains("l7")), "{custom:?}");
-		assert!(custom.iter().any(|row| {
-			row.contains(omp_tui::Charset::default().icon(omp_tui::Icon::Package))
-		}));
+		assert!(
+			custom
+				.iter()
+				.any(|row| { row.contains(omp_tui::Charset::default().icon(omp_tui::Icon::Package)) })
+		);
 	}
 
 	#[test]

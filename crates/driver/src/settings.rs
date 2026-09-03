@@ -1,7 +1,7 @@
 //! Small convar projections used by surviving standalone driver services.
 
 use std::{
-	fs, io,
+	io,
 	path::{Path, PathBuf},
 };
 

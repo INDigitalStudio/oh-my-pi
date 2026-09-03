@@ -33,15 +33,13 @@ impl ComputerHost for ComputerSessionHost {
 		let timeout = Duration::from_secs_f64(params.timeout.unwrap_or(20.0).clamp(0.001, 300.0));
 		let code = params.code.clone();
 		let program = parse_program(&params.code)?;
-		let (results, artifacts) = tokio::time::timeout(
-			timeout,
-			self.execute_program(program, params.read_only),
-		)
-		.await
-		.map_err(|_| Fault {
-			code:    sf!("desktop_timeout"),
-			message: sf!("computer program exceeded its timeout"),
-		})??;
+		let (results, artifacts) =
+			tokio::time::timeout(timeout, self.execute_program(program, params.read_only))
+				.await
+				.map_err(|_| Fault {
+					code:    sf!("desktop_timeout"),
+					message: sf!("computer program exceeded its timeout"),
+				})??;
 		Ok(Payload { code, results, artifacts })
 	}
 }
@@ -351,14 +349,9 @@ fn parse_program(code: &str) -> Result<Vec<Statement>, Fault> {
 			}
 			program.push(Statement::Wait(Duration::from_secs_f64(millis / 1_000.0)));
 		} else if let Some(method) = callee.strip_prefix("desktop.") {
-			program.push(Statement::Desktop {
-				bind,
-				params: parse_desktop_call(method, &arguments)?,
-			});
+			program.push(Statement::Desktop { bind, params: parse_desktop_call(method, &arguments)? });
 		} else {
-			return Err(invalid(
-				"computer code may call only `desktop`, `wait`, and `assert`",
-			));
+			return Err(invalid("computer code may call only `desktop`, `wait`, and `assert`"));
 		}
 	}
 	if program.is_empty() {
@@ -379,11 +372,9 @@ fn parse_assignment(statement: &str) -> Result<(Option<Str>, &str), Fault> {
 		.ok_or_else(|| invalid("computer variable declarations require `=`"))?;
 	let name = name.trim();
 	if name.is_empty()
-		|| !name
-			.bytes()
-			.enumerate()
-			.all(|(index, byte)| byte == b'_' || byte.is_ascii_alphanumeric() && (index != 0 || !byte.is_ascii_digit()))
-	{
+		|| !name.bytes().enumerate().all(|(index, byte)| {
+			byte == b'_' || byte.is_ascii_alphanumeric() && (index != 0 || !byte.is_ascii_digit())
+		}) {
 		return Err(invalid("computer variable name is invalid"));
 	}
 	Ok((Some(Str::new(name)), expression.trim()))
@@ -647,10 +638,7 @@ fn parse_desktop_call(method: &str, arguments: &[Value]) -> Result<NativeParams,
 		},
 		Action::Type | Action::KeyChord => {
 			require_arity_range(arguments, 1, 2)?;
-			params.value = arguments
-				.first()
-				.and_then(Value::as_str)
-				.map(Str::new);
+			params.value = arguments.first().and_then(Value::as_str).map(Str::new);
 			if params.value.is_none() {
 				return Err(invalid("desktop text and key chords must be strings"));
 			}
@@ -660,10 +648,7 @@ fn parse_desktop_call(method: &str, arguments: &[Value]) -> Result<NativeParams,
 		},
 		Action::RaiseWindow | Action::AxNode | Action::AxAttributes => {
 			require_arity(arguments, 1)?;
-			params.reference = arguments
-				.first()
-				.and_then(Value::as_str)
-				.map(Str::new);
+			params.reference = arguments.first().and_then(Value::as_str).map(Str::new);
 			if params.reference.is_none() {
 				return Err(invalid("desktop references must be strings"));
 			}
@@ -824,16 +809,16 @@ fn blob_fault(error: BlobError) -> Fault {
 
 #[cfg(test)]
 mod tests {
-	use super::{Action, Statement, evaluate_assertion, parse_program};
 	use serde_json::{Map, json};
+
+	use super::{Action, Statement, evaluate_assertion, parse_program};
 
 	#[test]
 	fn computer_program_composes_desktop_wait_and_assert() {
 		let program = parse_program(
-			"const windows = await desktop.windows();\n\
-			 await wait(5);\n\
-			 assert(windows.length > 0, \"a desktop window is required\");\n\
-			 await desktop.screenshot({\"maxWidth\":1280,\"maxHeight\":896});",
+			"const windows = await desktop.windows();\nawait wait(5);\nassert(windows.length > 0, \
+			 \"a desktop window is required\");\nawait \
+			 desktop.screenshot({\"maxWidth\":1280,\"maxHeight\":896});",
 		)
 		.expect("parse program");
 		assert_eq!(program.len(), 4);

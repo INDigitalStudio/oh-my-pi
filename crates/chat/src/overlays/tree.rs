@@ -23,8 +23,8 @@ use crate::cards::Component;
 const TITLE: &str = "Session Tree";
 /// pi `tree-selector.ts:1137`, restricted to the chords this port
 /// implements, plus the fold chord.
-const HINT: &str = "Enter: switch. PgUp/PgDn (←/→): page. Home/End: first/last item. \
-                    Ctrl+←/→: fold/unfold. Esc: close";
+const HINT: &str = "Enter: switch. PgUp/PgDn (←/→): page. Home/End: first/last item. Ctrl+←/→: \
+                    fold/unfold. Esc: close";
 /// pi `tree-selector.ts:578` empty-tree row.
 const EMPTY: &str = "No entries found";
 /// Top and bottom borders, the rule, and the hint row.
@@ -234,7 +234,7 @@ impl TreePanel {
 			.saturating_sub(content_reserve)
 			.saturating_sub(OVERHEAD_COLS)
 			/ 3)
-		.max(1);
+			.max(1);
 		let (thumb_start, thumb_end) = scrollbar_thumb(start, end - start, total);
 		let (track, thumb) = self.ctx.charset.scrollbar();
 		let lines: Vec<Component> = (start..end)
@@ -358,8 +358,16 @@ impl TreePanel {
 			// Leftmost cell marks ancestors compressed off-screen.
 			let glyph = if cell == 0 && scroll_offset > 0 {
 				'…'
-			} else if let Some(gutter) = row.gutters.iter().find(|gutter| gutter.position == original) {
-				if slot == 0 && gutter.show { vertical } else { ' ' }
+			} else if let Some(gutter) = row
+				.gutters
+				.iter()
+				.find(|gutter| gutter.position == original)
+			{
+				if slot == 0 && gutter.show {
+					vertical
+				} else {
+					' '
+				}
 			} else if connector_level == Some(level) {
 				match slot {
 					0 => connector.first().copied().unwrap_or(' '),
@@ -448,20 +456,21 @@ fn build_nodes(entries: &[TreeEntry]) -> Vec<Node> {
 		entry.kind == kind::MSG_USER || entry.kind == kind::MSG_ASSISTANT_START
 	};
 	let mut nodes: Vec<Node> = Vec::new();
-	let mut stack: Vec<(usize, Option<usize>)> = roots.iter().rev().map(|&root| (root, None)).collect();
+	let mut stack: Vec<(usize, Option<usize>)> =
+		roots.iter().rev().map(|&root| (root, None)).collect();
 	while let Some((index, owner)) = stack.pop() {
 		let entry = &entries[index];
 		let shown = message(index) || (owner.is_none() && children[index].len() > 1);
 		let owner = if shown {
 			let node = nodes.len();
 			nodes.push(Node {
-				id: entry.id,
-				target: entry.id,
-				kind: entry.kind.clone(),
-				text: entry.text.clone(),
-				live: entry.live,
-				head: entry.head,
-				parent: owner,
+				id:       entry.id,
+				target:   entry.id,
+				kind:     entry.kind.clone(),
+				text:     entry.text.clone(),
+				live:     entry.live,
+				head:     entry.head,
+				parent:   owner,
 				children: Vec::new(),
 			});
 			if let Some(owner) = owner {
@@ -545,7 +554,8 @@ fn flatten(nodes: &[Node]) -> (Vec<Row>, bool) {
 		};
 		let mut child_gutters = item.gutters.clone();
 		if connector_displayed {
-			child_gutters.push(Gutter { position: display_indent.saturating_sub(1), show: !item.is_last });
+			child_gutters
+				.push(Gutter { position: display_indent.saturating_sub(1), show: !item.is_last });
 		}
 		for (position, &child) in ordered.iter().enumerate().rev() {
 			stack.push(Item {
@@ -643,9 +653,7 @@ mod tests {
 	use crate::overlays::services::{NoServices, ServiceResult, Services};
 
 	fn id(n: u32) -> EntryId {
-		sf!("01ARZ3NDEKTSV4RRFFQ69G5{n:03}")
-			.parse()
-			.expect("ulid")
+		sf!("01ARZ3NDEKTSV4RRFFQ69G5{n:03}").parse().expect("ulid")
 	}
 
 	fn entry(n: u32, parent: Option<u32>, kind: &str, text: &str, live: bool) -> TreeEntry {
@@ -770,7 +778,10 @@ mod tests {
 		assert!(body.contains("❯ "), "cursor missing:\n{body}");
 		assert!(body.contains("Enter: switch."), "hint missing:\n{body}");
 		// Head row is selected on open: cursor glyph lands on it.
-		let head_row = text.iter().find(|line| line.contains("(head)")).expect("head row");
+		let head_row = text
+			.iter()
+			.find(|line| line.contains("(head)"))
+			.expect("head row");
 		assert!(head_row.contains("❯ "), "{head_row}");
 	}
 
@@ -850,7 +861,10 @@ mod tests {
 		let entries = vec![entry(1, None, kind::MSG_USER, &"x".repeat(120), true)];
 		let mut panel = panel(&entries);
 		let text = lines(&mut panel, Size::new(40, 10));
-		let row = text.iter().find(|line| line.contains("user:")).expect("user row");
+		let row = text
+			.iter()
+			.find(|line| line.contains("user:"))
+			.expect("user row");
 		assert!(row.ends_with("…│") || row.contains("…"), "{row}");
 		assert!(cell_width(row) <= 40, "{row}");
 	}

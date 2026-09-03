@@ -935,9 +935,8 @@ impl ExecHost {
 		// streams the complete byte sequence to the artifact store.
 		let (events_tx, events) = flume::bounded(OUTPUT_EVENT_CAPACITY);
 		let events = Arc::new(events);
-		let output = Arc::new(Mutex::new(OutputCapture::new(
-			self.inner.output_store.lock().as_ref(),
-		)?));
+		let output =
+			Arc::new(Mutex::new(OutputCapture::new(self.inner.output_store.lock().as_ref())?));
 		let (cancel_tx, cancel_rx) = flume::bounded(1);
 		let control = Arc::new(RunControl {
 			cancel_tx,
@@ -2372,9 +2371,9 @@ fn finish_session_command(
 	command.control.finished.store(true, Ordering::Release);
 	let spilled_output = match command.output.lock().finish() {
 		Ok(reference) => reference.map(|reference| WireBlob {
-			hash: Bytes::copy_from_slice(&reference.hash.into_bytes()),
-			mime: String::from("application/octet-stream"),
-			size: reference.size,
+			hash:   Bytes::copy_from_slice(&reference.hash.into_bytes()),
+			mime:   String::from("application/octet-stream"),
+			size:   reference.size,
 			inline: Bytes::new(),
 			detail: Default::default(),
 		}),
@@ -2711,12 +2710,12 @@ struct OutputCapture {
 impl OutputCapture {
 	fn new(store: Option<&BlobStore>) -> Result<Self, ExecError> {
 		Ok(Self {
-			stage: store.map(BlobStore::begin_put).transpose()?,
-			projected_bytes: 0,
-			projected_frames: 0,
+			stage:             store.map(BlobStore::begin_put).transpose()?,
+			projected_bytes:   0,
+			projected_frames:  0,
 			projection_closed: false,
-			spilled: false,
-			error: None,
+			spilled:           false,
+			error:             None,
 		})
 	}
 
@@ -2800,13 +2799,17 @@ impl OutputSequencer {
 		data.push(b'\n');
 		let projected = self.output.lock().project(&data);
 		if let Some(data) = projected {
-			if self.events.try_send(ExecEvent::Output(OutputFrame {
-				exec: exec.clone(),
-				channel: OutputChannel::Stderr as i32,
-				data,
-				sequence: self.next,
-				..OutputFrame::default()
-			})).is_err() {
+			if self
+				.events
+				.try_send(ExecEvent::Output(OutputFrame {
+					exec: exec.clone(),
+					channel: OutputChannel::Stderr as i32,
+					data,
+					sequence: self.next,
+					..OutputFrame::default()
+				}))
+				.is_err()
+			{
 				self.output.lock().close_projection();
 			}
 		}
@@ -3916,8 +3919,7 @@ mod tests {
 	#[tokio::test]
 	async fn jit_approval_names_only_the_detected_capability_and_exact_command() {
 		let host = ExecHost::new();
-		let (route, inbox) =
-			ApprovalRoute::new(Arc::new(omp_agent::ApprovalBook::new()), None);
+		let (route, inbox) = ApprovalRoute::new(Arc::new(omp_agent::ApprovalBook::new()), None);
 		host.bind_sandbox_approval_route(Some(route));
 		let command = "printf ready; touch /private/blocked";
 		let fact = SandboxDenialFact::WritePath(PathBuf::from("/private/blocked"));
@@ -3931,10 +3933,7 @@ mod tests {
 		assert_eq!(reason.kind, "sandbox_amendment");
 		assert_eq!(reason.subject, "/private");
 		assert_eq!(reason.pattern.as_deref(), Some(command));
-		assert_eq!(
-			reason.evidence,
-			[sf!("write /private/blocked"), sf!("/private")],
-		);
+		assert_eq!(reason.evidence, [sf!("write /private/blocked"), sf!("/private")],);
 		request
 			.respond(omp_agent::ApprovalDecision {
 				approved:   true,
@@ -3948,27 +3947,24 @@ mod tests {
 		assert!(approval.await);
 
 		let command = "curl https://api.example.test/data";
-		let fact = SandboxDenialFact::Network {
-			host: sf!("api.example.test"),
-			port: 443,
-		};
-		let approval =
-			host.approve_sandbox_amendment(command, &fact, "network api.example.test:443");
+		let fact = SandboxDenialFact::Network { host: sf!("api.example.test"), port: 443 };
+		let approval = host.approve_sandbox_amendment(command, &fact, "network api.example.test:443");
 		tokio::pin!(approval);
 		let request = tokio::select! {
 			request = inbox.recv() => request.expect("network approval request"),
 			approved = &mut approval => panic!("network approval settled early: {approved}"),
 		};
-		let reason = request.ticket.reasons.first().expect("network approval reason");
+		let reason = request
+			.ticket
+			.reasons
+			.first()
+			.expect("network approval reason");
 		assert_eq!(reason.subject, "network api.example.test:443");
 		assert_eq!(reason.pattern.as_deref(), Some(command));
-		assert_eq!(
-			reason.evidence,
-			[
-				sf!("network api.example.test:443"),
-				sf!("network api.example.test:443"),
-			],
-		);
+		assert_eq!(reason.evidence, [
+			sf!("network api.example.test:443"),
+			sf!("network api.example.test:443"),
+		],);
 		request
 			.respond(omp_agent::ApprovalDecision {
 				approved:   true,
@@ -4235,8 +4231,7 @@ mod tests {
 		.await;
 		assert_eq!(String::from_utf8_lossy(&output).trim(), "2");
 		for name in ["sort", "uniq", "wc", "seq", "cut", "sed", "sleep", "pgrep", "ps", "timeout"] {
-			let output =
-				run_output(&host, script_request(session, &format!("type -t {name}"))).await;
+			let output = run_output(&host, script_request(session, &format!("type -t {name}"))).await;
 			assert_eq!(String::from_utf8_lossy(&output).trim(), "builtin", "{name} is a builtin");
 		}
 		host.close_session(&opened.session).expect("session closes");
@@ -4260,7 +4255,10 @@ mod tests {
 			.expect("frame overflow spills");
 		let expected = vec![b'x'; LIVE_OUTPUT_FRAMES + 17];
 		assert_eq!(
-			store.get(&reference).expect("complete output artifact").as_ref(),
+			store
+				.get(&reference)
+				.expect("complete output artifact")
+				.as_ref(),
 			expected.as_slice(),
 		);
 	}
@@ -4302,10 +4300,7 @@ mod tests {
 		let spill = status.spilled_output.expect("oversized output spills");
 		let hash: [u8; 32] = spill.hash.as_ref().try_into().expect("SHA-256 digest");
 		let complete = store
-			.get(&omp_journal::blob::BlobRef {
-				hash: Hash32::new(hash),
-				size: spill.size,
-			})
+			.get(&omp_journal::blob::BlobRef { hash: Hash32::new(hash), size: spill.size })
 			.expect("complete output artifact");
 		assert_eq!(complete.as_ref(), expected.as_bytes());
 		host.close_session(&opened.session).expect("session closes");

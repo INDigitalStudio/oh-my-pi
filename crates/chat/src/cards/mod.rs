@@ -137,20 +137,20 @@ impl CardStatus {
 /// Borrowed state of one tool element and its standard child elements.
 pub struct CardView<'a> {
 	/// Tool input state.
-	pub input:  &'a Node,
+	pub input:   &'a Node,
 	/// Successful result state, when present.
-	pub result: Option<&'a Node>,
+	pub result:  Option<&'a Node>,
 	/// Diagnostic state, when present.
-	pub diag:   Option<&'a Node>,
+	pub diag:    Option<&'a Node>,
 	/// Usage state, when present.
-	pub usage:  Option<&'a Node>,
+	pub usage:   Option<&'a Node>,
 	/// Tool lifecycle status.
-	pub status: CardStatus,
+	pub status:  CardStatus,
 	/// Accumulated ordered output of a running call: the open stream the
 	/// dispatcher binds to the `<result>` text (ADR 0008 tool output
 	/// streaming; `Dom::stream_text`). `None` once the stream closes and the
 	/// settled result materializes into `result`.
-	pub output: Option<&'a str>,
+	pub output:  Option<&'a str>,
 	/// Presentation-clock instant the observer first saw the call executing
 	/// (pi `executionStartedAtNow`); `None` while streaming arguments or once
 	/// settled. Cards paint a live elapsed badge against

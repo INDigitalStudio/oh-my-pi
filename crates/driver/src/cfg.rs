@@ -69,10 +69,7 @@ impl CfgFiles {
 	/// Project-overlay path for a cfg name, when a project is attached.
 	#[must_use]
 	pub fn project_path(&self, name: &str) -> Option<PathBuf> {
-		self
-			.project
-			.as_ref()
-			.map(|root| root.join(file_name(name)))
+		self.project.as_ref().map(|root| root.join(file_name(name)))
 	}
 
 	/// Concatenated user-then-project script text, `None` when neither

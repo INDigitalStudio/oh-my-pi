@@ -19,7 +19,8 @@ pub const PALETTE: &[PaletteEntry] = &[
 ];
 
 /// pi `loop-limit.ts` usage error.
-pub const LOOP_USAGE: &str = "Usage: /loop [count|duration]. Examples: /loop 10, /loop 10m, /loop 10min.";
+pub const LOOP_USAGE: &str =
+	"Usage: /loop [count|duration]. Examples: /loop 10, /loop 10m, /loop 10min.";
 
 /// Splits `/loop [count] [prompt]`: a leading positive integer is the cap,
 /// the rest is the prompt re-sent each iteration. A leading duration
@@ -40,10 +41,7 @@ pub fn loop_args(words: Option<Str>) -> Result<(Option<u32>, Option<Str>), ConEr
 		}
 		return Ok((Some(limit), prompt(remainder)));
 	}
-	let looks_like_duration = first
-		.chars()
-		.next()
-		.is_some_and(|ch| ch.is_ascii_digit())
+	let looks_like_duration = first.chars().next().is_some_and(|ch| ch.is_ascii_digit())
 		&& first.chars().all(|ch| ch.is_ascii_alphanumeric());
 	if looks_like_duration {
 		return Err(usage(LOOP_USAGE));
@@ -158,7 +156,10 @@ mod tests {
 			GoalOp::Set(Str::new_static("ship it"))
 		);
 		assert_eq!(goal_op(Some(Str::new_static("budget off"))).unwrap(), GoalOp::Budget(None));
-		assert_eq!(goal_op(Some(Str::new_static("budget 5000"))).unwrap(), GoalOp::Budget(Some(5000)));
+		assert_eq!(
+			goal_op(Some(Str::new_static("budget 5000"))).unwrap(),
+			GoalOp::Budget(Some(5000))
+		);
 		assert!(goal_op(Some(Str::new_static("budget -1"))).is_err());
 	}
 }

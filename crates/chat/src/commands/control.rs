@@ -51,20 +51,18 @@ pub const PALETTE: &[PaletteEntry] = &[
 ];
 
 /// pi `MCPCommandController.#showHelp`.
-const MCP_HELP: &str = "**MCP Server Management**\n\n`/mcp add <name> [--scope project|user] \
-                        [--url <url>] [-- <command...>]` — Add a new MCP server\n`/mcp list` — \
-                        List all configured MCP servers\n`/mcp remove <name> [--scope \
-                        project|user]` — Remove an MCP server\n`/mcp test <name>` — Test \
-                        connection to a server\n`/mcp reauth <name>` — Reauthorize OAuth for a \
-                        server\n`/mcp unauth <name>` — Remove OAuth auth from a server\n`/mcp \
-                        enable <name>` — Enable an MCP server\n`/mcp disable <name>` — Disable an \
-                        MCP server\n`/mcp reconnect <name>` — Reconnect to a specific MCP \
-                        server\n`/mcp reload` — Force reload MCP runtime tools\n`/mcp resources` \
-                        — List available resources from connected servers\n`/mcp prompts` — List \
-                        available prompts from connected servers\n`/mcp notifications` — Show \
-                        notification capabilities and subscriptions\n`/mcp smithery-search \
-                        <keyword>`, `/mcp smithery-login`, `/mcp smithery-logout` — Smithery \
-                        registry (not available on this host)\n`/mcp help` — Show this message";
+const MCP_HELP: &str =
+	"**MCP Server Management**\n\n`/mcp add <name> [--scope project|user] [--url <url>] [-- \
+	 <command...>]` — Add a new MCP server\n`/mcp list` — List all configured MCP servers\n`/mcp \
+	 remove <name> [--scope project|user]` — Remove an MCP server\n`/mcp test <name>` — Test \
+	 connection to a server\n`/mcp reauth <name>` — Reauthorize OAuth for a server\n`/mcp unauth \
+	 <name>` — Remove OAuth auth from a server\n`/mcp enable <name>` — Enable an MCP server\n`/mcp \
+	 disable <name>` — Disable an MCP server\n`/mcp reconnect <name>` — Reconnect to a specific \
+	 MCP server\n`/mcp reload` — Force reload MCP runtime tools\n`/mcp resources` — List available \
+	 resources from connected servers\n`/mcp prompts` — List available prompts from connected \
+	 servers\n`/mcp notifications` — Show notification capabilities and subscriptions\n`/mcp \
+	 smithery-search <keyword>`, `/mcp smithery-login`, `/mcp smithery-logout` — Smithery registry \
+	 (not available on this host)\n`/mcp help` — Show this message";
 const SMITHERY_UNAVAILABLE: &str =
 	"Smithery registry integration is not available on this host; add servers with /mcp add.";
 
@@ -122,9 +120,17 @@ fn apply_fast(cx: &PanelCx<'_>, op: FastOp) -> PanelEvent {
 		if let Err(error) = cx.con.exec(&script, omp_con::Source::Console) {
 			return notice(error.to_string());
 		}
-		return notice(if next { "Fast mode enabled." } else { "Fast mode disabled." });
+		return notice(if next {
+			"Fast mode enabled."
+		} else {
+			"Fast mode disabled."
+		});
 	}
-	notice(if current { "Fast mode is on." } else { "Fast mode is off." })
+	notice(if current {
+		"Fast mode is on."
+	} else {
+		"Fast mode is off."
+	})
 }
 
 /// pi `formatSessionAsText`: the transcript as role-labelled plain text.
@@ -205,7 +211,9 @@ pub fn mcp_command(words: &[&str]) -> Result<McpCommand, ConError> {
 		"resources" => McpCommand::Run(McpOp::Resources),
 		"prompts" => McpCommand::Run(McpOp::Prompts),
 		"notifications" => McpCommand::Run(McpOp::Notifications),
-		"test" => McpCommand::Run(McpOp::Test(name("Server name required. Usage: /mcp test <name>")?)),
+		"test" => {
+			McpCommand::Run(McpOp::Test(name("Server name required. Usage: /mcp test <name>")?))
+		},
 		"reconnect" => McpCommand::Run(McpOp::Reconnect(name(
 			"Server name required. Usage: /mcp reconnect <name>",
 		)?)),
@@ -224,16 +232,13 @@ pub fn mcp_command(words: &[&str]) -> Result<McpCommand, ConError> {
 			false,
 		)),
 		"remove" | "rm" => {
-			let name =
-				name("Server name required. Usage: /mcp remove <name> [--scope project|user]")?;
+			let name = name("Server name required. Usage: /mcp remove <name> [--scope project|user]")?;
 			McpCommand::Run(McpOp::Remove(name, scope(&tail[1..])?))
 		},
 		"add" => McpCommand::Run(McpOp::Add(parse_add(tail)?)),
 		"smithery-search" | "smithery-login" | "smithery-logout" => McpCommand::Smithery,
 		_ => {
-			return Err(ConError::Usage(sf!(
-				"Unknown subcommand: {verb}. Type /mcp help for usage."
-			)));
+			return Err(ConError::Usage(sf!("Unknown subcommand: {verb}. Type /mcp help for usage.")));
 		},
 	})
 }
@@ -252,11 +257,16 @@ fn scope(words: &[&str]) -> Result<McpScope, ConError> {
 	Ok(scope)
 }
 
-/// pi `parseAddArgs`: `<name> [--scope project|user] [--url <url>] [-- <command…>]`.
+/// pi `parseAddArgs`: `<name> [--scope project|user] [--url <url>] [--
+/// <command…>]`.
 fn parse_add(words: &[&str]) -> Result<McpAdd, ConError> {
-	const USAGE: &str = "Usage: /mcp add <name> [--scope project|user] [--url <url>] [-- <command...>]";
+	const USAGE: &str =
+		"Usage: /mcp add <name> [--scope project|user] [--url <url>] [-- <command...>]";
 	let mut words = words.iter().copied();
-	let name = words.next().filter(|name| !name.starts_with("--")).ok_or_else(|| usage(USAGE))?;
+	let name = words
+		.next()
+		.filter(|name| !name.starts_with("--"))
+		.ok_or_else(|| usage(USAGE))?;
 	let mut add = McpAdd {
 		name:    Str::new(name),
 		scope:   McpScope::Project,
@@ -397,10 +407,7 @@ mod tests {
 		assert_eq!(fast_op(Some("ON")).unwrap(), FastOp::On);
 		assert_eq!(fast_op(Some("off")).unwrap(), FastOp::Off);
 		assert_eq!(fast_op(Some("status")).unwrap(), FastOp::Status);
-		assert_eq!(
-			fast_op(Some("bogus")).unwrap_err().to_string(),
-			"Usage: /fast [on|off|status]"
-		);
+		assert_eq!(fast_op(Some("bogus")).unwrap_err().to_string(), "Usage: /fast [on|off|status]");
 	}
 
 	#[test]
@@ -427,7 +434,11 @@ mod tests {
 				name:    Str::new_static("fs"),
 				scope:   McpScope::Project,
 				url:     None,
-				command: vec![Str::new_static("npx"), Str::new_static("server-fs"), Str::new_static(".")],
+				command: vec![
+					Str::new_static("npx"),
+					Str::new_static("server-fs"),
+					Str::new_static(".")
+				],
 			}))
 		);
 		assert_eq!(

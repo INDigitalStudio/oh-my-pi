@@ -100,16 +100,16 @@ impl AskPresenter for AskRoute {
 				id:      Str::new(id),
 				sender:  Arc::downgrade(&sender),
 			};
-			self.pending
+			self
+				.pending
 				.lock()
 				.insert(registration.id.clone(), Arc::clone(&sender));
 			drop(sender);
 			let outcome = response.recv_async().await;
 			match outcome {
-				Ok(AskReply::Answers(answers)) => Ok(Presentation {
-					answers: align(questions, answers),
-					headless: false,
-				}),
+				Ok(AskReply::Answers(answers)) => {
+					Ok(Presentation { answers: align(questions, answers), headless: false })
+				},
 				Ok(AskReply::Cancelled) => Err(Fault::cancelled()),
 				Err(_) => Err(Fault::Presenter {
 					message: Str::new_static("ask host went away before answering"),
@@ -154,7 +154,11 @@ mod tests {
 			id:          Str::new_static(id),
 			question:    Str::new_static("Which?"),
 			header:      None,
-			options:     vec![OptionItem { label: Str::new_static("A"), description: None, preview: None }],
+			options:     vec![OptionItem {
+				label:       Str::new_static("A"),
+				description: None,
+				preview:     None,
+			}],
 			multi:       false,
 			recommended: Some(0),
 		}

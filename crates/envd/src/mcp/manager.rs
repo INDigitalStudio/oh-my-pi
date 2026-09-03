@@ -1127,15 +1127,11 @@ impl McpManager {
 
 	/// Returns the declared approval envelope for one live dynamic MCP target.
 	pub(crate) fn dynamic_effects(&self, name: &str) -> Option<Effects> {
-		self
-			.catalog_snapshot()
-			.leaves
-			.iter()
-			.find_map(|leaf| {
-				mcp_dyn_definition(leaf)
-					.filter(|(candidate, _)| candidate == name)
-					.map(|_| mcp_tier_effects(leaf.value.tier.as_str()))
-			})
+		self.catalog_snapshot().leaves.iter().find_map(|leaf| {
+			mcp_dyn_definition(leaf)
+				.filter(|(candidate, _)| candidate == name)
+				.map(|_| mcp_tier_effects(leaf.value.tier.as_str()))
+		})
 	}
 
 	/// Captures every live MCP catalog once for UI inspection.
@@ -3221,10 +3217,7 @@ mod tests {
 			mcp_dyn_output(&result).expect("project MCP output"),
 			DynOutput::Parts(vec![
 				DynOutput::Text(sf!("caption")),
-				DynOutput::Blob {
-					mime:  sf!("image/png"),
-					bytes: Bytes::from_static(b"png"),
-				},
+				DynOutput::Blob { mime: sf!("image/png"), bytes: Bytes::from_static(b"png") },
 				DynOutput::Json(json!({"width": 1})),
 			])
 		);
@@ -3234,8 +3227,7 @@ mod tests {
 	async fn dynamic_catalog_is_live_and_caller_cancellation_reaches_transport() {
 		let scratch = tempfile::tempdir().expect("scratch");
 		let service = McpService::open(scratch.path().join("cache.sqlite3")).expect("service");
-		let transport =
-			Arc::new(DynTransport { call_cancellation: Mutex::new(None) });
+		let transport = Arc::new(DynTransport { call_cancellation: Mutex::new(None) });
 		let manager = McpManager::new(
 			Arc::clone(&service),
 			Arc::new(DynConnector { transport: Arc::clone(&transport) }),
@@ -3266,7 +3258,9 @@ mod tests {
 			}])
 			.await;
 		assert_eq!(
-			DynHost::list(manager.as_ref()).await.expect("live dyn catalog"),
+			DynHost::list(manager.as_ref())
+				.await
+				.expect("live dyn catalog"),
 			vec![DynDevice {
 				name:        sf!("live/wait"),
 				description: Some(sf!("Waits until caller cancellation.")),
@@ -3277,13 +3271,7 @@ mod tests {
 		let call_manager = Arc::clone(&manager);
 		let call_cancellation = cancellation.clone();
 		let call = tokio::spawn(async move {
-			DynHost::call(
-				call_manager.as_ref(),
-				"live/wait",
-				json!({}),
-				call_cancellation,
-			)
-			.await
+			DynHost::call(call_manager.as_ref(), "live/wait", json!({}), call_cancellation).await
 		});
 		for _ in 0..100 {
 			if transport.call_cancellation.lock().is_some() {

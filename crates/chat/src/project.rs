@@ -150,7 +150,14 @@ pub(crate) fn project(
 					if let Ok(framed) = kind.as_str().parse::<custom::CustomKind>() {
 						let component = custom::custom_message_card(framed, node, options.expanded);
 						let text = custom::framed_text(node);
-						blocks.push(rendered(*handle, BlockKind::Notice, text, Mode::Mutable, true, component));
+						blocks.push(rendered(
+							*handle,
+							BlockKind::Notice,
+							text,
+							Mode::Mutable,
+							true,
+							component,
+						));
 						continue;
 					}
 					let text = node.content.clone().unwrap_or_default();
@@ -159,9 +166,17 @@ pub(crate) fn project(
 					if !options.expanded && error::suppressed_inline(dom, *handle) {
 						continue;
 					}
-					let component = misc::custom_notice(kind.as_str(), node)
-						.unwrap_or_else(|| error::notice_card(kind.as_str(), text.clone(), options.expanded));
-					blocks.push(rendered(*handle, BlockKind::Notice, text, Mode::Mutable, true, component));
+					let component = misc::custom_notice(kind.as_str(), node).unwrap_or_else(|| {
+						error::notice_card(kind.as_str(), text.clone(), options.expanded)
+					});
+					blocks.push(rendered(
+						*handle,
+						BlockKind::Notice,
+						text,
+						Mode::Mutable,
+						true,
+						component,
+					));
 				},
 				Tag::Known(KnownTag::Usage) => {
 					let facts = usage::usage_facts(dom, *handle);
@@ -204,7 +219,14 @@ pub(crate) fn project(
 				.get(compaction)
 				.map(|node| divider::SummaryDivider::compaction(node, options.expanded).label)
 				.unwrap_or_default();
-			blocks.push(rendered(compaction, BlockKind::Divider, label, Mode::Mutable, true, component));
+			blocks.push(rendered(
+				compaction,
+				BlockKind::Divider,
+				label,
+				Mode::Mutable,
+				true,
+				component,
+			));
 		}
 	}
 	blocks
@@ -377,11 +399,19 @@ fn hub_is_wait(dom: &Dom, handle: Handle, _node: &Node) -> bool {
 		.and_then(|input| {
 			let raw = match input.prop(&PropId::Data.into()) {
 				Some(Value::Json(value)) => value.get().to_owned(),
-				_ => input.prop(&PropId::Text.into()).and_then(Value::as_str)?.to_owned(),
+				_ => input
+					.prop(&PropId::Text.into())
+					.and_then(Value::as_str)?
+					.to_owned(),
 			};
 			serde_json::from_str::<serde_json::Value>(&raw).ok()
 		})
-		.and_then(|args| args.get("op").and_then(serde_json::Value::as_str).map(str::to_owned))
+		.and_then(|args| {
+			args
+				.get("op")
+				.and_then(serde_json::Value::as_str)
+				.map(str::to_owned)
+		})
 		.is_some_and(|op| op == "wait")
 }
 
@@ -398,8 +428,7 @@ fn group_reads(
 ) {
 	let is_read = |block: &RenderedBlock| {
 		block.view.kind == BlockKind::Tool
-			&& Handle::new(block.view.key / 8)
-				.is_some_and(|handle| read_is_groupable(dom, handle))
+			&& Handle::new(block.view.key / 8).is_some_and(|handle| read_is_groupable(dom, handle))
 	};
 	let reads_only = blocks[start..]
 		.iter()
@@ -517,11 +546,10 @@ fn card_view<'a>(
 	let started = (card_status == CardStatus::InProgress)
 		.then(|| options.local.started(block_key(handle, BlockKind::Tool)))
 		.flatten();
-	let result = dom
-		.children(handle)
-		.iter()
-		.copied()
-		.find(|child| dom.get(*child).is_some_and(|node| node.tag == Tag::Known(KnownTag::Result)));
+	let result = dom.children(handle).iter().copied().find(|child| {
+		dom.get(*child)
+			.is_some_and(|node| node.tag == Tag::Known(KnownTag::Result))
+	});
 	Some(CardView {
 		input,
 		result: result.and_then(|handle| dom.get(handle)),
@@ -585,11 +613,19 @@ fn tool_block(
 	let mut text = StrMut::new(tool.as_str());
 	text.push_str(" ");
 	text.push_str(status.as_str());
-	if let Some(result) = view.result.and_then(node_text).filter(|text| !text.is_empty()) {
+	if let Some(result) = view
+		.result
+		.and_then(node_text)
+		.filter(|text| !text.is_empty())
+	{
 		text.push_str("\n");
 		text.push_str(result.as_str());
 	}
-	if let Some(diag) = view.diag.and_then(node_text).filter(|text| !text.is_empty()) {
+	if let Some(diag) = view
+		.diag
+		.and_then(node_text)
+		.filter(|text| !text.is_empty())
+	{
 		text.push_str("\n");
 		text.push_str(diag.as_str());
 	}

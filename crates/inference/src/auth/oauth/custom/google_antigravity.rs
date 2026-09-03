@@ -28,9 +28,6 @@ use crate::{
 const REDIRECT_URI_PARAMETER: &str = "redirect_uri";
 const ENDPOINT: &str = "https://daily-cloudcode-pa.googleapis.com";
 const GEMINI_CLI_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
-const LOAD_CODE_ASSIST_URL: &str =
-	"https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
-const ONBOARD_USER_URL: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser";
 const FREE_TIER_ID: &str = "free-tier";
 const ONBOARD_TIMEOUT: Duration = Duration::from_secs(30);
 const ONBOARD_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -432,6 +429,11 @@ fn json_body<T: Serialize>(value: &T) -> Result<SecretString, OAuthError> {
 #[cfg(test)]
 mod tests {
 	use std::{collections::VecDeque, sync::Arc};
+
+	const LOAD_CODE_ASSIST_URL: &str =
+		"https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+	const ONBOARD_USER_URL: &str =
+		"https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser";
 
 	use futures::FutureExt;
 	use parking_lot::Mutex;

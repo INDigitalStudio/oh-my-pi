@@ -33,12 +33,8 @@ pub fn stats_report(report: &StatsReport) -> Str {
 		report.files
 	);
 	out.push_str("**Overall**\n\n");
-	let _ = writeln!(
-		out,
-		"- Requests: {} ({} errors)",
-		number(report.requests),
-		number(report.errors)
-	);
+	let _ =
+		writeln!(out, "- Requests: {} ({} errors)", number(report.requests), number(report.errors));
 	let _ = writeln!(out, "- Error Rate: {}", percent(report.errors, report.requests));
 	let _ = writeln!(
 		out,
@@ -52,21 +48,17 @@ pub fn stats_report(report: &StatsReport) -> Str {
 		"- Cache Rate: {}",
 		percent(report.cache_read, report.input_tokens.saturating_add(report.cache_read))
 	);
-	let _ = writeln!(
-		out,
-		"- API-equivalent estimate: {}",
-		cost(report.cost_nano_usd, report.unpriced)
-	);
+	let _ =
+		writeln!(out, "- API-equivalent estimate: {}", cost(report.cost_nano_usd, report.unpriced));
 	let _ = writeln!(
 		out,
 		"- Avg Duration: {}",
-		report.avg_duration_ms.map_or_else(|| "-".to_owned(), duration)
+		report
+			.avg_duration_ms
+			.map_or_else(|| "-".to_owned(), duration)
 	);
-	let _ = writeln!(
-		out,
-		"- Avg TTFT: {}",
-		report.avg_ttft_ms.map_or_else(|| "-".to_owned(), duration)
-	);
+	let _ =
+		writeln!(out, "- Avg TTFT: {}", report.avg_ttft_ms.map_or_else(|| "-".to_owned(), duration));
 	if let Some(tps) = report.tokens_per_second {
 		let _ = writeln!(out, "- Avg Tokens/s: {tps:.1}");
 	}
@@ -203,7 +195,9 @@ pub fn trace_report(dom: &Dom, events: &[TraceEvent]) -> Option<Str> {
 				if let Some(ttft) = ttft {
 					let _ = write!(label, " · ttft {}", duration(ttft.unsigned_abs()));
 				}
-				let took = node.prop(&PropKey::from(PropId::DurationMs)).and_then(as_int);
+				let took = node
+					.prop(&PropKey::from(PropId::DurationMs))
+					.and_then(as_int);
 				if let Some(took) = took {
 					let _ = write!(label, " · {}", duration(took.unsigned_abs()));
 				}
@@ -215,8 +209,11 @@ pub fn trace_report(dom: &Dom, events: &[TraceEvent]) -> Option<Str> {
 					start_ms: start,
 					end_ms:   None,
 					kind:     "notice",
-					label:    sf!("{kind}: {}", preview(node.content.as_deref().unwrap_or_default(), 80))
-						.to_string(),
+					label:    sf!(
+						"{kind}: {}",
+						preview(node.content.as_deref().unwrap_or_default(), 80)
+					)
+					.to_string(),
 				});
 			},
 			Tag::Custom(name) => {
@@ -263,7 +260,11 @@ pub fn trace_report(dom: &Dom, events: &[TraceEvent]) -> Option<Str> {
 		});
 	spans.extend(kernel);
 	spans.sort_by_key(|span| span.start_ms);
-	if let Some(latest) = spans.iter().map(|span| span.end_ms.unwrap_or(span.start_ms)).max() {
+	if let Some(latest) = spans
+		.iter()
+		.map(|span| span.end_ms.unwrap_or(span.start_ms))
+		.max()
+	{
 		last_ms = last_ms.max(latest);
 	}
 	let wall_ms = last_ms.saturating_sub(turn_start);
@@ -294,7 +295,10 @@ pub fn trace_report(dom: &Dom, events: &[TraceEvent]) -> Option<Str> {
 	}
 	out.push_str("```\n");
 	if !tools.is_empty() {
-		out.push_str("\n**Tool Aggregates**\n\n| Tool | Calls | Errors | Total | Avg | Max |\n|---|---|---|---|---|---|\n");
+		out.push_str(
+			"\n**Tool Aggregates**\n\n| Tool | Calls | Errors | Total | Avg | Max \
+			 |\n|---|---|---|---|---|---|\n",
+		);
 		for (name, calls, errors, total, max) in &tools {
 			let _ = writeln!(
 				out,
@@ -309,7 +313,8 @@ pub fn trace_report(dom: &Dom, events: &[TraceEvent]) -> Option<Str> {
 }
 
 fn tag_is(dom: &Dom, handle: Handle, tag: KnownTag) -> bool {
-	dom.get(handle).is_some_and(|node| node.tag == Tag::Known(tag))
+	dom.get(handle)
+		.is_some_and(|node| node.tag == Tag::Known(tag))
 }
 
 fn entry_ms(node: &Node, prop: PropId) -> Option<u64> {
@@ -425,20 +430,20 @@ mod tests {
 	#[test]
 	fn stats_report_matches_the_pi_summary_layout() {
 		let report = StatsReport {
-			synced: 2,
-			files: 5,
-			requests: 42,
-			errors: 3,
-			input_tokens: 120_000,
-			output_tokens: 3_456,
-			cache_read: 80_000,
-			cache_write: 1_000,
-			cost_nano_usd: 1_234_000_000,
-			unpriced: 0,
-			avg_duration_ms: Some(3_200),
-			avg_ttft_ms: Some(800),
+			synced:            2,
+			files:             5,
+			requests:          42,
+			errors:            3,
+			input_tokens:      120_000,
+			output_tokens:     3_456,
+			cache_read:        80_000,
+			cache_write:       1_000,
+			cost_nano_usd:     1_234_000_000,
+			unpriced:          0,
+			avg_duration_ms:   Some(3_200),
+			avg_ttft_ms:       Some(800),
 			tokens_per_second: Some(45.26),
-			by_model: vec![StatsGroup {
+			by_model:          vec![StatsGroup {
 				key: Str::new_static("anthropic/claude-sonnet-4-5"),
 				requests: 40,
 				cost_nano_usd: 1_234_000_000,
@@ -446,13 +451,17 @@ mod tests {
 				cache_read: 100_000,
 				..StatsGroup::default()
 			}],
-			by_folder: vec![StatsGroup {
+			by_folder:         vec![StatsGroup {
 				key: Str::new_static("/work/omp"),
 				requests: 42,
 				unpriced: 2,
 				..StatsGroup::default()
 			}],
-			tools: vec![StatsTool { tool: Str::new_static("read"), calls: 12, errors: 1 }],
+			tools:             vec![StatsTool {
+				tool:   Str::new_static("read"),
+				calls:  12,
+				errors: 1,
+			}],
 		};
 		let text = stats_report(&report);
 		assert!(text.contains("Synced 2 changed journals (5 total)"), "{text}");
@@ -464,7 +473,10 @@ mod tests {
 		assert!(text.contains("- Avg Duration: 3.2s"), "{text}");
 		assert!(text.contains("- Avg TTFT: 800ms"), "{text}");
 		assert!(text.contains("- Avg Tokens/s: 45.3"), "{text}");
-		assert!(text.contains("- anthropic/claude-sonnet-4-5: 40 reqs, $1.23, 50.0% cache rate"), "{text}");
+		assert!(
+			text.contains("- anthropic/claude-sonnet-4-5: 40 reqs, $1.23, 50.0% cache rate"),
+			"{text}"
+		);
 		assert!(text.contains("- /work/omp: 42 reqs, N/A"), "{text}");
 		assert!(text.contains("- read: 12 calls, 1 error"), "{text}");
 	}
@@ -483,7 +495,8 @@ mod tests {
 	fn trace_report_spans_the_last_turn_and_interleaves_kernel_events() {
 		let directory = tempfile::tempdir().unwrap();
 		let mut session =
-			Session::create(directory.path().join("trace.oms"), ComponentRegistry::standard()).unwrap();
+			Session::create(directory.path().join("trace.oms"), ComponentRegistry::standard())
+				.unwrap();
 		assert!(trace_report(session.dom(), &[]).is_none());
 		session.begin_turn().unwrap();
 		session.user("fix the tests", Vec::new()).unwrap();
@@ -491,10 +504,25 @@ mod tests {
 			.assistant_start("anthropic/claude-sonnet-4-5", "anthropic", "anthropic")
 			.unwrap();
 		let call = session
-			.call("read", 1, "call-1", Some(Str::new_static("Reading note")), Some(serde_json::value::to_raw_value(&serde_json::json!({"path": "note.txt"})).unwrap()), None)
+			.call(
+				"read",
+				1,
+				"call-1",
+				Some(Str::new_static("Reading note")),
+				Some(
+					serde_json::value::to_raw_value(&serde_json::json!({"path": "note.txt"})).unwrap(),
+				),
+				None,
+			)
 			.unwrap();
 		session
-			.settle(call, serde_json::value::to_raw_value(&serde_json::json!({"kind": "ok", "value": {"text": "hi"}})).unwrap())
+			.settle(
+				call,
+				serde_json::value::to_raw_value(
+					&serde_json::json!({"kind": "ok", "value": {"text": "hi"}}),
+				)
+				.unwrap(),
+			)
 			.unwrap();
 		session.assistant_end("tool_calls").unwrap();
 		session

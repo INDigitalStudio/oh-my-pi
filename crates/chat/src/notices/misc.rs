@@ -101,9 +101,7 @@ pub fn diagnostics_card(node: &Node) -> Component {
 		})
 		.unwrap_or_default();
 	let count = lines.len();
-	let errored = lines
-		.iter()
-		.any(|line| line.contains("[error]"));
+	let errored = lines.iter().any(|line| line.contains("[error]"));
 	let rows: Vec<Component> = lines
 		.into_iter()
 		.enumerate()
@@ -308,7 +306,11 @@ fn synthetic_label(text: &str) -> &str {
 			&& let Some(heading) = line[hashes..].strip_prefix(char::is_whitespace)
 		{
 			let heading = heading.trim();
-			return if heading.is_empty() { "Synthetic input" } else { heading };
+			return if heading.is_empty() {
+				"Synthetic input"
+			} else {
+				heading
+			};
 		}
 		return "Synthetic input";
 	}
@@ -318,7 +320,11 @@ fn synthetic_label(text: &str) -> &str {
 /// pi `summarizeSyntheticInput` (`user-message.ts:176-181`):
 /// `<label> · <size> · <n> lines`.
 fn synthetic_summary(text: &str) -> Str {
-	let lines = if text.is_empty() { 0 } else { text.split('\n').count() };
+	let lines = if text.is_empty() {
+		0
+	} else {
+		text.split('\n').count()
+	};
 	sf!(
 		"{} · {} · {lines} line{}",
 		synthetic_label(text),
@@ -359,9 +365,9 @@ mod tests {
 			all.push(((*prop).into(), Value::Str(Str::new(value))));
 		}
 		Node {
-			tag: Tag::Known(KnownTag::Notice),
-			props: all,
-			kids: Vec::new(),
+			tag:     Tag::Known(KnownTag::Notice),
+			props:   all,
+			kids:    Vec::new(),
 			content: content.map(Str::new),
 		}
 	}
@@ -480,7 +486,8 @@ mod tests {
 			"diagnostics",
 			&[(PropId::Name, "rust-analyzer")],
 			Some(
-				"src/lib.rs:12:5 [error] [rustc] mismatched types (E0308)\nsrc/lib.rs:40:1 [warning] unused import\nserver restarted",
+				"src/lib.rs:12:5 [error] [rustc] mismatched types (E0308)\nsrc/lib.rs:40:1 [warning] \
+				 unused import\nserver restarted",
 			),
 		);
 		let text = render(diagnostics_card(&node), 80);

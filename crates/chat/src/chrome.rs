@@ -11,11 +11,11 @@ use omp_tui::{
 	components::{Col, ComposerStyle, EditorPane, KeywordAccent, Spacer},
 };
 
+use crate::overlays::ModelRow;
 pub use crate::{
 	status_band::{PathLabel, StatusBand, StatusFacts, display_path},
 	welcome::{Welcome, tip_for},
 };
-use crate::overlays::ModelRow;
 
 omp_con::var! {
 	/// pi `startup.quiet`: skip the welcome box and startup-only status
@@ -426,7 +426,8 @@ mod tests {
 		assert_eq!(badge.provider.as_str(), "openai");
 		assert_eq!(badge.context_window, Some(400_000));
 		assert!(badge.reasoning);
-		let plain = ModelBadge::from_row(&ModelRow { efforts: Vec::new(), name: Str::default(), ..row });
+		let plain =
+			ModelBadge::from_row(&ModelRow { efforts: Vec::new(), name: Str::default(), ..row });
 		assert!(!plain.reasoning);
 		assert_eq!(plain.name.as_str(), "openai/gpt-5", "a nameless row shows its key");
 	}

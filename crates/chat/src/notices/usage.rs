@@ -59,8 +59,7 @@ pub fn usage_facts(dom: &Dom, usage: Handle) -> UsageFacts {
 		return UsageFacts::default();
 	};
 	let started_ms = dom.parent(usage).and_then(|turn| {
-		dom
-			.children(turn)
+		dom.children(turn)
 			.iter()
 			.filter_map(|child| dom.get(*child))
 			.find(|child| child.tag == Tag::Known(KnownTag::User))
@@ -207,9 +206,8 @@ mod tests {
 	fn throughput_hidden_below_min_duration() {
 		let ui = ctx();
 		let throughput = ui.charset.icon(Icon::Throughput);
-		let at = |duration_ms| {
-			usage_line(&UsageFacts { duration_ms: Some(duration_ms), ..full() }, &ui)
-		};
+		let at =
+			|duration_ms| usage_line(&UsageFacts { duration_ms: Some(duration_ms), ..full() }, &ui);
 		assert!(!at(100).contains(throughput), "{}", at(100));
 		assert!(at(101).contains(throughput), "{}", at(101));
 		let silent = usage_line(&UsageFacts { output: 0, ..full() }, &ui);

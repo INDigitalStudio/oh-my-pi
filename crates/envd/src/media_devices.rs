@@ -10,8 +10,8 @@ use std::{
 };
 
 use async_stream::stream;
-use bytes::Bytes;
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::Stream;
 use omp_cache::telemetry_cache::{StoredIssue, TelemetryIndex};
 use omp_core::{ArtifactUrl, Str, sf};
@@ -123,8 +123,7 @@ pub(crate) fn ask_vocalizer(
 const MAX_INPUT_IMAGE_BYTES: u64 = 35 * 1024 * 1024;
 /// Longest `text` accepted by `tts`, in characters.
 const MAX_SPEECH_CHARS: usize = 15_000;
-const MAX_INPUT_IMAGE_BASE64_BYTES: usize =
-	((MAX_INPUT_IMAGE_BYTES as usize + 2) / 3) * 4;
+const MAX_INPUT_IMAGE_BASE64_BYTES: usize = ((MAX_INPUT_IMAGE_BYTES as usize + 2) / 3) * 4;
 
 /// One image-to-image input, provided either by contained path or inline data.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -322,26 +321,14 @@ fn media_schema(kind: MediaKind) -> Bytes {
 			"output_path",
 		],
 		MediaKind::Speech => {
-			&[
-				"i",
-				"notrunc",
-				"text",
-				"voice_id",
-				"language",
-				"output_path",
-				"sample_rate",
-				"bit_rate",
-			]
+			&["i", "notrunc", "text", "voice_id", "language", "output_path", "sample_rate", "bit_rate"]
 		},
 	};
 	properties.retain(|name, _| allowed.contains(&name.as_str()));
-	object.insert(
-		"required".to_owned(),
-		match kind {
-			MediaKind::Image => serde_json::json!(["i", "subject"]),
-			MediaKind::Speech => serde_json::json!(["i", "text", "output_path"]),
-		},
-	);
+	object.insert("required".to_owned(), match kind {
+		MediaKind::Image => serde_json::json!(["i", "subject"]),
+		MediaKind::Speech => serde_json::json!(["i", "text", "output_path"]),
+	});
 	Bytes::from(serde_json::to_vec(&value).expect("media schema serialization is infallible"))
 }
 
@@ -408,14 +395,14 @@ impl MediaDevice {
 		let id = self.blobs.put(&audio).map_err(media_blob_fault)?;
 		let output_path = Some(output.write(&audio)?);
 		let media_type = Str::new(match format {
-				"mp3" => "audio/mpeg",
-				"wav" => "audio/wav",
-				"pcm16" => "audio/L16",
-				"opus" => "audio/opus",
-				"aac" => "audio/aac",
-				"flac" => "audio/flac",
-				_ => unreachable!("validated audio format"),
-			});
+			"mp3" => "audio/mpeg",
+			"wav" => "audio/wav",
+			"pcm16" => "audio/L16",
+			"opus" => "audio/opus",
+			"aac" => "audio/aac",
+			"flac" => "audio/flac",
+			_ => unreachable!("validated audio format"),
+		});
 		Ok(MediaPayload {
 			artifact_id: Str::new(ArtifactUrl::from_digest(id.hash).as_str()),
 			media_type: media_type.clone(),
@@ -438,7 +425,9 @@ fn validate_image_params(params: &MediaParams) -> Result<(), MediaFault> {
 		return Err(media_fault("invalid_media_request", "none", "subject must not be empty"));
 	}
 	if params.input.as_ref().is_some_and(|inputs| {
-		inputs.iter().any(|input| input.path.is_some() == input.data.is_some())
+		inputs
+			.iter()
+			.any(|input| input.path.is_some() == input.data.is_some())
 	}) {
 		return Err(media_fault(
 			"invalid_input_image",
@@ -538,19 +527,25 @@ fn assemble_image_prompt(params: &MediaParams) -> String {
 		subject.push_str(detail);
 	}
 	sentences.push(subject);
-	for detail in [
-		params.composition.as_deref(),
-		params.lighting.as_deref(),
-		params.style.as_deref(),
-	] {
+	for detail in
+		[params.composition.as_deref(), params.lighting.as_deref(), params.style.as_deref()]
+	{
 		if let Some(detail) = detail.filter(|detail| !detail.trim().is_empty()) {
 			sentences.push(detail.to_owned());
 		}
 	}
-	if let Some(text) = params.text.as_deref().filter(|text| !text.trim().is_empty()) {
+	if let Some(text) = params
+		.text
+		.as_deref()
+		.filter(|text| !text.trim().is_empty())
+	{
 		sentences.push(format!("Render this text exactly: {text}"));
 	}
-	if let Some(changes) = params.changes.as_deref().filter(|changes| !changes.is_empty()) {
+	if let Some(changes) = params
+		.changes
+		.as_deref()
+		.filter(|changes| !changes.is_empty())
+	{
 		sentences.push(format!(
 			"Apply these changes: {}. Preserve all unspecified details.",
 			changes.join("; ")
@@ -665,9 +660,8 @@ fn load_input_image(root: &Path, authored: &str) -> Result<thread_pb::Blob, Medi
 			"input_image exceeds the 35 MiB limit",
 		));
 	}
-	let mut bytes = Vec::with_capacity(
-		usize::try_from(metadata.len().min(MAX_INPUT_IMAGE_BYTES)).unwrap_or(0),
-	);
+	let mut bytes =
+		Vec::with_capacity(usize::try_from(metadata.len().min(MAX_INPUT_IMAGE_BYTES)).unwrap_or(0));
 	file
 		.take(MAX_INPUT_IMAGE_BYTES + 1)
 		.read_to_end(&mut bytes)
@@ -825,12 +819,14 @@ impl Tool for MediaDevice {
 	fn prompt(&self, view: Result<&MediaPayload, &MediaFault>, _: &PromptCaps) -> Vec<Part> {
 		match view {
 			Ok(payload) => payload.blob.clone().map_or_else(
-				|| vec![Part::Text {
-					text: Str::from(format!(
-						"Generated {} artifact {}",
-						payload.media_type, payload.artifact_id
-					)),
-				}],
+				|| {
+					vec![Part::Text {
+						text: Str::from(format!(
+							"Generated {} artifact {}",
+							payload.media_type, payload.artifact_id
+						)),
+					}]
+				},
 				|blob| vec![Part::Blob { blob, alt: None }],
 			),
 			Err(fault) => vec![Part::Json {
@@ -905,11 +901,9 @@ fn speech_format(output_path: &str) -> Result<&'static str, MediaFault> {
 	{
 		Some("mp3") => Ok("mp3"),
 		Some("wav") => Ok("wav"),
-		_ => Err(media_fault(
-			"invalid_audio_format",
-			"speech",
-			"output_path must end in .mp3 or .wav",
-		)),
+		_ => {
+			Err(media_fault("invalid_audio_format", "speech", "output_path must end in .mp3 or .wav"))
+		},
 	}
 }
 
@@ -1282,13 +1276,17 @@ mod tests {
 
 		params.text = Some(Str::new("x".repeat(MAX_SPEECH_CHARS + 1)));
 		assert_eq!(
-			validate_speech_params(&params).expect_err("overlong speech").code,
+			validate_speech_params(&params)
+				.expect_err("overlong speech")
+				.code,
 			"text_too_long"
 		);
 		params.text = Some(sf!("hello"));
 		params.output_path = None;
 		assert_eq!(
-			validate_speech_params(&params).expect_err("missing output path").code,
+			validate_speech_params(&params)
+				.expect_err("missing output path")
+				.code,
 			"output_path_required"
 		);
 	}
@@ -1339,17 +1337,15 @@ mod tests {
 		params.image_size = Some(sf!("1536x1024"));
 		params.input = Some(vec![ImageInput {
 			path:      None,
-			data:      Some(Str::new(
-				omp_core::base64::encode(b"\x89PNG\r\n\x1a\n")
-					.into_string(),
-			)),
+			data:      Some(Str::new(omp_core::base64::encode(b"\x89PNG\r\n\x1a\n").into_string())),
 			mime_type: Some(sf!("image/png")),
 		}]);
 		assert_eq!(validate_image_params(&params), Ok(()));
 		let request = image_request(root.path(), &params).expect("image request");
 		assert_eq!(
 			request.prompt,
-			"frog, jumping, a pond. wide shot. Apply these changes: make the frog blue. Preserve all unspecified details."
+			"frog, jumping, a pond. wide shot. Apply these changes: make the frog blue. Preserve all \
+			 unspecified details."
 		);
 		assert_eq!(
 			request.size,
@@ -1366,13 +1362,10 @@ mod tests {
 		let backend = Arc::new(SearchBridgeHost::new(None));
 		let image = image_gen(Arc::clone(&backend), blobs.clone(), root.path().to_path_buf());
 		let lifted = image
-			.lift(
-				&Rev { family: Str::default(), n: 2 },
-				RecordedCall {
-					raw_args: br#"{"prompt":"frog","input_image":"frog.png","format":"png"}"#,
-					verdict:  br#"{"kind":"ok","value":{}}"#,
-				},
-			)
+			.lift(&Rev { family: Str::default(), n: 2 }, RecordedCall {
+				raw_args: br#"{"prompt":"frog","input_image":"frog.png","format":"png"}"#,
+				verdict:  br#"{"kind":"ok","value":{}}"#,
+			})
 			.expect("legacy image lift");
 		let arguments: Value = serde_json::from_slice(&lifted.raw_args).expect("lifted arguments");
 		assert_eq!(arguments["subject"], "frog");
@@ -1404,17 +1397,13 @@ mod tests {
 		let blobs = BlobHost::open(root.path().join("blobs")).expect("blobs");
 		let backend = Arc::new(SearchBridgeHost::new(None));
 		let device = image_gen(backend, blobs.clone(), root.path().to_path_buf());
-		let payload = finish_image(
-			&blobs,
-			None,
-			&thread_pb::Blob {
-				hash:   Bytes::new(),
-				mime:   "image/png".to_owned(),
-				size:   3,
-				inline: Bytes::from_static(b"png"),
-				detail: blob::Detail::Original as i32,
-			},
-		)
+		let payload = finish_image(&blobs, None, &thread_pb::Blob {
+			hash:   Bytes::new(),
+			mime:   "image/png".to_owned(),
+			size:   3,
+			inline: Bytes::from_static(b"png"),
+			detail: blob::Detail::Original as i32,
+		})
 		.expect("finish image");
 		let parts = device.prompt(Ok(&payload), &PromptCaps {
 			maximum_parts:      16,
@@ -1504,10 +1493,7 @@ mod tests {
 
 		let replacement =
 			OutputTarget::resolve(root.path(), "out/speech.wav").expect("replacement target");
-		assert_eq!(
-			replacement.write(b"second").expect("replacement write"),
-			"out/speech.wav"
-		);
+		assert_eq!(replacement.write(b"second").expect("replacement write"), "out/speech.wav");
 		assert_eq!(
 			fs::read(root.path().join("out/speech.wav")).expect("replacement read"),
 			b"second"

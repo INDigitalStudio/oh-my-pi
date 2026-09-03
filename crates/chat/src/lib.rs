@@ -50,8 +50,7 @@ pub use actions::{HostAction, HostMailbox};
 pub use chrome::ModelBadge;
 pub use host::{
 	CtrlCAction, Host, HostCommand, HostError, HostOptions, InitialPanel, LocalFacts, NativeEffect,
-	NativeHost,
-	UpEvent, ctrl_c_action, render_surface,
+	NativeHost, UpEvent, ctrl_c_action, render_surface,
 };
 pub use overlays::{ModelRow, PickerEvent};
 pub use project::{BlockKind, BlockView, block_views};

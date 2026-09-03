@@ -92,16 +92,18 @@ struct HeadWatcher {
 impl HeadWatcher {
 	fn install(repo: &GitRepo, events: Sender<()>) -> Option<Self> {
 		let target = repo.head_watch_target();
-		let directory = if target.is_dir() { target.as_path() } else { target.parent()? };
+		let directory = if target.is_dir() {
+			target.as_path()
+		} else {
+			target.parent()?
+		};
 		let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
 			if event.is_ok() {
 				let _ = events.send(());
 			}
 		})
 		.ok()?;
-		watcher
-			.watch(directory, RecursiveMode::NonRecursive)
-			.ok()?;
+		watcher.watch(directory, RecursiveMode::NonRecursive).ok()?;
 		let mut watcher = Self { watcher, target };
 		watcher.rearm();
 		Some(watcher)
@@ -160,11 +162,7 @@ async fn watch_loop(
 }
 
 fn branch_of(repo: &GitRepo) -> Option<Str> {
-	repo
-		.current_branch()
-		.ok()
-		.flatten()
-		.map(Str::from)
+	repo.current_branch().ok().flatten().map(Str::from)
 }
 
 fn probe_facts(repo: &GitRepo) -> GitFacts {

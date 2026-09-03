@@ -480,10 +480,9 @@ impl StatusBand {
 		let mode = self.facts.mode?;
 		Some(match mode {
 			ModeChip::Plan => (sf!("{} Plan", charset.icon(Icon::Plan)), theme.accent),
-			ModeChip::PlanPaused => (
-				sf!("{} Plan {}", charset.icon(Icon::Plan), charset.icon(Icon::Pause)),
-				theme.warn,
-			),
+			ModeChip::PlanPaused => {
+				(sf!("{} Plan {}", charset.icon(Icon::Plan), charset.icon(Icon::Pause)), theme.warn)
+			},
 			ModeChip::Prewalk => (sf!("{} Prewalk", charset.icon(Icon::Prewalk)), theme.accent),
 			ModeChip::Goal(state) => {
 				let (icon, color) = match state {
@@ -742,10 +741,7 @@ impl StatusBand {
 			}
 			let drop = [Chip::Git, Chip::Model, Chip::Brand, Chip::Path, Chip::Mode]
 				.into_iter()
-				.find_map(|candidate| {
-					left.iter()
-						.position(|(chip, ..)| *chip == candidate)
-				})
+				.find_map(|candidate| left.iter().position(|(chip, ..)| *chip == candidate))
 				.unwrap_or(left.len() - 1);
 			left.remove(drop);
 		}
@@ -878,17 +874,11 @@ impl Component for StatusBand {
 			.min(rect.width.saturating_sub(left_width));
 		let mut advisor_column = None;
 		if left_width > 0 {
-			Self::paint_group(
-				pc,
-				left,
-				Rect::new(rect.x, rect.y, left_width, 1),
-				false,
-				|chip, x| {
-					if chip == Chip::Model {
-						advisor_column = advisor.map(|(offset, icon)| (x.saturating_add(offset), icon));
-					}
-				},
-			);
+			Self::paint_group(pc, left, Rect::new(rect.x, rect.y, left_width, 1), false, |chip, x| {
+				if chip == Chip::Model {
+					advisor_column = advisor.map(|(offset, icon)| (x.saturating_add(offset), icon));
+				}
+			});
 		}
 		if let Some(((column, icon), badge)) = advisor_column.zip(advisor_badge)
 			&& column.saturating_add(cell_width(icon)) <= rect.x.saturating_add(left_width)

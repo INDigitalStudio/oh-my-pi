@@ -58,12 +58,11 @@ const SHARE_SNAPSHOT_VERSION: u8 = 1;
 const SHARE_MESSAGE: &str = "Sharing session…";
 const CLEANSE_MESSAGE: &str = "Cleansing workspace…";
 /// Legacy `security review` child brief (`chat_ui/commands/security.rs`).
-const SECURITY_REVIEW_BRIEF: &str = "Launch exactly one ordinary local child agent to review \
-                                     `{target}` for security defects: injection, secrets in \
-                                     source, unsafe deserialization, path traversal, missing \
-                                     authorization checks, and unsafe shell or SQL construction. \
-                                     Report findings first, each with file:line, severity, and \
-                                     a concrete fix; never edit files.";
+const SECURITY_REVIEW_BRIEF: &str =
+	"Launch exactly one ordinary local child agent to review `{target}` for security defects: \
+	 injection, secrets in source, unsafe deserialization, path traversal, missing authorization \
+	 checks, and unsafe shell or SQL construction. Report findings first, each with file:line, \
+	 severity, and a concrete fix; never edit files.";
 const DEFERRED_COLLAB: &str = "Collaboration hosting is unavailable: the relay host loop \
                                (HostJournalBridge over the removed omp_agent::Journal replication \
                                subscription) has no seam on the journal-first session.";
@@ -71,8 +70,8 @@ const DEFERRED_JOIN: &str = "Joining a collaboration room is unavailable: the gu
                              its UI state were removed in 7546bcfa06; omp_driver::collab only \
                              keeps relay presence.";
 const DEFERRED_PREWALK: &str = "Prewalk is unavailable: it needs a prewalk Director in \
-                                crates/agent/src/directors (the mode regime was deleted with \
-                                the kernel cutover); sv_task_agent_prewalk only affects children.";
+                                crates/agent/src/directors (the mode regime was deleted with the \
+                                kernel cutover); sv_task_agent_prewalk only affects children.";
 const DEFERRED_ADVISOR: &str = "Advisor is unavailable: no advisor Director exists in \
                                 crates/agent/src/directors (only prompts/modes/advisor.md).";
 
@@ -175,21 +174,44 @@ pub(crate) fn share_snapshot(dom: &omp_dom::Dom) -> serde_json::Value {
 /// same facts as a markdown block).
 pub(crate) fn security_report(cx: &PanelCx<'_>) -> Str {
 	let mut out = StrMut::new("**Security posture**\n\n");
-	let _ = writeln!(out, "- Host approval: `sv_approval_mode {}`", var_text(cx, "sv_approval_mode"));
+	let _ =
+		writeln!(out, "- Host approval: `sv_approval_mode {}`", var_text(cx, "sv_approval_mode"));
 	let _ = writeln!(
 		out,
 		"- Tool approval tier: `sv_tools_approval_mode {}`",
 		var_text(cx, "sv_tools_approval_mode")
 	);
-	let _ = writeln!(out, "- Per-tool overrides: `sv_tools_approval {}`", var_text(cx, "sv_tools_approval"));
+	let _ = writeln!(
+		out,
+		"- Per-tool overrides: `sv_tools_approval {}`",
+		var_text(cx, "sv_tools_approval")
+	);
 	let _ = writeln!(out, "- Tool roster enabled: `sv_tools {}`", var_text(cx, "sv_tools"));
 	let _ = writeln!(out, "- Sandbox: `sv_sandbox_mode {}`", var_text(cx, "sv_sandbox_mode"));
-	let _ = writeln!(out, "- Network: `sv_sandbox_network_mode {}`", var_text(cx, "sv_sandbox_network_mode"));
-	let _ = writeln!(out, "- Writable roots: `sv_sandbox_writable_roots {}`", var_text(cx, "sv_sandbox_writable_roots"));
-	let _ = writeln!(out, "- Read mode: `sv_sandbox_read_mode {}`", var_text(cx, "sv_sandbox_read_mode"));
-	let _ = writeln!(out, "- Browser tool: `sv_browser_enabled {}` · headless `{}`", var_text(cx, "sv_browser_enabled"), var_text(cx, "sv_browser_headless"));
-	let _ = writeln!(out, "- Fetch in read: `sv_fetch_enabled {}`", var_text(cx, "sv_fetch_enabled"));
-	let _ = write!(out, "\n`/security review [path]` drafts a findings-first review brief for a child agent.");
+	let _ = writeln!(
+		out,
+		"- Network: `sv_sandbox_network_mode {}`",
+		var_text(cx, "sv_sandbox_network_mode")
+	);
+	let _ = writeln!(
+		out,
+		"- Writable roots: `sv_sandbox_writable_roots {}`",
+		var_text(cx, "sv_sandbox_writable_roots")
+	);
+	let _ =
+		writeln!(out, "- Read mode: `sv_sandbox_read_mode {}`", var_text(cx, "sv_sandbox_read_mode"));
+	let _ = writeln!(
+		out,
+		"- Browser tool: `sv_browser_enabled {}` · headless `{}`",
+		var_text(cx, "sv_browser_enabled"),
+		var_text(cx, "sv_browser_headless")
+	);
+	let _ =
+		writeln!(out, "- Fetch in read: `sv_fetch_enabled {}`", var_text(cx, "sv_fetch_enabled"));
+	let _ = write!(
+		out,
+		"\n`/security review [path]` drafts a findings-first review brief for a child agent."
+	);
 	out.freeze()
 }
 
@@ -197,7 +219,8 @@ pub(crate) fn security_report(cx: &PanelCx<'_>) -> Str {
 /// --host-key <SHA256:…> [--port <n>] [--key <path>] [--scope user|project]`.
 fn parse_ssh_add(words: &[&str]) -> Result<SshHostSpec, ConError> {
 	const USAGE: &str = "Usage: /ssh add <alias> --host <host> --user <user> --host-key \
-	                     <SHA256:fingerprint> [--port <1-65535>] [--key <path>] [--scope user|project]";
+	                     <SHA256:fingerprint> [--port <1-65535>] [--key <path>] [--scope \
+	                     user|project]";
 	let mut words = words.iter().copied();
 	let alias = words.next().ok_or_else(|| usage(USAGE))?;
 	let mut spec = SshHostSpec {
@@ -256,7 +279,8 @@ fn ssh_list(cx: &PanelCx<'_>) -> Result<Box<dyn crate::overlays::Panel>, Str> {
 	}
 	let mut body = StrMut::new("**Configured SSH hosts**\n");
 	for host in &hosts {
-		let _ = writeln!(body, "- `{}` ({}) — `{}` · {}", host.name, host.scope, host.target, host.auth);
+		let _ =
+			writeln!(body, "- `{}` ({}) — `{}` · {}", host.name, host.scope, host.target, host.auth);
 	}
 	Ok(Box::new(ReportPanel::new("ssh", "SSH hosts", body.freeze(), cx.ui)))
 }
@@ -530,8 +554,17 @@ mod tests {
 	#[test]
 	fn ssh_add_parses_the_legacy_flag_grammar() {
 		let spec = parse_ssh_add(&[
-			"build", "--host", "10.0.0.5", "--user", "ci", "--host-key", "SHA256:abc", "--port",
-			"2222", "--scope", "user",
+			"build",
+			"--host",
+			"10.0.0.5",
+			"--user",
+			"ci",
+			"--host-key",
+			"SHA256:abc",
+			"--port",
+			"2222",
+			"--scope",
+			"user",
 		])
 		.unwrap();
 		assert_eq!(spec.alias, "build");
@@ -541,7 +574,9 @@ mod tests {
 		assert!(!spec.project);
 		assert!(spec.key.is_none());
 		assert!(parse_ssh_add(&["build", "--host", "x"]).is_err(), "user and host key are required");
-		assert!(parse_ssh_add(&["build", "--host", "x", "--user", "u", "--host-key", "MD5:z"]).is_err());
+		assert!(
+			parse_ssh_add(&["build", "--host", "x", "--user", "u", "--host-key", "MD5:z"]).is_err()
+		);
 	}
 
 	#[test]
@@ -594,7 +629,9 @@ mod tests {
 		assert!(AI_EXTENDED_CONTEXT.get(&ctx));
 		let (_, event) = run_call("extended-context");
 		assert_eq!(event, PanelEvent::Notice(Str::new_static("Extended context: off")));
-		let ctx = crate::actions::HostMailbox::new().attach(omp_con::Ctx::builder()).build();
+		let ctx = crate::actions::HostMailbox::new()
+			.attach(omp_con::Ctx::builder())
+			.build();
 		assert!(ctx.run("extended-context sideways").is_err(), "bad words are usage errors");
 	}
 
@@ -629,8 +666,14 @@ mod tests {
 	#[test]
 	fn vision_sets_the_session_convar_and_reports_the_flow() {
 		let (_, event) = run_call("vision off");
-		assert!(matches!(&event, PanelEvent::Notice(text) if text == "Vision mode: off · images never sent"), "{event:?}");
+		assert!(
+			matches!(&event, PanelEvent::Notice(text) if text == "Vision mode: off · images never sent"),
+			"{event:?}"
+		);
 		let (_, event) = run_call("vision status");
-		assert!(matches!(&event, PanelEvent::Notice(text) if text.starts_with("Vision mode: ")), "{event:?}");
+		assert!(
+			matches!(&event, PanelEvent::Notice(text) if text.starts_with("Vision mode: ")),
+			"{event:?}"
+		);
 	}
 }

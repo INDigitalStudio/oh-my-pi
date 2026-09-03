@@ -133,10 +133,10 @@ pub fn pick_weighted_tip<'a>(tips: &[&'a str], r: f32) -> &'a str {
 fn rolls(seed: u64) -> (f32, f32) {
 	let mut state = seed;
 	let mut next = || {
-		state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+		state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
 		let mut z = state;
-		z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-		z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+		z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+		z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
 		z ^= z >> 31;
 		(z >> 40) as f32 / (1u64 << 24) as f32
 	};
@@ -153,9 +153,9 @@ static LAUNCH_SEED: LazyLock<u64> = LazyLock::new(|| {
 /// Deterministic seed for `cwd` (FNV-1a), the headless golden's tip source.
 #[must_use]
 pub fn welcome_seed(cwd: &str) -> u64 {
-	cwd
-		.bytes()
-		.fold(0xcbf2_9ce4_8422_2325_u64, |acc, byte| (acc ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3))
+	cwd.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |acc, byte| {
+		(acc ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+	})
 }
 
 /// Picks the session's startup tip from `seed` with pi's rolls: the
@@ -320,9 +320,9 @@ impl Welcome {
 		let mut column = x;
 		let mut utf8 = [0; 4];
 		for (index, glyph) in NEW_TAG_TEXT.chars().enumerate() {
-			column = pc
-				.frame
-				.put(column, y, glyph.encode_utf8(&mut utf8), rainbow.style(index, count));
+			column =
+				pc.frame
+					.put(column, y, glyph.encode_utf8(&mut utf8), rainbow.style(index, count));
 		}
 	}
 
@@ -332,7 +332,8 @@ impl Welcome {
 		let muted = Style::new().fg(theme.muted);
 		if self.facts.recent.is_empty() {
 			if index == 0 {
-				pc.frame.put(x.saturating_add(1), y, "No recent sessions", dim);
+				pc.frame
+					.put(x.saturating_add(1), y, "No recent sessions", dim);
 			}
 			return;
 		}
@@ -381,7 +382,9 @@ impl Welcome {
 			LspStatus::Error => (Icon::Error, Style::new().fg(theme.err)),
 		};
 		let mut column = pc.frame.put(x, y, " ", dim);
-		column = pc.frame.put(column, y, pc.ctx.charset.icon(icon), icon_style);
+		column = pc
+			.frame
+			.put(column, y, pc.ctx.charset.icon(icon), icon_style);
 		column = pc.frame.put(column, y, " ", dim);
 		column = pc.frame.put(column, y, &server.name, muted);
 		for file_type in server.file_types.iter().take(3) {
@@ -590,9 +593,7 @@ impl Component for Welcome {
 					row if row == sessions_top - 1 => {
 						pc.frame.put(content_x, y, "Recent sessions", accent);
 					},
-					row if row >= sessions_top
-						&& usize::from(row - sessions_top) < SESSION_SLOTS =>
-					{
+					row if row >= sessions_top && usize::from(row - sessions_top) < SESSION_SLOTS => {
 						self.paint_session(pc, right_x, y, right_col, usize::from(row - sessions_top));
 					},
 					_ => {},
@@ -611,7 +612,11 @@ impl Component for Welcome {
 			let mut column = pc.frame.put(x, y, bl.encode_utf8(&mut [0; 4]), dim);
 			column = put_repeat(pc, column, y, horizontal, left_col, dim);
 			if show_right {
-				let tee = if pc.ctx.charset == Charset::Ascii { "+" } else { "┴" };
+				let tee = if pc.ctx.charset == Charset::Ascii {
+					"+"
+				} else {
+					"┴"
+				};
 				column = pc.frame.put(column, y, tee, dim);
 				column = put_repeat(pc, column, y, horizontal, right_col, dim);
 			}
@@ -717,9 +722,14 @@ mod tests {
 	fn recent_sessions_keep_the_time_suffix_and_pad_to_four_slots() {
 		let facts = WelcomeFacts {
 			recent: vec![
-				RecentSession { name: Str::new_static("fix the parser"), time_ago: Str::new_static("2h ago") },
 				RecentSession {
-					name:     Str::new_static("a very long session name that certainly does not fit inside the column"),
+					name:     Str::new_static("fix the parser"),
+					time_ago: Str::new_static("2h ago"),
+				},
+				RecentSession {
+					name:     Str::new_static(
+						"a very long session name that certainly does not fit inside the column",
+					),
 					time_ago: Str::new_static("3d ago"),
 				},
 			],
@@ -802,14 +812,21 @@ mod tests {
 
 	#[test]
 	fn new_tag_rides_the_last_tip_line_or_its_own_line() {
-		let ui = Ui::from_root(welcome("Try /omfg [NEW]", WelcomeFacts::default()), 120, UiContext::default());
+		let ui = Ui::from_root(
+			welcome("Try /omfg [NEW]", WelcomeFacts::default()),
+			120,
+			UiContext::default(),
+		);
 		let rows = rows_of(&ui);
 		assert_eq!(rows[21], " Tip: Try /omfg NEW!");
 		assert_eq!(rows.len(), 22);
 		// Rainbow at phase 0: N=0°, E=90°, W=180°, !=270°, bold.
 		let style = ui.frame().cell(16, 21).style();
 		assert_eq!(style, Rainbow::default().style(0, 4));
-		assert_eq!(ui.frame().cell(17, 21).style().foreground_color(), omp_tui::anim::hsl(90.0, 0.95, 0.6));
+		assert_eq!(
+			ui.frame().cell(17, 21).style().foreground_color(),
+			omp_tui::anim::hsl(90.0, 0.95, 0.6)
+		);
 		assert_eq!(ui.next_wake(), None, "a resting welcome never animates the tag");
 
 		// A body filling the budget pushes the tag to its own indented line.
@@ -830,7 +847,10 @@ mod tests {
 
 	#[test]
 	fn tip_wrap_is_retained_across_frames_and_rebuilt_only_on_width_change() {
-		let mut component = welcome("Press shift+tab to cycle through reasoning effort levels of the current model", WelcomeFacts::default());
+		let mut component = welcome(
+			"Press shift+tab to cycle through reasoning effort levels of the current model",
+			WelcomeFacts::default(),
+		);
 		let ctx = UiContext::default();
 		let first = component.height(&ctx, 60);
 		let count = component.tip_wrap.lines.len();

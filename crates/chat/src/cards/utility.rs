@@ -1,4 +1,5 @@
-//! Typed cards for checkpointing, structured yield, memory maintenance, skills, and media.
+//! Typed cards for checkpointing, structured yield, memory maintenance, skills,
+//! and media.
 
 use omp_core::{Str, sf};
 use omp_tui::{IntoComponent as _, UiContext, dom};
@@ -30,7 +31,9 @@ pub struct TtsCard;
 pub struct SecurityScanCard;
 
 impl Card for CheckpointCard {
-	fn tool(&self) -> &'static str { "checkpoint" }
+	fn tool(&self) -> &'static str {
+		"checkpoint"
+	}
 
 	fn render(&self, view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::checkpoint::CheckpointParams>(view);
@@ -50,7 +53,9 @@ impl Card for CheckpointCard {
 }
 
 impl Card for RewindCard {
-	fn tool(&self) -> &'static str { "rewind" }
+	fn tool(&self) -> &'static str {
+		"rewind"
+	}
 
 	fn render(&self, view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::checkpoint::RewindParams>(view);
@@ -70,7 +75,9 @@ impl Card for RewindCard {
 }
 
 impl Card for YieldCard {
-	fn tool(&self) -> &'static str { "yield" }
+	fn tool(&self) -> &'static str {
+		"yield"
+	}
 
 	fn render(&self, view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::yield_tool::Params>(view);
@@ -80,13 +87,23 @@ impl Card for YieldCard {
 			.and_then(|value| value.get("incremental"))
 			.and_then(Value::as_bool)
 			.unwrap_or(false);
-		let detail = if incremental { "incremental section" } else { "terminal result" };
+		let detail = if incremental {
+			"incremental section"
+		} else {
+			"terminal result"
+		};
 		let kind = args
 			.as_ref()
 			.and_then(|value| value.get("type"))
 			.map(compact_json)
 			.unwrap_or_default();
-		semantic_row("output", "Submit result", detail, (!kind.is_empty()).then_some(kind.as_str()), view)
+		semantic_row(
+			"output",
+			"Submit result",
+			detail,
+			(!kind.is_empty()).then_some(kind.as_str()),
+			view,
+		)
 	}
 }
 
@@ -99,7 +116,9 @@ struct MemoryEditOutcome {
 }
 
 impl Card for MemoryEditCard {
-	fn tool(&self) -> &'static str { "memory_edit" }
+	fn tool(&self) -> &'static str {
+		"memory_edit"
+	}
 
 	fn render(&self, view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::memory_edit::Params>(view);
@@ -125,7 +144,9 @@ impl Card for MemoryEditCard {
 }
 
 impl Card for LearnCard {
-	fn tool(&self) -> &'static str { "learn" }
+	fn tool(&self) -> &'static str {
+		"learn"
+	}
 
 	fn render(&self, view: &CardView<'_>, expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::learn::Params>(view);
@@ -139,13 +160,19 @@ impl Card for LearnCard {
 			.as_ref()
 			.and_then(|value| value.get("memory_id"))
 			.and_then(Value::as_str);
-		let body = if expanded { memory } else { memory.lines().next().unwrap_or_default() };
+		let body = if expanded {
+			memory
+		} else {
+			memory.lines().next().unwrap_or_default()
+		};
 		semantic_row("memory-tool", "Learn", body, id, view)
 	}
 }
 
 impl Card for ManageSkillCard {
-	fn tool(&self) -> &'static str { "manage_skill" }
+	fn tool(&self) -> &'static str {
+		"manage_skill"
+	}
 
 	fn render(&self, view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::manage_skill::Params>(view);
@@ -193,7 +220,9 @@ struct MediaFault {
 }
 
 impl Card for ImageGenCard {
-	fn tool(&self) -> &'static str { "image_gen" }
+	fn tool(&self) -> &'static str {
+		"image_gen"
+	}
 
 	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
 		render_media(view, expanded, ui, false)
@@ -201,7 +230,9 @@ impl Card for ImageGenCard {
 }
 
 impl Card for TtsCard {
-	fn tool(&self) -> &'static str { "tts" }
+	fn tool(&self) -> &'static str {
+		"tts"
+	}
 
 	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
 		render_media(view, expanded, ui, true)
@@ -209,7 +240,9 @@ impl Card for TtsCard {
 }
 
 impl Card for SecurityScanCard {
-	fn tool(&self) -> &'static str { "security_scan" }
+	fn tool(&self) -> &'static str {
+		"security_scan"
+	}
 
 	fn render(&self, view: &CardView<'_>, expanded: bool, _ui: &UiContext) -> Component {
 		let result = view.outcome_json();
@@ -236,7 +269,8 @@ impl Card for SecurityScanCard {
 				if let Some(detail) = detail { <pre pad-x=2>{detail}</pre> }
 				if let Some(fault) = fault { <text pad-x=2 fg=err>{fault}</text> }
 			</col>
-		}.into_component()
+		}
+		.into_component()
 	}
 }
 
@@ -250,7 +284,10 @@ fn render_media(view: &CardView<'_>, expanded: bool, ui: &UiContext, speech: boo
 		.and_then(|value| value.get("prompt"))
 		.map(compact_json);
 	let description = if speech {
-		args.as_ref().and_then(|value| value.get("text")).and_then(Value::as_str)
+		args
+			.as_ref()
+			.and_then(|value| value.get("text"))
+			.and_then(Value::as_str)
 	} else {
 		prompt.as_deref()
 	};
@@ -270,7 +307,11 @@ fn render_media(view: &CardView<'_>, expanded: bool, ui: &UiContext, speech: boo
 		.and_then(Value::as_str)
 		.map(Str::new);
 	let image = (!speech)
-		.then(|| artifact.as_ref().map(|src| result_image(src, mime, output_path.as_deref(), ui)))
+		.then(|| {
+			artifact
+				.as_ref()
+				.map(|src| result_image(src, mime, output_path.as_deref(), ui))
+		})
 		.flatten();
 	dom! {
 		<col>
@@ -289,7 +330,8 @@ fn render_media(view: &CardView<'_>, expanded: bool, ui: &UiContext, speech: boo
 			if speech && expanded { if let Some(artifact) = artifact { <text pad-x=2>{artifact}</text> } }
 			if let Some(fault) = fault { <text pad-x=2 fg=err>{fault}</text> }
 		</col>
-	}.into_component()
+	}
+	.into_component()
 }
 
 fn semantic_row(
@@ -314,7 +356,8 @@ fn semantic_row(
 			</row>
 			if let Some(fault) = fault { <text pad-x=2 fg=err>{fault}</text> }
 		</col>
-	}.into_component()
+	}
+	.into_component()
 }
 
 fn compact_json(value: &Value) -> String {

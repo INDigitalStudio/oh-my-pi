@@ -108,17 +108,15 @@ pub fn plugins_op(words: Option<Str>) -> Result<PluginsOp, ConError> {
 	let id = |enabled: bool| {
 		(!rest.is_empty())
 			.then(|| PluginsOp::SetEnabled { id: Str::new(rest), enabled })
-			.ok_or_else(|| {
-				ConError::Usage(sf!(
-					"Usage: /plugins {verb} <name@marketplace>"
-				))
-			})
+			.ok_or_else(|| ConError::Usage(sf!("Usage: /plugins {verb} <name@marketplace>")))
 	};
 	match verb {
 		"" | "list" => Ok(PluginsOp::List),
 		"enable" => id(true),
 		"disable" => id(false),
-		_ => Err(usage("Usage: /plugins [list|enable <name@marketplace>|disable <name@marketplace>]")),
+		_ => {
+			Err(usage("Usage: /plugins [list|enable <name@marketplace>|disable <name@marketplace>]"))
+		},
 	}
 }
 
@@ -131,7 +129,9 @@ pub fn marketplace_op(words: Option<Str>) -> Result<MarketplaceOp, ConError> {
 	let optional = || (!rest.is_empty()).then(|| Str::new(rest));
 	Ok(match verb {
 		"" => MarketplaceOp::Browse,
-		"add" => MarketplaceOp::Add(optional().ok_or_else(|| usage("Usage: /marketplace add <source>"))?),
+		"add" => {
+			MarketplaceOp::Add(optional().ok_or_else(|| usage("Usage: /marketplace add <source>"))?)
+		},
 		"remove" | "rm" => MarketplaceOp::Remove(
 			optional().ok_or_else(|| usage("Usage: /marketplace remove <name>"))?,
 		),
@@ -176,7 +176,12 @@ pub fn tools_report(rows: &[ToolRow], roster: &[Str]) -> Option<Str> {
 		if let Some(tier) = &row.tier {
 			let _ = write!(body, " [{tier}]");
 		}
-		if let Some(summary) = row.description.lines().next().filter(|line| !line.is_empty()) {
+		if let Some(summary) = row
+			.description
+			.lines()
+			.next()
+			.filter(|line| !line.is_empty())
+		{
 			let _ = write!(body, " — {summary}");
 		}
 		if !active(row) {
@@ -207,7 +212,11 @@ pub fn plugins_report(report: &PluginsReport) -> Option<Str> {
 			plugin.id,
 			plugin.version.as_deref().unwrap_or("?"),
 			if plugin.enabled { "" } else { " (disabled)" },
-			if plugin.scope.is_empty() { "user" } else { plugin.scope.as_str() },
+			if plugin.scope.is_empty() {
+				"user"
+			} else {
+				plugin.scope.as_str()
+			},
 			if plugin.shadowed { " [shadowed]" } else { "" }
 		);
 	}
@@ -236,7 +245,8 @@ fn discover_text(report: &PluginsReport, marketplace: Option<&str>) -> Str {
 	if plugins.is_empty() {
 		return if report.sources.is_empty() {
 			Str::new_static(
-				"No marketplaces configured. Try:\n  /marketplace add anthropics/claude-plugins-official",
+				"No marketplaces configured. Try:\n  /marketplace add \
+				 anthropics/claude-plugins-official",
 			)
 		} else {
 			Str::new_static("No plugins available in configured marketplaces")
@@ -272,7 +282,11 @@ fn installed_text(report: &PluginsReport) -> Str {
 			body,
 			"  {} [{}]{}",
 			plugin.id,
-			if plugin.scope.is_empty() { "user" } else { plugin.scope.as_str() },
+			if plugin.scope.is_empty() {
+				"user"
+			} else {
+				plugin.scope.as_str()
+			},
 			if plugin.shadowed { " [shadowed]" } else { "" }
 		);
 	}
@@ -297,7 +311,10 @@ fn pending(
 	id: &'static str,
 	title: &'static str,
 	message: Str,
-	started: Result<crate::overlays::services::Pending<Str>, crate::overlays::services::ServiceError>,
+	started: Result<
+		crate::overlays::services::Pending<Str>,
+		crate::overlays::services::ServiceError,
+	>,
 	cx: &PanelCx<'_>,
 ) -> Opened {
 	let pending = started.map_err(services_error)?;
@@ -330,7 +347,9 @@ fn open_marketplace(op: &MarketplaceOp, cx: &PanelCx<'_>) -> Opened {
 			return open_selector(PluginMode::Install, cx);
 		},
 		MarketplaceOp::Uninstall(None) => return open_selector(PluginMode::Uninstall, cx),
-		MarketplaceOp::Help => report("marketplace", "Marketplace", preformatted(MARKETPLACE_HELP), cx),
+		MarketplaceOp::Help => {
+			report("marketplace", "Marketplace", preformatted(MARKETPLACE_HELP), cx)
+		},
 		MarketplaceOp::List => {
 			let text = marketplaces_text(&marketplace_report(cx)?);
 			report("marketplace", "Marketplaces", preformatted(&text), cx)
@@ -505,7 +524,10 @@ mod tests {
 		assert_eq!(parse("add owner/repo"), MarketplaceOp::Add(Str::new_static("owner/repo")));
 		assert_eq!(parse("rm official"), MarketplaceOp::Remove(Str::new_static("official")));
 		assert_eq!(parse("update"), MarketplaceOp::Update(None));
-		assert_eq!(parse("update official"), MarketplaceOp::Update(Some(Str::new_static("official"))));
+		assert_eq!(
+			parse("update official"),
+			MarketplaceOp::Update(Some(Str::new_static("official")))
+		);
 		assert_eq!(parse("list"), MarketplaceOp::List);
 		assert_eq!(parse("discover"), MarketplaceOp::Discover(None));
 		assert_eq!(parse("install"), MarketplaceOp::Install(None));
@@ -528,10 +550,12 @@ mod tests {
 		assert_eq!(marketplaces_text(&report).as_str(), "No marketplaces configured.");
 		assert!(discover_text(&report, None).contains("No marketplaces configured. Try:"));
 		assert_eq!(installed_text(&report).as_str(), "No marketplace plugins installed");
-		report.sources.push(crate::overlays::services::MarketplaceSource {
-			name: Str::new_static("official"),
-			uri:  Str::new_static("anthropics/claude-plugins-official"),
-		});
+		report
+			.sources
+			.push(crate::overlays::services::MarketplaceSource {
+				name: Str::new_static("official"),
+				uri:  Str::new_static("anthropics/claude-plugins-official"),
+			});
 		report.marketplaces.push(Str::new_static("official"));
 		assert_eq!(
 			discover_text(&report, None).as_str(),
@@ -560,7 +584,10 @@ mod tests {
 			discover_text(&report, Some("official")).as_str(),
 			"Available plugins:\n  docs@1.2.0 - Docs helper\n"
 		);
-		assert_eq!(installed_text(&report).as_str(), "Installed plugins:\n  docs@official [project]\n");
+		assert_eq!(
+			installed_text(&report).as_str(),
+			"Installed plugins:\n  docs@official [project]\n"
+		);
 		assert!(MARKETPLACE_HELP.starts_with("Marketplace commands:"));
 	}
 }

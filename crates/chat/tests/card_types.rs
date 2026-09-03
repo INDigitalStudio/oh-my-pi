@@ -31,7 +31,8 @@ where
 	let payload: T = serde_json::from_value(fixture)
 		.unwrap_or_else(|error| panic!("{tool} typed payload fixture must deserialize: {error}"));
 	let encoded = serde_json::to_value(&payload).expect("typed payload fixture must serialize");
-	let mut result = node(KnownTag::Result, r#"{"results":[{"error":"projection decoy"}]}"#.to_owned());
+	let mut result =
+		node(KnownTag::Result, r#"{"results":[{"error":"projection decoy"}]}"#.to_owned());
 	result.props.push((
 		PropId::Outcome.into(),
 		DomValue::Json(
@@ -50,12 +51,12 @@ where
 	));
 	let input = node(KnownTag::Input, "{}".to_owned());
 	let view = CardView {
-		input:  &input,
-		result: Some(&result),
-		diag:   None,
-		usage:  None,
-		status: CardStatus::Done,
-		output: None,
+		input:   &input,
+		result:  Some(&result),
+		diag:    None,
+		usage:   None,
+		status:  CardStatus::Done,
+		output:  None,
 		started: None,
 	};
 	let registry = CardRegistry::standard();
@@ -224,7 +225,10 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 		tools::checkpoint::RewindParams,
 		tools::checkpoint::RewindPayload,
 		tools::checkpoint::Fault,
-	>("rewind", json!({"token":"checkpoint-1","report":"parser is sound","receipt":"r1","scheduled":true}));
+	>(
+		"rewind",
+		json!({"token":"checkpoint-1","report":"parser is sound","receipt":"r1","scheduled":true}),
+	);
 	renders_typed::<tools::yield_tool::Params, tools::yield_tool::Payload, tools::yield_tool::Fault>(
 		"yield",
 		json!({"incremental":false,"use_last_turn":false}),

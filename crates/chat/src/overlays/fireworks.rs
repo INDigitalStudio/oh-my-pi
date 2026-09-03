@@ -253,7 +253,8 @@ impl Fireworks {
 			return;
 		}
 		let center_x = left + js_round(f64::from(art_width - 1) * burst.x);
-		let center_y = js_round(f64::from(sky_height - 1) * burst.y).clamp(0, i64::from(sky_height - 2));
+		let center_y =
+			js_round(f64::from(sky_height - 1) * burst.y).clamp(0, i64::from(sky_height - 2));
 		let age = i32::try_from(frame).unwrap_or(i32::MAX) - burst.start;
 
 		if (-6..0).contains(&age) {
@@ -269,7 +270,11 @@ impl Fireworks {
 			return;
 		}
 		let age = age as usize;
-		let radius = if age == 0 { 0.0 } else { 0.8 + age as f64 * 0.92 };
+		let radius = if age == 0 {
+			0.0
+		} else {
+			0.8 + age as f64 * 0.92
+		};
 		let gravity = (age * age / 22) as f64;
 		let glyph = BURST_GLYPHS[age];
 		let particle_color = match age {
@@ -381,7 +386,8 @@ impl Panel for Fireworks {
 	fn tick(&mut self, now: Duration) -> bool {
 		let started = *self.started.get_or_insert(now);
 		let elapsed = now.saturating_sub(started);
-		let step = u32::try_from(elapsed.as_millis() / FRAME_INTERVAL.as_millis()).unwrap_or(u32::MAX);
+		let step =
+			u32::try_from(elapsed.as_millis() / FRAME_INTERVAL.as_millis()).unwrap_or(u32::MAX);
 		if step == self.step {
 			return false;
 		}
@@ -416,9 +422,9 @@ mod tests {
 		let ui = UiContext::default();
 		let services: Arc<dyn Services> = Arc::new(NoServices);
 		let cx = PanelCx {
-			dom: &dom,
-			con: &con,
-			ui: &ui,
+			dom:      &dom,
+			con:      &con,
+			ui:       &ui,
 			viewport: Size { width, height },
 			services: &services,
 		};
@@ -447,10 +453,7 @@ mod tests {
 		assert!(panel.tick(start + Duration::from_millis(85 * 34)));
 		assert_eq!(panel.frame_index(), 0);
 		assert!(!panel.finished());
-		assert_eq!(
-			panel.next_wake(),
-			Some(start + Duration::from_millis(85 * 35))
-		);
+		assert_eq!(panel.next_wake(), Some(start + Duration::from_millis(85 * 35)));
 	}
 
 	#[test]

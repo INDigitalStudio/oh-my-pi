@@ -153,7 +153,9 @@ mod tests {
 	fn multibyte_glyph_before_the_hash_never_panics() {
 		let mut refs = GithubRefs;
 		let chip = "\u{f15c} #1";
-		let suggestions = refs.suggest(chip, chip.len()).expect("standalone #1 still offers rows");
+		let suggestions = refs
+			.suggest(chip, chip.len())
+			.expect("standalone #1 still offers rows");
 		assert_eq!(suggestions.range, 4..chip.len());
 		assert!(refs.suggest("\u{f15c}#1", "\u{f15c}#1".len()).is_none());
 		assert!(refs.suggest("日本 pr #1", "日本 pr #1".len()).is_some());

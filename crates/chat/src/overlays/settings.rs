@@ -352,7 +352,9 @@ impl SettingsPanel {
 		let mut last_row = self.selected;
 		let mut moved = 0;
 		while moved < delta.unsigned_abs() {
-			let Some(candidate) = next.checked_add_signed(delta.signum()) else { break };
+			let Some(candidate) = next.checked_add_signed(delta.signum()) else {
+				break;
+			};
 			if candidate >= self.items.len() {
 				break;
 			}
@@ -532,11 +534,9 @@ impl SettingsPanel {
 					.map_err(|_| sf!("{} expects a number, got {text:?}", row.name))
 					.and_then(number)?,
 			),
-			Widget::Duration => Value::Duration(
-				text
-					.parse::<Span>()
-					.map_err(|_| sf!("{} expects a duration such as 90s or never, got {text:?}", row.name))?,
-			),
+			Widget::Duration => Value::Duration(text.parse::<Span>().map_err(|_| {
+				sf!("{} expects a duration such as 90s or never, got {text:?}", row.name)
+			})?),
 			Widget::Text => Value::Str(Str::new(text)),
 			Widget::List => Value::List(
 				text
@@ -676,7 +676,11 @@ impl SettingsPanel {
 			.selected()
 			.map(|row| row.desc.clone())
 			.unwrap_or_default();
-		let footer = Str::new_static(if self.editor.is_some() { EDIT_FOOTER } else { FOOTER });
+		let footer = Str::new_static(if self.editor.is_some() {
+			EDIT_FOOTER
+		} else {
+			FOOTER
+		});
 		let mut tabs = Tabs::new().with_str(Prop::Id, "groups");
 		for group in &self.tabs {
 			let count = self.rows.iter().filter(|row| row.group == *group).count();
@@ -896,8 +900,9 @@ impl Panel for SettingsPanel {
 	}
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
-		let event =
-			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		self.sync_pointer_tab();
 		match event {
 			UiEvent::Cancel => PanelEvent::Close,
@@ -927,7 +932,11 @@ mod tests {
 			desc: sf!("Doc for {name}."),
 			group: Group::of(name),
 			widget,
-			variants: if widget == Widget::Enum { &["off", "low", "high"] } else { &[] },
+			variants: if widget == Widget::Enum {
+				&["off", "low", "high"]
+			} else {
+				&[]
+			},
 			elem: ValueKind::Str,
 			value,
 			default,
@@ -948,7 +957,8 @@ mod tests {
 	}
 
 	fn point(text: &str, needle: &str) -> (u16, u16) {
-		text.lines()
+		text
+			.lines()
 			.enumerate()
 			.find_map(|(row, line)| {
 				let byte = line.find(needle)?;
@@ -1012,7 +1022,10 @@ mod tests {
 			PanelEvent::Run(Str::new_static("ai_fastmode true; writecfg"))
 		);
 		assert!(panel.selected().unwrap().changed());
-		assert_eq!(panel.key(Key::Space), PanelEvent::Run(Str::new_static("ai_fastmode false; writecfg")));
+		assert_eq!(
+			panel.key(Key::Space),
+			PanelEvent::Run(Str::new_static("ai_fastmode false; writecfg"))
+		);
 	}
 
 	#[test]

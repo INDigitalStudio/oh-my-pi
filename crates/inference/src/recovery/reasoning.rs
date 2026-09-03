@@ -1,8 +1,12 @@
 //! Incremental reasoning-progress and stall detection.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::{
+	collections::{BTreeSet, VecDeque},
+	sync::LazyLock,
+};
 
 use omp_core::Str;
+use regex::Regex;
 
 use super::{
 	RecoveryError, Stage,
@@ -18,13 +22,23 @@ pub struct ReasoningLimits {
 	pub repeated_delta_limit: u32,
 	/// Substantial semantic segments required before similarity may declare a stall.
 	pub no_progress_limit:    u32,
+	/// Consecutive low-novelty, anchor-free segments that declare a
+	/// progress-lexicon stall: reworded filler that recycles recent vocabulary
+	/// and names nothing new. Calibrated by pi against 536k real reasoning
+	/// blocks (longest legitimate run observed: 7).
+	pub low_novelty_run_limit: u32,
 	/// Maximum retained normalized bytes per delta.
 	pub max_delta_bytes:      usize,
 }
 
 impl Default for ReasoningLimits {
 	fn default() -> Self {
-		Self { repeated_delta_limit: 4, no_progress_limit: 12, max_delta_bytes: 16 * 1024 }
+		Self {
+			repeated_delta_limit:  4,
+			no_progress_limit:     12,
+			low_novelty_run_limit: 8,
+			max_delta_bytes:       16 * 1024,
+		}
 	}
 }
 
@@ -42,26 +56,54 @@ pub struct ReasoningObservation<'a> {
 
 /// Bounded state machine detecting direct repeats and semantically repetitive
 /// reasoning segments.
+///
+/// Two semantic shapes are recognized over completed paragraphs, mirroring
+/// pi's `ThinkingLoopDetector`: near-duplicate segments (high word-trigram
+/// overlap with cosmetic wording drift) and progress-lexicon stalls (segments
+/// that keep reshuffling the recent vocabulary without naming any new concrete
+/// reference, so trigrams never match yet nothing advances).
 #[derive(Debug)]
 pub struct ReasoningStallGuard {
-	limits:        ReasoningLimits,
-	last:          Option<(u64, Str)>,
-	repeated:      u32,
-	input_bytes:   u64,
-	pending:       String,
-	segments_seen: u32,
-	segments:      VecDeque<SemanticSegment>,
+	limits:          ReasoningLimits,
+	last:            Option<(u64, Str)>,
+	repeated:        u32,
+	input_bytes:     u64,
+	pending:         String,
+	segments_seen:   u32,
+	low_novelty_run: u32,
+	segments:        VecDeque<SemanticSegment>,
 }
 
 #[derive(Debug)]
 struct SemanticSegment {
-	fingerprint: u64,
-	shingles:    BTreeSet<u64>,
+	/// Word-trigram shingles of the normalized segment.
+	shingles: BTreeSet<u64>,
+	/// Hashed unigram vocabulary of the normalized segment.
+	words:    BTreeSet<u64>,
+	/// Hashed canonical concrete references (paths, identifiers, code spans).
+	anchors:  BTreeSet<u64>,
 }
 
 const SEGMENT_CHAR_CAP: usize = 700;
 const SEGMENT_MIN_NORMALIZED_BYTES: usize = 60;
 const SEGMENT_WINDOW: usize = 16;
+/// Recent segments whose pooled vocabulary and anchors form the novelty
+/// baseline for progress-lexicon stall detection.
+const LEX_NOVELTY_WINDOW: usize = 8;
+/// Novelty (fraction of a segment's words unseen across the recent window) at
+/// or below which a segment counts as recycling earlier wording: `1/5`.
+const LEX_STALL_NOVELTY_FLOOR_RECIPROCAL: usize = 5;
+
+/// A concrete reference the model is actually reasoning about: a code span, a
+/// file extension or dotted member, a multi-segment path, or a
+/// snake/camel/Pascal identifier. Bare digits, abbreviations, and decimals are
+/// excluded so numbered or punctuated filler is not self-anchoring.
+static CONCRETE_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(
+		r"`[^`]+`|\b\w{2,}\.[a-zA-Z]\w{0,4}\b|[\w-]+(?:/[\w-]+){2,}|\b\w+_\w+\b|\b[a-z]+[A-Z]\w*\b|\b[A-Z][a-z]+[A-Z]\w*\b",
+	)
+	.expect("concrete-anchor regex")
+});
 
 impl ReasoningStallGuard {
 	/// Creates a reasoning guard with fixed memory bounds.
@@ -73,6 +115,7 @@ impl ReasoningStallGuard {
 			input_bytes: 0,
 			pending: String::new(),
 			segments_seen: 0,
+			low_novelty_run: 0,
 			segments: VecDeque::new(),
 		}
 	}
@@ -135,14 +178,47 @@ impl ReasoningStallGuard {
 			.filter(|previous| semantic_similarity(&shingles, &previous.shingles))
 			.count()
 			.saturating_add(1) as u32;
+
+		// Progress-lexicon stall: recycled recent vocabulary with no new concrete
+		// reference. Only a *new* anchor breaks the run, so filler that keeps
+		// name-dropping one fixed path or identifier is still caught while
+		// genuine per-target work naming a fresh file or symbol is spared.
+		let words = normalized
+			.split(' ')
+			.map(|word| stable_hash(word.as_bytes()))
+			.collect::<BTreeSet<u64>>();
+		let anchors = concrete_anchors(raw);
+		let recent = || self.segments.iter().rev().take(LEX_NOVELTY_WINDOW);
+		let unseen = words
+			.iter()
+			.filter(|word| recent().all(|previous| !previous.words.contains(word)))
+			.count();
+		let new_anchor = anchors
+			.iter()
+			.any(|anchor| recent().all(|previous| !previous.anchors.contains(anchor)));
+		let low_novelty = recent().next().is_some()
+			&& unseen.saturating_mul(LEX_STALL_NOVELTY_FLOOR_RECIPROCAL) <= words.len();
+		self.low_novelty_run = if low_novelty && !new_anchor {
+			self.low_novelty_run.saturating_add(1)
+		} else {
+			0
+		};
+
 		self.segments_seen = self.segments_seen.saturating_add(1);
-		self.segments.push_back(SemanticSegment { fingerprint, shingles });
+		self
+			.segments
+			.push_back(SemanticSegment { shingles, words, anchors });
 		while self.segments.len() > SEGMENT_WINDOW {
 			self.segments.pop_front();
 		}
-		(self.segments_seen >= self.limits.no_progress_limit
-			&& cluster >= self.limits.repeated_delta_limit)
-			.then_some((fingerprint, cluster))
+		if self.segments_seen < self.limits.no_progress_limit {
+			return None;
+		}
+		if cluster >= self.limits.repeated_delta_limit {
+			return Some((fingerprint, cluster));
+		}
+		(self.low_novelty_run >= self.limits.low_novelty_run_limit)
+			.then_some((fingerprint, self.low_novelty_run))
 	}
 
 	fn finish_semantic(&mut self, visibility: OutputVisibility) -> Option<LoopSignal> {
@@ -177,6 +253,7 @@ impl ReasoningStallGuard {
 		self.repeated = 0;
 		self.pending.clear();
 		self.segments_seen = 0;
+		self.low_novelty_run = 0;
 		self.segments.clear();
 	}
 
@@ -222,6 +299,26 @@ fn normalize_semantic_segment(input: &str, limit: usize) -> Option<String> {
 		}
 	}
 	(!output.is_empty()).then_some(output)
+}
+
+/// Canonical concrete references in a raw segment, skipping title lines the
+/// semantic normalizer also drops. Case-folded with code-span backticks removed
+/// so `Foo`, Foo, and FOO are one anchor and cannot masquerade as "new".
+fn concrete_anchors(raw: &str) -> BTreeSet<u64> {
+	raw.lines()
+		.map(str::trim)
+		.filter(|line| !line.starts_with('#') && !is_emphasis_title(line))
+		.flat_map(|line| CONCRETE_ANCHOR.find_iter(line))
+		.map(|found| {
+			let anchor = found
+				.as_str()
+				.chars()
+				.filter(|character| *character != '`')
+				.flat_map(char::to_lowercase)
+				.collect::<String>();
+			stable_hash(anchor.as_bytes())
+		})
+		.collect()
 }
 
 fn is_emphasis_title(line: &str) -> bool {
@@ -379,10 +476,34 @@ mod tests {
 	}
 
 	#[test]
+	fn near_duplicate_segments_trip_by_trigram_cluster() {
+		let limits = ReasoningLimits {
+			repeated_delta_limit: 3,
+			no_progress_limit: 4,
+			..ReasoningLimits::default()
+		};
+		let mut guard = ReasoningStallGuard::new(limits);
+		let mut signal = None;
+		for suffix in ["carefully", "thoroughly", "diligently", "rigorously"] {
+			signal = guard.observe(ReasoningObservation {
+				delta: &format!(
+					"I am now checking the implementation to ensure the final result is safe complete correct and ready for delivery {suffix}.\n\n"
+				),
+				semantic_progress: false,
+				visibility: OutputVisibility::Gated,
+			});
+		}
+		let signal = signal.expect("near-duplicate segments must terminate the stall");
+		assert_eq!(signal.evidence.kind, LoopKind::ReasoningStall);
+		assert_eq!(signal.evidence.repetitions, 4);
+	}
+
+	#[test]
 	fn repetitive_semantic_segments_trip_after_bounded_evidence() {
 		let limits = ReasoningLimits {
 			repeated_delta_limit: 3,
 			no_progress_limit: 4,
+			low_novelty_run_limit: 3,
 			..ReasoningLimits::default()
 		};
 		let mut guard = ReasoningStallGuard::new(limits);
@@ -403,6 +524,36 @@ mod tests {
 		let signal = signal.expect("repetitive semantic segments must terminate the stall");
 		assert_eq!(signal.evidence.kind, LoopKind::ReasoningStall);
 		assert_eq!(signal.disposition, LoopDisposition::RetryEligible);
+		assert_eq!(signal.evidence.repetitions, 3, "three low-novelty segments follow the first");
+	}
+
+	#[test]
+	fn a_new_concrete_anchor_resets_the_low_novelty_run() {
+		let limits = ReasoningLimits {
+			repeated_delta_limit: 3,
+			no_progress_limit: 4,
+			low_novelty_run_limit: 3,
+			..ReasoningLimits::default()
+		};
+		let mut guard = ReasoningStallGuard::new(limits);
+		let paragraphs = [
+			"I am now carefully checking the implementation to ensure the final result is safe complete correct and ready for delivery with every detail verified.",
+			"I am now carefully checking the implementation to ensure the final result is safe complete correct and ready for delivery with all details verified.",
+			"I am now carefully checking the implementation in src/codec/schema.rs to ensure the final result is safe complete correct and ready for delivery.",
+			"I am now carefully checking the implementation to ensure the final result is safe complete correct and ready for delivery and each detail verified.",
+		];
+		for paragraph in paragraphs {
+			assert!(
+				guard
+					.observe(ReasoningObservation {
+						delta: &format!("{paragraph}\n\n"),
+						semantic_progress: false,
+						visibility: OutputVisibility::Gated,
+					})
+					.is_none(),
+				"a segment naming a fresh reference is real work, not a stall"
+			);
+		}
 	}
 
 	#[test]

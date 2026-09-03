@@ -16,14 +16,12 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flume::Receiver;
-
 use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
 use omp_core::{Str, StrMut, sf};
 use omp_dom::{Dom, KnownTag, Node, PropId, PropKey, Tag, Value};
 use omp_tui::{
 	Frame, IntoComponent, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent,
-	components::hr::truncate_to_width,
-	dom,
+	components::hr::truncate_to_width, dom,
 };
 
 use super::{
@@ -113,15 +111,10 @@ pub struct JobRow {
 /// Reads every `<subagent>`/`<job>` under `<meta><jobs>`.
 #[must_use]
 pub fn job_rows(dom: &Dom) -> Vec<JobRow> {
-	let Some(jobs) = dom
-		.children(dom.meta())
-		.iter()
-		.copied()
-		.find(|handle| {
-			dom.get(*handle)
-				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Jobs))
-		})
-	else {
+	let Some(jobs) = dom.children(dom.meta()).iter().copied().find(|handle| {
+		dom.get(*handle)
+			.is_some_and(|node| node.tag == Tag::Known(KnownTag::Jobs))
+	}) else {
 		return Vec::new();
 	};
 	dom.children(jobs)
@@ -131,16 +124,17 @@ pub fn job_rows(dom: &Dom) -> Vec<JobRow> {
 		.map(|node| JobRow {
 			id:         prop_text(node, PropId::Id).unwrap_or_default(),
 			kind:       prop_text(node, PropId::Kind).unwrap_or_else(|| Str::new_static("job")),
-			status:     prop_text(node, PropId::Status)
-				.unwrap_or_else(|| Str::new_static("running")),
+			status:     prop_text(node, PropId::Status).unwrap_or_else(|| Str::new_static("running")),
 			owner:      custom_text(node, "owner").unwrap_or_else(|| Str::new_static("Main")),
 			agent:      custom_text(node, "agent"),
 			model:      prop_text(node, PropId::Model),
 			started_ms: custom_text(node, "started").and_then(|text| text.parse().ok()),
-			data:       node.prop(&PropId::Data.into()).and_then(|value| match value {
-				Value::Json(raw) => Some(Str::new(raw.get())),
-				other => other.as_str().map(Str::new),
-			}),
+			data:       node
+				.prop(&PropId::Data.into())
+				.and_then(|value| match value {
+					Value::Json(raw) => Some(Str::new(raw.get())),
+					other => other.as_str().map(Str::new),
+				}),
 		})
 		.collect()
 }
@@ -356,7 +350,8 @@ impl AgentHub {
 			.services
 			.sessions(super::services::SessionScope::Project)
 			.map(|rows| {
-				rows.into_iter()
+				rows
+					.into_iter()
 					.filter(|row| stems.iter().any(|stem| *stem == row.id))
 					.collect()
 			})
@@ -427,11 +422,15 @@ impl AgentHub {
 	}
 
 	fn selected_job(&self) -> Option<&JobRow> {
-		self.lines.get(self.selected).map(|line| &self.jobs[line.job])
+		self
+			.lines
+			.get(self.selected)
+			.map(|line| &self.jobs[line.job])
 	}
 
 	fn children_of(&self, id: &str) -> Vec<usize> {
-		self.jobs
+		self
+			.jobs
 			.iter()
 			.enumerate()
 			.filter(|(_, job)| job.owner.as_str() == id)
@@ -481,7 +480,12 @@ impl AgentHub {
 			},
 		};
 		self.selected = selected_id
-			.and_then(|id| self.lines.iter().position(|line| self.jobs[line.job].id == id))
+			.and_then(|id| {
+				self
+					.lines
+					.iter()
+					.position(|line| self.jobs[line.job].id == id)
+			})
 			.unwrap_or_else(|| self.selected.min(self.lines.len().saturating_sub(1)));
 		self.refresh_activity();
 	}
@@ -515,9 +519,13 @@ impl AgentHub {
 	fn scope_ids(&self) -> Option<Vec<Str>> {
 		match self.activity_scope {
 			ActivityScope::All => None,
-			ActivityScope::Agent => {
-				Some(self.selected_job().map(|job| job.id.clone()).into_iter().collect())
-			},
+			ActivityScope::Agent => Some(
+				self
+					.selected_job()
+					.map(|job| job.id.clone())
+					.into_iter()
+					.collect(),
+			),
 			ActivityScope::Subtree => {
 				let Some(root) = self.selected_job() else {
 					return Some(Vec::new());
@@ -635,7 +643,9 @@ impl AgentHub {
 			);
 		}
 		if self.width.saturating_sub(4) < SPLIT_MIN_WIDTH {
-			return sf!("{filter}j/k:select  Enter:open  t:{next}  Tab:details  r/x:manage  Esc:close");
+			return sf!(
+				"{filter}j/k:select  Enter:open  t:{next}  Tab:details  r/x:manage  Esc:close"
+			);
 		}
 		sf!(
 			"{filter}1:agents  2:activity  j/k:select  PgUp/PgDn:details  Enter:open  t:{next}  \
@@ -674,14 +684,18 @@ impl AgentHub {
 		if rows >= 8 {
 			lines.push(dom! { <text>{" "}</text> }.into_component());
 		}
-		let budget = usize::from(rows).saturating_sub(lines.len() + usize::from(self.notice.is_some()));
+		let budget =
+			usize::from(rows).saturating_sub(lines.len() + usize::from(self.notice.is_some()));
 		if self.lines.is_empty() {
-			lines.push(dom! {
-				<row gap=1>
-					<icon name="idle" fg=muted/>
-					<text bold truncate>{NO_AGENTS}</text>
-				</row>
-			}.into_component());
+			lines.push(
+				dom! {
+					<row gap=1>
+						<icon name="idle" fg=muted/>
+						<text bold truncate>{NO_AGENTS}</text>
+					</row>
+				}
+				.into_component(),
+			);
 			lines.push(dom! { <text fg=muted truncate>{NO_AGENTS_DETAIL}</text> }.into_component());
 		} else if budget > 0 {
 			let start = self
@@ -723,7 +737,9 @@ impl AgentHub {
 	) -> Box<dyn omp_tui::Component> {
 		let job = &self.jobs[line.job];
 		let (icon, fg) = status_icon(&job.status);
-		let age = job.started_ms.map(|started| epoch_ms().saturating_sub(started));
+		let age = job
+			.started_ms
+			.map(|started| epoch_ms().saturating_sub(started));
 		let agent = job.agent.clone().unwrap_or_else(|| job.kind.clone());
 		let model = self
 			.show_model
@@ -745,14 +761,11 @@ impl AgentHub {
 						if let Some(model) = model { <text dim truncate>{model}</text> }
 						if let Some(age) = age { <time ms={age} kind="relative" fg=muted/> }
 					</row>
-				}.into_component()
+				}
+				.into_component()
 			},
 			View::Tree => {
-				let rails = line
-					.rails
-					.iter()
-					.map(|&last| !last)
-					.collect::<Vec<_>>();
+				let rails = line.rails.iter().map(|&last| !last).collect::<Vec<_>>();
 				let branch = line.depth > 0;
 				let last = line.last;
 				let id = job.id.clone();
@@ -790,22 +803,28 @@ impl AgentHub {
 		let status = job.status.clone();
 		let now = epoch_ms();
 		let age = job.started_ms.map(|started| now.saturating_sub(started));
-		lines.push(dom! {
-			<row gap=1>
-				<icon name={icon} fg={fg}/>
-				<text bold truncate>{id}</text>
-			</row>
-		}.into_component());
-		lines.push(dom! {
-			<row>
-				<text fg={fg}>{status}</text>
-				if let Some(age) = age {
-					<icon name="dot" fg=muted/>
-					<pre fg=muted>{"started "}</pre>
-					<time ms={age} kind="relative" fg=muted/>
-				}
-			</row>
-		}.into_component());
+		lines.push(
+			dom! {
+				<row gap=1>
+					<icon name={icon} fg={fg}/>
+					<text bold truncate>{id}</text>
+				</row>
+			}
+			.into_component(),
+		);
+		lines.push(
+			dom! {
+				<row>
+					<text fg={fg}>{status}</text>
+					if let Some(age) = age {
+						<icon name="dot" fg=muted/>
+						<pre fg=muted>{"started "}</pre>
+						<time ms={age} kind="relative" fg=muted/>
+					}
+				</row>
+			}
+			.into_component(),
+		);
 		let kind = job.kind.clone();
 		let agent = job.agent.clone().unwrap_or_else(|| Str::new_static("—"));
 		let owner = job.owner.clone();
@@ -815,11 +834,26 @@ impl AgentHub {
 			_ => Str::new_static("—"),
 		};
 		lines.push(dom! { <text>{" "}</text> }.into_component());
-		lines.push(dom! { <row><pre fg=muted>{"kind     "}</pre><text truncate>{kind}</text></row> }.into_component());
-		lines.push(dom! { <row><pre fg=muted>{"agent    "}</pre><text truncate>{agent}</text></row> }.into_component());
-		lines.push(dom! { <row><pre fg=muted>{"owner    "}</pre><text truncate>{owner}</text></row> }.into_component());
-		lines.push(dom! { <row><pre fg=muted>{"started  "}</pre><text truncate>{started}</text></row> }.into_component());
-		lines.push(dom! { <row><pre fg=muted>{"elapsed  "}</pre><text truncate>{elapsed}</text></row> }.into_component());
+		lines.push(
+			dom! { <row><pre fg=muted>{"kind     "}</pre><text truncate>{kind}</text></row> }
+				.into_component(),
+		);
+		lines.push(
+			dom! { <row><pre fg=muted>{"agent    "}</pre><text truncate>{agent}</text></row> }
+				.into_component(),
+		);
+		lines.push(
+			dom! { <row><pre fg=muted>{"owner    "}</pre><text truncate>{owner}</text></row> }
+				.into_component(),
+		);
+		lines.push(
+			dom! { <row><pre fg=muted>{"started  "}</pre><text truncate>{started}</text></row> }
+				.into_component(),
+		);
+		lines.push(
+			dom! { <row><pre fg=muted>{"elapsed  "}</pre><text truncate>{elapsed}</text></row> }
+				.into_component(),
+		);
 		if let Some(data) = &job.data {
 			lines.push(dom! { <text>{" "}</text> }.into_component());
 			lines.push(dom! { <text bold fg=accent>{"Data"}</text> }.into_component());
@@ -861,7 +895,9 @@ impl AgentHub {
 				lines.push(dom! { <text fg=muted truncate>{path}</text> }.into_component());
 				lines.push(dom! { <text fg=muted truncate>{messages}</text> }.into_component());
 			},
-			None => lines.push(dom! { <text fg=muted>{"No session file available yet."}</text> }.into_component()),
+			None => lines.push(
+				dom! { <text fg=muted>{"No session file available yet."}</text> }.into_component(),
+			),
 		}
 		let max_scroll = lines.len().saturating_sub(usize::from(rows));
 		let offset = self.detail_scroll.min(max_scroll);
@@ -886,7 +922,11 @@ impl AgentHub {
 		let id = sf!("{:width$}", job.id.as_str(), width = id_width);
 		let title = job.agent.clone().unwrap_or_else(|| job.kind.clone());
 		let summary = self.activity_summary(job);
-		let title_fg = if job.status.as_str() == "completed" { "ok" } else { "muted" };
+		let title_fg = if job.status.as_str() == "completed" {
+			"ok"
+		} else {
+			"muted"
+		};
 		dom! {
 			<row gap=1>
 				if selected { <icon name="cursor" fg=accent/> } else { <text>{" "}</text> }
@@ -897,7 +937,8 @@ impl AgentHub {
 				<icon name="dot" fg=muted/>
 				<text truncate grow>{summary}</text>
 			</row>
-		}.into_component()
+		}
+		.into_component()
 	}
 
 	fn activity_body(&self, rows: u16, width: u16) -> Vec<Box<dyn omp_tui::Component>> {
@@ -925,13 +966,18 @@ impl AgentHub {
 		}
 		let budget = usize::from(rows).saturating_sub(lines.len());
 		if self.activity.is_empty() {
-			let empty = if self.activity_search.is_empty() { NO_ACTIVITY } else { NO_MATCHING_ACTIVITY };
+			let empty = if self.activity_search.is_empty() {
+				NO_ACTIVITY
+			} else {
+				NO_MATCHING_ACTIVITY
+			};
 			lines.push(dom! { <text fg=muted>{empty}</text> }.into_component());
 		} else if budget > 0 {
 			let start = if self.follow {
 				self.activity.len().saturating_sub(budget)
 			} else {
-				self.activity_index
+				self
+					.activity_index
 					.saturating_sub(budget / 2)
 					.min(self.activity.len().saturating_sub(budget))
 			};
@@ -955,7 +1001,10 @@ impl AgentHub {
 			Section::Activity => {
 				self.split = false;
 				let lines = self.activity_body(content_rows.saturating_sub(1), inner);
-				(dom! { <col>for line in lines { {line} }</col> }.into_component(), Str::new_static(ACTIVITY_HINT))
+				(
+					dom! { <col>for line in lines { {line} }</col> }.into_component(),
+					Str::new_static(ACTIVITY_HINT),
+				)
 			},
 			Section::Agents => {
 				let split = self.split_roster_width();
@@ -971,7 +1020,8 @@ impl AgentHub {
 								<hr vertical border=round fg=muted/>
 								<col w={detail_width}>for line in detail { {line} }</col>
 							</row>
-						}.into_component()
+						}
+						.into_component()
 					},
 					None if self.narrow_details && self.selected_job().is_some() => {
 						let detail = self.inspector(content_rows.saturating_sub(1));
@@ -1000,7 +1050,8 @@ impl AgentHub {
 					<text fg=muted truncate>{footer}</text>
 				</col>
 			</box>
-		}.into_component();
+		}
+		.into_component();
 		self.ui = Ui::from_root(tree, self.width, self.ctx.clone());
 	}
 
@@ -1027,7 +1078,11 @@ impl AgentHub {
 			Some(job) if job.kind.as_str() == "subagent" => {
 				PanelEvent::Run(sf!("transcript {}", job.id))
 			},
-			Some(job) => PanelEvent::Notice(sf!("{} is a detached {} job without a transcript", job.id, job.kind)),
+			Some(job) => PanelEvent::Notice(sf!(
+				"{} is a detached {} job without a transcript",
+				job.id,
+				job.kind
+			)),
 			None => PanelEvent::Consumed,
 		}
 	}
@@ -1194,10 +1249,9 @@ impl AgentHub {
 			},
 			Key::Char('x') => {
 				return match self.selected_job() {
-					Some(job) => PanelEvent::Command(HostCommand::Agent {
-						id: job.id.clone(),
-						op: AgentOp::Kill,
-					}),
+					Some(job) => {
+						PanelEvent::Command(HostCommand::Agent { id: job.id.clone(), op: AgentOp::Kill })
+					},
 					None => PanelEvent::Consumed,
 				};
 			},
@@ -1318,8 +1372,14 @@ fn render_transcript(
 	show_thinking: bool,
 	expanded: bool,
 ) -> Rendered {
-	let mut rendered =
-		Rendered { blocks: Vec::new(), model: None, tools: 0, tokens: 0, duration: 0, cost: 0 };
+	let mut rendered = Rendered {
+		blocks:   Vec::new(),
+		model:    None,
+		tools:    0,
+		tokens:   0,
+		duration: 0,
+		cost:     0,
+	};
 	for turn in dom.children(dom.body()) {
 		if dom
 			.get(*turn)
@@ -1346,14 +1406,16 @@ fn render_transcript(
 						&& let Some(thinking) = live_text(dom, *handle, node, PropId::Thinking)
 						&& !thinking.is_empty()
 					{
-						rendered
-							.blocks
-							.push(dom! { <text fg=muted italic pad-x=1>{thinking}</text> }.into_component());
+						rendered.blocks.push(
+							dom! { <text fg=muted italic pad-x=1>{thinking}</text> }.into_component(),
+						);
 					}
 					if let Some(text) = live_text(dom, *handle, node, PropId::Text)
 						&& !text.is_empty()
 					{
-						rendered.blocks.push(dom! { <md pad-x=1>{text}</md> }.into_component());
+						rendered
+							.blocks
+							.push(dom! { <md pad-x=1>{text}</md> }.into_component());
 					}
 				},
 				Tag::Known(KnownTag::Notice) => {
@@ -1363,7 +1425,8 @@ fn render_transcript(
 						.push(dom! { <row gap=1 pad-x=1><icon name="info" fg=info/><text grow>{text}</text></row> }.into_component());
 				},
 				Tag::Known(KnownTag::Usage) => {
-					rendered.tokens += prop_u64(node, PropId::TokensIn) + prop_u64(node, PropId::TokensOut);
+					rendered.tokens +=
+						prop_u64(node, PropId::TokensIn) + prop_u64(node, PropId::TokensOut);
 					rendered.duration += prop_u64(node, PropId::DurationMs);
 					rendered.cost += prop_u64(node, PropId::CostNanoUsd);
 				},
@@ -1372,8 +1435,8 @@ fn render_transcript(
 						continue;
 					};
 					rendered.tools += 1;
-					let status = prop_text(node, PropId::Status)
-						.unwrap_or_else(|| Str::new_static("running"));
+					let status =
+						prop_text(node, PropId::Status).unwrap_or_else(|| Str::new_static("running"));
 					let result = child_handle(dom, *handle, KnownTag::Result);
 					let view = CardView {
 						input,
@@ -1381,8 +1444,7 @@ fn render_transcript(
 						diag: child(dom, *handle, KnownTag::Diag),
 						usage: child(dom, *handle, KnownTag::Usage),
 						status: CardStatus::from_dom(status.as_str()),
-						output: result
-							.and_then(|result| dom.stream_text(result, &PropId::Text.into())),
+						output: result.and_then(|result| dom.stream_text(result, &PropId::Text.into())),
 						started: None,
 					};
 					rendered
@@ -1397,10 +1459,10 @@ fn render_transcript(
 }
 
 fn child_handle(dom: &Dom, parent: omp_dom::Handle, tag: KnownTag) -> Option<omp_dom::Handle> {
-	dom.children(parent)
-		.iter()
-		.copied()
-		.find(|handle| dom.get(*handle).is_some_and(|node| node.tag == Tag::Known(tag)))
+	dom.children(parent).iter().copied().find(|handle| {
+		dom.get(*handle)
+			.is_some_and(|node| node.tag == Tag::Known(tag))
+	})
 }
 
 fn child(dom: &Dom, parent: omp_dom::Handle, tag: KnownTag) -> Option<&Node> {
@@ -1581,7 +1643,8 @@ impl TranscriptViewer {
 					<text fg=muted pad-x=1 truncate>{VIEWER_HINT}</text>
 				</col>
 			</box>
-		}.into_component();
+		}
+		.into_component();
 		self.ui = Ui::from_root(tree, self.width, self.ctx.clone());
 		if self.follow {
 			self.scroll(Key::End);
@@ -1603,10 +1666,7 @@ impl TranscriptViewer {
 		if text.is_empty() {
 			return PanelEvent::Consumed;
 		}
-		PanelEvent::Command(HostCommand::Agent {
-			id: self.job.id.clone(),
-			op: AgentOp::Send(text),
-		})
+		PanelEvent::Command(HostCommand::Agent { id: self.job.id.clone(), op: AgentOp::Send(text) })
 	}
 
 	/// Applies a ready snapshot and every currently queued patch. Returns
@@ -1742,10 +1802,7 @@ impl Panel for TranscriptViewer {
 	fn notify(&mut self, note: PanelNote<'_>) -> PanelEvent {
 		match note {
 			PanelNote::Dom(dom) => {
-				let Some(job) = job_rows(dom)
-					.into_iter()
-					.find(|job| job.id == self.job.id)
-				else {
+				let Some(job) = job_rows(dom).into_iter().find(|job| job.id == self.job.id) else {
 					return PanelEvent::Ignored;
 				};
 				if job == self.job {
@@ -1778,7 +1835,8 @@ impl Panel for TranscriptViewer {
 		let mut repaint = self.ui.tick(now);
 		if self.next_poll.is_some_and(|due| now >= due) {
 			repaint |= self.poll_stream();
-			self.next_poll = (self.pending.is_some() || self.events.is_some()).then_some(now + STREAM_POLL);
+			self.next_poll =
+				(self.pending.is_some() || self.events.is_some()).then_some(now + STREAM_POLL);
 			if repaint {
 				self.rebuild();
 			}
@@ -1814,10 +1872,9 @@ mod tests {
 		let directory = tempdir().expect("temp directory");
 		let path = directory.path().join("parent.oms");
 		let mut session = Session::create(path, ComponentRegistry::standard()).expect("create");
-		for (id, owner, agent, status) in [
-			("alpha", "Main", "task", "running"),
-			("beta", "alpha", "sonic", "completed"),
-		] {
+		for (id, owner, agent, status) in
+			[("alpha", "Main", "task", "running"), ("beta", "alpha", "sonic", "completed")]
+		{
 			let cause = session.head().expect("head");
 			let txn = jobs::insert(session.dom(), cause, JobSpec {
 				id:      Str::new(id),
@@ -1878,8 +1935,8 @@ mod tests {
 				cause,
 				label: Some(Str::new_static("test.model")),
 				ops: vec![omp_dom::Op::Set {
-					h: alpha,
-					prop: PropId::Model.into(),
+					h:     alpha,
+					prop:  PropId::Model.into(),
 					value: Value::Str(Str::new_static("provider/model")),
 				}],
 			})
@@ -1899,8 +1956,7 @@ mod tests {
 	fn resolved_model_badge_is_flagged_and_clamped_to_thirty_cells() {
 		let (session, _dir) = session_with_jobs();
 		let mut hub = hub_over(&session);
-		hub.jobs[0].model =
-			Some(Str::new_static("provider/a-very-long-resolved-model-name"));
+		hub.jobs[0].model = Some(Str::new_static("provider/a-very-long-resolved-model-name"));
 		hub.rebuild();
 		assert!(
 			!text(&mut hub).contains("· provider/"),
@@ -1938,7 +1994,10 @@ mod tests {
 			.expect("status patch");
 		assert_eq!(hub.notify(PanelNote::Dom(session.dom())), PanelEvent::Consumed);
 		assert_eq!(
-			hub.jobs.iter().find(|job| job.id == "beta").map(|job| job.status.as_str()),
+			hub.jobs
+				.iter()
+				.find(|job| job.id == "beta")
+				.map(|job| job.status.as_str()),
 			Some("failed")
 		);
 		let painted = text(&mut hub);
@@ -1992,10 +2051,7 @@ mod tests {
 		);
 		assert_eq!(
 			hub.key(Key::Char('x')),
-			PanelEvent::Command(HostCommand::Agent {
-				id: Str::new_static("beta"),
-				op: AgentOp::Kill,
-			})
+			PanelEvent::Command(HostCommand::Agent { id: Str::new_static("beta"), op: AgentOp::Kill })
 		);
 	}
 
@@ -2048,8 +2104,7 @@ mod tests {
 
 	#[test]
 	fn empty_hub_shows_the_empty_state() {
-		let mut hub =
-			AgentHub::with_rows(Vec::new(), Vec::new(), viewport(), &UiContext::default());
+		let mut hub = AgentHub::with_rows(Vec::new(), Vec::new(), viewport(), &UiContext::default());
 		let painted = text(&mut hub);
 		assert!(painted.contains(NO_AGENTS), "{painted}");
 		assert_eq!(hub.key(Key::Enter), PanelEvent::Consumed);
@@ -2120,13 +2175,8 @@ mod tests {
 		let directory = tempdir().expect("temp directory");
 		let mut session = child_session(directory.path());
 		let (sender, pending) = flume::bounded(1);
-		let mut viewer = TranscriptViewer::waiting(
-			job("alpha"),
-			pending,
-			true,
-			viewport(),
-			&UiContext::default(),
-		);
+		let mut viewer =
+			TranscriptViewer::waiting(job("alpha"), pending, true, viewport(), &UiContext::default());
 		assert!(!text(&mut viewer).contains("inspect the widgets"));
 		assert!(sender.send(Ok(view(&mut session))).is_ok(), "subscription result");
 		assert!(viewer.tick(Duration::ZERO));
@@ -2137,8 +2187,13 @@ mod tests {
 	fn viewer_shows_user_text_header_footer_and_applies_patch_stream() {
 		let directory = tempdir().expect("temp directory");
 		let mut session = child_session(directory.path());
-		let mut viewer =
-			TranscriptViewer::with_view(job("alpha"), view(&mut session), true, viewport(), &UiContext::default());
+		let mut viewer = TranscriptViewer::with_view(
+			job("alpha"),
+			view(&mut session),
+			true,
+			viewport(),
+			&UiContext::default(),
+		);
 		let painted = text(&mut viewer);
 		assert!(painted.contains("Agent Hub"), "{painted}");
 		assert!(painted.contains("alpha"), "{painted}");
@@ -2165,8 +2220,13 @@ mod tests {
 	fn viewer_input_gates_scrolling_and_esc_clears_before_closing() {
 		let directory = tempdir().expect("temp directory");
 		let mut session = child_session(directory.path());
-		let mut viewer =
-			TranscriptViewer::with_view(job("alpha"), view(&mut session), true, viewport(), &UiContext::default());
+		let mut viewer = TranscriptViewer::with_view(
+			job("alpha"),
+			view(&mut session),
+			true,
+			viewport(),
+			&UiContext::default(),
+		);
 		assert_eq!(viewer.key(Key::Char('k')), PanelEvent::Consumed);
 		assert!(!viewer.follow);
 		assert_eq!(viewer.key(Key::Char('G')), PanelEvent::Consumed);

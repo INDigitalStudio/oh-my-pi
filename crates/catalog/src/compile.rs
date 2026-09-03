@@ -42,7 +42,7 @@ use crate::{
 		ApplyPatchWireKind, CacheControlFormat, ComputerUseConfigSupport, ComputerUseWireSupport,
 		ExtendedContextMode, MaxOutputTokensEmission, NativeToolChoicePenalty, PromptCacheMode,
 		ReasoningBodyOverride,
-		StreamWatchdog, ToolCallIdProfile, WhenThinkingPolicy, WirePolicy,
+		StreamWatchdog, ToolCallIdProfile, ToolPolicy, WhenThinkingPolicy, WirePolicy,
 	},
 	pricing::{PremiumMultiplier, Price, PriceTier, PriceUnit, Pricing, ServiceTierPrice},
 	provider::{
@@ -3540,9 +3540,13 @@ fn compile_models(
 		let provider_policy_id = provider_policies.get(&provider).ok_or_else(|| {
 			CompileError::Invariant(Str::from(format!("provider `{provider}` has no wire policy")))
 		})?;
-		if !policies.contains_key(provider_policy_id) {
-			return Err(CompileError::Invariant(sf!("provider wire policy was not interned",)));
-		}
+		let provider_policy = policies
+			.get(provider_policy_id)
+			.ok_or_else(|| CompileError::Invariant(sf!("provider wire policy was not interned",)))?;
+		// The native forced-tool-choice penalty is a host-imposed contract
+		// declared once per provider; every model served by that host pays it
+		// unless a more specific rule declares otherwise (ADR 0019).
+		let provider_forced_choice_penalty = provider_policy.tool.forced_choice_penalty;
 		let facets = provider_facets
 			.get(&provider)
 			.map(Vec::as_slice)
@@ -3753,6 +3757,10 @@ fn compile_models(
 					wire_policy = compile_wire_policy(wire_policy, source)?;
 				}
 			}
+			wire_policy.tool.forced_choice_penalty = wire_policy
+				.tool
+				.forced_choice_penalty
+				.or(provider_forced_choice_penalty);
 			if let Some(enabled) = first.1.cursor_max_mode {
 				wire_policy.context.extended_mode = Some(ExtendedContextMode::from_enabled(enabled));
 			}
@@ -3796,6 +3804,9 @@ fn compile_models(
 			if let Some(chat) = capabilities.chat.as_mut() {
 				chat.reasoning = reasoning_capabilities(merged_row.reasoning, thinking.as_ref());
 				chat.prompt_caching = prompt_cache_capabilities(&wire_policy, &pricing);
+				if let Availability::Native(tools) = &mut chat.tools {
+					tools.features = tool_feature_bits(&wire_policy.tool);
+				}
 			}
 			let wire_policy_id = wire_policy.content_id();
 			policies
@@ -5124,6 +5135,34 @@ fn reasoning_capabilities(
 		minimum_budget_tokens,
 		maximum_budget_tokens,
 	})
+}
+
+/// Derives the router-facing tool feature bits from compiled tool policy.
+///
+/// Only an affirmative compiled fact sets a bit (ADR 0017: unknown is
+/// unsupported). A route that rejects every tool-choice control clears the
+/// choice bits even when a broader rule declared forced or named choice, so
+/// the forced-call ladder (ADR 0019) never reaches for a selector the wire
+/// refuses.
+fn tool_feature_bits(policy: &ToolPolicy) -> ToolFeatureBits {
+	let mut features = ToolFeatureBits::empty();
+	let choice_accepted = policy.supports_tool_choice != Some(false);
+	if choice_accepted && policy.forced_choice == Some(true) {
+		features |= ToolFeatureBits::REQUIRED_CHOICE;
+	}
+	if choice_accepted && policy.named_choice == Some(true) {
+		features |= ToolFeatureBits::NAMED_CHOICE;
+	}
+	if policy.supports_tool_choice == Some(true) {
+		features |= ToolFeatureBits::DISABLED_CHOICE;
+	}
+	if policy.supports_strict_mode == Some(true) {
+		features |= ToolFeatureBits::STRICT_SCHEMA;
+	}
+	if policy.supports_parallel_calls == Some(true) {
+		features |= ToolFeatureBits::PARALLEL;
+	}
+	features
 }
 
 fn prompt_cache_capabilities(
@@ -6533,6 +6572,73 @@ facets = ["chat"]
 		assert!(cache.retention.contains(CacheRetentionBits::LONG));
 		assert_eq!(cache.minimum_prefix_tokens, Some(1_024));
 		assert_eq!(cache.maximum_breakpoints, Some(4));
+	}
+
+	#[test]
+	fn tool_feature_bits_follow_affirmative_wire_policy_only() {
+		assert_eq!(tool_feature_bits(&WirePolicy::overrides().tool), ToolFeatureBits::empty());
+
+		let baseline = WirePolicy::baseline();
+		let features = tool_feature_bits(&baseline.tool);
+		assert!(features.contains(ToolFeatureBits::REQUIRED_CHOICE));
+		assert!(features.contains(ToolFeatureBits::NAMED_CHOICE));
+		assert!(!features.contains(ToolFeatureBits::DISABLED_CHOICE));
+		assert!(!features.contains(ToolFeatureBits::STRICT_SCHEMA));
+		assert!(!features.contains(ToolFeatureBits::PARALLEL));
+
+		let mut policy = baseline.tool.clone();
+		policy.supports_tool_choice = Some(true);
+		policy.supports_strict_mode = Some(true);
+		policy.supports_parallel_calls = Some(true);
+		let features = tool_feature_bits(&policy);
+		assert!(features.contains(ToolFeatureBits::DISABLED_CHOICE));
+		assert!(features.contains(ToolFeatureBits::STRICT_SCHEMA));
+		assert!(features.contains(ToolFeatureBits::PARALLEL));
+
+		policy.supports_tool_choice = Some(false);
+		let features = tool_feature_bits(&policy);
+		assert!(
+			!features.contains(ToolFeatureBits::REQUIRED_CHOICE)
+				&& !features.contains(ToolFeatureBits::NAMED_CHOICE)
+				&& !features.contains(ToolFeatureBits::DISABLED_CHOICE),
+			"a route refusing tool choice exposes no selector bit",
+		);
+		assert!(features.contains(ToolFeatureBits::STRICT_SCHEMA));
+
+		let providers = r#"
+[providers.anthropic]
+transport = "anthropic-messages"
+base_url = "https://api.anthropic.test"
+facets = ["chat"]
+compat = { "forced_tool_choice_penalty" = "cache_invalidated" }
+"#;
+		let models = br#"{"anthropic":{"claude-sonnet-4-5":{"api":"anthropic-messages","input":["text"],"supportsTools":true}}}"#;
+		let compressed = zstd::stream::encode_all(&models[..], 1).expect("fixture compression");
+		let compiled = compile(parse_oracle(providers, &compressed).expect("typed source"))
+			.expect("catalog compilation");
+		let anthropic = compiled
+			.models
+			.iter()
+			.find(|model| model.key.as_str() == "anthropic/claude-sonnet-4-5")
+			.expect("compiled Anthropic Sonnet model");
+		let tools = anthropic
+			.capabilities
+			.chat
+			.as_ref()
+			.and_then(|chat| chat.tools.constraints())
+			.expect("native Anthropic tools");
+		assert!(tools.features.contains(ToolFeatureBits::REQUIRED_CHOICE));
+		assert!(tools.features.contains(ToolFeatureBits::NAMED_CHOICE));
+		let policy = compiled
+			.wire_policies
+			.iter()
+			.find(|policy| policy.content_id() == anthropic.wire_policy)
+			.expect("Anthropic model wire policy");
+		assert_eq!(
+			policy.tool.forced_choice_penalty,
+			Some(NativeToolChoicePenalty::CacheInvalidated),
+			"the host-declared native forced-choice penalty reaches every served model",
+		);
 	}
 
 	#[test]

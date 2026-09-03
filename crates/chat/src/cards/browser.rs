@@ -51,9 +51,7 @@ impl Card for BrowserCard {
 			.into_iter()
 			.flatten()
 			.filter_map(Value::as_str)
-			.map(|artifact| {
-				result_image(&omp_core::Str::new(artifact), "image/png", None, ui)
-			})
+			.map(|artifact| result_image(&omp_core::Str::new(artifact), "image/png", None, ui))
 			.collect::<Vec<_>>();
 		let returned = result
 			.as_ref()

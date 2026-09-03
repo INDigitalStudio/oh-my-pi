@@ -23,7 +23,7 @@ use omp_dom::{Dom, Event, Handle, KnownTag, Op, PropId, Snapshot, Tag, Value};
 use omp_journal::{EntryId, blob::BlobRef};
 use omp_tui::{
 	CursorStyle, DebugOp, Dim, Frame, InputEvent, Key, KeyEvent, Layer, MouseReport, OverlayAnchor,
-	OverlayOptions, Progress, Renderer, Size, Terminal, TerminalEvent, TerminalOptions, Theme, TtyOut, Ui,
+	OverlayOptions, Progress, Renderer, Size, Terminal, TerminalEvent, TerminalOptions, TtyOut, Ui,
 	UiContext,
 	anim::Intro,
 	components::Countdown,
@@ -53,8 +53,8 @@ use crate::{
 		voice::{SpeechSynth, Vocalizer},
 	},
 	overlays::{
-		HistoryPicker, ModelPicker, ModelRow, Overlay, Overlays, PanelAction, PanelAnchor,
-		PanelCx, PanelEvent, PickerEvent, QuickRoleRow, Services,
+		HistoryPicker, ModelPicker, ModelRow, Overlay, Overlays, PanelAnchor, PanelCx, PanelEvent,
+		PickerEvent, QuickRoleRow, Services,
 	},
 	project::{BlockKind, BlockView, RenderedBlock, project},
 	status_band::Speculation,
@@ -786,7 +786,9 @@ impl Presenter {
 				{
 					let mode = Vocalizer::mode(&self.con);
 					let text = last_assistant_text(&self.replica);
-					speech.lock().turn_ended(mode, text.as_deref().unwrap_or_default());
+					speech
+						.lock()
+						.turn_ended(mode, text.as_deref().unwrap_or_default());
 				}
 			},
 			KernelEvent::TextDelta(delta) => {
@@ -908,9 +910,10 @@ impl Presenter {
 		);
 		self.overlays.show(Overlay::Panel(Box::new(dialog)));
 		self.ask_open = Some(ask);
-		let _ = self
-			.commands
-			.send(HostCommand::Overlay { id: Str::new_static(crate::overlays::ask::ID), open: true });
+		let _ = self.commands.send(HostCommand::Overlay {
+			id:   Str::new_static(crate::overlays::ask::ID),
+			open: true,
+		});
 	}
 
 	/// Chord label of the `cl_retry` binding for the idle retry hint (pi
@@ -934,7 +937,11 @@ impl Presenter {
 		if self.dismissed_error == Some(handle) || self.superseded.contains(&handle) {
 			return None;
 		}
-		Some(Ui::from_root(error_banner(text), width, self.ui.clone()).frame().clone())
+		Some(
+			Ui::from_root(error_banner(text), width, self.ui.clone())
+				.frame()
+				.clone(),
+		)
 	}
 
 	/// pi's status container row above the editor: the retry countdown
@@ -1067,7 +1074,8 @@ impl Presenter {
 		let projected = project(&self.replica, &self.cards, &self.ui, &self.project_options());
 		for block in projected {
 			// Retry-superseded elements stay in the DOM but leave the view.
-			if Handle::new(block.view.key / 8).is_some_and(|handle| self.superseded.contains(&handle)) {
+			if Handle::new(block.view.key / 8).is_some_and(|handle| self.superseded.contains(&handle))
+			{
 				continue;
 			}
 			blocks.push(block);
@@ -1155,9 +1163,9 @@ impl Presenter {
 	/// Facts a panel reads while opening or running a call.
 	fn panel_cx(&self, viewport: Size) -> PanelCx<'_> {
 		PanelCx {
-			dom:      &self.replica,
-			con:      &self.con,
-			ui:       &self.ui,
+			dom: &self.replica,
+			con: &self.con,
+			ui: &self.ui,
 			viewport,
 			services: &self.services,
 		}
@@ -1276,7 +1284,9 @@ impl Presenter {
 	fn route_chord(&mut self, event: KeyEvent) -> Result<Routed, HostError> {
 		if self.overlays.approval().is_some() {
 			return if event.pressed {
-				event.key.map_or(Ok(Routed::Repaint), |key| self.route_approval_key(key))
+				event
+					.key
+					.map_or(Ok(Routed::Repaint), |key| self.route_approval_key(key))
 			} else {
 				Ok(Routed::Ignored)
 			};
@@ -1289,7 +1299,9 @@ impl Presenter {
 			return self.run_bound_key(chord.as_str(), event.pressed);
 		}
 		if event.pressed {
-			event.key.map_or(Ok(Routed::Ignored), |key| self.route_unbound_key(key))
+			event
+				.key
+				.map_or(Ok(Routed::Ignored), |key| self.route_unbound_key(key))
 		} else {
 			Ok(Routed::Ignored)
 		}
@@ -1488,7 +1500,9 @@ impl Presenter {
 			.cloned()
 			.collect::<Vec<_>>();
 		if !cancels.is_empty() {
-			self.escape_hooks.retain(|hook| hook.rung != EscapeRung::Cancel);
+			self
+				.escape_hooks
+				.retain(|hook| hook.rung != EscapeRung::Cancel);
 			for hook in cancels {
 				let _ = hook.fire();
 			}
@@ -1543,9 +1557,7 @@ impl Presenter {
 		if local_run_active(&self.replica) {
 			return Ok(self.interrupt_turn());
 		}
-		if self.composer.prefix_mode().is_some()
-			|| self.composer.text().starts_with(['!', '$'])
-		{
+		if self.composer.prefix_mode().is_some() || self.composer.text().starts_with(['!', '$']) {
 			self.composer.clear();
 			return Ok(Routed::Repaint);
 		}
@@ -1630,7 +1642,10 @@ impl Presenter {
 		let restored = texts.len();
 		let current = self.composer.text();
 		let mut combined = String::new();
-		for text in texts.iter().chain(std::iter::once(&Str::new(current.as_str()))) {
+		for text in texts
+			.iter()
+			.chain(std::iter::once(&Str::new(current.as_str())))
+		{
 			if text.trim().is_empty() {
 				continue;
 			}
@@ -1659,7 +1674,11 @@ impl Presenter {
 		let before = self.projection_inputs();
 		let failure = self.con.key(chord, pressed).err();
 		let mut routed = if before == self.projection_inputs() {
-			if pressed { Routed::Repaint } else { Routed::Ignored }
+			if pressed {
+				Routed::Repaint
+			} else {
+				Routed::Ignored
+			}
 		} else {
 			Routed::RebuildProjection
 		};
@@ -1794,17 +1813,17 @@ impl Presenter {
 		// "A bash command is already running. Press Esc to cancel it first.").
 		if let Some(local) = crate::composer::parse_local_input(&text) {
 			if self.focused_agent.is_some() {
-				return self.refuse_local(
-					&text,
-					"Commands run in the main session — press ←← to return first",
-				);
+				return self
+					.refuse_local(&text, "Commands run in the main session — press ←← to return first");
 			}
 			if self.collab_guest {
 				return self.notice("Local execution is host-only during a collab session");
 			}
 			if local_run_active(&self.replica) {
 				return self.refuse_local(&text, match local.mode {
-					PrefixMode::Bash => "A bash command is already running. Press Esc to cancel it first.",
+					PrefixMode::Bash => {
+						"A bash command is already running. Press Esc to cancel it first."
+					},
 					PrefixMode::Eval => {
 						"A Python execution is already running. Press Esc to cancel it first."
 					},
@@ -1812,7 +1831,9 @@ impl Presenter {
 			}
 			self.set_turn_active(true);
 			self.dismissed_error = pinned_error(&self.replica).map(|(handle, _)| handle);
-			let _ = self.commands.send(HostCommand::RunLocal { input: local, draft: text });
+			let _ = self
+				.commands
+				.send(HostCommand::RunLocal { input: local, draft: text });
 			return Routed::Repaint;
 		}
 		if !self.turn_active {
@@ -1888,8 +1909,9 @@ impl Presenter {
 							})
 					})
 					.collect::<Vec<_>>();
-				let current_role =
-					quick_roles.iter().position(|role| self.models[role.model].key == live);
+				let current_role = quick_roles
+					.iter()
+					.position(|role| self.models[role.model].key == live);
 				let picker = ModelPicker::open(
 					self.models.clone(),
 					current,
@@ -2077,10 +2099,9 @@ impl Presenter {
 				let opened = opener.open(&self.panel_cx(viewport));
 				match opened {
 					Ok(panel) => {
-						let _ = self.commands.send(HostCommand::Overlay {
-							id:   Str::new_static(panel.id()),
-							open: true,
-						});
+						let _ = self
+							.commands
+							.send(HostCommand::Overlay { id: Str::new_static(panel.id()), open: true });
 						self.overlays.show(Overlay::Panel(panel));
 						Routed::Repaint
 					},
@@ -2094,7 +2115,9 @@ impl Presenter {
 			},
 			HostAction::Command(action) => self.run_command(action)?,
 			HostAction::Outcome(outcome) => {
-				let event = self.overlays.notify_panels(crate::overlays::PanelNote::Outcome(&outcome));
+				let event = self
+					.overlays
+					.notify_panels(crate::overlays::PanelNote::Outcome(&outcome));
 				match event {
 					PanelEvent::Ignored => match outcome {
 						crate::overlays::Outcome::Service(outcome) => match outcome.result {
@@ -2369,7 +2392,7 @@ impl Presenter {
 		}
 		self.sync_status();
 		let mut track = String::new();
-		for (index, (name, _, _)) in self.cycle.iter().enumerate() {
+		for (index, (name, ..)) in self.cycle.iter().enumerate() {
 			if index > 0 {
 				track.push_str("  ");
 			}
@@ -2443,9 +2466,7 @@ impl Presenter {
 		let center = Size::new(size.width * 4 / 5, size.height.saturating_sub(2));
 		match self.overlays.active_mut() {
 			Some(Overlay::Models(picker)) => Some((picker.frame(size).clone(), PanelAnchor::Bottom)),
-			Some(Overlay::History(picker)) => {
-				Some((picker.frame(size).clone(), PanelAnchor::Bottom))
-			},
+			Some(Overlay::History(picker)) => Some((picker.frame(size).clone(), PanelAnchor::Bottom)),
 			Some(Overlay::Panel(panel)) => {
 				let anchor = panel.anchor();
 				let viewport = match anchor {
@@ -2641,7 +2662,8 @@ impl Host {
 			self.sync_terminal_state(terminal)?;
 			let deadline = self.next_deadline();
 			if let Some(scope) = self.presenter.clipboard_read.take() {
-				clipboard = Some((spawn_clipboard_read(scope), scope == ClipboardRead::Text, Instant::now()));
+				clipboard =
+					Some((spawn_clipboard_read(scope), scope == ClipboardRead::Text, Instant::now()));
 			}
 			let clipboard_pending = clipboard.is_some();
 			tokio::select! {
@@ -2845,8 +2867,8 @@ impl Host {
 	/// Synchronizes title and OSC progress from the same retained run state
 	/// used by the status band.
 	fn sync_terminal_state(&mut self, terminal: &mut Terminal) -> Result<(), HostError> {
-		let attention = self.presenter.overlays.approval().is_some()
-			|| self.presenter.ask_open.is_some();
+		let attention =
+			self.presenter.overlays.approval().is_some() || self.presenter.ask_open.is_some();
 		let working = self.presenter.turn_active
 			|| self.presenter.maintenance_active()
 			|| self.presenter.local.speculation == Speculation::Running;
@@ -2857,7 +2879,10 @@ impl Host {
 		} else {
 			TitleState::Idle
 		};
-		self.presenter.title.set_enabled(CL_TITLE_STATE.get(&self.presenter.con));
+		self
+			.presenter
+			.title
+			.set_enabled(CL_TITLE_STATE.get(&self.presenter.con));
 		self.presenter.title.set_state(state);
 		if let Some(title) = self
 			.presenter
@@ -3642,9 +3667,9 @@ fn status_facts(
 
 /// Whether the kernel is still working on the last turn, decided by the
 /// newest lifecycle element in it. Only terminal error/interrupt notices
-/// close the turn; informational notices are transparent. An open assistant or a running
-/// tool keeps it active; a settled tool defers to its assistant, whose
-/// `tool_calls` stop means another inference follows; `<usage>` is
+/// close the turn; informational notices are transparent. An open assistant or
+/// a running tool keeps it active; a settled tool defers to its assistant,
+/// whose `tool_calls` stop means another inference follows; `<usage>` is
 /// per-inference accounting and closes nothing; a turn with only the user's
 /// message is awaiting its first inference; a local run (a turn holding
 /// only its tool element) is over once that element settles.
@@ -3699,7 +3724,10 @@ fn local_run_active(dom: &Dom) -> bool {
 	let Some(turn) = dom.children(dom.body()).last() else {
 		return false;
 	};
-	let mut children = dom.children(*turn).iter().filter_map(|handle| dom.get(*handle));
+	let mut children = dom
+		.children(*turn)
+		.iter()
+		.filter_map(|handle| dom.get(*handle));
 	children
 		.next()
 		.is_some_and(|first| matches!(first.tag, Tag::Custom(_)) && !tool_settled(first))
@@ -3716,9 +3744,8 @@ fn approval_frame(
 	let scope = Str::new(approval.scope.as_str());
 	// pi `CountdownTimer`: the modal shows `(Ns remaining)` ticking once a
 	// second until the kernel answers with the prompt's default.
-	let remaining = countdown.map_or_else(Str::default, |seconds| {
-		Str::new(format!("  ({seconds}s remaining)"))
-	});
+	let remaining =
+		countdown.map_or_else(Str::default, |seconds| Str::new(format!("  ({seconds}s remaining)")));
 	let tree = omp_tui::dom! {
 		<box border=round bc=warning pad="1 2">
 			<col gap=1>

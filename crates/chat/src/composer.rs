@@ -182,7 +182,7 @@ fn split_local(text: &str) -> Option<(PrefixMode, usize, &str)> {
 /// a pasted shell prompt behind a single `$` is prose.
 #[must_use]
 pub fn prefix_mode_of(text: &str) -> Option<PrefixMode> {
-	split_local(text).map(|(mode, _, _)| mode)
+	split_local(text).map(|(mode, ..)| mode)
 }
 
 /// Parses a submitted line into a local run (pi `input-controller.ts`
@@ -280,9 +280,7 @@ impl SpaceHold {
 		if !enabled {
 			return SpaceHoldEvent::Pass;
 		}
-		let gap = self
-			.last_space
-			.map(|last| now.saturating_sub(last));
+		let gap = self.last_space.map(|last| now.saturating_sub(last));
 		let prev = self.prev_gap;
 		self.last_space = Some(now);
 		self.prev_gap = gap;
@@ -322,9 +320,7 @@ impl SpaceHold {
 	/// Host-clock deadline for the release check.
 	#[must_use]
 	pub fn next_wake(&self) -> Option<Duration> {
-		self
-			.active
-			.then_some(self.last_space? + SPACE_HOLD_RELEASE)
+		self.active.then_some(self.last_space? + SPACE_HOLD_RELEASE)
 	}
 
 	/// Ends a hold unconditionally (toggle, interrupt).
@@ -401,12 +397,10 @@ impl Composer {
 			return false;
 		}
 		self.ime_safe = enabled;
-		self
-			.ui
-			.update_component::<EditorPane>(COMPOSER_ID, |pane| {
-				pane.set_ime_safe_cursor(enabled);
-				true
-			});
+		self.ui.update_component::<EditorPane>(COMPOSER_ID, |pane| {
+			pane.set_ime_safe_cursor(enabled);
+			true
+		});
 		true
 	}
 
@@ -423,12 +417,10 @@ impl Composer {
 			return false;
 		}
 		self.shape = shape;
-		self
-			.ui
-			.update_component::<EditorPane>(COMPOSER_ID, |pane| {
-				pane.set_composer_style(shape);
-				true
-			});
+		self.ui.update_component::<EditorPane>(COMPOSER_ID, |pane| {
+			pane.set_composer_style(shape);
+			true
+		});
 		self.sync_gap();
 		true
 	}
@@ -631,12 +623,10 @@ impl Composer {
 	pub fn resize(&mut self, width: u16, height: u16) {
 		self.width = width;
 		let rows = editor_max_rows(height);
-		self
-			.ui
-			.update_component::<EditorPane>(COMPOSER_ID, |pane| {
-				pane.set_max_rows(rows);
-				true
-			});
+		self.ui.update_component::<EditorPane>(COMPOSER_ID, |pane| {
+			pane.set_max_rows(rows);
+			true
+		});
 		self.ui.resize(width);
 	}
 
@@ -863,7 +853,12 @@ mod tests {
 		assert_eq!(composer.shape(), ComposerStyle::Rail);
 		let railed = rows(&composer);
 		assert_eq!(railed[0], "", "rail keeps the top gap even under a notice");
-		assert!(railed.iter().any(|row| row.starts_with('▎') && row.contains("hi")), "{railed:?}");
+		assert!(
+			railed
+				.iter()
+				.any(|row| row.starts_with('▎') && row.contains("hi")),
+			"{railed:?}"
+		);
 		assert_eq!(composer.text(), "hi", "the draft survives the reshape");
 
 		assert!(composer.set_plan_mode(false));
@@ -890,7 +885,11 @@ mod tests {
 		// Budget 6 rows: the status band, the four content rows, and picker
 		// room all fit; a 20-line draft is clamped instead.
 		composer.paste_raw(&"\nx".repeat(20));
-		assert!(composer.height() <= base + 6, "height {} exceeds the small-terminal budget", composer.height());
+		assert!(
+			composer.height() <= base + 6,
+			"height {} exceeds the small-terminal budget",
+			composer.height()
+		);
 		composer.resize(60, 40);
 		assert!(composer.height() > base + 6, "a roomy terminal lets the draft grow again");
 	}
@@ -927,12 +926,20 @@ mod tests {
 	#[test]
 	fn prefix_lines_parse_like_pi_and_prose_stays_prose() {
 		let bash = parse_local_input("  !echo hi").expect("bash");
-		assert_eq!(bash, LocalInput { mode: PrefixMode::Bash, code: "echo hi".into(), exclude: false });
+		assert_eq!(bash, LocalInput {
+			mode:    PrefixMode::Bash,
+			code:    "echo hi".into(),
+			exclude: false,
+		});
 		let hidden = parse_local_input("!! ls -la ").expect("excluded bash");
 		assert_eq!(hidden.code, "ls -la");
 		assert!(hidden.exclude);
 		let eval = parse_local_input("$ 1+1").expect("eval");
-		assert_eq!(eval, LocalInput { mode: PrefixMode::Eval, code: "1+1".into(), exclude: false });
+		assert_eq!(eval, LocalInput {
+			mode:    PrefixMode::Eval,
+			code:    "1+1".into(),
+			exclude: false,
+		});
 		let hidden_eval = parse_local_input("$$\tprint(2)").expect("excluded eval");
 		assert!(hidden_eval.exclude && hidden_eval.mode == PrefixMode::Eval);
 		// A bare sigil runs nothing; shell-style variables and `${…}` are prose.

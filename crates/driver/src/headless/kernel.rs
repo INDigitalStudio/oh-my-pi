@@ -74,27 +74,27 @@ pub enum NativeExtensionMode {
 #[derive(Clone, Debug)]
 pub struct LaunchExtensionPolicy {
 	/// Ordered explicit native extension roots.
-	pub native_roots:        Vec<PathBuf>,
+	pub native_roots:      Vec<PathBuf>,
 	/// How explicit roots compose with configured roots.
-	pub native_mode:         NativeExtensionMode,
+	pub native_mode:       NativeExtensionMode,
 	/// Whether workspace-owned roots participate.
-	pub include_workspace:   bool,
+	pub include_workspace: bool,
 	/// Exact operator-trusted Python extension hosts.
-	pub trusted:             Vec<omp_envd::worker::ExtHostSpec>,
+	pub trusted:           Vec<omp_envd::worker::ExtHostSpec>,
 	/// Declaration-owned CLI values delivered at activation.
-	pub contributed:         Vec<omp_ext::config::ContributedCliValue>,
+	pub contributed:       Vec<omp_ext::config::ContributedCliValue>,
 	/// Manifest setting overrides applied before environment attachment.
-	pub setting_overrides:   Vec<omp_ext::config::CliSettingOverride>,
+	pub setting_overrides: Vec<omp_ext::config::CliSettingOverride>,
 }
 
 impl Default for LaunchExtensionPolicy {
 	fn default() -> Self {
 		Self {
-			native_roots: Vec::new(),
-			native_mode: NativeExtensionMode::Merge,
+			native_roots:      Vec::new(),
+			native_mode:       NativeExtensionMode::Merge,
 			include_workspace: true,
-			trusted: Vec::new(),
-			contributed: Vec::new(),
+			trusted:           Vec::new(),
+			contributed:       Vec::new(),
 			setting_overrides: Vec::new(),
 		}
 	}
@@ -640,9 +640,7 @@ pub async fn compose_kernel(
 	}
 	let native_mode = match options.extensions.native_mode {
 		NativeExtensionMode::Merge => crate::discovery::native::NativeLoadMode::Merge,
-		NativeExtensionMode::ExplicitOnly => {
-			crate::discovery::native::NativeLoadMode::ExplicitOnly
-		},
+		NativeExtensionMode::ExplicitOnly => crate::discovery::native::NativeLoadMode::ExplicitOnly,
 		NativeExtensionMode::Disabled => crate::discovery::native::NativeLoadMode::Disabled,
 	};
 	let home = if native_mode == crate::discovery::native::NativeLoadMode::Merge {
@@ -654,8 +652,8 @@ pub async fn compose_kernel(
 		&project_root,
 		&home,
 		crate::discovery::native::NativeAdmissionOptions {
-			explicit_roots: &options.extensions.native_roots,
-			mode: native_mode,
+			explicit_roots:    &options.extensions.native_roots,
+			mode:              native_mode,
 			include_workspace: options.extensions.include_workspace,
 			setting_overrides: &options.extensions.setting_overrides,
 		},
@@ -691,11 +689,13 @@ pub async fn compose_kernel(
 		.unwrap_or_else(|| environment.registry());
 	let registry = if options.no_tools {
 		if options.tools.is_some() {
-			return Err(std::io::Error::new(
-				std::io::ErrorKind::InvalidInput,
-				"--tools and --no-tools are mutually exclusive",
-			)
-			.into());
+			return Err(
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidInput,
+					"--tools and --no-tools are mutually exclusive",
+				)
+				.into(),
+			);
 		}
 		Arc::new(Registry::new())
 	} else if let Some(names) = &options.tools {
@@ -776,8 +776,9 @@ pub async fn compose_kernel(
 		options.ephemeral,
 		terminal.as_deref(),
 	)?;
-	let ephemeral_journal =
-		options.ephemeral.then(|| EphemeralJournal { path: journal_path.clone() });
+	let ephemeral_journal = options
+		.ephemeral
+		.then(|| EphemeralJournal { path: journal_path.clone() });
 	let mut session = if journal_path.exists() {
 		Session::open(&journal_path, component_registry)?
 	} else {
@@ -807,21 +808,21 @@ pub async fn compose_kernel(
 	let policy = DispatchPolicy::new(spill)
 		.with_interrupt_grace(unit_grace.saturating_add(Duration::from_secs(1)));
 	let runtime_flags = RuntimeFlags {
-		automatic_compaction: ctx
+		automatic_compaction:     ctx
 			.get("ai_compaction_enabled")
 			.and_then(|value| match value {
 				omp_con::Value::Bool(value) => Some(value),
 				_ => None,
 			})
 			.unwrap_or(true),
-		goal_enabled: ctx
+		goal_enabled:             ctx
 			.get("cl_goal_enabled")
 			.and_then(|value| match value {
 				omp_con::Value::Bool(value) => Some(value),
 				_ => None,
 			})
 			.unwrap_or(true),
-		autolearn_enabled: ctx
+		autolearn_enabled:        ctx
 			.get("ai_autolearn_enabled")
 			.and_then(|value| match value {
 				omp_con::Value::Bool(value) => Some(value),
@@ -835,7 +836,7 @@ pub async fn compose_kernel(
 				_ => None,
 			})
 			.unwrap_or(5),
-		recover_inline_edits: ctx
+		recover_inline_edits:     ctx
 			.get("sv_edit_recover_inline_edits")
 			.and_then(|value| match value {
 				omp_con::Value::Bool(value) => Some(value),
@@ -863,9 +864,9 @@ pub async fn compose_kernel(
 		.map_or_else(|| Str::new(Ulid::generate().to_string()), Str::new);
 	let name = options.session_name.clone().unwrap_or_else(|| id.clone());
 	live_sessions.register(name.clone(), crate::sessions::KernelHandle {
-		id: crate::sessions::SessionId::new(id),
-		name: name.clone(),
-		up: kernel.mailbox(),
+		id:       crate::sessions::SessionId::new(id),
+		name:     name.clone(),
+		up:       kernel.mailbox(),
 		snapshot: Arc::new(RwLock::new(session.dom().snapshot())),
 	});
 	if tools_enabled {
@@ -933,14 +934,7 @@ impl SessionHome {
 			.sessions
 			.clone()
 			.unwrap_or_else(|| Arc::new(crate::sessions::SessionRegistry::new()));
-		Ok(Self {
-			sessions_dir,
-			project_root,
-			model,
-			prompt: options.prompt.clone(),
-			live,
-			up,
-		})
+		Ok(Self { sessions_dir, project_root, model, prompt: options.prompt.clone(), live, up })
 	}
 
 	/// Path of a fresh journal in the session directory.
@@ -957,12 +951,7 @@ impl SessionHome {
 			fs::create_dir_all(parent)?;
 		}
 		let mut session = Session::create(&path, ComponentRegistry::standard())?;
-		install_prompt_facts(
-			&mut session,
-			&self.project_root,
-			self.model.as_str(),
-			&self.prompt,
-		)?;
+		install_prompt_facts(&mut session, &self.project_root, self.model.as_str(), &self.prompt)?;
 		self.register(&session);
 		Ok(session)
 	}
@@ -971,12 +960,7 @@ impl SessionHome {
 	pub fn open(&self, path: &Path) -> Result<Session, HeadlessError> {
 		let path = resolve_session_path(&self.sessions_dir, path);
 		let mut session = Session::open(&path, ComponentRegistry::standard())?;
-		install_prompt_facts(
-			&mut session,
-			&self.project_root,
-			self.model.as_str(),
-			&self.prompt,
-		)?;
+		install_prompt_facts(&mut session, &self.project_root, self.model.as_str(), &self.prompt)?;
 		self.register(&session);
 		Ok(session)
 	}
@@ -997,12 +981,14 @@ impl SessionHome {
 			.file_stem()
 			.and_then(|name| name.to_str())
 			.map_or_else(|| Str::new(Ulid::generate().to_string()), Str::new);
-		self.live.register(id.clone(), crate::sessions::KernelHandle {
-			id:       crate::sessions::SessionId::new(id.clone()),
-			name:     id,
-			up:       self.up.clone(),
-			snapshot: Arc::new(RwLock::new(session.dom().snapshot())),
-		});
+		self
+			.live
+			.register(id.clone(), crate::sessions::KernelHandle {
+				id:       crate::sessions::SessionId::new(id.clone()),
+				name:     id,
+				up:       self.up.clone(),
+				snapshot: Arc::new(RwLock::new(session.dom().snapshot())),
+			});
 	}
 
 	/// Removes `session`'s journal from the live index (before its file is
@@ -1059,7 +1045,9 @@ fn route_facts(
 			.chat
 			.as_ref()
 			.and_then(|chat| chat.input_modalities.constraints())
-			.is_some_and(|modalities| modalities.contains(omp_catalog::capability::ModalityBits::IMAGE)),
+			.is_some_and(|modalities| {
+				modalities.contains(omp_catalog::capability::ModalityBits::IMAGE)
+			}),
 	}
 }
 
@@ -1122,7 +1110,9 @@ fn terminal_device_identity() -> Option<Str> {
 	}
 	["/dev/fd/0", "/proc/self/fd/0"].into_iter().find_map(|fd| {
 		let path = fs::canonicalize(fd).ok()?;
-		path.starts_with("/dev/").then(|| Str::new(path.to_string_lossy()))
+		path
+			.starts_with("/dev/")
+			.then(|| Str::new(path.to_string_lossy()))
 	})
 }
 
@@ -1153,7 +1143,9 @@ fn remembered_terminal_session(
 	let relative = Path::new(name);
 	if name.is_empty()
 		|| relative.components().count() != 1
-		|| relative.extension().and_then(|extension| extension.to_str())
+		|| relative
+			.extension()
+			.and_then(|extension| extension.to_str())
 			!= Some(omp_journal::FILE_EXTENSION)
 	{
 		return Ok(None);
@@ -1200,11 +1192,13 @@ fn select_journal_path(
 		+ usize::from(continue_session)
 		+ usize::from(ephemeral);
 	if selected > 1 {
-		return Err(std::io::Error::new(
-			std::io::ErrorKind::InvalidInput,
-			"session, fork, continue, and ephemeral modes are mutually exclusive",
-		)
-		.into());
+		return Err(
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"session, fork, continue, and ephemeral modes are mutually exclusive",
+			)
+			.into(),
+		);
 	}
 	if let Some(path) = explicit {
 		return Ok(resolve_session_path(sessions_dir, path));
@@ -1215,9 +1209,7 @@ fn select_journal_path(
 		fs::copy(source, &destination)?;
 		return Ok(destination);
 	}
-	if continue_session
-		&& let Some(path) = remembered_terminal_session(sessions_dir, terminal)?
-	{
+	if continue_session && let Some(path) = remembered_terminal_session(sessions_dir, terminal)? {
 		return Ok(path);
 	}
 	let name = format!("{}.oms", Ulid::generate());
@@ -1477,9 +1469,8 @@ mod tests {
 		std::fs::write(&first, b"journal").expect("journal");
 		remember_terminal_session(sessions, Some("terminal-a"), &first).expect("breadcrumb");
 
-		let resumed =
-			select_journal_path(sessions, None, None, true, false, Some("terminal-a"))
-				.expect("continue");
+		let resumed = select_journal_path(sessions, None, None, true, false, Some("terminal-a"))
+			.expect("continue");
 		assert_eq!(resumed, first);
 
 		let fresh = select_journal_path(sessions, None, None, true, false, Some("terminal-b"))
@@ -1563,10 +1554,12 @@ mod tests {
 			.iter()
 			.find(|model| {
 				model.key.as_str().contains("claude")
-					&& catalog.wire_policy(&model.wire_policy).is_some_and(|policy| {
-						policy.tool.forced_choice == Some(true)
-							&& policy.tool.named_choice != Some(true)
-					})
+					&& catalog
+						.wire_policy(&model.wire_policy)
+						.is_some_and(|policy| {
+							policy.tool.forced_choice == Some(true)
+								&& policy.tool.named_choice != Some(true)
+						})
 			})
 			.expect("embedded Anthropic model has paid forced choice");
 		assert!(!route_facts(catalog, paid).forced_choice_free);
@@ -1629,8 +1622,8 @@ mod tests {
 		let schema: serde_json::Value =
 			serde_json::from_slice(&spec.schema).expect("yield parameter schema");
 		assert_eq!(
-			schema["properties"]["result"]["oneOf"][0]["properties"]["data"]["anyOf"][0]
-				["properties"]["ok"]["type"],
+			schema["properties"]["result"]["oneOf"][0]["properties"]["data"]["anyOf"][0]["properties"]
+				["ok"]["type"],
 			"boolean"
 		);
 	}
@@ -1664,11 +1657,9 @@ mod tests {
 	#[test]
 	fn unknown_tool_allow_list_is_rejected_before_kernel_construction() {
 		let registry = omp_tool::Registry::new();
-		let error = validate_tool_names(
-			&registry,
-			&[omp_core::Str::new_static("definitely-not-installed")],
-		)
-		.expect_err("unknown tool");
+		let error =
+			validate_tool_names(&registry, &[omp_core::Str::new_static("definitely-not-installed")])
+				.expect_err("unknown tool");
 		let HeadlessError::Io(error) = error else {
 			panic!("tool validation is an invalid-input error");
 		};
@@ -1681,9 +1672,6 @@ mod tests {
 			approval_mode: Some(omp_envd::tool_settings::ApprovalMode::AlwaysAsk),
 			..KernelOptions::default()
 		};
-		assert_eq!(
-			options.approval_mode,
-			Some(omp_envd::tool_settings::ApprovalMode::AlwaysAsk)
-		);
+		assert_eq!(options.approval_mode, Some(omp_envd::tool_settings::ApprovalMode::AlwaysAsk));
 	}
 }

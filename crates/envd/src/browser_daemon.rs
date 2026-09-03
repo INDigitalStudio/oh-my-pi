@@ -235,11 +235,7 @@ fn open(
 	})
 }
 
-fn run_tab(
-	tabs: &mut HashMap<Str, WebView>,
-	name: Str,
-	params: Params,
-) -> Result<Payload, Fault> {
+fn run_tab(tabs: &mut HashMap<Str, WebView>, name: Str, params: Params) -> Result<Payload, Fault> {
 	let view = tabs.get(&name).ok_or_else(|| not_found(&name))?;
 	let tab = view.automation();
 	let timeout = timeout(&params);

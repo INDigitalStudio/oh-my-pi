@@ -82,10 +82,7 @@ fn render_checklist(view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Com
 		for (task_index, task) in tasks.iter().enumerate() {
 			let text = task.content.clone();
 			let completed = task.status == Status::Completed;
-			let blocker = task
-				.blocker
-				.clone()
-				.filter(|text| !text.is_empty());
+			let blocker = task.blocker.clone().filter(|text| !text.is_empty());
 			let last = task_index + 1 == tasks.len();
 			let sweeping = completed
 				&& completed_now.as_ref().is_some_and(|(phase, item)| {
@@ -220,7 +217,11 @@ mod tests {
 			output:  None,
 			started: None,
 		};
-		let mut ui = Ui::from_root(TodoCard.render(&view, false, &UiContext::default()), 40, UiContext::default());
+		let mut ui = Ui::from_root(
+			TodoCard.render(&view, false, &UiContext::default()),
+			40,
+			UiContext::default(),
+		);
 		let row = frame_row_text(ui.frame(), 2);
 		let at = column_of(&row, "Scaffold");
 		let len = u16::try_from("Scaffold crate".len()).unwrap();
@@ -253,7 +254,11 @@ mod tests {
 			output:  None,
 			started: None,
 		};
-		let ui = Ui::from_root(TodoCard.render(&view, false, &UiContext::default()), 40, UiContext::default());
+		let ui = Ui::from_root(
+			TodoCard.render(&view, false, &UiContext::default()),
+			40,
+			UiContext::default(),
+		);
 		let at = column_of(&frame_row_text(ui.frame(), 2), "Scaffold");
 		assert!(struck(&ui, 2, at, 14).iter().all(|s| *s));
 		assert_eq!(ui.next_wake(), None);

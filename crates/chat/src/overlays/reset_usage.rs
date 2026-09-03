@@ -30,21 +30,24 @@ pub struct ResetUsageSelector {
 impl ResetUsageSelector {
 	/// Starts loading the redeemable account roster from the controller feed.
 	pub fn open(cx: &PanelCx<'_>) -> Result<Self, Str> {
-		let pending = cx.services.reset_accounts().map_err(|error| sf!("{error}"))?;
+		let pending = cx
+			.services
+			.reset_accounts()
+			.map_err(|error| sf!("{error}"))?;
 		Ok(Self::new(pending, cx.ui))
 	}
 
 	fn new(pending: Pending<Vec<ResetAccountRow>>, ctx: &UiContext) -> Self {
 		let mut panel = Self {
-			pending: Some(pending),
-			rows: Vec::new(),
-			selected: 0,
-			awaiting: None,
-			status: None,
+			pending:   Some(pending),
+			rows:      Vec::new(),
+			selected:  0,
+			awaiting:  None,
+			status:    None,
 			next_wake: Some(Duration::ZERO),
-			ui: Ui::from_root(dom! { <col/> }, 80, ctx.clone()),
-			ctx: ctx.clone(),
-			width: 80,
+			ui:        Ui::from_root(dom! { <col/> }, 80, ctx.clone()),
+			ctx:       ctx.clone(),
+			width:     80,
 		};
 		panel.rebuild();
 		panel
@@ -54,8 +57,8 @@ impl ResetUsageSelector {
 		if self.rows.is_empty() || self.awaiting.is_some() {
 			return;
 		}
-		self.selected = (self.selected as isize + delta)
-			.rem_euclid(self.rows.len() as isize) as usize;
+		self.selected =
+			(self.selected as isize + delta).rem_euclid(self.rows.len() as isize) as usize;
 		self.status = None;
 		self.rebuild();
 	}
@@ -84,9 +87,7 @@ impl ResetUsageSelector {
 			.rows
 			.iter()
 			.enumerate()
-			.map(|(index, row)| {
-				(index == self.selected, row.label.clone(), row.available, row.active)
-			})
+			.map(|(index, row)| (index == self.selected, row.label.clone(), row.available, row.active))
 			.collect::<Vec<_>>();
 		let loading = self.pending.is_some();
 		let status = self.status.clone();
@@ -113,9 +114,13 @@ impl ResetUsageSelector {
 }
 
 impl Panel for ResetUsageSelector {
-	fn id(&self) -> &'static str { ID }
+	fn id(&self) -> &'static str {
+		ID
+	}
 
-	fn anchor(&self) -> PanelAnchor { PanelAnchor::Center }
+	fn anchor(&self) -> PanelAnchor {
+		PanelAnchor::Center
+	}
 
 	fn key(&mut self, key: Key) -> PanelEvent {
 		match key {
@@ -172,7 +177,11 @@ impl Panel for ResetUsageSelector {
 		match pending.try_recv() {
 			Ok(Ok(rows)) => {
 				self.rows = rows;
-				self.selected = self.rows.iter().position(|row| row.available > 0).unwrap_or(0);
+				self.selected = self
+					.rows
+					.iter()
+					.position(|row| row.available > 0)
+					.unwrap_or(0);
 				self.pending = None;
 				self.next_wake = None;
 				self.rebuild();
@@ -199,7 +208,9 @@ impl Panel for ResetUsageSelector {
 		}
 	}
 
-	fn next_wake(&self) -> Option<Duration> { self.next_wake }
+	fn next_wake(&self) -> Option<Duration> {
+		self.next_wake
+	}
 }
 
 #[cfg(test)]
@@ -210,9 +221,20 @@ mod tests {
 	fn preselects_redeemable_and_requires_confirmation_enter() {
 		let (tx, rx) = flume::bounded(1);
 		tx.send(Ok(vec![
-			ResetAccountRow { target: "empty".into(), label: "empty".into(), available: 0, active: true },
-			ResetAccountRow { target: "ready".into(), label: "ready".into(), available: 2, active: false },
-		])).unwrap();
+			ResetAccountRow {
+				target:    "empty".into(),
+				label:     "empty".into(),
+				available: 0,
+				active:    true,
+			},
+			ResetAccountRow {
+				target:    "ready".into(),
+				label:     "ready".into(),
+				available: 2,
+				active:    false,
+			},
+		]))
+		.unwrap();
 		let mut panel = ResetUsageSelector::new(rx, &UiContext::default());
 		assert!(panel.tick(Duration::ZERO));
 		assert_eq!(panel.selected, 1);
@@ -226,8 +248,12 @@ mod tests {
 	fn zero_credit_account_cannot_emit_redemption() {
 		let (tx, rx) = flume::bounded(1);
 		tx.send(Ok(vec![ResetAccountRow {
-			target: "empty".into(), label: "empty".into(), available: 0, active: true,
-		}])).unwrap();
+			target:    "empty".into(),
+			label:     "empty".into(),
+			available: 0,
+			active:    true,
+		}]))
+		.unwrap();
 		let mut panel = ResetUsageSelector::new(rx, &UiContext::default());
 		panel.tick(Duration::ZERO);
 		assert_eq!(panel.key(Key::Enter), PanelEvent::Consumed);

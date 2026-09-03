@@ -24,8 +24,7 @@ use omp_tool::{
 	CallOutcome, CapsBase, Claims, ModelClass, Precedence, Presentation, Registry, Rev, ToolIdentity,
 };
 use omp_tools::edit::{
-	self, Fault, FormatPolicy, LegacyReplaceParams, Payload, RejectionReason,
-	observer::EditObserver,
+	self, Fault, FormatPolicy, LegacyReplaceParams, Payload, RejectionReason, observer::EditObserver,
 };
 
 const CAPS: CapsBase = CapsBase {

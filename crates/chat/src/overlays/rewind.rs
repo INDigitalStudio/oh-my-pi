@@ -181,14 +181,12 @@ impl RewindPanel {
 	fn route(&mut self, event: UiEvent) -> PanelEvent {
 		match event {
 			UiEvent::Cancel => PanelEvent::Close,
-			UiEvent::Changed { id, value } if id.as_str() == "turns" => {
-				match self.index_of(&value) {
-					Some(index) => {
-						self.selected = index;
-						PanelEvent::Finish(self.line())
-					},
-					None => PanelEvent::Consumed,
-				}
+			UiEvent::Changed { id, value } if id.as_str() == "turns" => match self.index_of(&value) {
+				Some(index) => {
+					self.selected = index;
+					PanelEvent::Finish(self.line())
+				},
+				None => PanelEvent::Consumed,
 			},
 			UiEvent::Highlighted { id, value } if id.as_str() == "turns" => {
 				if let Some(index) = self.index_of(&value)
@@ -271,8 +269,9 @@ impl Panel for RewindPanel {
 	}
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
-		let event =
-			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		self.route(event)
 	}
 
@@ -311,7 +310,11 @@ fn rewind_rows(dom: &Dom) -> Vec<RewindRow> {
 		let Some(target) = node
 			.prop(&PropKey::from(PropId::Cause))
 			.and_then(Value::as_str)
-			.or_else(|| node.prop(&PropKey::from(PropId::Id)).and_then(Value::as_str))
+			.or_else(|| {
+				node
+					.prop(&PropKey::from(PropId::Id))
+					.and_then(Value::as_str)
+			})
 		else {
 			continue;
 		};
@@ -362,13 +365,16 @@ mod tests {
 	use omp_session::{ComponentRegistry, Session};
 	use omp_tui::{Mods, Mouse, MouseButton};
 
-	use super::super::{NoServices, Services};
-	use super::*;
+	use super::{
+		super::{NoServices, Services},
+		*,
+	};
 
 	fn session(prompts: &[&str]) -> Session {
 		let directory = tempfile::tempdir().expect("temp directory");
-		let mut session = Session::create(directory.keep().join("rewind.oms"), ComponentRegistry::standard())
-			.expect("session");
+		let mut session =
+			Session::create(directory.keep().join("rewind.oms"), ComponentRegistry::standard())
+				.expect("session");
 		for prompt in prompts {
 			session.begin_turn().expect("turn");
 			session.user(*prompt, Vec::new()).expect("user");
@@ -395,7 +401,8 @@ mod tests {
 	}
 
 	fn point(text: &str, needle: &str) -> (u16, u16) {
-		text.lines()
+		text
+			.lines()
 			.enumerate()
 			.find_map(|(row, line)| {
 				let byte = line.find(needle)?;

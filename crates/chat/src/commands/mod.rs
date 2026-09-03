@@ -23,38 +23,38 @@ use omp_tui::Icon;
 
 use crate::actions::{HostAction, HostMailbox};
 
+/// Provider accounts (`/login`, `/logout`, `/setup`, `/providers`, `/pin`).
+pub mod accounts;
+/// Agent definitions and the live supervisor (`/agents`, `/hub`,
+/// `transcript <id>`).
+pub mod agents;
+/// Model, lifecycle, and MCP commands (`/model`, `/switch`, `/fast`,
+/// `/retry`, `/clear`, `/exit`, `/quit`, `/restart`, `/dump`, `/mcp`).
+pub mod control;
+/// Dashboards and reports (`/usage`, `/context`, `/hotkeys`, `/changelog`,
+/// `/debug`, `/stats`, `/trace`).
+pub mod dashboards;
 /// Director-shaped modes (`/plan`, `/vibe`, `/goal`, `/loop`).
 pub mod directors;
+/// Git workbench and transcript copy (`/git`, `/copy`).
+pub mod git;
+/// Collaboration, lifecycle, and capability toggles (`/export`, `/share`,
+/// `/cleanse`, `/security`, `/memory`, `/ssh`, `/browser`, …).
+pub mod misc;
 /// Plan mode and plan review (`/plan`, `/plan-review`).
 pub mod plan;
 /// Host-side application of posted actions.
 mod run;
 /// Session lifecycle (`/new`, `/resume`, `/rewind`, `/tree`, …).
 pub mod session;
-/// Git workbench and transcript copy (`/git`, `/copy`).
-pub mod git;
-/// Agent definitions and the live supervisor (`/agents`, `/hub`,
-/// `transcript <id>`).
-pub mod agents;
+/// Settings selector (`/settings`).
+pub mod settings;
 /// Tools and extensions (`/tools`, `/extensions`, `/plugins`,
 /// `/marketplace`, `/reload-plugins`).
 pub mod tools;
-/// Provider accounts (`/login`, `/logout`, `/setup`, `/providers`, `/pin`).
-pub mod accounts;
-/// Dashboards and reports (`/usage`, `/context`, `/hotkeys`, `/changelog`,
-/// `/debug`, `/stats`, `/trace`).
-pub mod dashboards;
-/// Collaboration, lifecycle, and capability toggles (`/export`, `/share`,
-/// `/cleanse`, `/security`, `/memory`, `/ssh`, `/browser`, …).
-pub mod misc;
-/// Model, lifecycle, and MCP commands (`/model`, `/switch`, `/fast`,
-/// `/retry`, `/clear`, `/exit`, `/quit`, `/restart`, `/dump`, `/mcp`).
-pub mod control;
 /// Workspace roots and relocation (`/add-dir`, `/remove-dir`, `/dirs`,
 /// `/move`, `/wt`).
 pub mod workspace;
-/// Settings selector (`/settings`).
-pub mod settings;
 
 pub use run::{director_active, director_frame, message_count, todo_markdown};
 

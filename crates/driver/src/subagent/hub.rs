@@ -27,9 +27,7 @@ use omp_proto::{
 };
 use omp_session::components::jobs::{self, JobSpec};
 use omp_tool::{CallOutcome, ToolSpec};
-use omp_tools::hub::{
-	Fault, HubBackend, Op as HubOp, Params, Request, Response, RestartPolicy,
-};
+use omp_tools::hub::{Fault, HubBackend, Op as HubOp, Params, Request, Response, RestartPolicy};
 use tokio_util::sync::CancellationToken;
 
 /// Declaration-only backend; kernel session routing intercepts every call.
@@ -122,49 +120,39 @@ impl SessionTool for HubSessionTool {
 				},
 				HubOp::Send => send(cx.authority, &params).map_err(fault_text),
 				HubOp::Inbox => inbox(cx.session, params.peek).map_err(fault_text),
-				HubOp::Wait => {
-					wait(cx.session, cx.jobs, cx.control, &self.env, &params)
-						.await
-						.map_err(fault_text)
-				},
+				HubOp::Wait => wait(cx.session, cx.jobs, cx.control, &self.env, &params)
+					.await
+					.map_err(fault_text),
 				HubOp::List => list(cx.authority, params.limit).map_err(fault_text),
 				HubOp::Jobs => roster(cx.jobs).map_err(fault_text),
-				HubOp::Cancel => {
-					cancel(cx.session, cx.jobs, params.ids.as_deref().unwrap_or_default())
-						.await
-						.map_err(fault_text)
-				},
-				HubOp::Start => {
-					process_start(
-						cx.session,
-						cx.jobs,
-						&self.env,
-						&self.project_root,
-						self.caller_id.as_str(),
-						&params,
-					)
+				HubOp::Cancel => cancel(cx.session, cx.jobs, params.ids.as_deref().unwrap_or_default())
 					.await
-					.map_err(fault_text)
-				},
-				HubOp::Ps => process_list(cx.session, cx.jobs, &self.env).await.map_err(fault_text),
+					.map_err(fault_text),
+				HubOp::Start => process_start(
+					cx.session,
+					cx.jobs,
+					&self.env,
+					&self.project_root,
+					self.caller_id.as_str(),
+					&params,
+				)
+				.await
+				.map_err(fault_text),
+				HubOp::Ps => process_list(cx.session, cx.jobs, &self.env)
+					.await
+					.map_err(fault_text),
 				HubOp::Logs => process_logs(&self.env, &params).await.map_err(fault_text),
-				HubOp::Stop => {
-					process_stop(cx.session, cx.jobs, &self.env, &params)
+				HubOp::Stop => process_stop(cx.session, cx.jobs, &self.env, &params)
+					.await
+					.map_err(fault_text),
+				HubOp::Restart => {
+					process_restart(cx.session, cx.jobs, &self.env, self.caller_id.as_str(), &params)
 						.await
 						.map_err(fault_text)
 				},
-				HubOp::Restart => {
-					process_restart(
-						cx.session,
-						cx.jobs,
-						&self.env,
-						self.caller_id.as_str(),
-						&params,
-					)
+				HubOp::Describe => process_describe(&self.env, &params)
 					.await
-					.map_err(fault_text)
-				},
-				HubOp::Describe => process_describe(&self.env, &params).await.map_err(fault_text),
+					.map_err(fault_text),
 			};
 			match response {
 				Ok(response) => {
@@ -348,11 +336,12 @@ async fn wait_peer(
 	timeout_ms: Option<u64>,
 ) -> Result<Response, omp_agent::SessionToolError> {
 	let timeout = timeout_ms.unwrap_or(120_000);
-	let deadline = (timeout != 0).then(|| tokio::time::Instant::now() + Duration::from_millis(timeout));
+	let deadline =
+		(timeout != 0).then(|| tokio::time::Instant::now() + Duration::from_millis(timeout));
 	loop {
 		if let Some(message) = pop_inbox_message(session)? {
 			return Ok(Response {
-				text: Str::new(serde_json::json!({ "messages": [message] }).to_string()),
+				text:    Str::new(serde_json::json!({ "messages": [message] }).to_string()),
 				useless: false,
 			});
 		}
@@ -392,7 +381,8 @@ async fn wait(
 		return process_wait(session, control, env, params).await;
 	}
 	let timeout = params.timeout_ms.unwrap_or(120_000);
-	let deadline = (timeout != 0).then(|| tokio::time::Instant::now() + Duration::from_millis(timeout));
+	let deadline =
+		(timeout != 0).then(|| tokio::time::Instant::now() + Duration::from_millis(timeout));
 	let selected = params
 		.ids
 		.clone()
@@ -409,7 +399,7 @@ async fn wait(
 		jobs.poll(session)?;
 		if let Some(message) = pop_inbox_message(session)? {
 			return Ok(Response {
-				text: Str::new(serde_json::json!({ "messages": [message] }).to_string()),
+				text:    Str::new(serde_json::json!({ "messages": [message] }).to_string()),
 				useless: false,
 			});
 		}
@@ -417,7 +407,7 @@ async fn wait(
 			&& let Some(job) = selected_settled_job(jobs, Some(&selected))
 		{
 			return Ok(Response {
-				text: Str::new(
+				text:    Str::new(
 					serde_json::json!({
 						"job": {
 							"id": job.id,
@@ -457,18 +447,12 @@ async fn wait(
 			sleep.await;
 		}
 		if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-			return Ok(Response {
-				text: Str::new_static(r#"{"timeout":true}"#),
-				useless: true,
-			});
+			return Ok(Response { text: Str::new_static(r#"{"timeout":true}"#), useless: true });
 		}
 	}
 }
 
-fn selected_settled_job(
-	jobs: &JobBoard,
-	ids: Option<&[Str]>,
-) -> Option<omp_agent::JobRecord> {
+fn selected_settled_job(jobs: &JobBoard, ids: Option<&[Str]>) -> Option<omp_agent::JobRecord> {
 	jobs.list().into_iter().find(|job| {
 		ids.is_none_or(|ids| ids.is_empty() || ids.contains(&job.id))
 			&& !matches!(job.status.as_str(), "running" | "starting")
@@ -505,7 +489,13 @@ fn pop_inbox_message(
 		.children(steering)
 		.iter()
 		.copied()
-		.find(|handle| session.dom().get(*handle).and_then(|node| node.content.as_ref()) == Some(&message))
+		.find(|handle| {
+			session
+				.dom()
+				.get(*handle)
+				.and_then(|node| node.content.as_ref())
+				== Some(&message)
+		})
 		.expect("message came from a steering child");
 	let cause = session
 		.head()
@@ -536,17 +526,16 @@ async fn process_start(
 			.ok_or_else(|| omp_agent::SessionToolError::Rejected {
 				message: Str::new_static("hub start requires `application`"),
 			})?;
-	let cwd_path = params
-		.cwd
-		.as_deref()
-		.map(PathBuf::from)
-		.map_or_else(|| project_root.to_path_buf(), |path| {
+	let cwd_path = params.cwd.as_deref().map(PathBuf::from).map_or_else(
+		|| project_root.to_path_buf(),
+		|path| {
 			if path.is_absolute() {
 				path
 			} else {
 				project_root.join(path)
 			}
-		});
+		},
+	);
 	let cwd_url = url::Url::from_file_path(&cwd_path).map_err(|()| {
 		omp_agent::SessionToolError::Rejected { message: Str::new_static("process cwd is invalid") }
 	})?;
@@ -559,15 +548,9 @@ async fn process_start(
 		let _ = jobs.terminate(session, handle).await?;
 	}
 	let start = process_start_request(name, application, params);
-	let started = env
-		.start_process(
-			&cwd,
-			start,
-		)
-		.await
-		.map_err(|error| omp_agent::SessionToolError::Rejected {
-			message: Str::new(error.to_string()),
-		})?;
+	let started = env.start_process(&cwd, start).await.map_err(|error| {
+		omp_agent::SessionToolError::Rejected { message: Str::new(error.to_string()) }
+	})?;
 	attach_process_job(session, jobs, env, owner, name)?;
 	Ok(Response {
 		text:    Str::new(
@@ -598,36 +581,36 @@ fn process_start_request(name: &str, application: &str, params: &Params) -> Star
 	let mut probes = Vec::new();
 	if let Some(pattern) = params.ready.as_ref().and_then(|ready| ready.log.as_ref()) {
 		probes.push(ReadyProbe {
-			probe: Some(ready_probe::Probe::Log(ReadyLog {
+			probe:      Some(ready_probe::Probe::Log(ReadyLog {
 				pattern: pattern.to_string(),
-				props: None,
+				props:   None,
 			})),
 			timeout_ms: ready_timeout,
-			props: None,
+			props:      None,
 		});
 	}
 	if let Some(port) = params.ready.as_ref().and_then(|ready| ready.port) {
 		probes.push(ReadyProbe {
-			probe: Some(ready_probe::Probe::Tcp(ReadyTcp {
-				host: params
+			probe:      Some(ready_probe::Probe::Tcp(ReadyTcp {
+				host:  params
 					.ready
 					.as_ref()
 					.and_then(|ready| ready.host.as_ref())
 					.map_or_else(|| String::from("127.0.0.1"), ToString::to_string),
-				port: u32::from(port),
+				port:  u32::from(port),
 				props: None,
 			})),
 			timeout_ms: ready_timeout,
-			props: None,
+			props:      None,
 		});
 	}
 	let detached = params.detached;
 	StartProcess {
-		name: name.to_owned(),
-		spec: Some(ProcessSpec {
+		name:  name.to_owned(),
+		spec:  Some(ProcessSpec {
 			source: Some(Script { text: command, props: None }),
 			env_delta: Some(EnvironmentDelta {
-				set: params
+				set:   params
 					.env
 					.clone()
 					.unwrap_or_default()
@@ -638,10 +621,10 @@ fn process_start_request(name: &str, application: &str, params: &Params) -> Star
 				props: None,
 			}),
 			pty: (params.pty.unwrap_or(true) && !detached).then(|| PtySpec {
-				rows: 24,
-				columns: 120,
+				rows:     24,
+				columns:  120,
 				terminal: String::from("xterm-256color"),
-				props: None,
+				props:    None,
 			}),
 			restart: Some(RestartSpec {
 				policy: match params.restart.unwrap_or(RestartPolicy::No) {
@@ -653,7 +636,10 @@ fn process_start_request(name: &str, application: &str, params: &Params) -> Star
 			}),
 			detached,
 			persist: params.persist || detached,
-			timeout_ms: params.timeout.map(seconds_millis).filter(|timeout| *timeout != 0),
+			timeout_ms: params
+				.timeout
+				.map(seconds_millis)
+				.filter(|timeout| *timeout != 0),
 			..ProcessSpec::default()
 		}),
 		ready: probes,
@@ -671,16 +657,20 @@ fn attach_process_job(
 	let handle = job_handle(session, name);
 	let handle = match handle {
 		Some(handle) => {
-			let cause = session.head().ok_or_else(|| omp_agent::SessionToolError::Rejected {
-				message: Str::new_static("session has no journal head"),
-			})?;
+			let cause = session
+				.head()
+				.ok_or_else(|| omp_agent::SessionToolError::Rejected {
+					message: Str::new_static("session has no journal head"),
+				})?;
 			session.patch(jobs::set_status(cause, handle, "running"))?;
 			handle
 		},
 		None => {
-			let cause = session.head().ok_or_else(|| omp_agent::SessionToolError::Rejected {
-				message: Str::new_static("session has no journal head"),
-			})?;
+			let cause = session
+				.head()
+				.ok_or_else(|| omp_agent::SessionToolError::Rejected {
+					message: Str::new_static("session has no journal head"),
+				})?;
 			let started = SystemTime::now()
 				.duration_since(UNIX_EPOCH)
 				.map_err(|error| omp_agent::SessionToolError::Rejected {
@@ -690,11 +680,11 @@ fn attach_process_job(
 				.to_string();
 			session.patch(
 				jobs::insert(session.dom(), cause, JobSpec {
-					id: Str::new(name),
-					kind: Str::new_static("process"),
-					owner: Str::new(owner),
+					id:      Str::new(name),
+					kind:    Str::new_static("process"),
+					owner:   Str::new(owner),
 					started: Str::new(started),
-					agent: None,
+					agent:   None,
 				})
 				.ok_or_else(|| omp_agent::SessionToolError::Rejected {
 					message: Str::new_static("session jobs component is absent"),
@@ -731,7 +721,7 @@ fn spawn_process_task(
 			Err(error) => JobSettlement {
 				status: Str::new_static("failed"),
 				output: None,
-				error: Some(Str::new(error.to_string())),
+				error:  Some(Str::new(error.to_string())),
 			},
 		}
 	})
@@ -747,10 +737,10 @@ async fn monitor_process(
 	if !initial && terminal_process(&process) {
 		let started = env
 			.restart_process(RestartProcess {
-				name: name.to_owned(),
-				generation: process.generation,
+				name:          name.to_owned(),
+				generation:    process.generation,
 				wire_revision: SCHEMA_REV,
-				props: None,
+				props:         None,
 			})
 			.await
 			.map_err(env_error)?;
@@ -761,14 +751,14 @@ async fn monitor_process(
 	}
 	let mut attachment = env
 		.attach_output(AttachOutput {
-			name: name.to_owned(),
-			after_sequence: process.log_end_offset,
-			generation: process.generation,
-			max_bytes: 1,
-			terminal_text: false,
+			name:             name.to_owned(),
+			after_sequence:   process.log_end_offset,
+			generation:       process.generation,
+			max_bytes:        1,
+			terminal_text:    false,
 			terminal_columns: 1,
-			terminal_rows: 1,
-			props: None,
+			terminal_rows:    1,
+			props:            None,
 		})
 		.await
 		.map_err(env_error)?;
@@ -807,7 +797,9 @@ fn process_status(process: &ProcessInfo) -> Str {
 		ProcessState::Exited => Str::new_static("completed"),
 		ProcessState::Stopped => Str::new_static("cancelled"),
 		ProcessState::Failed => Str::new_static("failed"),
-		ProcessState::Starting | ProcessState::Ready | ProcessState::Running
+		ProcessState::Starting
+		| ProcessState::Ready
+		| ProcessState::Running
 		| ProcessState::Unspecified => Str::new_static("running"),
 	}
 }
@@ -822,10 +814,14 @@ async fn process_list(
 		.await
 		.map_err(env_error)?;
 	sync_process_statuses(session, jobs, &processes.processes)?;
-	let rows = processes.processes.iter().map(process_json).collect::<Vec<_>>();
+	let rows = processes
+		.processes
+		.iter()
+		.map(process_json)
+		.collect::<Vec<_>>();
 	Ok(Response {
 		useless: rows.is_empty(),
-		text: Str::new(serde_json::json!({ "processes": rows }).to_string()),
+		text:    Str::new(serde_json::json!({ "processes": rows }).to_string()),
 	})
 }
 
@@ -851,10 +847,10 @@ async fn process_restart(
 	}
 	let started = env
 		.restart_process(RestartProcess {
-			name: name.to_owned(),
-			generation: process.generation,
+			name:          name.to_owned(),
+			generation:    process.generation,
 			wire_revision: SCHEMA_REV,
-			props: None,
+			props:         None,
 		})
 		.await
 		.map_err(env_error)?;
@@ -892,7 +888,7 @@ async fn process_stop(
 	set_job_status(session, name, "stopped")?;
 	jobs.rebuild(session);
 	Ok(Response {
-		text: Str::new(serde_json::json!({ "name": name, "status": "stopped" }).to_string()),
+		text:    Str::new(serde_json::json!({ "name": name, "status": "stopped" }).to_string()),
 		useless: false,
 	})
 }
@@ -905,10 +901,10 @@ async fn process_send(
 	let process = find_process(env, name).await?;
 	if let Some(signal) = params.signal {
 		env.signal_process(SignalProcess {
-			name: name.to_owned(),
-			signal: signal_name(signal).to_owned(),
+			name:       name.to_owned(),
+			signal:     signal_name(signal).to_owned(),
 			generation: process.generation,
-			props: None,
+			props:      None,
 		})
 		.await
 		.map_err(env_error)?;
@@ -928,16 +924,16 @@ async fn process_send(
 			});
 		}
 		env.send_process_input(SendInput {
-			name: name.to_owned(),
-			input: Some(send_input::Input::Data(text.into_bytes().into())),
+			name:       name.to_owned(),
+			input:      Some(send_input::Input::Data(text.into_bytes().into())),
 			generation: process.generation,
-			props: None,
+			props:      None,
 		})
 		.await
 		.map_err(env_error)?;
 	}
 	Ok(Response {
-		text: Str::new(serde_json::json!({ "name": name, "accepted": true }).to_string()),
+		text:    Str::new(serde_json::json!({ "name": name, "accepted": true }).to_string()),
 		useless: false,
 	})
 }
@@ -950,14 +946,14 @@ async fn process_logs(
 	let process = find_process(env, name).await?;
 	let mut attachment = env
 		.attach_output(AttachOutput {
-			name: name.to_owned(),
-			after_sequence: params.cursor.unwrap_or(0),
-			generation: process.generation,
-			max_bytes: 1024 * 1024,
-			terminal_text: false,
+			name:             name.to_owned(),
+			after_sequence:   params.cursor.unwrap_or(0),
+			generation:       process.generation,
+			max_bytes:        1024 * 1024,
+			terminal_text:    false,
 			terminal_columns: 120,
-			terminal_rows: u32::from(params.lines.unwrap_or(100)),
-			props: None,
+			terminal_rows:    u32::from(params.lines.unwrap_or(100)),
+			props:            None,
 		})
 		.await
 		.map_err(env_error)?;
@@ -969,7 +965,9 @@ async fn process_logs(
 		.map_err(|error| omp_agent::SessionToolError::Rejected {
 			message: Str::new(error.to_string()),
 		})?;
-	let timeout = params.timeout.map_or(Duration::from_secs(30), Duration::from_secs_f64);
+	let timeout = params
+		.timeout
+		.map_or(Duration::from_secs(30), Duration::from_secs_f64);
 	let mut bytes = Vec::new();
 	let mut cursor = params.cursor.unwrap_or(0);
 	loop {
@@ -1046,7 +1044,7 @@ async fn process_wait(
 	let lifecycle = params.wait_for.as_deref().unwrap_or("exit");
 	if process_matches_wait(&process, lifecycle) {
 		return Ok(Response {
-			text: Str::new(serde_json::json!({ "process": process_json(&process) }).to_string()),
+			text:    Str::new(serde_json::json!({ "process": process_json(&process) }).to_string()),
 			useless: false,
 		});
 	}
@@ -1060,14 +1058,14 @@ async fn process_wait(
 		})?;
 	let mut attachment = env
 		.attach_output(AttachOutput {
-			name: name.to_owned(),
-			after_sequence: process.log_end_offset,
-			generation: process.generation,
-			max_bytes: 1024 * 1024,
-			terminal_text: false,
+			name:             name.to_owned(),
+			after_sequence:   process.log_end_offset,
+			generation:       process.generation,
+			max_bytes:        1024 * 1024,
+			terminal_text:    false,
 			terminal_columns: 120,
-			terminal_rows: 100,
-			props: None,
+			terminal_rows:    100,
+			props:            None,
 		})
 		.await
 		.map_err(env_error)?;
@@ -1110,7 +1108,7 @@ async fn process_wait(
 		let Some(event) = event.flatten() else {
 			if let Some(message) = pop_inbox_message(session)? {
 				return Ok(Response {
-					text: Str::new(serde_json::json!({ "messages": [message] }).to_string()),
+					text:    Str::new(serde_json::json!({ "messages": [message] }).to_string()),
 					useless: false,
 				});
 			}
@@ -1123,7 +1121,7 @@ async fn process_wait(
 					.is_some_and(|pattern| pattern.is_match(&String::from_utf8_lossy(&output.data))) =>
 			{
 				return Ok(Response {
-					text: Str::new(
+					text:    Str::new(
 						serde_json::json!({
 							"name": name,
 							"generation": output.generation,
@@ -1139,7 +1137,7 @@ async fn process_wait(
 				let Some(info) = state.process else { continue };
 				if info.generation != process.generation {
 					return Ok(Response {
-						text: Str::new(
+						text:    Str::new(
 							serde_json::json!({
 								"name": name,
 								"generation": process.generation,
@@ -1152,7 +1150,7 @@ async fn process_wait(
 				}
 				if pattern.is_none() && process_matches_wait(&info, lifecycle) {
 					return Ok(Response {
-						text: Str::new(
+						text:    Str::new(
 							serde_json::json!({ "process": process_json(&info) }).to_string(),
 						),
 						useless: false,
@@ -1205,10 +1203,7 @@ fn process_json(process: &ProcessInfo) -> serde_json::Value {
 }
 
 fn terminal_process(process: &ProcessInfo) -> bool {
-	matches!(
-		process.state(),
-		ProcessState::Exited | ProcessState::Stopped | ProcessState::Failed
-	)
+	matches!(process.state(), ProcessState::Exited | ProcessState::Stopped | ProcessState::Failed)
 }
 
 fn process_matches_wait(process: &ProcessInfo, lifecycle: &str) -> bool {
@@ -1255,9 +1250,11 @@ fn set_job_status(
 	if current == Some(status) {
 		return Ok(());
 	}
-	let cause = session.head().ok_or_else(|| omp_agent::SessionToolError::Rejected {
-		message: Str::new_static("session has no journal head"),
-	})?;
+	let cause = session
+		.head()
+		.ok_or_else(|| omp_agent::SessionToolError::Rejected {
+			message: Str::new_static("session has no journal head"),
+		})?;
 	session.patch(jobs::set_status(cause, handle, status))?;
 	Ok(())
 }
@@ -1347,14 +1344,8 @@ mod tests {
 		assert!(spec.pty.is_none());
 		assert!(spec.persist);
 		assert!(spec.detached);
-		assert_eq!(
-			spec.restart.expect("restart").policy,
-			WireRestartPolicy::OnFailure as i32
-		);
-		assert_eq!(
-			spec.source.expect("source").text,
-			"'printf' 'hello world'"
-		);
+		assert_eq!(spec.restart.expect("restart").policy, WireRestartPolicy::OnFailure as i32);
+		assert_eq!(spec.source.expect("source").text, "'printf' 'hello world'");
 	}
 
 	#[test]

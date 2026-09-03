@@ -1250,10 +1250,6 @@ fn retry_after_hint(headers: &HeaderMap) -> Option<time::Duration> {
 	maximum
 }
 
-fn classify_http_error(status: u16, body: &[u8]) -> Error {
-	classify_http_error_with_hint(status, body, None)
-}
-
 fn classify_http_error_with_hint(
 	status: u16,
 	body: &[u8],
@@ -1962,6 +1958,10 @@ mod tests {
 	use omp_core::sf;
 
 	use super::*;
+
+	fn classify_http_error(status: u16, body: &[u8]) -> Error {
+		classify_http_error_with_hint(status, body, None)
+	}
 
 	#[test]
 	fn reflected_secret_is_rejected_for_every_public_header_surface() {

@@ -12,7 +12,7 @@ use std::{
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use jiff::{ToSpan as _, Timestamp, Zoned, civil::Date, tz::TimeZone};
+use jiff::{Timestamp, ToSpan as _, Zoned, civil::Date, tz::TimeZone};
 use omp_core::Str;
 use omp_tui::{
 	Component, Frame, Icon, IntoComponent as _, Key, MouseReport, PaintCtx, Props, Rect, Size, Slot,
@@ -143,11 +143,9 @@ impl UsageDashboard {
 		let inner = width.saturating_sub(5).max(20);
 		let checked = self.checked_text();
 		let (title, body, scrollable): (&str, Box<dyn Component>, bool) = match &self.state {
-			State::Loading(_) => (
-				"Usage",
-				dom! { <spinner fg=accent>{LOADING}</spinner> }.into_component(),
-				false,
-			),
+			State::Loading(_) => {
+				("Usage", dom! { <spinner fg=accent>{LOADING}</spinner> }.into_component(), false)
+			},
 			State::Failed(error) => {
 				let error = error.clone();
 				("Usage", dom! { <text fg=err wrap=word>{error}</text> }.into_component(), false)
@@ -225,8 +223,9 @@ impl Panel for UsageDashboard {
 	}
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
-		let event =
-			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		self.route(event)
 	}
 
@@ -251,8 +250,7 @@ impl Panel for UsageDashboard {
 			Ok(Err(error)) => State::Failed(Str::new(error.to_string())),
 			Err(flume::TryRecvError::Empty) => return false,
 			Err(flume::TryRecvError::Disconnected) => State::Failed(Str::new(
-				ServiceError::Failed(Str::new_static("usage fetch ended without a report"))
-					.to_string(),
+				ServiceError::Failed(Str::new_static("usage fetch ended without a report")).to_string(),
 			)),
 		};
 		self.state = settled;
@@ -350,9 +348,11 @@ fn build_cards(accounts: &[UsageAccount]) -> Vec<Card> {
 			});
 			let unlimited = windows.is_empty() && account.error.is_none();
 			let idle = !windows.is_empty()
-				&& windows
-					.iter()
-					.all(|window| window.fraction.is_some_and(|fraction| fraction < IDLE_FRACTION));
+				&& windows.iter().all(|window| {
+					window
+						.fraction
+						.is_some_and(|fraction| fraction < IDLE_FRACTION)
+				});
 			let status = if account.error.is_some() {
 				UsageStatus::Unknown
 			} else if unlimited {
@@ -418,9 +418,7 @@ fn build_heatmap(points: &[UsageDay], weeks: usize, today: Date) -> Heatmap {
 		}
 	};
 	let monday_offset = i64::from(today.weekday().to_monday_zero_offset());
-	let current_monday = today
-		.checked_sub(monday_offset.days())
-		.unwrap_or(today);
+	let current_monday = today.checked_sub(monday_offset.days()).unwrap_or(today);
 	let start = current_monday
 		.checked_sub((i64::try_from(weeks).unwrap_or(1).saturating_sub(1) * 7).days())
 		.unwrap_or(current_monday);
@@ -446,15 +444,16 @@ fn build_heatmap(points: &[UsageDay], weeks: usize, today: Date) -> Heatmap {
 	let mut cells = vec![[None; 7]; weeks];
 	let mut previous_month = 0_i8;
 	for (week, column) in cells.iter_mut().enumerate() {
-		let Some(week_start) = start.checked_add((i64::try_from(week).unwrap_or(0) * 7).days()).ok()
+		let Some(week_start) = start
+			.checked_add((i64::try_from(week).unwrap_or(0) * 7).days())
+			.ok()
 		else {
 			month_labels.push(None);
 			continue;
 		};
 		let month = week_start.month();
-		month_labels.push(
-			(month != previous_month).then(|| MONTHS[usize::from(month.unsigned_abs()) - 1]),
-		);
+		month_labels
+			.push((month != previous_month).then(|| MONTHS[usize::from(month.unsigned_abs()) - 1]));
 		previous_month = month;
 		for (day, cell) in column.iter_mut().enumerate() {
 			let Some(date) = week_start
@@ -577,7 +576,15 @@ struct Overview {
 
 impl Overview {
 	fn new(cards: Arc<[Card]>, points: Arc<[UsageDay]>, note: Option<Str>) -> Self {
-		Self { props: Props::new(), slot: next_slot(), cards, points, note, width: 0, lines: Vec::new() }
+		Self {
+			props: Props::new(),
+			slot: next_slot(),
+			cards,
+			points,
+			note,
+			width: 0,
+			lines: Vec::new(),
+		}
 	}
 
 	fn layout(&mut self, ctx: &UiContext, width: u16) {
@@ -665,7 +672,8 @@ impl Overview {
 				label_text.push('…');
 			}
 			let label_cells = cell_width(&label_text);
-			label_text.extend(std::iter::repeat_n(' ', usize::from(label_width.saturating_sub(label_cells))));
+			label_text
+				.extend(std::iter::repeat_n(' ', usize::from(label_width.saturating_sub(label_cells))));
 			line.push(label_text, Tone::Muted);
 			line.push(" ", Tone::Fg);
 			let Some(fraction) = window.fraction else {
@@ -686,7 +694,11 @@ impl Overview {
 			if reset_width > 0 {
 				line.push(" ", Tone::Fg);
 				line.push(
-					format!("{:>width$}", window.reset.as_deref().unwrap_or(""), width = usize::from(reset_width)),
+					format!(
+						"{:>width$}",
+						window.reset.as_deref().unwrap_or(""),
+						width = usize::from(reset_width)
+					),
 					Tone::Dim,
 				);
 			}
@@ -927,7 +939,8 @@ mod tests {
 	}
 
 	fn point(text: &str, needle: &str) -> (u16, u16) {
-		text.lines()
+		text
+			.lines()
 			.enumerate()
 			.find_map(|(row, line)| {
 				let byte = line.find(needle)?;
@@ -1022,9 +1035,8 @@ mod tests {
 	fn wheel_scrolls_the_detail_report() {
 		let ctx = UiContext::default();
 		let mut report = report();
-		report.detail = sf!(
-			"line 1  \nline 2  \nline 3  \nline 4  \nline 5  \nline 6  \nline 7  \nline 8"
-		);
+		report.detail =
+			sf!("line 1  \nline 2  \nline 3  \nline 4  \nline 5  \nline 6  \nline 7  \nline 8");
 		let mut panel = UsageDashboard::from_report(report, &ctx, 60, NOW_MS);
 		assert_eq!(panel.key(Key::Enter), PanelEvent::Consumed);
 		let size = Size { width: 60, height: 10 };

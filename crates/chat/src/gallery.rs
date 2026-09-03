@@ -162,13 +162,15 @@ fn render_fixture(
 					.fault
 					.map(serde_json::from_str)
 					.transpose()?
-					.unwrap_or_else(|| serde_json::json!({
-						"message": state_fixture
-							.result
-							.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-							.and_then(|value| value.get("error").and_then(Value::as_str).map(str::to_owned))
-							.unwrap_or_else(|| "operation failed".to_owned())
-					}));
+					.unwrap_or_else(|| {
+						serde_json::json!({
+							"message": state_fixture
+								.result
+								.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+								.and_then(|value| value.get("error").and_then(Value::as_str).map(str::to_owned))
+								.unwrap_or_else(|| "operation failed".to_owned())
+						})
+					});
 				let fault = fixture_fault(card_tool(fixture.tool), raw_fault);
 				let parts = projected_parts(card_tool(fixture.tool), &fault)?;
 				session.fail_projected(call, outcome_value("faulted", fault)?, raw_parts(parts)?)?;
@@ -184,23 +186,21 @@ fn render_fixture(
 	let input =
 		child(&snapshot, tool, KnownTag::Input).ok_or(GalleryError::Missing("input element"))?;
 	let status = node
-				.prop(&PropId::Status.into())
+		.prop(&PropId::Status.into())
 		.and_then(DomValue::as_str)
 		.map_or(CardStatus::InProgress, CardStatus::from_dom);
 	if status == CardStatus::Done {
-		let result = child(&snapshot, tool, KnownTag::Result)
-			.ok_or(GalleryError::Missing("result element"))?;
+		let result =
+			child(&snapshot, tool, KnownTag::Result).ok_or(GalleryError::Missing("result element"))?;
 		if result.prop(&PropId::Outcome.into()).is_none()
 			|| result.prop(&PropId::Data.into()).is_none()
 		{
 			return Err(GalleryError::Missing("projected result truth"));
 		}
 	} else if status == CardStatus::Failed {
-		let diag = child(&snapshot, tool, KnownTag::Diag)
-			.ok_or(GalleryError::Missing("diag element"))?;
-		if diag.prop(&PropId::Fault.into()).is_none()
-			|| diag.prop(&PropId::Data.into()).is_none()
-		{
+		let diag =
+			child(&snapshot, tool, KnownTag::Diag).ok_or(GalleryError::Missing("diag element"))?;
+		if diag.prop(&PropId::Fault.into()).is_none() || diag.prop(&PropId::Data.into()).is_none() {
 			return Err(GalleryError::Missing("projected fault truth"));
 		}
 	}
@@ -230,10 +230,7 @@ fn raw(text: &str) -> Result<Box<RawValue>, serde_json::Error> {
 /// Wraps a fixture payload in the `CallOutcome` envelope the kernel journals
 /// (`{"kind":"ok"|"faulted","value":…}`), so cards read the gallery exactly
 /// like a live session.
-fn outcome_value(
-	kind: &str,
-	value: serde_json::Value,
-) -> Result<Box<RawValue>, serde_json::Error> {
+fn outcome_value(kind: &str, value: serde_json::Value) -> Result<Box<RawValue>, serde_json::Error> {
 	serde_json::value::to_raw_value(&serde_json::json!({ "kind": kind, "value": value }))
 }
 
@@ -373,11 +370,13 @@ fn fixture_payload(
 				.and_then(Value::as_array)
 				.into_iter()
 				.flatten()
-				.map(|entry| serde_json::json!({
-					"path": entry.get("path").cloned().unwrap_or_else(|| entry.clone()),
-					"modified_ms": 0,
-					"is_dir": false
-				}))
+				.map(|entry| {
+					serde_json::json!({
+						"path": entry.get("path").cloned().unwrap_or_else(|| entry.clone()),
+						"modified_ms": 0,
+						"is_dir": false
+					})
+				})
 				.collect::<Vec<_>>();
 			let count = value
 				.get("partial_match_count")
@@ -401,7 +400,12 @@ fn fixture_payload(
 		},
 		"grep" => {
 			let mut files = serde_json::Map::new();
-			for row in value.get("matches").and_then(Value::as_array).into_iter().flatten() {
+			for row in value
+				.get("matches")
+				.and_then(Value::as_array)
+				.into_iter()
+				.flatten()
+			{
 				let path = row.get("path").and_then(Value::as_str).unwrap_or_default();
 				files
 					.entry(path.to_owned())
@@ -418,12 +422,14 @@ fn fixture_payload(
 			}
 			let groups = files
 				.into_iter()
-				.map(|(path, matches)| serde_json::json!({
-					"path": path.clone(),
-					"source_key": path,
-					"snapshot_tag": null,
-					"matches": matches
-				}))
+				.map(|(path, matches)| {
+					serde_json::json!({
+						"path": path.clone(),
+						"source_key": path,
+						"snapshot_tag": null,
+						"matches": matches
+					})
+				})
 				.collect::<Vec<_>>();
 			serde_json::json!({
 				"total_files": groups.len(),
@@ -481,27 +487,29 @@ fn fixture_payload(
 				.and_then(Value::as_array)
 				.into_iter()
 				.flatten()
-				.map(|item| serde_json::json!({
-					"memory": {
-						"id": item.get("id").cloned().unwrap_or_else(|| serde_json::json!("memory")),
-						"bank": item.get("bank").cloned().unwrap_or_else(|| serde_json::json!("global")),
-						"tier": "working",
-						"content": item.get("content").cloned().unwrap_or_else(|| serde_json::json!("")),
-						"source": null,
-						"session_id": "gallery",
-						"timestamp": "2026-01-01T00:00:00Z",
-						"importance": 0.5,
-						"veracity": "observed",
-						"memory_type": "fact",
-						"metadata": {
-							"context": item.get("context").cloned().unwrap_or(serde_json::Value::Null)
+				.map(|item| {
+					serde_json::json!({
+						"memory": {
+							"id": item.get("id").cloned().unwrap_or_else(|| serde_json::json!("memory")),
+							"bank": item.get("bank").cloned().unwrap_or_else(|| serde_json::json!("global")),
+							"tier": "working",
+							"content": item.get("content").cloned().unwrap_or_else(|| serde_json::json!("")),
+							"source": null,
+							"session_id": "gallery",
+							"timestamp": "2026-01-01T00:00:00Z",
+							"importance": 0.5,
+							"veracity": "observed",
+							"memory_type": "fact",
+							"metadata": {
+								"context": item.get("context").cloned().unwrap_or(serde_json::Value::Null)
+							},
+							"superseded_by": null
 						},
-						"superseded_by": null
-					},
-					"score": item.get("score").cloned().unwrap_or_else(|| serde_json::json!(0.0)),
-					"voice_scores": {"vector":0.0,"graph":0.0,"episodic":0.0,"working":0.0},
-					"broadened": false
-				}))
+						"score": item.get("score").cloned().unwrap_or_else(|| serde_json::json!(0.0)),
+						"voice_scores": {"vector":0.0,"graph":0.0,"episodic":0.0,"working":0.0},
+						"broadened": false
+					})
+				})
 				.collect::<Vec<_>>();
 			serde_json::json!({
 				"query": value.get("query").cloned().unwrap_or_else(|| serde_json::json!("")),
@@ -516,8 +524,14 @@ fn fixture_payload(
 			serde_json::json!({ "parts": [{ "kind": "text", "text": text }] })
 		},
 		"write" => {
-			let path = args.get("path").and_then(serde_json::Value::as_str).unwrap_or_default();
-			let content = args.get("content").and_then(serde_json::Value::as_str).unwrap_or_default();
+			let path = args
+				.get("path")
+				.and_then(serde_json::Value::as_str)
+				.unwrap_or_default();
+			let content = args
+				.get("content")
+				.and_then(serde_json::Value::as_str)
+				.unwrap_or_default();
 			serde_json::json!({
 				"resolved_path": path,
 				"display_path": path,
@@ -553,7 +567,11 @@ fn fixture_fault(tool: &str, value: serde_json::Value) -> serde_json::Value {
 /// typed outcome; wrapper tools explicitly unwrap their projection contract.
 fn projected_parts(tool: &str, value: &serde_json::Value) -> Result<Vec<Part>, serde_json::Error> {
 	let text = match tool {
-		"hub" => value.get("text").and_then(Value::as_str).unwrap_or_default().to_owned(),
+		"hub" => value
+			.get("text")
+			.and_then(Value::as_str)
+			.unwrap_or_default()
+			.to_owned(),
 		"bash" | "eval" => value
 			.get("_projection")
 			.and_then(Value::as_str)
@@ -609,8 +627,14 @@ fn web_projection(response: &Value) -> String {
 				text,
 				"{}. [{}]({})",
 				index + 1,
-				source.get("title").and_then(Value::as_str).unwrap_or_default(),
-				source.get("url").and_then(Value::as_str).unwrap_or_default(),
+				source
+					.get("title")
+					.and_then(Value::as_str)
+					.unwrap_or_default(),
+				source
+					.get("url")
+					.and_then(Value::as_str)
+					.unwrap_or_default(),
 			);
 			if let Some(snippet) = source.get("snippet").and_then(Value::as_str)
 				&& !snippet.is_empty()
@@ -628,7 +652,7 @@ fn find_snapshot_call(snapshot: &Snapshot, call_id: &str) -> Option<Handle> {
 		snapshot.get(*handle).is_some_and(|node| {
 			matches!(&node.tag, Tag::Custom(_))
 				&& node
-										.prop(&PropId::Id.into())
+					.prop(&PropId::Id.into())
 					.and_then(DomValue::as_str)
 					.is_some_and(|id| id == call_id)
 		})
@@ -645,7 +669,7 @@ fn child(snapshot: &Snapshot, parent: Handle, tag: KnownTag) -> Option<&Node> {
 
 fn node_text(node: &Node) -> Option<&str> {
 	node
-				.prop(&PropId::Text.into())
+		.prop(&PropId::Text.into())
 		.and_then(DomValue::as_str)
 		.filter(|text| !text.is_empty())
 		.or(node.content.as_deref())
@@ -741,7 +765,9 @@ mod tests {
 		assert_eq!(fixture_names().len(), 46);
 		assert_eq!(sections.len(), 46 * GalleryState::ALL.len());
 		assert!(
-			sections.iter().all(|section| !frame_text(&section.frame).trim().is_empty()),
+			sections
+				.iter()
+				.all(|section| !frame_text(&section.frame).trim().is_empty()),
 			"every lifecycle frame must carry meaningful presentation"
 		);
 	}

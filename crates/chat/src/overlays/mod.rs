@@ -24,52 +24,52 @@ use omp_tui::{
 
 use crate::host::HostCommand;
 
+/// `/agents` agent-definition browser.
+pub mod agents;
+/// `ask@1` dialog projected from the running tool element.
+pub mod ask;
+/// `/copy` transcript picker.
+pub mod copy;
+/// `/extensions` Extension Control Center dashboard.
+pub mod extensions;
 /// Codex quota-reset fireworks celebration.
 pub mod fireworks;
+/// `/git` fullscreen Git workbench.
+pub mod git;
+/// `/hub` live agent supervisor and its transcript viewer.
+pub mod hub;
+/// Debug tools selector plus the context, hotkeys, and changelog reports.
+pub mod info;
+/// Login dialog, logout account selector, and provider picker.
+pub mod login;
 /// `/pause` full-screen hold screen.
 pub mod pause;
 /// `/plan-review` plan review dialog.
 pub mod plan_review;
-/// Centered scrollable markdown report.
-pub mod report;
-/// `/git` fullscreen Git workbench.
-pub mod git;
-/// `/copy` transcript picker.
-pub mod copy;
-/// `/agents` agent-definition browser.
-pub mod agents;
-/// `/hub` live agent supervisor and its transcript viewer.
-pub mod hub;
-/// `/extensions` Extension Control Center dashboard.
-pub mod extensions;
 /// `/plugins`, `/marketplace` plugin selector.
 pub mod plugins;
-/// Login dialog, logout account selector, and provider picker.
-pub mod login;
-/// Debug tools selector plus the context, hotkeys, and changelog reports.
-pub mod info;
-/// Full-screen `/usage` dashboard.
-pub mod usage;
+/// Centered scrollable markdown report.
+pub mod report;
 /// Confirmation selector for spending a saved usage reset.
 pub mod reset_usage;
-/// `/stats` and `/trace` report builders.
-pub mod stats;
-/// `ask@1` dialog projected from the running tool element.
-pub mod ask;
-/// Loader-then-result panel over one asynchronous service request.
-pub mod tasks;
 /// `/branch` rewind selector.
 pub mod rewind;
-/// `/resume` session picker.
-pub mod sessions;
-/// Side-channel panels above the editor (`/btw`).
-pub mod side;
-/// `/tree` branch explorer.
-pub mod tree;
-/// `/settings` selector over the console variable registry.
-pub mod settings;
 /// Application-supplied data feeds for dashboards and account commands.
 pub mod services;
+/// `/resume` session picker.
+pub mod sessions;
+/// `/settings` selector over the console variable registry.
+pub mod settings;
+/// Side-channel panels above the editor (`/btw`).
+pub mod side;
+/// `/stats` and `/trace` report builders.
+pub mod stats;
+/// Loader-then-result panel over one asynchronous service request.
+pub mod tasks;
+/// `/tree` branch explorer.
+pub mod tree;
+/// Full-screen `/usage` dashboard.
+pub mod usage;
 
 pub use services::{NoServices, Services};
 
@@ -326,8 +326,7 @@ impl Eq for PanelCall {}
 
 const MODEL_HINT: &str =
 	"↑/↓ models · Enter switch · type to search · @ quick roles · Alt+P task model · Esc close";
-const MODEL_ROLE_HINT: &str =
-	"↑/↓ roles · Enter apply role model · type to search · Esc close";
+const MODEL_ROLE_HINT: &str = "↑/↓ roles · Enter apply role model · type to search · Esc close";
 const MODEL_TASK_HINT: &str =
 	"↑/↓ models · Enter use for task subagents · type to search · Alt+P session model · Esc close";
 const HISTORY_HINT: &str = "↑/↓ prompts · Enter edit · type to search · Esc close";
@@ -340,11 +339,11 @@ const OUTPUT_PRICE_WIDTH: u16 = 88;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalOverlay {
 	/// Stable prompt identity returned with the decision.
-	pub id:     Str,
+	pub id:      Str,
 	/// Short user-facing operation title.
-	pub title:  Str,
+	pub title:   Str,
 	/// Explanation supplied by host policy.
-	pub reason: Str,
+	pub reason:  Str,
 	/// Default scope offered by the controller.
 	pub scope:   ApprovalScope,
 	/// Controller-set deadline after which the kernel answers with the
@@ -516,8 +515,9 @@ impl ModelPicker {
 
 	/// Routes pointer input through the picker hit map.
 	pub fn mouse(&mut self, report: MouseReport) -> PickerEvent {
-		let event =
-			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		self.route(event)
 	}
 
@@ -733,11 +733,11 @@ fn build_roles(
 	ctx: &UiContext,
 ) -> Ui {
 	struct RoleDisplay {
-		value:   Str,
-		label:   Str,
-		role:    Str,
-		model:   Str,
-		current: bool,
+		value:    Str,
+		label:    Str,
+		role:     Str,
+		model:    Str,
+		current:  bool,
 		thinking: Option<Str>,
 	}
 	let display = roles
@@ -751,11 +751,11 @@ fn build_roles(
 				model.name.clone()
 			};
 			Some(RoleDisplay {
-				value: sf!("{index}"),
-				label: sf!("@{} {} {} {}", role.role, model.provider, name, model.key),
-				role: sf!("@{}", role.role),
-				model: name,
-				current: index == current,
+				value:    sf!("{index}"),
+				label:    sf!("@{} {} {} {}", role.role, model.provider, name, model.key),
+				role:     sf!("@{}", role.role),
+				model:    name,
+				current:  index == current,
 				thinking: role.thinking.clone(),
 			})
 		})
@@ -886,8 +886,9 @@ impl HistoryPicker {
 
 	/// Routes pointer input through the picker hit map.
 	pub fn mouse(&mut self, report: MouseReport) -> PickerEvent {
-		let event =
-			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		self.route(event)
 	}
 
@@ -1262,26 +1263,18 @@ mod tests {
 		let rows = vec![row("alpha", "first"), row("beta", "second")];
 		let roles = vec![
 			QuickRoleRow {
-				role: Str::new_static("default"),
-				model: 0,
+				role:     Str::new_static("default"),
+				model:    0,
 				thinking: Some(Str::new_static("medium")),
 			},
 			QuickRoleRow {
-				role: Str::new_static("slow"),
-				model: 1,
+				role:     Str::new_static("slow"),
+				model:    1,
 				thinking: Some(Str::new_static("high")),
 			},
 		];
-		let mut picker = ModelPicker::open(
-			rows,
-			0,
-			0,
-			roles,
-			Some(0),
-			true,
-			100,
-			&UiContext::default(),
-		);
+		let mut picker =
+			ModelPicker::open(rows, 0, 0, roles, Some(0), true, 100, &UiContext::default());
 		for ch in "@slow".chars() {
 			assert_eq!(picker.key(Key::Char(ch)), PickerEvent::Consumed);
 		}

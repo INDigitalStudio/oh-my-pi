@@ -179,7 +179,8 @@ fn queue_prompt(session: &mut Session, id: &'static str, text: &'static str) {
 		.expect("queue prompt");
 }
 
-// ---------------------------------------------------------------- escape ladder
+// ---------------------------------------------------------------- escape
+// ladder
 
 #[test]
 fn escape_preserves_a_draft_and_never_interrupts_an_idle_session() {
@@ -242,14 +243,9 @@ fn double_escape_within_500ms_on_an_empty_composer_runs_the_selector_line() {
 	// Two within the window: the `branch` line runs.
 	h.host.key(Key::Esc).expect("esc");
 	assert_eq!((h.host.overlay_id(), h.host.notice().map(str::to_owned)), expected);
-	assert!(
-		expected.0.is_some() || expected.1.is_some(),
-		"double escape must reach the console"
-	);
+	assert!(expected.0.is_some() || expected.1.is_some(), "double escape must reach the console");
 	// `none` disables it.
-	h.con
-		.run("cl_double_escape none")
-		.expect("set");
+	h.con.run("cl_double_escape none").expect("set");
 	while h.host.overlay_id().is_some() {
 		h.host.key(Key::Esc).expect("close");
 	}
@@ -303,14 +299,18 @@ fn escape_cancel_hooks_fire_once_and_silence_hooks_stay() {
 		let silenced = Arc::clone(&silenced);
 		let speaking = Arc::clone(&speaking);
 		h.host
-			.act(HostAction::EscapeHook(EscapeHook::new("vocalizer", EscapeRung::Silence, move || {
-				if speaking.swap(0, Ordering::SeqCst) == 1 {
-					silenced.fetch_add(1, Ordering::SeqCst);
-					true
-				} else {
-					false
-				}
-			})))
+			.act(HostAction::EscapeHook(EscapeHook::new(
+				"vocalizer",
+				EscapeRung::Silence,
+				move || {
+					if speaking.swap(0, Ordering::SeqCst) == 1 {
+						silenced.fetch_add(1, Ordering::SeqCst);
+						true
+					} else {
+						false
+					}
+				},
+			)))
 			.expect("hook");
 	}
 	assert_eq!(h.host.escape_hooks(), ["mcp-test", "vocalizer"]);
@@ -346,7 +346,11 @@ fn escape_in_loop_mode_pauses_when_idle_and_interrupts_when_streaming() {
 	open_turn(&mut h.session);
 	h.host.poll().expect("apply");
 	h.host.key(Key::Esc).expect("esc");
-	assert!(h.commands.try_iter().any(|command| matches!(command, HostCommand::Interrupt)));
+	assert!(
+		h.commands
+			.try_iter()
+			.any(|command| matches!(command, HostCommand::Interrupt))
+	);
 }
 
 #[test]
@@ -358,24 +362,15 @@ fn escape_in_a_subagent_view_clears_text_then_returns_to_main() {
 		.act(HostAction::FocusAgent(Some(Str::new_static("worker-1"))))
 		.expect("focus");
 	assert_eq!(h.host.focused_agent(), Some("worker-1"));
-	assert!(matches!(
-		h.commands.try_recv(),
-		Ok(HostCommand::Overlay { open: true, .. })
-	));
+	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::Overlay { open: true, .. })));
 	type_text(&mut h.host, "note");
 	h.host.key(Key::Esc).expect("esc");
 	assert_eq!(h.host.composer_text(), "");
 	assert_eq!(h.host.focused_agent(), Some("worker-1"), "first Esc only clears text");
 	h.host.key(Key::Esc).expect("esc");
 	assert_eq!(h.host.focused_agent(), None, "second Esc returns to main");
-	assert!(matches!(
-		h.commands.try_recv(),
-		Ok(HostCommand::Overlay { open: false, .. })
-	));
-	assert!(
-		h.commands.try_recv().is_err(),
-		"the focused subagent's turn is never interrupted"
-	);
+	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::Overlay { open: false, .. })));
+	assert!(h.commands.try_recv().is_err(), "the focused subagent's turn is never interrupted");
 }
 
 #[test]
@@ -422,7 +417,9 @@ fn escape_cancels_main_session_maintenance_but_not_from_a_subagent_view() {
 	h.host.key(Key::Esc).expect("esc");
 	assert_eq!(h.host.focused_agent(), None);
 	assert!(
-		!h.commands.try_iter().any(|command| matches!(command, HostCommand::Interrupt)),
+		!h.commands
+			.try_iter()
+			.any(|command| matches!(command, HostCommand::Interrupt)),
 		"Esc from a focused subagent returns to main instead of cancelling maintenance"
 	);
 }
@@ -491,7 +488,9 @@ fn copy_line_and_copy_prompt_hand_text_to_the_clipboard() {
 fn live_bind_changes_apply_to_the_next_physical_edge() {
 	let mut h = harness(idle_session());
 	let f6 = Chord::parse("f6").expect("chord");
-	h.con.run("bind f6 cl_paste_image").expect("bind smart paste");
+	h.con
+		.run("bind f6 cl_paste_image")
+		.expect("bind smart paste");
 	h.host
 		.chord(KeyEvent { chord: f6, key: Some(Key::Function(6)), pressed: true })
 		.expect("smart paste chord");
@@ -517,9 +516,7 @@ fn live_bind_changes_apply_to_the_next_physical_edge() {
 fn physical_release_runs_the_minus_action_from_the_live_bind() {
 	let mut h = harness(idle_session());
 	h.con
-		.run(
-			r#"alias +peek "cl_showthinking 1"; alias -peek "cl_showthinking 0"; bind ctrl+h +peek"#,
-		)
+		.run(r#"alias +peek "cl_showthinking 1"; alias -peek "cl_showthinking 0"; bind ctrl+h +peek"#)
 		.expect("hold action");
 	let chord = Chord::parse("ctrl+h").expect("chord");
 	h.host
@@ -546,11 +543,11 @@ fn paste_chords_request_the_matching_clipboard_read_and_deliver_it() {
 	// An image lands as an attachment chip referencing the persisted file.
 	// A 1x1 PNG: signature, IHDR, IDAT, IEND.
 	let png = omp_tui::PastedImage::from_bytes(vec![
-		0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
-		0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
-		0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8,
-		0xFF, 0xFF, 0x3F, 0x00, 0x05, 0xFE, 0x02, 0xFE, 0xA7, 0x35, 0x81, 0x84, 0x00, 0x00, 0x00,
-		0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+		0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+		0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8,
+		0xff, 0xff, 0x3f, 0x00, 0x05, 0xfe, 0x02, 0xfe, 0xa7, 0x35, 0x81, 0x84, 0x00, 0x00, 0x00,
+		0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 	])
 	.expect("png header");
 	h.host.key(Key::Ctrl('c')).expect("clear");
@@ -633,10 +630,7 @@ fn panels_receive_lowered_session_and_tree_chords_before_raw_keys() {
 	let mut h = harness(idle_session());
 	let actions = open_probe(&mut h.host, "sessions", PanelAnchor::Bottom);
 	assert_eq!(h.host.overlay_id(), Some("sessions"));
-	assert!(matches!(
-		h.commands.try_recv(),
-		Ok(HostCommand::Overlay { open: true, .. })
-	));
+	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::Overlay { open: true, .. })));
 	for key in [
 		Key::Ctrl('p'),
 		Key::Ctrl('s'),
@@ -662,10 +656,7 @@ fn panels_receive_lowered_session_and_tree_chords_before_raw_keys() {
 	// Esc closes a panel that ignores it.
 	h.host.key(Key::Esc).expect("esc");
 	assert_eq!(h.host.overlay_id(), None);
-	assert!(matches!(
-		h.commands.try_recv(),
-		Ok(HostCommand::Overlay { open: false, .. })
-	));
+	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::Overlay { open: false, .. })));
 }
 
 #[test]
@@ -674,11 +665,11 @@ fn pointer_reports_reach_the_active_panel() {
 	open_probe(&mut h.host, "probe", PanelAnchor::Center);
 	h.host
 		.mouse(MouseReport {
-			kind: Mouse::Click,
-			col: 2,
-			row: 1,
-			button: MouseButton::Left,
-			mods: Mods::default(),
+			kind:    Mouse::Click,
+			col:     2,
+			row:     1,
+			button:  MouseButton::Left,
+			mods:    Mods::default(),
 			pressed: true,
 		})
 		.expect("mouse");
@@ -719,7 +710,9 @@ fn side_panels_leave_the_composer_live_and_close_at_escape_rung_two() {
 	h.host.key(Key::Esc).expect("esc");
 	assert_eq!(h.host.overlay_depth(), 0, "rung 2 closes the side panel");
 	assert!(
-		!h.commands.try_iter().any(|command| matches!(command, HostCommand::Interrupt)),
+		!h.commands
+			.try_iter()
+			.any(|command| matches!(command, HostCommand::Interrupt)),
 		"the streaming turn survives the side-panel Esc"
 	);
 	assert_eq!(h.host.composer_text(), "typed");
@@ -819,7 +812,8 @@ fn live_toggle_flips_the_session_and_stops_push_to_talk_first() {
 	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::LiveVoice { active: false })));
 }
 
-// ---------------------------------------------------------------- console words
+// ---------------------------------------------------------------- console
+// words
 
 #[test]
 fn every_key_command_is_registered_on_the_console() {

@@ -817,15 +817,17 @@ mod tests {
 		let mut picker = picker(vec![row("project", Some("Project"), MODIFIED, CREATED)]);
 		assert!(matches!(
 			picker.key(Key::Tab),
-			PanelEvent::Command(HostCommand::SessionIndex {
-				scope: SessionScope::All
-			})
+			PanelEvent::Command(HostCommand::SessionIndex { scope: SessionScope::All })
 		));
-		assert_eq!(picker.rows()[0].id.as_str(), "project", "old projection stays visible while loading");
+		assert_eq!(
+			picker.rows()[0].id.as_str(),
+			"project",
+			"old projection stays visible while loading"
+		);
 		assert!(text(&mut picker).contains("all projects"));
 
 		let outcome = Outcome::SessionIndex(SessionIndexOutcome {
-			scope: SessionScope::All,
+			scope:  SessionScope::All,
 			result: Ok(vec![row("global", Some("Global"), MODIFIED + 1, CREATED)]),
 		});
 		assert_eq!(picker.notify(PanelNote::Outcome(&outcome)), PanelEvent::Consumed);
@@ -836,9 +838,7 @@ mod tests {
 
 		assert!(matches!(
 			picker.key(Key::Tab),
-			PanelEvent::Command(HostCommand::SessionIndex {
-				scope: SessionScope::Project
-			})
+			PanelEvent::Command(HostCommand::SessionIndex { scope: SessionScope::Project })
 		));
 	}
 

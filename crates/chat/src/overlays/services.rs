@@ -224,13 +224,13 @@ pub struct ToolRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SshHostRow {
 	/// Host alias.
-	pub name:    Str,
+	pub name:   Str,
 	/// `user@host:port`.
-	pub target:  Str,
+	pub target: Str,
 	/// Scope the declaration lives in (`project` or `user`).
-	pub scope:   Str,
+	pub scope:  Str,
 	/// Authentication policy (`agent` or the key path).
-	pub auth:    Str,
+	pub auth:   Str,
 }
 
 /// Where an extension row comes from.

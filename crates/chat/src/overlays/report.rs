@@ -35,7 +35,12 @@ pub struct ReportPanel {
 impl ReportPanel {
 	/// Builds a report titled `title` over markdown `body`.
 	#[must_use]
-	pub fn new(id: &'static str, title: impl Into<Str>, body: impl Into<Str>, ctx: &UiContext) -> Self {
+	pub fn new(
+		id: &'static str,
+		title: impl Into<Str>,
+		body: impl Into<Str>,
+		ctx: &UiContext,
+	) -> Self {
 		let mut panel = Self {
 			id,
 			title: title.into(),
@@ -108,8 +113,9 @@ impl Panel for ReportPanel {
 	}
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
-		let event =
-			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		self.route(event)
 	}
 
@@ -191,7 +197,8 @@ impl<T> PendingReportPanel<T> {
 	}
 
 	fn settle(&mut self, body: Str) {
-		self.state = PendingState::Ready(ReportPanel::new(self.id, self.title.clone(), body, &self.ctx));
+		self.state =
+			PendingState::Ready(ReportPanel::new(self.id, self.title.clone(), body, &self.ctx));
 		self.next_wake = None;
 	}
 }
@@ -276,7 +283,8 @@ mod tests {
 	}
 
 	fn point(text: &str, needle: &str) -> (u16, u16) {
-		text.lines()
+		text
+			.lines()
 			.enumerate()
 			.find_map(|(row, line)| {
 				let byte = line.find(needle)?;
@@ -307,8 +315,14 @@ mod tests {
 	fn pending_report_shows_loader_then_the_rendered_body() {
 		let ctx = UiContext::default();
 		let (tx, rx) = flume::bounded(1);
-		let mut panel =
-			PendingReportPanel::new("stats", "Stats", "Syncing session files...", rx, |n: &u32| sf!("requests: {n}"), &ctx);
+		let mut panel = PendingReportPanel::new(
+			"stats",
+			"Stats",
+			"Syncing session files...",
+			rx,
+			|n: &u32| sf!("requests: {n}"),
+			&ctx,
+		);
 		let text = omp_tui::frame_text(panel.frame(Size { width: 60, height: 12 }));
 		assert!(text.contains("Syncing session files..."), "loader missing:\n{text}");
 		assert!(!panel.tick(Duration::from_millis(10)));

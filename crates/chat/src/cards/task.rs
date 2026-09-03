@@ -19,17 +19,15 @@ impl Card for TaskCard {
 		let _input = view.input::<omp_tools::task::Params>();
 		let _fault = view.fault::<omp_tools::task::Fault>();
 		match view.status {
-			CardStatus::StreamingArgs | CardStatus::InProgress => {
-				dom! {
-					<box border=round title_pad=3 pad="0 1">
-						<row kind=title gap=1 bold>
-							<i:task/><text bold>{"Task: task"}</text>
-							if let Some(badge) = elapsed_badge(view) { {badge} }
-						</row>
-					</box>
-				}
-				.into_component()
-			},
+			CardStatus::StreamingArgs | CardStatus::InProgress => dom! {
+				<box border=round title_pad=3 pad="0 1">
+					<row kind=title gap=1 bold>
+						<i:task/><text bold>{"Task: task"}</text>
+						if let Some(badge) = elapsed_badge(view) { {badge} }
+					</row>
+				</box>
+			}
+			.into_component(),
 			CardStatus::Done | CardStatus::Failed => render_settled(view, expanded, ui),
 		}
 	}
@@ -150,7 +148,10 @@ fn row_failed(row: &Value) -> bool {
 
 fn task_detail(row: &Value) -> Option<Str> {
 	let tokens_in = row.get("tokens_in").and_then(Value::as_u64)?;
-	let tokens_out = row.get("tokens_out").and_then(Value::as_u64).unwrap_or_default();
+	let tokens_out = row
+		.get("tokens_out")
+		.and_then(Value::as_u64)
+		.unwrap_or_default();
 	Some(sf!("↓{tokens_in} · ↑{tokens_out}"))
 }
 

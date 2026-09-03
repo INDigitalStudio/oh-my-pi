@@ -34,9 +34,21 @@ pub struct DebugAction {
 
 /// Inspectors offered by the selector, in menu order.
 pub const DEBUG_ACTIONS: [DebugAction; 3] = [
-	DebugAction { key: "paths", label: "paths", description: "Session and data paths" },
-	DebugAction { key: "system", label: "system", description: "Process and terminal facts" },
-	DebugAction { key: "values", label: "values", description: "Console variables (dump)" },
+	DebugAction {
+		key:         "paths",
+		label:       "paths",
+		description: "Session and data paths",
+	},
+	DebugAction {
+		key:         "system",
+		label:       "system",
+		description: "Process and terminal facts",
+	},
+	DebugAction {
+		key:         "values",
+		label:       "values",
+		description: "Console variables (dump)",
+	},
 ];
 
 /// Retained `/debug` selector; Enter finishes with `debug <key>`.
@@ -51,7 +63,12 @@ impl DebugSelector {
 	/// Opens the selector for a viewport width.
 	#[must_use]
 	pub fn open(ctx: &UiContext, width: u16) -> Self {
-		let mut panel = Self { ui: Ui::from_root(dom! { <col/> }, width, ctx.clone()), ctx: ctx.clone(), width, rows: 0 };
+		let mut panel = Self {
+			ui: Ui::from_root(dom! { <col/> }, width, ctx.clone()),
+			ctx: ctx.clone(),
+			width,
+			rows: 0,
+		};
 		panel.rebuild(width, u16::try_from(DEBUG_ACTIONS.len()).unwrap_or(u16::MAX));
 		panel
 	}
@@ -108,8 +125,9 @@ impl Panel for DebugSelector {
 	}
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
-		let event =
-			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		self.route(event)
 	}
 
@@ -215,7 +233,9 @@ pub fn hotkeys_report(con: &Ctx) -> Str {
 	out.push_str("| `Ctrl+K` | Delete to end of line |\n");
 	out.push_str("\n**Other**\n| Key | Action |\n|-----|--------|\n");
 	out.push_str("| `Tab` | Path completion / accept autocomplete |\n");
-	out.push_str("| `#<number>` | GitHub issue/PR reference (e.g. `#3164` → `pr://`/`issue://`) |\n");
+	out.push_str(
+		"| `#<number>` | GitHub issue/PR reference (e.g. `#3164` → `pr://`/`issue://`) |\n",
+	);
 	out.push_str("| `/` | Slash commands |\n");
 	out.push_str("| `!` | Run bash command |\n");
 	out.push_str("| `!!` | Run bash command (excluded from context) |\n");
@@ -273,7 +293,8 @@ pub fn debug_report(cx: &PanelCx<'_>, key: &str) -> Result<Str, Str> {
 		"system" => Ok(system_report(cx)),
 		"values" => Ok(sf!(
 			"## Console values\n\n```\n{}\n```",
-			cx.con.dump_with_options(DumpOptions { all_vars: true, include_defaults: true })
+			cx.con
+				.dump_with_options(DumpOptions { all_vars: true, include_defaults: true })
 		)),
 		other => Err(sf!("unknown debug inspector `{other}`; expected paths, system, or values")),
 	}
@@ -326,7 +347,8 @@ mod tests {
 	}
 
 	fn point(text: &str, needle: &str) -> (u16, u16) {
-		text.lines()
+		text
+			.lines()
 			.enumerate()
 			.find_map(|(row, line)| {
 				let byte = line.find(needle)?;
@@ -379,7 +401,13 @@ mod tests {
 	fn changelog_report_limits_recent_sections_and_rejects_empty() {
 		let text = "# Changelog\n\n## 1.3\n- c\n\n## 1.2\n- b\n\n## 1.1\n- a\n\n## 1.0\n- z\n";
 		let recent = changelog_report(text, false).unwrap();
-		assert_eq!(recent.lines().filter(|line| line.starts_with("## ")).count(), 3);
+		assert_eq!(
+			recent
+				.lines()
+				.filter(|line| line.starts_with("## "))
+				.count(),
+			3
+		);
 		assert!(recent.starts_with("## 1.3"));
 		let full = changelog_report(text, true).unwrap();
 		assert_eq!(full.lines().filter(|line| line.starts_with("## ")).count(), 4);

@@ -431,9 +431,9 @@ impl DocumentLspControl {
 			Some(lsp_response::Outcome::Error(_)) | None => return Err(Fault::Server),
 		};
 		Ok(Payload {
-			action:  Action::Request,
+			action: Action::Request,
 			servers: vec![Str::from(server.name)],
-			output:  render::structured(&data, 200),
+			output: render::structured(&data, 200),
 			data,
 		})
 	}
@@ -590,10 +590,7 @@ impl LspControl for DocumentLspControl {
 				if params.action == Action::Capabilities {
 					let roster = self
 						.documents
-						.lsp_status(
-							pb::LspStatusRequest { reload: false, start: true },
-							&cancel,
-						)
+						.lsp_status(pb::LspStatusRequest { reload: false, start: true }, &cancel)
 						.await
 						.map_err(|_| Fault::Server)?;
 					return lsp_capabilities_payload(roster);
@@ -1189,18 +1186,14 @@ mod tests {
 	fn request_payload_is_real_json_or_an_empty_object() {
 		assert_eq!(parse_request_payload(None).expect("default payload"), json!({}));
 		assert_eq!(
-			parse_request_payload(Some(r#"{"context":{"triggerKind":1}}"#))
-				.expect("object payload"),
+			parse_request_payload(Some(r#"{"context":{"triggerKind":1}}"#)).expect("object payload"),
 			json!({"context": {"triggerKind": 1}})
 		);
 		assert_eq!(
 			parse_request_payload(Some(r#"["literal",1]"#)).expect("array payload"),
 			json!(["literal", 1])
 		);
-		assert!(matches!(
-			parse_request_payload(Some("{broken")),
-			Err(Fault::InvalidArguments)
-		));
+		assert!(matches!(parse_request_payload(Some("{broken")), Err(Fault::InvalidArguments)));
 	}
 
 	#[test]

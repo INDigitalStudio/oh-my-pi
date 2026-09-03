@@ -246,14 +246,9 @@ impl ShellDynHost for DynHost {
 					.devices()
 					.find(|device| device.name.as_str() == path.root())
 			{
-				let schema = serde_json::from_slice(device.schema).map_err(|_| {
-					DynFault::new(format!("device `{name}` has an invalid JSON schema"))
-				})?;
-				return Ok(DynSchema {
-					name,
-					description: Some(device.summary.clone()),
-					schema,
-				});
+				let schema = serde_json::from_slice(device.schema)
+					.map_err(|_| DynFault::new(format!("device `{name}` has an invalid JSON schema")))?;
+				return Ok(DynSchema { name, description: Some(device.summary.clone()), schema });
 			}
 			self.mcp.schema(name.as_str()).await
 		})
@@ -279,10 +274,12 @@ impl ShellDynHost for DynHost {
 			};
 			let target = match registry.resolve_device(&path) {
 				Ok(target) => target,
-				Err(_) if registry.devices().any(|device| device.name.as_str() == path.root()) => {
-					return Err(DynFault::new(format!(
-						"device `{name}` rejected its path arguments"
-					)));
+				Err(_)
+					if registry
+						.devices()
+						.any(|device| device.name.as_str() == path.root()) =>
+				{
+					return Err(DynFault::new(format!("device `{name}` rejected its path arguments")));
 				},
 				Err(_) => return self.call_mcp(name, args, cancellation).await,
 			};
@@ -576,31 +573,22 @@ mod tests {
 		let scratch = tempfile::tempdir().expect("scratch");
 		let blobs = BlobHost::open(scratch.path()).expect("blobs");
 		let id = blobs.put(b"image").expect("store image");
-		let json = project_part(
-			&blobs,
-			Part::Json { json: Bytes::from_static(br#"{"ok":true}"#) },
-		)
-		.expect("JSON part");
+		let json = project_part(&blobs, Part::Json { json: Bytes::from_static(br#"{"ok":true}"#) })
+			.expect("JSON part");
 		assert_eq!(json, DynOutput::Json(json!({"ok": true})));
-		let blob = project_part(
-			&blobs,
-			Part::Blob {
-				blob: omp_tool::BlobRef {
-					hash:       Str::new(Hash32::new(id.hash).to_hex().as_str()),
-					media_type: sf!("image/png"),
-					byte_len:   id.size,
-				},
-				alt: None,
+		let blob = project_part(&blobs, Part::Blob {
+			blob: omp_tool::BlobRef {
+				hash:       Str::new(Hash32::new(id.hash).to_hex().as_str()),
+				media_type: sf!("image/png"),
+				byte_len:   id.size,
 			},
-		)
+			alt:  None,
+		})
 		.expect("blob part");
-		assert_eq!(
-			blob,
-			DynOutput::Blob {
-				mime:  sf!("image/png"),
-				bytes: Bytes::from_static(b"image"),
-			}
-		);
+		assert_eq!(blob, DynOutput::Blob {
+			mime:  sf!("image/png"),
+			bytes: Bytes::from_static(b"image"),
+		});
 	}
 
 	#[tokio::test]
@@ -611,19 +599,14 @@ mod tests {
 		registry
 			.register(
 				CountingDevice {
-					spec: ToolSpec {
+					spec:  ToolSpec {
 						name:            sf!("danger"),
 						rev:             Rev { family: sf!("test"), n: 1 },
 						description:     sf!("mutating test device"),
-						schema:          Bytes::from_static(
-							br#"{"type":"object","properties":{}}"#,
-						),
+						schema:          Bytes::from_static(br#"{"type":"object","properties":{}}"#),
 						constraint:      Constraint::None,
 						effects:         Effects {
-							exec: Some(ExecEffects {
-								commands: Arc::from([sf!("*")]),
-								network: true,
-							}),
+							exec: Some(ExecEffects { commands: Arc::from([sf!("*")]), network: true }),
 							..Effects::empty()
 						},
 						projection_code: [1; 32],
@@ -644,8 +627,7 @@ mod tests {
 			.install_registry(Arc::clone(&registry))
 			.expect("install catalog");
 		let blobs = BlobHost::open(scratch.path().join("blobs")).expect("blobs");
-		let mcp_service =
-			McpService::open(scratch.path().join("mcp.sqlite3")).expect("MCP service");
+		let mcp_service = McpService::open(scratch.path().join("mcp.sqlite3")).expect("MCP service");
 		let mcp = McpManager::new(
 			Arc::clone(&mcp_service),
 			Arc::new(ProductionConnector::new(scratch.path().to_path_buf())),
@@ -664,13 +646,7 @@ mod tests {
 			admission,
 		);
 
-		let result = ShellDynHost::call(
-			&host,
-			"danger",
-			json!({}),
-			CancellationToken::new(),
-		)
-		.await;
+		let result = ShellDynHost::call(&host, "danger", json!({}), CancellationToken::new()).await;
 		assert!(result.is_err());
 		assert_eq!(calls.load(Ordering::Relaxed), 0);
 	}

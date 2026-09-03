@@ -21,7 +21,8 @@ const MAX_VISIBLE: usize = 20;
 /// Border rows, divider, status row, and hint.
 const CHROME_ROWS: u16 = 5;
 const EMPTY_VALUE: &str = "__empty__";
-const HINT_INSTALL: &str = "↑/↓ plugins · Enter install (uninstall when installed) · type to search · Esc close";
+const HINT_INSTALL: &str =
+	"↑/↓ plugins · Enter install (uninstall when installed) · type to search · Esc close";
 const HINT_UNINSTALL: &str = "↑/↓ plugins · Enter uninstall · type to search · Esc close";
 
 /// Which pi selector opened: the install browser over every catalog
@@ -136,11 +137,7 @@ impl PluginSelector {
 					.version
 					.as_ref()
 					.map_or_else(Str::default, |version| sf!("@{version}"));
-				let status = if plugin.installed {
-					" [installed]"
-				} else {
-					""
-				};
+				let status = if plugin.installed { " [installed]" } else { "" };
 				let scope = if plugin.scope.is_empty() {
 					Str::default()
 				} else {
@@ -227,11 +224,7 @@ impl PluginSelector {
 		} else {
 			Mutation::UninstallPlugin { id: Str::new(id) }
 		};
-		self.in_flight = Some(InFlight {
-			id: Str::new(id),
-			installing,
-			mutation: mutation.clone(),
-		});
+		self.in_flight = Some(InFlight { id: Str::new(id), installing, mutation: mutation.clone() });
 		self.rebuild();
 		PanelEvent::Command(HostCommand::Service(mutation))
 	}
@@ -239,9 +232,7 @@ impl PluginSelector {
 	fn route(&mut self, event: UiEvent) -> PanelEvent {
 		match event {
 			UiEvent::Cancel => PanelEvent::Close,
-			UiEvent::Changed { id, value } if id.as_str() == "plugins" => {
-				self.choose(value.as_str())
-			},
+			UiEvent::Changed { id, value } if id.as_str() == "plugins" => self.choose(value.as_str()),
 			UiEvent::Filtered { id, query, .. } if id.as_str() == "plugins" => {
 				self.query = query;
 				PanelEvent::Consumed
@@ -271,8 +262,9 @@ impl Panel for PluginSelector {
 	}
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
-		let event =
-			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		self.route(event)
 	}
 
@@ -300,7 +292,9 @@ impl Panel for PluginSelector {
 			return PanelEvent::Ignored;
 		}
 		self.in_flight = None;
-		if outcome.result.is_ok() && let Ok(report) = self.services.plugins() {
+		if outcome.result.is_ok()
+			&& let Ok(report) = self.services.plugins()
+		{
 			self.report = report;
 		}
 		self.rebuild();
@@ -331,24 +325,25 @@ mod tests {
 
 	fn plugin(name: &str, installed: bool) -> PluginRow {
 		PluginRow {
-			id:          sf!("{name}@official"),
-			name:        Str::new(name),
-			version:     Some(Str::new_static("1.0.0")),
+			id: sf!("{name}@official"),
+			name: Str::new(name),
+			version: Some(Str::new_static("1.0.0")),
 			description: sf!("The {name} plugin"),
 			marketplace: Str::new_static("official"),
 			installed,
-			enabled:     installed,
-			scope:       if installed {
+			enabled: installed,
+			scope: if installed {
 				Str::new_static("user")
 			} else {
 				Str::default()
 			},
-			shadowed:    false,
+			shadowed: false,
 		}
 	}
 
 	fn point(text: &str, needle: &str) -> (u16, u16) {
-		text.lines()
+		text
+			.lines()
 			.enumerate()
 			.find_map(|(row, line)| {
 				let byte = line.find(needle)?;
@@ -370,7 +365,10 @@ mod tests {
 
 	fn feed(plugins: Vec<PluginRow>, marketplaces: usize) -> Arc<Feed> {
 		let sources = (0..marketplaces)
-			.map(|index| MarketplaceSource { name: sf!("market{index}"), uri: sf!("org/repo{index}") })
+			.map(|index| MarketplaceSource {
+				name: sf!("market{index}"),
+				uri:  sf!("org/repo{index}"),
+			})
 			.collect::<Vec<_>>();
 		Arc::new(Feed {
 			report: Mutex::new(PluginsReport {

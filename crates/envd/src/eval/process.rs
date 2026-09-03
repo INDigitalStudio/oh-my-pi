@@ -374,9 +374,13 @@ impl ProcessEvalExec {
 							if task_cancelled.is_cancelled()
 								&& let Some(completion) = retry_cancelled.take()
 							{
-								let _ = events_tx.send_async(Ok(RunEvent::Completed(completion))).await;
+								let _ = events_tx
+									.send_async(Ok(RunEvent::Completed(completion)))
+									.await;
 							} else {
-								let _ = events_tx.send_async(Err(resource_fault("open_session", error))).await;
+								let _ = events_tx
+									.send_async(Err(resource_fault("open_session", error)))
+									.await;
 							}
 							return;
 						},
@@ -391,7 +395,9 @@ impl ProcessEvalExec {
 					if disposable && let Some(mut child) = child_slot.take() {
 						child.terminate().await;
 					}
-					let _ = events_tx.send_async(Ok(RunEvent::Completed(completion))).await;
+					let _ = events_tx
+						.send_async(Ok(RunEvent::Completed(completion)))
+						.await;
 					return;
 				}
 				let child = child_slot.as_mut().expect("eval child initialized above");
@@ -417,11 +423,13 @@ impl ProcessEvalExec {
 						retry_cancelled = Some(completion);
 						if task_cancelled.is_cancelled() {
 							owned.needs_reset.store(true, Ordering::Release);
-							let _ = events_tx.send_async(Ok(RunEvent::Completed(
-								retry_cancelled
-									.take()
-									.expect("dead-kernel cancellation recorded above"),
-							))).await;
+							let _ = events_tx
+								.send_async(Ok(RunEvent::Completed(
+									retry_cancelled
+										.take()
+										.expect("dead-kernel cancellation recorded above"),
+								)))
+								.await;
 							return;
 						}
 					},
@@ -687,7 +695,9 @@ impl EvalChild {
 			.map(|duration| u64::try_from(duration.as_nanos()))
 			.transpose()
 		else {
-			let _ = events.send_async(Err(resource_fault("run", ProcessError::Duration(DurationError::Overflow)))).await;
+			let _ = events
+				.send_async(Err(resource_fault("run", ProcessError::Duration(DurationError::Overflow))))
+				.await;
 			return RunCellDisposition::Drop;
 		};
 		if let Err(error) = write_frame(&mut self.stdin, &ParentFrame::Run {
@@ -755,8 +765,9 @@ impl EvalChild {
 				ParentLoopEvent::InterruptGraceExpired => {
 					needs_reset.store(true, Ordering::Release);
 					cancel_bridge_tasks(&mut bridge_tasks).await;
-					let _ =
-						events.send_async(Ok(RunEvent::Completed(cancelled_completion(elapsed_ms(started))))).await;
+					let _ = events
+						.send_async(Ok(RunEvent::Completed(cancelled_completion(elapsed_ms(started)))))
+						.await;
 					return RunCellDisposition::Drop;
 				},
 				ParentLoopEvent::Timeout => {
@@ -764,8 +775,9 @@ impl EvalChild {
 					self.interrupt();
 					cancel_bridge_tasks(&mut bridge_tasks).await;
 					time::sleep(self.interrupt_grace).await;
-					let _ =
-						events.send_async(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started))))).await;
+					let _ = events
+						.send_async(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started)))))
+						.await;
 					return RunCellDisposition::Drop;
 				},
 				ParentLoopEvent::Bridge(Some(BridgeTaskEvent::Progress { request_id, event })) => {
@@ -801,9 +813,11 @@ impl EvalChild {
 					{
 						needs_reset.store(true, Ordering::Release);
 						cancel_bridge_tasks(&mut bridge_tasks).await;
-						let _ = events.send_async(Err(Fault::SessionLost {
-							message: sf!("Python eval child exited during a host bridge response",),
-						})).await;
+						let _ = events
+							.send_async(Err(Fault::SessionLost {
+								message: sf!("Python eval child exited during a host bridge response",),
+							}))
+							.await;
 						return RunCellDisposition::Drop;
 					}
 					continue;
@@ -823,12 +837,15 @@ impl EvalChild {
 						.and_then(|status| status.code())
 						== Some(CHILD_TIMEOUT_EXIT)
 					{
-						let _ =
-							events.send_async(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started))))).await;
+						let _ = events
+							.send_async(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started)))))
+							.await;
 					} else {
-						let _ = events.send_async(Err(Fault::SessionLost {
-							message: sf!("Python eval child exited during the active cell"),
-						})).await;
+						let _ = events
+							.send_async(Err(Fault::SessionLost {
+								message: sf!("Python eval child exited during the active cell"),
+							}))
+							.await;
 					}
 					return RunCellDisposition::Drop;
 				},
@@ -842,7 +859,9 @@ impl EvalChild {
 				ChildFrame::Started { run_id: actual, cell_id: actual_cell }
 					if actual == run_id && actual_cell == cell_id =>
 				{
-					let _ = events.send_async(Ok(RunEvent::Started { cell_id: actual_cell })).await;
+					let _ = events
+						.send_async(Ok(RunEvent::Started { cell_id: actual_cell }))
+						.await;
 				},
 				ChildFrame::Stdout { run_id: actual, mut update }
 				| ChildFrame::Stderr { run_id: actual, mut update }
@@ -942,9 +961,11 @@ impl EvalChild {
 				},
 				_ => {
 					needs_reset.store(true, Ordering::Release);
-					let _ = events.send_async(Err(Fault::SessionLost {
-						message: sf!("Python eval child sent an invalid or out-of-order frame",),
-					})).await;
+					let _ = events
+						.send_async(Err(Fault::SessionLost {
+							message: sf!("Python eval child sent an invalid or out-of-order frame",),
+						}))
+						.await;
 
 					return RunCellDisposition::Drop;
 				},
@@ -1536,9 +1557,7 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 						child_host.active_run.store(0, Ordering::Release);
 						child_host
 							.outgoing
-							.send_async(ChildFrame::Fatal {
-								message: Str::from(format!("{error:?}")),
-							})
+							.send_async(ChildFrame::Fatal { message: Str::from(format!("{error:?}")) })
 							.await
 							.map_err(|_| ProcessError::Exited)?;
 						continue;
@@ -1552,8 +1571,9 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 					loop {
 						match run.next_event().await {
 							Ok(Some(RunEvent::Started { .. })) => {
-								let _ =
-									outgoing.send_async(ChildFrame::Started { run_id, cell_id: cell_id.clone() }).await;
+								let _ = outgoing
+									.send_async(ChildFrame::Started { run_id, cell_id: cell_id.clone() })
+									.await;
 							},
 							Ok(Some(RunEvent::Output(update))) => {
 								let frame = match update.channel {
@@ -1568,29 +1588,43 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 								active_flag.store(false, Ordering::Release);
 								let RunCompletion { mut status, result, display_outputs } = completion;
 								for output in display_outputs {
-									let _ = outgoing.send_async(ChildFrame::Display { run_id, output }).await;
+									let _ = outgoing
+										.send_async(ChildFrame::Display { run_id, output })
+										.await;
 								}
 								if let Some(value) = result {
-									let _ = outgoing.send_async(ChildFrame::Result { run_id, value }).await;
+									let _ = outgoing
+										.send_async(ChildFrame::Result { run_id, value })
+										.await;
 								}
 								if let Some(value) = status.exception.take() {
-									let _ = outgoing.send_async(ChildFrame::Error { run_id, value }).await;
+									let _ = outgoing
+										.send_async(ChildFrame::Error { run_id, value })
+										.await;
 								}
-								let _ = outgoing.send_async(ChildFrame::Done { run_id, status }).await;
+								let _ = outgoing
+									.send_async(ChildFrame::Done { run_id, status })
+									.await;
 								break;
 							},
 							Ok(None) => {
 								run_route.active_run.store(0, Ordering::Release);
 								active_flag.store(false, Ordering::Release);
-								let _ = outgoing.send_async(ChildFrame::Fatal {
-									message: sf!("embedded eval stream ended without completion",),
-								}).await;
+								let _ = outgoing
+									.send_async(ChildFrame::Fatal {
+										message: sf!("embedded eval stream ended without completion",),
+									})
+									.await;
 								break;
 							},
 							Err(error) => {
 								run_route.active_run.store(0, Ordering::Release);
 								active_flag.store(false, Ordering::Release);
-								let _ = outgoing.send_async(ChildFrame::Fatal { message: Str::from(format!("{error:?}")) }).await;
+								let _ = outgoing
+									.send_async(ChildFrame::Fatal {
+										message: Str::from(format!("{error:?}")),
+									})
+									.await;
 								break;
 							},
 						}
@@ -2137,9 +2171,9 @@ mod tests {
 			.run_cell(
 				Bytes::from_static(b"external-runner-large-output:cell-1"),
 				RunRequest {
-					code: sf!("import sys\nsys.stdout.write(('x' * 350 + '\\n') * 3001)"),
+					code:    sf!("import sys\nsys.stdout.write(('x' * 350 + '\\n') * 3001)"),
 					timeout: None,
-					reset: false,
+					reset:   false,
 					runtime: runtime_snapshot(cwd),
 				},
 				CancellationToken::new(),

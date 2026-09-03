@@ -9,10 +9,11 @@ use omp_tui::Icon;
 use super::{CommandAction, PaletteEntry, post, rest};
 
 /// Palette icons for this module's commands.
-pub const PALETTE: &[PaletteEntry] = &[
-	PaletteEntry { name: "plan", icon: Icon::Plan },
-	PaletteEntry { name: "plan-review", icon: Icon::Plan },
-];
+pub const PALETTE: &[PaletteEntry] =
+	&[PaletteEntry { name: "plan", icon: Icon::Plan }, PaletteEntry {
+		name: "plan-review",
+		icon: Icon::Plan,
+	}];
 
 /// pi's default plan artifact (`interactive-mode.ts` `#getPlanFilePath`).
 pub const DEFAULT_PLAN: &str = "local://PLAN.md";

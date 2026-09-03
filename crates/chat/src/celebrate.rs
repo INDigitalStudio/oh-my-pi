@@ -86,8 +86,7 @@ pub fn detect_codex_reset(
 		}
 	}
 
-	let (Some(previous_week), Some(current_week)) = (&previous.seven_day, &current.seven_day)
-	else {
+	let (Some(previous_week), Some(current_week)) = (&previous.seven_day, &current.seven_day) else {
 		return None;
 	};
 	if previous_week.tier != current_week.tier || previous_week.plan != current_week.plan {
@@ -171,7 +170,8 @@ pub fn snapshot_from_report(report: &UsageReport) -> Option<QuotaSnapshot> {
 		});
 		observed_at = Some(window.observed_at);
 	}
-	let observed_at = observed_at.or_else(|| report.windows.first().map(|window| window.observed_at));
+	let observed_at =
+		observed_at.or_else(|| report.windows.first().map(|window| window.observed_at));
 	let saved_resets = report
 		.reset_credits
 		.as_ref()
@@ -230,9 +230,9 @@ pub fn snapshot_from_account(
 /// compares consecutive snapshots.
 #[derive(Default)]
 pub struct QuotaWatch {
-	fetched_at: Option<Duration>,
-	pending:    Option<crate::overlays::services::Pending<crate::overlays::services::UsageReport>>,
-	previous:   Option<QuotaSnapshot>,
+	fetched_at:  Option<Duration>,
+	pending:     Option<crate::overlays::services::Pending<crate::overlays::services::UsageReport>>,
+	previous:    Option<QuotaSnapshot>,
 	/// Whether the service reported usage unavailable; no retries then.
 	unavailable: bool,
 }
@@ -296,7 +296,11 @@ impl QuotaWatch {
 		if self.pending.is_some() {
 			return Some(now + Self::SETTLE_POLL);
 		}
-		Some(self.fetched_at.map_or(now, |fetched| fetched + Self::REFRESH))
+		Some(
+			self
+				.fetched_at
+				.map_or(now, |fetched| fetched + Self::REFRESH),
+		)
 	}
 }
 
@@ -310,7 +314,9 @@ mod tests {
 		UsageResetCredits, UsageSource, UsageStatus, UsageUnit, UsageWindow, UsageWindowKind,
 	};
 
-	use super::{CodexResetEvent, QuotaSnapshot, SevenDay, detect_codex_reset, snapshot_from_report};
+	use super::{
+		CodexResetEvent, QuotaSnapshot, SevenDay, detect_codex_reset, snapshot_from_report,
+	};
 
 	fn at(millis: u64) -> SystemTime {
 		SystemTime::UNIX_EPOCH + Duration::from_millis(millis)
@@ -477,10 +483,8 @@ mod tests {
 			account_meta: UsageAccountMetadata::default(),
 			source_label: None,
 			notes: Box::default(),
-			reset_credits: credits.map(|available| UsageResetCredits {
-				available,
-				credits: Box::default(),
-			}),
+			reset_credits: credits
+				.map(|available| UsageResetCredits { available, credits: Box::default() }),
 			windows,
 		}
 	}

@@ -4,7 +4,7 @@ use std::fs;
 
 use omp_agent::{
 	BindValue, Director, DirectorCx, DirectorEffect, DirectorRegistry, DirectorStack,
-	ExtensionRegistrar, LoopDecision, Slot, StateUpdate, TurnView, Verdict,
+	ExtensionRegistrar, LoopDecision, Slot, TurnView, Verdict,
 };
 use omp_core::Str;
 use omp_dom::{NodeSpec, Tag, Value};

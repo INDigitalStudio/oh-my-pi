@@ -140,11 +140,7 @@ fn session() -> Session {
 		.children(session.dom().body())
 		.last()
 		.expect("turn");
-	let assistant = *session
-		.dom()
-		.children(turn)
-		.last()
-		.expect("assistant");
+	let assistant = *session.dom().children(turn).last().expect("assistant");
 	let text = session
 		.stream_open(assistant, omp_dom::PropId::Text.into())
 		.expect("text stream");
@@ -267,22 +263,44 @@ fn settings_fixture() -> Vec<SettingRow> {
 		desc: Str::new(format!("Doc for {name}.")),
 		group: Group::of(name),
 		widget,
-		variants: if widget == Widget::Enum { &["off", "low", "medium", "high"] } else { &[] },
+		variants: if widget == Widget::Enum {
+			&["off", "low", "medium", "high"]
+		} else {
+			&[]
+		},
 		elem: ValueKind::Str,
 		value,
 		default,
-		min: if widget == Widget::Int { Some(1.0) } else { None },
-		max: if widget == Widget::Int { Some(100.0) } else { None },
+		min: if widget == Widget::Int {
+			Some(1.0)
+		} else {
+			None
+		},
+		max: if widget == Widget::Int {
+			Some(100.0)
+		} else {
+			None
+		},
 	};
 	vec![
 		row("ai_fastmode", Widget::Bool, Value::Bool(false), Value::Bool(false)),
-		row("ai_model", Widget::Text, Value::Str("anthropic/claude-fable-5".into()), Value::Str("".into())),
+		row(
+			"ai_model",
+			Widget::Text,
+			Value::Str("anthropic/claude-fable-5".into()),
+			Value::Str("".into()),
+		),
 		row("ai_thinking", Widget::Enum, Value::Enum("medium".into()), Value::Enum("off".into())),
 		row("ai_compact_threshold", Widget::Int, Value::Int(80), Value::Int(80)),
 		row("cl_showthinking", Widget::Bool, Value::Bool(true), Value::Bool(true)),
 		row("cl_showtools", Widget::Bool, Value::Bool(true), Value::Bool(true)),
 		row("cl_theme", Widget::Text, Value::Str("cyanotype".into()), Value::Str("".into())),
-		row("cl_resize_policy", Widget::Enum, Value::Enum("rebuild".into()), Value::Enum("rebuild".into())),
+		row(
+			"cl_resize_policy",
+			Widget::Enum,
+			Value::Enum("rebuild".into()),
+			Value::Enum("rebuild".into()),
+		),
 		row("sv_approval_mode", Widget::Enum, Value::Enum("ask".into()), Value::Enum("ask".into())),
 		row(
 			"sv_tools",
@@ -424,10 +442,8 @@ fn settings_command_opens_the_panel_over_the_live_registry_and_applies_a_toggle(
 
 #[test]
 fn model_opens_the_picker_and_model_with_a_selector_sets_ai_model() {
-	let mut h = harness(vec![
-		model_row("test/model", "Test Model"),
-		model_row("test/other", "Other Model"),
-	]);
+	let mut h =
+		harness(vec![model_row("test/model", "Test Model"), model_row("test/other", "Other Model")]);
 	h.host.console("model").expect("console");
 	assert_eq!(h.host.overlay_id(), Some("models"));
 	h.host.key(Key::Esc).expect("close");
@@ -460,7 +476,8 @@ fn model_opens_the_picker_and_model_with_a_selector_sets_ai_model() {
 
 #[test]
 fn switch_opens_the_session_only_picker() {
-	let mut h = harness(vec![model_row("test/model", "Test Model"), model_row("test/other", "Other")]);
+	let mut h =
+		harness(vec![model_row("test/model", "Test Model"), model_row("test/other", "Other")]);
 	h.host.console("switch").expect("console");
 	assert_eq!(h.host.overlay_id(), Some("models"));
 	h.host.key(Key::Down).expect("down");
@@ -542,7 +559,9 @@ fn dump_copies_the_transcript_with_the_sidecar_path() {
 	assert!(copied.contains("LLM request JSON: /tmp/omp-request-commands.json"), "{copied}");
 	assert!(copied.contains("may contain raw context/secrets"), "{copied}");
 	assert!(
-		h.host.notice().is_some_and(|text| text.starts_with("Session copied to clipboard")),
+		h.host
+			.notice()
+			.is_some_and(|text| text.starts_with("Session copied to clipboard")),
 		"{:?}",
 		h.host.notice()
 	);
@@ -565,17 +584,17 @@ fn mcp_help_opens_the_report_and_subcommands_run_through_services() {
 	h.host.key(Key::Esc).expect("close");
 	h.host.console("mcp reload").expect("reload");
 	h.host.key(Key::Esc).expect("close");
-	assert_eq!(&*h.feed.mcp_ops.lock(), &[
-		McpOp::List,
-		McpOp::Test("github".into()),
-		McpOp::Reload
-	]);
+	assert_eq!(&*h.feed.mcp_ops.lock(), &[McpOp::List, McpOp::Test("github".into()), McpOp::Reload]);
 	h.host.console("mcp test").expect("usage");
 	assert_eq!(h.host.notice(), Some("Server name required. Usage: /mcp test <name>"));
 	h.host.console("mcp bogus").expect("unknown");
 	assert_eq!(h.host.notice(), Some("Unknown subcommand: bogus. Type /mcp help for usage."));
 	h.host.console("mcp smithery-login").expect("smithery");
-	assert!(h.host.notice().is_some_and(|text| text.contains("Smithery")));
+	assert!(
+		h.host
+			.notice()
+			.is_some_and(|text| text.contains("Smithery"))
+	);
 }
 
 // ---------------------------------------------- /add-dir /remove-dir /dirs
@@ -592,7 +611,11 @@ fn workspace_dirs_are_a_session_convar_listed_like_pi() {
 		Some(format!("Workspace directories:\n  {} (working directory)", project.display()).as_str())
 	);
 	h.host.console("add-dir").expect("usage");
-	assert!(h.host.notice().is_some_and(|text| text.starts_with("Usage: /add-dir <path>\n")));
+	assert!(
+		h.host
+			.notice()
+			.is_some_and(|text| text.starts_with("Usage: /add-dir <path>\n"))
+	);
 	h.host.console("add-dir extra").expect("add");
 	assert_eq!(
 		h.host.notice(),
@@ -610,25 +633,37 @@ fn workspace_dirs_are_a_session_convar_listed_like_pi() {
 		Some(Value::List(vec![Value::Str(Str::new(extra.display().to_string()))]))
 	);
 	assert!(
-		h.con.session_writes().any(|(name, _)| name == "sv_workspace_dirs"),
+		h.con
+			.session_writes()
+			.any(|(name, _)| name == "sv_workspace_dirs"),
 		"workspace dirs live in the session layer"
 	);
 	h.host.console("add-dir extra").expect("again");
-	assert_eq!(h.host.notice(), Some(format!("Already in the workspace: {}", extra.display()).as_str()));
+	assert_eq!(
+		h.host.notice(),
+		Some(format!("Already in the workspace: {}", extra.display()).as_str())
+	);
 	h.host.console("add-dir missing").expect("missing");
 	assert_eq!(
 		h.host.notice(),
 		Some(format!("Directory does not exist: {}", project.join("missing").display()).as_str())
 	);
 	h.host.console("remove-dir .").expect("cwd");
-	assert_eq!(h.host.notice(), Some("Cannot remove the working directory; use /move to change it."));
+	assert_eq!(
+		h.host.notice(),
+		Some("Cannot remove the working directory; use /move to change it.")
+	);
 	h.host.console("remove-dir nope").expect("not a dir");
 	assert_eq!(
 		h.host.notice(),
 		Some(format!("Not a workspace directory: {}", project.join("nope").display()).as_str())
 	);
 	h.host.console("remove-dir extra").expect("remove");
-	assert!(h.host.notice().is_some_and(|text| text.starts_with(&format!("Removed {}.", extra.display()))));
+	assert!(
+		h.host
+			.notice()
+			.is_some_and(|text| text.starts_with(&format!("Removed {}.", extra.display())))
+	);
 	assert_eq!(h.con.get("sv_workspace_dirs"), Some(Value::List(Vec::new())));
 }
 

@@ -138,8 +138,6 @@ fn take(output: &mut Vec<u8>) -> Bytes {
 
 #[cfg(test)]
 mod tests {
-	use std::io::Write as _;
-
 	use http::HeaderValue;
 
 	use super::*;

@@ -410,8 +410,7 @@ async fn require_human_is_enforced_for_every_decision_source() {
 		for (source, human) in sources {
 			let identity = identity();
 			let context = context(Arc::clone(&identity));
-			let (approval_route, inbox) =
-				ApprovalRoute::new(Arc::new(ApprovalBook::new()), None);
+			let (approval_route, inbox) = ApprovalRoute::new(Arc::new(ApprovalBook::new()), None);
 			let audit = Arc::new(PolicyAudit(AtomicBool::new(false)));
 			let audit_sink: Arc<dyn PolicyAuditSink> = audit.clone();
 			let policy = PolicyControlOwner::new(
@@ -452,7 +451,12 @@ async fn require_human_is_enforced_for_every_decision_source() {
 				assert!(!audit.0.load(Ordering::Acquire), "rejected decisions are never audited");
 				assert_eq!(approval_route.pending().len(), 1, "ticket stays pending");
 				pending.abort();
-				assert!(pending.await.expect_err("request task was cancelled").is_cancelled());
+				assert!(
+					pending
+						.await
+						.expect_err("request task was cancelled")
+						.is_cancelled()
+				);
 				assert!(approval_route.pending().is_empty(), "cancelled request is withdrawn");
 			}
 		}

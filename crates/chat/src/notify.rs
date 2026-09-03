@@ -156,8 +156,9 @@ impl Notifier {
 					tail = None;
 				},
 				Tag::Custom(_) => {
-					tool_open |= !prop_text(node, PropId::Status)
-						.is_some_and(|status| matches!(status.as_str(), "ok" | "error" | "cancelled" | "aborted"));
+					tool_open |= !prop_text(node, PropId::Status).is_some_and(|status| {
+						matches!(status.as_str(), "ok" | "error" | "cancelled" | "aborted")
+					});
 					tail = None;
 				},
 				Tag::Known(KnownTag::Notice) => {
@@ -165,10 +166,9 @@ impl Notifier {
 					tail = match kind.as_deref() {
 						Some("error") => Some(TurnEnd::Errored),
 						Some("warn" | "warning")
-							if node
-								.content
-								.as_deref()
-								.is_some_and(|text| text.starts_with(INTERRUPT_NOTICE) || text.starts_with("Interrupted")) =>
+							if node.content.as_deref().is_some_and(|text| {
+								text.starts_with(INTERRUPT_NOTICE) || text.starts_with("Interrupted")
+							}) =>
 						{
 							Some(TurnEnd::Aborted)
 						},
@@ -251,8 +251,10 @@ mod tests {
 		assert_eq!(toast.body.as_deref(), Some("Complete"));
 		assert_eq!(toast.actions, Some(NotificationAction::Focus));
 
-		con.exec("cl_notify_completion 0", Source::Console).expect("set");
-		con.exec("cl_notify_error 1", Source::Console).expect("opt in");
+		con.exec("cl_notify_completion 0", Source::Console)
+			.expect("set");
+		con.exec("cl_notify_error 1", Source::Console)
+			.expect("opt in");
 		assert_eq!(notifier.turn_ended(&con, TurnEnd::Completed), None);
 		assert!(
 			notifier.turn_ended(&con, TurnEnd::Errored).is_some(),
@@ -277,7 +279,8 @@ mod tests {
 	#[test]
 	fn error_toast_suppressed_while_retry_pending() {
 		let con = ctx();
-		con.exec("cl_notify_error 1", Source::Console).expect("opt in");
+		con.exec("cl_notify_error 1", Source::Console)
+			.expect("opt in");
 		let mut notifier = Notifier::new(None);
 		let toast = notifier
 			.turn_ended(&con, TurnEnd::Errored)
@@ -387,15 +390,25 @@ mod tests {
 			.call("read", 1, "call-1", None, Some(raw("{}")), None)
 			.expect("call");
 		assert_eq!(Notifier::turn_end_from_dom(completed.dom()), None, "tool still running");
-		completed.settle(call, raw("{\"text\":\"done\"}")).expect("settle");
-		assert_eq!(Notifier::turn_end_from_dom(completed.dom()), None, "tool_calls continues the turn");
+		completed
+			.settle(call, raw("{\"text\":\"done\"}"))
+			.expect("settle");
+		assert_eq!(
+			Notifier::turn_end_from_dom(completed.dom()),
+			None,
+			"tool_calls continues the turn"
+		);
 		completed
 			.assistant_start("test/model", "test", "test/model")
 			.expect("assistant");
 		assert_eq!(Notifier::turn_end_from_dom(completed.dom()), None, "second assistant open");
 		completed.assistant_end("stop").expect("end");
 		completed
-			.receipt(omp_journal::data::TurnReceipt { tokens_in: 10, tokens_out: 5, ..Default::default() })
+			.receipt(omp_journal::data::TurnReceipt {
+				tokens_in: 10,
+				tokens_out: 5,
+				..Default::default()
+			})
 			.expect("receipt");
 		assert_eq!(Notifier::turn_end_from_dom(completed.dom()), Some(TurnEnd::Completed));
 

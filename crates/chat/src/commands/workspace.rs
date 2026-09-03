@@ -64,13 +64,18 @@ pub fn resolve_to_cwd(input: &str, cwd: &Path) -> PathBuf {
 		.and_then(|rest| rest.strip_suffix('"'))
 		.unwrap_or(input);
 	let raw = if let Some(rest) = input.strip_prefix("~/") {
-		std::env::var_os("HOME").map_or_else(|| PathBuf::from(input), |home| Path::new(&home).join(rest))
+		std::env::var_os("HOME")
+			.map_or_else(|| PathBuf::from(input), |home| Path::new(&home).join(rest))
 	} else if input == "~" {
 		std::env::var_os("HOME").map_or_else(|| PathBuf::from(input), PathBuf::from)
 	} else {
 		PathBuf::from(input)
 	};
-	let joined = if raw.is_absolute() { raw } else { cwd.join(raw) };
+	let joined = if raw.is_absolute() {
+		raw
+	} else {
+		cwd.join(raw)
+	};
 	let mut out = PathBuf::new();
 	for component in joined.components() {
 		match component {
@@ -232,7 +237,11 @@ mod tests {
 
 	#[test]
 	fn workspace_listing_matches_pi() {
-		let text = format_dirs(Path::new("/work/omp"), &[Str::new_static("/work/pi")], Some("Added /work/pi."));
+		let text = format_dirs(
+			Path::new("/work/omp"),
+			&[Str::new_static("/work/pi")],
+			Some("Added /work/pi."),
+		);
 		assert_eq!(
 			text,
 			"Added /work/pi.\nWorkspace directories:\n  /work/omp (working directory)\n  /work/pi"

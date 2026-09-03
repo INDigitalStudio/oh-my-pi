@@ -663,11 +663,7 @@ impl ShellExec for ShellExecHost {
 		})
 	}
 
-	async fn store_attachment(
-		&self,
-		bytes: Bytes,
-		media_type: Str,
-	) -> Result<BlobRef, Fault> {
+	async fn store_attachment(&self, bytes: Bytes, media_type: Str) -> Result<BlobRef, Fault> {
 		let blobs = self.blobs.clone();
 		let id = tokio::task::spawn_blocking(move || blobs.put(&bytes))
 			.await
@@ -701,10 +697,7 @@ impl ShellExec for ShellExecHost {
 		let start = StartProcess {
 			name: request.name.to_string(),
 			spec: Some(ProcessSpec {
-				source: Some(Script {
-					text: self.detached_command(&command),
-					..Default::default()
-				}),
+				source: Some(Script { text: self.detached_command(&command), ..Default::default() }),
 				cwd_uri: cwd_uri.to_string(),
 				env_delta: Some(environment),
 				pty: pty

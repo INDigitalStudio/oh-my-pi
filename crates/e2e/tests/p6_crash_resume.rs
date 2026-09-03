@@ -64,8 +64,8 @@ struct CrashRoute {
 
 impl Service<LayerCall<Call>> for CrashRoute {
 	type Error = InferenceError;
-	type Response = Answer;
 	type Future = Pin<Box<dyn Future<Output = Result<Answer, InferenceError>> + Send>>;
+	type Response = Answer;
 
 	fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		<FakeProvider as Service<Call>>::poll_ready(&mut self.fake, context)
@@ -150,11 +150,8 @@ impl CrashGateway {
 		])]);
 		let (streamed_tx, streamed) = flume::bounded(1);
 		let (release, release_rx) = flume::bounded(1);
-		let route_service = RouteProviderService::new(CrashRoute {
-			fake,
-			streamed: streamed_tx,
-			release: release_rx,
-		});
+		let route_service =
+			RouteProviderService::new(CrashRoute { fake, streamed: streamed_tx, release: release_rx });
 		let mut builder = Registry::builder(Arc::clone(&catalog));
 		for candidate in catalog.routes() {
 			builder = if candidate.id == route_id {
@@ -230,7 +227,10 @@ fn spawn_chat(
 	if resume {
 		command.arg("-c");
 	} else {
-		command.arg("--session").arg(session).arg("stream until killed");
+		command
+			.arg("--session")
+			.arg(session)
+			.arg("stream until killed");
 	}
 	command
 		.current_dir(project)
@@ -350,7 +350,10 @@ async fn p6_killed_real_streaming_omp_resumes_durable_prefix_through_cli() {
 		.expect("reap crashed OMP");
 	use std::os::unix::process::ExitStatusExt as _;
 	assert_eq!(status.signal(), Some(libc::SIGKILL), "OMP was not killed by SIGKILL");
-	gateway.release.send(()).expect("release crashed provider call");
+	gateway
+		.release
+		.send(())
+		.expect("release crashed provider call");
 
 	let journal = fs::read_to_string(&session).expect("crashed journal remains readable");
 	assert!(journal.contains("stream until killed"), "committed user block was lost");
@@ -372,11 +375,8 @@ async fn p6_killed_real_streaming_omp_resumes_durable_prefix_through_cli() {
 	);
 	let frame = wait_for_resumed_frame(&resume_debug);
 	assert!(!frame.contains(LOST_SUFFIX), "resumed host displayed an uncommitted suffix\n{frame}");
-	debug_request(
-		&resume_debug,
-		&json!({ "op": "keys", "keys": "ctrl+c ctrl+c" }),
-	)
-	.expect("quit resumed chat through its real input path");
+	debug_request(&resume_debug, &json!({ "op": "keys", "keys": "ctrl+c ctrl+c" }))
+		.expect("quit resumed chat through its real input path");
 	let status = resumed
 		.process
 		.wait(READY_TIMEOUT)

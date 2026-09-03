@@ -34,19 +34,19 @@ enum State {
 
 /// Retained loader-then-result panel.
 pub struct PendingPanel {
-	id:         &'static str,
-	anchor:     PanelAnchor,
-	title:      Str,
-	message:    Str,
-	state:      State,
-	cancel:     Option<Sender<()>>,
-	settle:     Settle,
+	id:        &'static str,
+	anchor:    PanelAnchor,
+	title:     Str,
+	message:   Str,
+	state:     State,
+	cancel:    Option<Sender<()>>,
+	settle:    Settle,
 	/// Copy requested by the settle policy and not yet delivered.
-	copy_due:   bool,
-	next_wake:  Option<Duration>,
-	ui:         Ui,
-	ctx:        UiContext,
-	width:      u16,
+	copy_due:  bool,
+	next_wake: Option<Duration>,
+	ui:        Ui,
+	ctx:       UiContext,
+	width:     u16,
 }
 
 impl PendingPanel {
@@ -236,9 +236,13 @@ mod tests {
 		assert!(text.contains("esc cancel"), "hint missing:\n{text}");
 		assert!(!panel.tick(Duration::ZERO), "nothing settled yet");
 		assert_eq!(panel.next_wake(), Some(POLL));
-		tx.send(Ok(Str::new_static("https://share.example/#k"))).unwrap();
+		tx.send(Ok(Str::new_static("https://share.example/#k")))
+			.unwrap();
 		assert!(panel.tick(POLL), "settling repaints");
-		assert_eq!(panel.settled(), Some(PanelEvent::Copy(Str::new_static("https://share.example/#k"))));
+		assert_eq!(
+			panel.settled(),
+			Some(PanelEvent::Copy(Str::new_static("https://share.example/#k")))
+		);
 		assert_eq!(panel.settled(), None, "copy delivered once");
 		let text = omp_tui::frame_text(panel.frame(Size { width: 50, height: 12 }));
 		assert!(text.contains("share.example"), "result missing:\n{text}");

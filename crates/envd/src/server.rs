@@ -12284,8 +12284,7 @@ mod tests {
 		let root = tempfile::tempdir().expect("workspace");
 		let state = tempfile::tempdir().expect("state");
 		let con = Arc::new(Ctx::new());
-		let convars =
-			Arc::new(crate::exthost::ConvarControlFactory::new(Arc::clone(&con)));
+		let convars = Arc::new(crate::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 		let server = Arc::new(
 			EnvServer::open_local(
 				root.path(),
@@ -12418,8 +12417,7 @@ mod tests {
 		let root = tempfile::tempdir().expect("workspace");
 		let state = tempfile::tempdir().expect("state");
 		let con = Arc::new(Ctx::new());
-		let convars =
-			Arc::new(crate::exthost::ConvarControlFactory::new(Arc::clone(&con)));
+		let convars = Arc::new(crate::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 		let server = Arc::new(
 			EnvServer::open_local(
 				root.path(),
@@ -13265,8 +13263,7 @@ mod tests {
 		let state = tempfile::tempdir().expect("state");
 		fs::create_dir(root.path().join(".git")).expect("protected carve-out");
 		let con = Arc::new(Ctx::new());
-		let convars =
-			Arc::new(crate::exthost::ConvarControlFactory::new(Arc::clone(&con)));
+		let convars = Arc::new(crate::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 		let server = Arc::new(
 			EnvServer::open_local(
 				root.path(),

@@ -72,7 +72,12 @@ pub fn format_error_rows(message: &str, content_width: u16, max_rows: Option<usi
 /// [`format_error_rows`] with `lead` pieces run ahead of the first logical
 /// line so the lead-in counts toward the first row's width, exactly as pi's
 /// `styleLine(line, 0)` prefixes before wrapping.
-fn wrap_rows(message: &str, content_width: u16, max_rows: Option<usize>, lead: &[&str]) -> ErrorRows {
+fn wrap_rows(
+	message: &str,
+	content_width: u16,
+	max_rows: Option<usize>,
+	lead: &[&str],
+) -> ErrorRows {
 	let wrap_width = content_width
 		.saturating_sub(cell_width(CONTINUATION_INDENT))
 		.max(1);
@@ -154,7 +159,11 @@ impl ErrorBody {
 	/// [`MAX_INLINE_ROWS`] unless `expanded`.
 	#[must_use]
 	pub fn inline(message: Str, expanded: bool) -> Self {
-		let max_rows = if expanded { None } else { Some(MAX_INLINE_ROWS) };
+		let max_rows = if expanded {
+			None
+		} else {
+			Some(MAX_INLINE_ROWS)
+		};
 		Self::new(message, max_rows, Lead::Prefix)
 	}
 
@@ -313,14 +322,10 @@ pub fn error_banner(message: Str) -> Component {
 
 /// The last `<turn>` in `<body>`.
 fn last_turn(dom: &Dom) -> Option<Handle> {
-	dom.children(dom.body())
-		.iter()
-		.rev()
-		.copied()
-		.find(|turn| {
-			dom.get(*turn)
-				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Turn))
-		})
+	dom.children(dom.body()).iter().rev().copied().find(|turn| {
+		dom.get(*turn)
+			.is_some_and(|node| node.tag == Tag::Known(KnownTag::Turn))
+	})
 }
 
 /// Whether `node` is `<notice kind=K>` for one of `kinds`.
@@ -336,15 +341,10 @@ fn is_notice(node: &Node, kinds: &[&str]) -> bool {
 #[must_use]
 pub fn pinned_error(dom: &Dom) -> Option<(Handle, Str)> {
 	let turn = last_turn(dom)?;
-	let tail = dom
-		.children(turn)
-		.iter()
-		.rev()
-		.copied()
-		.find(|handle| {
-			dom.get(*handle)
-				.is_none_or(|node| node.tag != Tag::Known(KnownTag::Usage))
-		})?;
+	let tail = dom.children(turn).iter().rev().copied().find(|handle| {
+		dom.get(*handle)
+			.is_none_or(|node| node.tag != Tag::Known(KnownTag::Usage))
+	})?;
 	let node = dom.get(tail)?;
 	is_notice(node, &["error"]).then(|| (tail, node.content.clone().unwrap_or_default()))
 }
@@ -407,7 +407,12 @@ fn diag_is_abort(dom: &Dom, tool: Handle) -> bool {
 		.iter()
 		.filter_map(|handle| dom.get(*handle))
 		.find(|node| node.tag == Tag::Known(KnownTag::Diag))
-		.and_then(|diag| diag.content.clone().or_else(|| prop_text(diag, PropId::Text)))
+		.and_then(|diag| {
+			diag
+				.content
+				.clone()
+				.or_else(|| prop_text(diag, PropId::Text))
+		})
 		.is_some_and(|text| {
 			let text = text.as_str().trim_start();
 			if text.starts_with('{') {
@@ -416,7 +421,9 @@ fn diag_is_abort(dom: &Dom, tool: Handle) -> bool {
 					.and_then(|value| value.get("kind")?.as_str().map(|kind| kind == "aborted"))
 					.unwrap_or(false);
 			}
-			text.starts_with("interrupted:") || text.starts_with("aborted") || text.starts_with("skipped:")
+			text.starts_with("interrupted:")
+				|| text.starts_with("aborted")
+				|| text.starts_with("skipped:")
 		})
 }
 
@@ -461,7 +468,8 @@ mod tests {
 	fn session() -> Session {
 		let directory = tempdir().expect("temp directory");
 		let path = directory.keep().join("notices.oms");
-		let mut session = Session::create(path, ComponentRegistry::standard()).expect("create session");
+		let mut session =
+			Session::create(path, ComponentRegistry::standard()).expect("create session");
 		session.begin_turn().expect("begin turn");
 		session.user("hello", Vec::new()).expect("user");
 		session
@@ -479,8 +487,8 @@ mod tests {
 				label: Some(Str::new_static("kernel.notice")),
 				ops:   vec![Op::Ins {
 					parent: turn,
-					after: session.dom().children(turn).last().copied(),
-					node: NodeSpec::new(KnownTag::Notice)
+					after:  session.dom().children(turn).last().copied(),
+					node:   NodeSpec::new(KnownTag::Notice)
 						.with_prop(PropId::Kind, Value::Str(Str::new_static(kind)))
 						.with_content(Str::new_static(text)),
 				}],
@@ -493,7 +501,8 @@ mod tests {
 			.assistant_start("test/model", "test", "test/model")
 			.expect("assistant start");
 		session.assistant_end("tool_calls").expect("assistant end");
-		let args = serde_json::value::to_raw_value(&serde_json::json!({"cmd":"sleep 9"})).expect("args");
+		let args =
+			serde_json::value::to_raw_value(&serde_json::json!({"cmd":"sleep 9"})).expect("args");
 		session
 			.call("bash", 1, "call-1", None, Some(args), None)
 			.expect("tool call");
@@ -541,7 +550,12 @@ mod tests {
 		let message = Str::new(numbered(12));
 		let collapsed = rows(notice_card("error", message.clone(), false), 60);
 		assert_eq!(collapsed[1], " Error: line 1");
-		assert!(collapsed.iter().any(|row| row.contains("+4 more lines (ctrl+o to expand)")), "{collapsed:?}");
+		assert!(
+			collapsed
+				.iter()
+				.any(|row| row.contains("+4 more lines (ctrl+o to expand)")),
+			"{collapsed:?}"
+		);
 		assert!(!collapsed.iter().any(|row| row.contains("line 12")));
 
 		let expanded = rows(notice_card("error", message, true), 60);
@@ -574,7 +588,9 @@ mod tests {
 		let user = session.dom().children(current_turn(&session))[0];
 		assert!(!suppressed_inline(session.dom(), user));
 		// A receipt after the notice does not unpin it; a warning does.
-		session.receipt(omp_journal::data::TurnReceipt::tokens(1, 1, 0)).expect("receipt");
+		session
+			.receipt(omp_journal::data::TurnReceipt::tokens(1, 1, 0))
+			.expect("receipt");
 		assert_eq!(pinned_error(session.dom()).map(|(h, _)| h), Some(handle));
 		append_notice(&mut session, "warn", "later");
 		assert_eq!(pinned_error(session.dom()), None);

@@ -184,12 +184,12 @@ impl Panel for PausePanel {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
 	use omp_con::Ctx;
 	use omp_dom::Dom;
 
 	use super::*;
-	use std::sync::Arc;
-
 	use crate::overlays::{NoServices, Services};
 
 	#[test]
@@ -199,9 +199,9 @@ mod tests {
 		let ui = UiContext::default();
 		let services: Arc<dyn Services> = Arc::new(NoServices);
 		let cx = PanelCx {
-			dom: &dom,
-			con: &con,
-			ui: &ui,
+			dom:      &dom,
+			con:      &con,
+			ui:       &ui,
 			viewport: Size { width: 80, height: 24 },
 			services: &services,
 		};
@@ -218,7 +218,10 @@ mod tests {
 		let text = omp_tui::frame_text(panel.frame(Size { width: 80, height: 24 }));
 		assert!(text.contains("paused for 1:01"), "clock did not advance:\n{text}");
 		assert_eq!(panel.key(Key::Char('x')), PanelEvent::Consumed);
-		assert_eq!(panel.key(Key::Char(' ')), PanelEvent::Finish(Str::new_static("pause_resume 61000")));
+		assert_eq!(
+			panel.key(Key::Char(' ')),
+			PanelEvent::Finish(Str::new_static("pause_resume 61000"))
+		);
 	}
 
 	#[test]
@@ -228,9 +231,9 @@ mod tests {
 		let ui = UiContext::default();
 		let services: Arc<dyn Services> = Arc::new(NoServices);
 		let cx = PanelCx {
-			dom: &dom,
-			con: &con,
-			ui: &ui,
+			dom:      &dom,
+			con:      &con,
+			ui:       &ui,
 			viewport: Size { width: 50, height: 12 },
 			services: &services,
 		};

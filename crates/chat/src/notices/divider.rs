@@ -137,7 +137,13 @@ impl SummaryDivider {
 				compaction_detail(before, after, warning.as_deref(), &summary)
 			},
 		};
-		Self { icon: method.icon(), label: label.freeze(), warning: warning.is_some(), detail, expanded }
+		Self {
+			icon: method.icon(),
+			label: label.freeze(),
+			warning: warning.is_some(),
+			detail,
+			expanded,
+		}
 	}
 
 	/// Renders the banner, plus the tinted detail box when expanded
@@ -233,9 +239,11 @@ pub fn compaction_dividers(dom: &Dom, turn: Handle, expanded: bool) -> Vec<(Hand
 	let Some(start) = dom.get(turn).and_then(entry_ulid) else {
 		return Vec::new();
 	};
-	let end = turns.get(index + 1).and_then(|next| dom.get(*next)).and_then(entry_ulid);
-	dom
-		.children(dom.meta())
+	let end = turns
+		.get(index + 1)
+		.and_then(|next| dom.get(*next))
+		.and_then(entry_ulid);
+	dom.children(dom.meta())
 		.iter()
 		.filter_map(|handle| {
 			let node = dom.get(*handle)?;
@@ -312,7 +320,9 @@ impl Divider {
 
 	fn rule(&mut self, ctx: &UiContext, count: u16) -> &str {
 		self.bar.clear();
-		self.bar.extend(iter::repeat_n(ctx.charset.rule(), usize::from(count)));
+		self
+			.bar
+			.extend(iter::repeat_n(ctx.charset.rule(), usize::from(count)));
 		&self.bar
 	}
 }
@@ -365,7 +375,9 @@ impl omp_tui::Component for Divider {
 			return;
 		}
 		let left = u16::try_from(remaining / 2).unwrap_or(u16::MAX);
-		let right = u16::try_from(remaining).unwrap_or(u16::MAX).saturating_sub(left);
+		let right = u16::try_from(remaining)
+			.unwrap_or(u16::MAX)
+			.saturating_sub(left);
 		let rule = self.rule(pc.ctx, left);
 		x = pc.frame.put(x, y, rule, dim);
 		x = pc.frame.put(x, y, " ", base);
@@ -396,10 +408,16 @@ mod tests {
 
 	use super::*;
 
-	fn compaction_node(method: Option<&str>, before: u64, after: u64, warning: Option<&str>) -> Node {
-		let mut props: smallvec::SmallVec<(PropKey, Value), 4> = smallvec![
-			(PropId::Summary.into(), Value::Str(Str::new_static("Earlier work: wired the parser."))),
-		];
+	fn compaction_node(
+		method: Option<&str>,
+		before: u64,
+		after: u64,
+		warning: Option<&str>,
+	) -> Node {
+		let mut props: smallvec::SmallVec<(PropKey, Value), 4> = smallvec![(
+			PropId::Summary.into(),
+			Value::Str(Str::new_static("Earlier work: wired the parser."))
+		),];
 		if let Some(method) = method {
 			props.push((PropId::Method.into(), Value::Str(Str::new(method))));
 		}
@@ -445,7 +463,12 @@ mod tests {
 
 	#[test]
 	fn compaction_label_carries_amount_and_warning() {
-		let node = compaction_node(Some("remote"), 256_000, 20_000, Some("No progress since last compaction"));
+		let node = compaction_node(
+			Some("remote"),
+			256_000,
+			20_000,
+			Some("No progress since last compaction"),
+		);
 		let divider = SummaryDivider::compaction(&node, false);
 		assert_eq!(divider.icon, "camera");
 		assert!(divider.warning);
@@ -475,7 +498,8 @@ mod tests {
 		let divider = SummaryDivider::compaction(&node, true);
 		assert_eq!(
 			divider.detail,
-			"**Compacted from 256,000 to 20,000 tokens**\n\n**Warning:** stalled\n\nEarlier work: wired the parser."
+			"**Compacted from 256,000 to 20,000 tokens**\n\n**Warning:** stalled\n\nEarlier work: \
+			 wired the parser."
 		);
 		let text = render(divider, 60);
 		let lines: Vec<&str> = text.lines().collect();
@@ -488,14 +512,19 @@ mod tests {
 		let bare = SummaryDivider::compaction(&compaction_node(None, 0, 0, None), true);
 		assert!(bare.detail.starts_with("**Compacted context**\n\n"));
 		let from_only = SummaryDivider::compaction(&compaction_node(None, 1_500, 0, None), true);
-		assert!(from_only.detail.starts_with("**Compacted from 1,500 tokens**"));
+		assert!(
+			from_only
+				.detail
+				.starts_with("**Compacted from 1,500 tokens**")
+		);
 		let to_only = SummaryDivider::compaction(&compaction_node(None, 0, 900, None), true);
 		assert!(to_only.detail.starts_with("**Compacted to 900 tokens**"));
 	}
 
 	#[test]
 	fn branch_and_handoff_dividers_use_their_icons() {
-		let branch = SummaryDivider::compaction(&compaction_node(Some("branch"), 9_000, 1_000, None), false);
+		let branch =
+			SummaryDivider::compaction(&compaction_node(Some("branch"), 9_000, 1_000, None), false);
 		assert_eq!(branch.icon, "branch");
 		assert_eq!(branch.label, "branch", "branch banners carry no amount badge");
 		assert_eq!(branch.detail, "**Branch summary**\n\nEarlier work: wired the parser.");
@@ -552,7 +581,8 @@ mod tests {
 		let first = compaction_dividers(dom, turns[0], false);
 		assert_eq!(first.len(), 1, "the boundary receipt lives in turn one");
 		let compaction = dom.children(dom.meta()).iter().copied().find(|handle| {
-			dom.get(*handle).is_some_and(|node| node.tag == Tag::Known(KnownTag::Compaction))
+			dom.get(*handle)
+				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Compaction))
 		});
 		assert_eq!(Some(first[0].0), compaction, "block key is the compaction handle");
 		let ui = Ui::from_root(first.into_iter().next().unwrap().1, 60, UiContext::default());

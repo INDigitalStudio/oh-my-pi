@@ -240,17 +240,12 @@ mod tests {
 		session.rewind(before).expect("rewind to genesis");
 		omp_agent::SessionStateBridge::resync(&journal, session.dom());
 		assert!(!omp_con::AI_FASTMODE.get(&ctx), "the rewound write is gone");
-		assert!(
-			!ctx
-				.session_writes()
-				.any(|(name, _)| name == "ai_fastmode")
-		);
+		assert!(!ctx.session_writes().any(|(name, _)| name == "ai_fastmode"));
 	}
 
 	/// The kernel reducer journals pending writes at the turn boundary.
 	#[test]
 	fn live_component_journals_at_turn_start() {
-		use omp_agent::LiveComponent as _;
 		let directory = tempfile::tempdir().expect("tempdir");
 		let path = directory.path().join("turn.oms");
 		let ctx = Arc::new(Ctx::new());
@@ -261,9 +256,7 @@ mod tests {
 		let turn = session.begin_turn().expect("turn");
 		let entry = session.entry(turn).cloned().expect("turn entry");
 		assert!(component.interested(&entry.kind));
-		let ops = component
-			.reduce(&entry, session.dom())
-			.expect("reduce");
+		let ops = component.reduce(&entry, session.dom()).expect("reduce");
 		assert!(!ops.is_empty());
 		session
 			.patch(omp_dom::Txn { cause: turn, label: None, ops })

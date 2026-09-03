@@ -3,7 +3,9 @@
 use omp_tui::{Border, IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result};
+use super::{
+	Card, CardStatus, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result,
+};
 
 /// Renders a web-search answer, source list, provider metadata, or fault.
 pub struct WebSearchCard;
@@ -22,10 +24,7 @@ impl Card for WebSearchCard {
 		if view.status == CardStatus::Failed {
 			let error = typed_fault::<omp_tools::web_search::Fault>(view)
 				.unwrap_or_else(|| omp_core::Str::new_static("search failed"));
-			let title = format!(
-				"{} Web Search",
-				ui.charset.icon_named("error").unwrap_or_default()
-			);
+			let title = format!("{} Web Search", ui.charset.icon_named("error").unwrap_or_default());
 			return dom! { <box border=round title={title} title_pad=3 pad="0 1"><text>{format!("Error: {error}")}</text></box> }.into_component();
 		}
 		let Some(_typed) = typed_result::<omp_tools::web_search::Payload>(view) else {

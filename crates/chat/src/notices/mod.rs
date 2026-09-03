@@ -7,20 +7,20 @@
 //! 0005: the actor projects, never authors). The DOM contract the renderers
 //! read, all on elements the kernel journals into a `<turn>`:
 //!
-//! - `<notice kind=K>` with text content. `K` ∈ `error | warn | warning |
-//!   info | success` (controller notices), `diagnostics` (late LSP findings,
-//!   `name` = server), `tangent` (background `/tan` dispatch, `id` = job id,
-//!   `label` = work summary), `advisor` (`severity` = `blocker | concern`,
-//!   `label` = summary header, body = paragraphs), `hook` (`name` = hook
-//!   name, body = Markdown, folded to five lines unless expanded), `custom`
-//!   (`name` = the extension's message type, body = Markdown). The kernel
-//!   journals the last two from `EnvEvent::Notice`.
-//! - `<user author=guest>` renders as the collaboration guest bubble;
-//!   `<user synthetic=true>` collapses to pi's `Synthetic input · size ·
-//!   lines · ctrl+o` row.
-//! - `<usage tokens-in tokens-out cost-nano-usd cache-read cache-write
-//!   ttft-ms duration-ms>`; the row timestamp and prompt→yield wait derive
-//!   from the ULID timestamps of the `<usage>` and `<user>` entry ids.
+//! - `<notice kind=K>` with text content. `K` ∈ `error | warn | warning | info
+//!   | success` (controller notices), `diagnostics` (late LSP findings, `name`
+//!   = server), `tangent` (background `/tan` dispatch, `id` = job id, `label` =
+//!   work summary), `advisor` (`severity` = `blocker | concern`, `label` =
+//!   summary header, body = paragraphs), `hook` (`name` = hook name, body =
+//!   Markdown, folded to five lines unless expanded), `custom` (`name` = the
+//!   extension's message type, body = Markdown). The kernel journals the last
+//!   two from `EnvEvent::Notice`.
+//! - `<user author=guest>` renders as the collaboration guest bubble; `<user
+//!   synthetic=true>` collapses to pi's `Synthetic input · size · lines ·
+//!   ctrl+o` row.
+//! - `<usage tokens-in tokens-out cost-nano-usd cache-read cache-write ttft-ms
+//!   duration-ms>`; the row timestamp and prompt→yield wait derive from the
+//!   ULID timestamps of the `<usage>` and `<user>` entry ids.
 //! - `<meta><compaction boundary method tokens-before tokens-after warning
 //!   summary>`; `boundary` names the last entry hidden by the summary, so the
 //!   divider lands after the turn containing that entry.

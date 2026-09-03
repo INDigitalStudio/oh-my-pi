@@ -145,11 +145,15 @@ pub fn render_calls_group(
 			let args = typed_input::<omp_tools::read::Params>(view).unwrap_or(Value::Null);
 			let label = string_at(&args, "path")
 				.map(str::to_owned)
-				.or_else(|| partial_string(view.args_text().unwrap_or_default(), "path").map(str::to_owned))
+				.or_else(|| {
+					partial_string(view.args_text().unwrap_or_default(), "path").map(str::to_owned)
+				})
 				.unwrap_or_default();
 			let label = match args.get("offset").and_then(Value::as_u64) {
 				Some(offset) => match args.get("limit").and_then(Value::as_u64) {
-					Some(limit) => sf!("{label}:{offset}-{}", offset.saturating_add(limit).saturating_sub(1)),
+					Some(limit) => {
+						sf!("{label}:{offset}-{}", offset.saturating_add(limit).saturating_sub(1))
+					},
 					None => sf!("{label}:{offset}-"),
 				},
 				None => Str::new(label),
@@ -192,10 +196,7 @@ fn result_images(result: &Value, target: &str, ui: &UiContext) -> Vec<Component>
 	let Some(parts) = result.get("parts").and_then(Value::as_array) else {
 		return Vec::new();
 	};
-	let filename = target
-		.rsplit('/')
-		.next()
-		.filter(|name| !name.is_empty());
+	let filename = target.rsplit('/').next().filter(|name| !name.is_empty());
 	parts
 		.iter()
 		.filter(|part| string_at(part, "kind") == Some("blob"))
@@ -339,7 +340,9 @@ mod tests {
 		let (rows, has_image) = render(&UiContext::default());
 		assert!(!has_image, "{rows:?}");
 		assert!(
-			rows.iter().any(|row| row.contains("[Image: logo.png [image/png]]")),
+			rows
+				.iter()
+				.any(|row| row.contains("[Image: logo.png [image/png]]")),
 			"cells tier shows pi's placeholder: {rows:?}"
 		);
 		let _ = fs::remove_file(path);

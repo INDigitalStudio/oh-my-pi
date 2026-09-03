@@ -28,6 +28,8 @@ pub mod managed_skills_domain;
 pub mod mcp;
 mod media_devices;
 pub mod memory;
+/// Additional literal pi environment-setting convars.
+pub mod pi_settings;
 pub mod policy;
 mod presence;
 pub mod process_identity;
@@ -38,8 +40,8 @@ mod resource_materializer;
 mod sandbox_proxy;
 mod schedule_plan;
 pub mod schedules;
-mod security_scan;
 pub mod search_backend;
+mod security_scan;
 mod server;
 /// Hidden in-process shell child used by detached named processes.
 pub mod shell_child;
@@ -51,8 +53,6 @@ mod tool_lsp;
 mod tool_read_sources;
 mod tool_search;
 pub mod tool_settings;
-/// Additional literal pi environment-setting convars.
-pub mod pi_settings;
 /// Shell-tool execution, managed process sessions, and shell URI resolution.
 pub mod tool_shell;
 pub mod tool_url;

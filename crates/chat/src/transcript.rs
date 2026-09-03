@@ -163,7 +163,11 @@ impl Local {
 			KernelEvent::Usage { output_tokens, reasoning_tokens } => {
 				// pi: `usage.reasoningTokens ?? usage.output`, fed as deltas so
 				// a fresh turn restarting at zero never spikes the gauge.
-				let tokens = if *reasoning_tokens > 0 { *reasoning_tokens } else { *output_tokens };
+				let tokens = if *reasoning_tokens > 0 {
+					*reasoning_tokens
+				} else {
+					*output_tokens
+				};
 				if let Some((previous, at)) = self.last_tokens
 					&& tokens > previous
 					&& now > at
@@ -229,7 +233,7 @@ fn classify_reset(previous: &Dom, next: &Dom) -> ResetKind {
 
 /// Retained transcript: the history ledger plus one live tree per block.
 pub(crate) struct Projection {
-	pub(crate) slots: Slots,
+	pub(crate) slots:  Slots,
 	pub(crate) blocks: Vec<Mounted>,
 	ctx:               UiContext,
 	width:             u16,
@@ -293,7 +297,9 @@ impl Projection {
 	fn open(&mut self, block: RenderedBlock, twin: RenderedBlock, now: Duration) -> Mounted {
 		let id = match (block.view.mode, &block.stream) {
 			(Mode::AppendOnly, Some(text)) => {
-				let id = self.slots.open_with(Mode::AppendOnly, spaced(block.component));
+				let id = self
+					.slots
+					.open_with(Mode::AppendOnly, spaced(block.component));
 				self.slots.append(id, text.as_str());
 				id
 			},
@@ -323,7 +329,10 @@ impl Projection {
 		mirror: Vec<RenderedBlock>,
 		now: Duration,
 	) -> bool {
-		let keys = blocks.iter().map(|block| block.view.key).collect::<Vec<_>>();
+		let keys = blocks
+			.iter()
+			.map(|block| block.view.key)
+			.collect::<Vec<_>>();
 		let present = |key: u64| keys.contains(&key);
 		let mut survivors = Vec::with_capacity(self.blocks.len());
 		for mounted in std::mem::take(&mut self.blocks) {
@@ -384,7 +393,13 @@ impl Projection {
 		true
 	}
 
-	fn update(&mut self, mounted: &mut Mounted, next: RenderedBlock, twin: RenderedBlock, now: Duration) {
+	fn update(
+		&mut self,
+		mounted: &mut Mounted,
+		next: RenderedBlock,
+		twin: RenderedBlock,
+		now: Duration,
+	) {
 		// Rows already in native scrollback are never rewritten (ADR 0034).
 		if mounted.retired {
 			mounted.view = next.view;
@@ -550,7 +565,10 @@ impl Projection {
 
 	/// Earliest animation wake across live blocks, on the presentation clock.
 	pub(crate) fn next_wake(&self) -> Option<Duration> {
-		self.live().filter_map(|mounted| mounted.ui.next_wake()).min()
+		self
+			.live()
+			.filter_map(|mounted| mounted.ui.next_wake())
+			.min()
 	}
 
 	/// Advances every live tree and the ledger's streaming heads to `now`.
@@ -793,7 +811,11 @@ mod tests {
 			"a live block moving behind a newer one reopens the live set"
 		);
 		assert_eq!(
-			live.blocks.iter().map(|mounted| mounted.view.key).collect::<Vec<_>>(),
+			live
+				.blocks
+				.iter()
+				.map(|mounted| mounted.view.key)
+				.collect::<Vec<_>>(),
 			[1, 3, 2]
 		);
 		assert_eq!(live.slots.logical_history().count(), 0, "a reorder writes no history");
@@ -825,7 +847,11 @@ mod tests {
 		};
 		assert!(projection.reconcile(next(), next(), Duration::ZERO));
 		assert_eq!(
-			projection.blocks.iter().map(|mounted| mounted.view.key).collect::<Vec<_>>(),
+			projection
+				.blocks
+				.iter()
+				.map(|mounted| mounted.view.key)
+				.collect::<Vec<_>>(),
 			[1, 2, 9]
 		);
 		assert!(projection.blocks[0].retired, "the retired block stays retired");
@@ -869,7 +895,11 @@ mod tests {
 		assert!(!projection.reconcile(swapped(), swapped(), Duration::ZERO));
 		assert_eq!(projection.slots.logical_history().count(), 4, "reopening writes no history");
 		assert_eq!(
-			projection.blocks.iter().filter(|mounted| mounted.retired).count(),
+			projection
+				.blocks
+				.iter()
+				.filter(|mounted| mounted.retired)
+				.count(),
 			2,
 			"both retired blocks survive the reorder exactly once"
 		);
@@ -900,13 +930,22 @@ mod tests {
 	#[test]
 	fn a_vanished_live_block_is_displaced_without_rebuilding_or_writing_history() {
 		let mut projection = fixture(20, &[true, false, false]);
-		let dropped = || vec![block(1, BlockKind::User, "row", true), block(3, BlockKind::Tool, "row", false)];
-		assert!(projection.reconcile(dropped(), dropped(), Duration::ZERO), "displacement reconciles");
+		let dropped =
+			|| vec![block(1, BlockKind::User, "row", true), block(3, BlockKind::Tool, "row", false)];
+		assert!(
+			projection.reconcile(dropped(), dropped(), Duration::ZERO),
+			"displacement reconciles"
+		);
 		assert_eq!(
-			projection.blocks.iter().map(|mounted| mounted.view.key).collect::<Vec<_>>(),
+			projection
+				.blocks
+				.iter()
+				.map(|mounted| mounted.view.key)
+				.collect::<Vec<_>>(),
 			[1, 3]
 		);
-		// The discarded slot no longer stalls the frontier: block 1 retires and commits.
+		// The discarded slot no longer stalls the frontier: block 1 retires and
+		// commits.
 		projection.retire_under_pressure(19, 20);
 		let plan = projection.slots.plan();
 		assert_eq!(plan.rows().len(), 2, "only the retired block's rows are staged");
@@ -939,7 +978,9 @@ mod tests {
 			.iter()
 			.find(|mounted| mounted.view.key == key)
 			.expect("mounted");
-		omp_tui::frame_text(mounted.ui.frame()).trim_end().to_owned()
+		omp_tui::frame_text(mounted.ui.frame())
+			.trim_end()
+			.to_owned()
 	}
 
 	#[test]
@@ -981,7 +1022,11 @@ mod tests {
 	#[test]
 	fn append_only_head_streams_stable_rows_and_hides_them_from_the_live_document() {
 		let ui = UiContext::default();
-		let lines = |count: usize| (1..=count).map(|n| format!("line {n}\n")).collect::<String>();
+		let lines = |count: usize| {
+			(1..=count)
+				.map(|n| format!("line {n}\n"))
+				.collect::<String>()
+		};
 		let mut projection = Projection::new(
 			Size::new(20, 6),
 			ResizePolicy::Rebuild,
@@ -1014,7 +1059,11 @@ mod tests {
 		// Tall enough to hold every live row, so the document is top-anchored
 		// and its first row is the first row not yet in scrollback.
 		let document = projection.document(&chrome, Size::new(20, 20));
-		let first = omp_tui::frame_text(&document).lines().next().unwrap_or_default().to_owned();
+		let first = omp_tui::frame_text(&document)
+			.lines()
+			.next()
+			.unwrap_or_default()
+			.to_owned();
 		assert_eq!(
 			first,
 			format!("line {}", emitted + 1),
@@ -1031,7 +1080,14 @@ mod tests {
 			.logical_history()
 			.map(|row| row.text().to_owned())
 			.collect::<Vec<_>>();
-		assert_eq!(history.iter().filter(|row| row.starts_with("line ")).count(), 12, "{history:?}");
+		assert_eq!(
+			history
+				.iter()
+				.filter(|row| row.starts_with("line "))
+				.count(),
+			12,
+			"{history:?}"
+		);
 		assert_eq!(history[0], "line 1", "rows commit once, in order");
 	}
 
@@ -1057,7 +1113,9 @@ mod tests {
 		}
 		for index in 0..users {
 			live.begin_turn().expect("turn");
-			live.user(format!("prompt {index}"), Vec::new()).expect("user");
+			live
+				.user(format!("prompt {index}"), Vec::new())
+				.expect("user");
 		}
 		Dom::from_snapshot(&live.dom().snapshot())
 	}
@@ -1089,10 +1147,15 @@ mod tests {
 	#[test]
 	fn usage_events_feed_the_gauge_as_deltas_and_inference_start_resets_it() {
 		let mut local = Local::default();
-		let usage = |reasoning: u64| KernelEvent::Usage { output_tokens: 0, reasoning_tokens: reasoning };
+		let usage =
+			|reasoning: u64| KernelEvent::Usage { output_tokens: 0, reasoning_tokens: reasoning };
 		assert!(!local.on_kernel_event(&KernelEvent::InferenceStarted, Duration::ZERO));
 		assert!(local.on_kernel_event(&usage(100), Duration::from_millis(1_000)));
-		assert_eq!(local.gauge().speed(Duration::from_millis(1_000)), 0.0, "the first sample only anchors");
+		assert_eq!(
+			local.gauge().speed(Duration::from_millis(1_000)),
+			0.0,
+			"the first sample only anchors"
+		);
 		assert!(local.on_kernel_event(&usage(150), Duration::from_millis(2_000)));
 		assert_eq!(local.gauge().speed(Duration::from_millis(2_000)), 50.0);
 		assert_eq!(local.thinking_tokens(), 150);
@@ -1100,6 +1163,10 @@ mod tests {
 		assert_eq!(local.thinking_tokens(), 0);
 		assert!(!local.gauge().is_live(Duration::from_millis(2_500)));
 		assert!(local.on_kernel_event(&usage(10), Duration::from_millis(3_000)));
-		assert_eq!(local.gauge().speed(Duration::from_millis(3_000)), 0.0, "a restart at zero never spikes");
+		assert_eq!(
+			local.gauge().speed(Duration::from_millis(3_000)),
+			0.0,
+			"a restart at zero never spikes"
+		);
 	}
 }

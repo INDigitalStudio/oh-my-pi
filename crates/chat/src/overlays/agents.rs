@@ -72,23 +72,23 @@ impl Chip {
 
 /// Retained `/agents` browser.
 pub struct AgentsHub {
-	ui:        Ui,
-	ctx:       UiContext,
-	services:  Arc<dyn Services>,
-	agents:    Vec<AgentRow>,
+	ui:       Ui,
+	ctx:      UiContext,
+	services: Arc<dyn Services>,
+	agents:   Vec<AgentRow>,
 	/// Indices into `agents` shown by the active scope and query.
-	rows:      Vec<usize>,
-	scope:     Scope,
-	focus:     Focus,
-	index:     usize,
-	scroll:    usize,
-	query:     String,
+	rows:     Vec<usize>,
+	scope:    Scope,
+	focus:    Focus,
+	index:    usize,
+	scroll:   usize,
+	query:    String,
 	/// Open strip: the agent being configured and the highlighted chip.
-	strip:     Option<(usize, usize)>,
-	notice:    Option<Str>,
-	error:     Option<Str>,
-	width:     u16,
-	height:    u16,
+	strip:    Option<(usize, usize)>,
+	notice:   Option<Str>,
+	error:    Option<Str>,
+	width:    u16,
+	height:   u16,
 }
 
 impl AgentsHub {
@@ -370,9 +370,7 @@ impl AgentsHub {
 		} else if self.index >= self.scroll + visible {
 			self.scroll = self.index + 1 - visible;
 		}
-		self.scroll = self
-			.scroll
-			.min(self.rows.len().saturating_sub(visible));
+		self.scroll = self.scroll.min(self.rows.len().saturating_sub(visible));
 		let name_width = self
 			.rows
 			.iter()
@@ -418,12 +416,15 @@ impl AgentsHub {
 					.map(|path| Str::new(path.display().to_string()))
 					.unwrap_or_default();
 				lines.push(dom! { <pre fg=muted truncate>{" "}{description}</pre> }.into_component());
-				lines.push(dom! {
-					<row>
-						<pre fg=muted>{" model: "}</pre>
-						<text truncate>{model}</text>
-					</row>
-				}.into_component());
+				lines.push(
+					dom! {
+						<row>
+							<pre fg=muted>{" model: "}</pre>
+							<text truncate>{model}</text>
+						</row>
+					}
+					.into_component(),
+				);
 				lines.push(dom! {
 					<row gap=3>
 						<row><pre fg=muted>{" tools: "}</pre><text truncate>{tools}</text></row>
@@ -514,7 +515,8 @@ impl AgentsHub {
 					</row>
 				</col>
 			</box>
-		}.into_component();
+		}
+		.into_component();
 		self.ui = Ui::from_root(tree, self.width, self.ctx.clone());
 	}
 }
@@ -637,7 +639,9 @@ impl Panel for AgentsHub {
 		if self.strip.is_some() {
 			return PanelEvent::Consumed;
 		}
-		self.query.extend(text.chars().filter(|ch| !ch.is_control()));
+		self
+			.query
+			.extend(text.chars().filter(|ch| !ch.is_control()));
 		self.focus = Focus::List;
 		self.build_rows();
 		self.index = 0;
@@ -731,14 +735,9 @@ mod tests {
 	#[test]
 	fn space_toggles_through_the_controller_and_notice_shows() {
 		let (mut hub, _) = hub(vec![agent("sonic", "project", None, None)]);
-		let mutation = Mutation::SetAgentEnabled {
-			name: Str::new_static("sonic"),
-			enabled: false,
-		};
-		assert_eq!(
-			hub.key(Key::Space),
-			PanelEvent::Command(HostCommand::Service(mutation.clone()))
-		);
+		let mutation =
+			Mutation::SetAgentEnabled { name: Str::new_static("sonic"), enabled: false };
+		assert_eq!(hub.key(Key::Space), PanelEvent::Command(HostCommand::Service(mutation.clone())));
 		assert!(hub.agents()[0].enabled, "rows change only after the owner settles");
 		let outcome = Outcome::Service(ServiceOutcome {
 			mutation,
@@ -814,14 +813,9 @@ mod tests {
 	#[test]
 	fn toggle_failure_shows_the_error_row() {
 		let (mut hub, _) = hub(vec![agent("broken", "project", None, None)]);
-		let mutation = Mutation::SetAgentEnabled {
-			name: Str::new_static("broken"),
-			enabled: false,
-		};
-		assert_eq!(
-			hub.key(Key::Space),
-			PanelEvent::Command(HostCommand::Service(mutation.clone()))
-		);
+		let mutation =
+			Mutation::SetAgentEnabled { name: Str::new_static("broken"), enabled: false };
+		assert_eq!(hub.key(Key::Space), PanelEvent::Command(HostCommand::Service(mutation.clone())));
 		let outcome = Outcome::Service(ServiceOutcome {
 			mutation,
 			result: Err(ServiceError::Unavailable("agent toggling")),

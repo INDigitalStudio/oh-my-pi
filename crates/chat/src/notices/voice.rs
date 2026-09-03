@@ -182,9 +182,11 @@ impl Shared {
 				},
 			}
 		}
-		let written = slot
-			.as_ref()
-			.map(|(_, stream)| stream.writer().and_then(|writer| writer.write_owned(audio.samples)));
+		let written = slot.as_ref().map(|(_, stream)| {
+			stream
+				.writer()
+				.and_then(|writer| writer.write_owned(audio.samples))
+		});
 		if let Some(Err(error)) = written {
 			tracing::debug!(error = %error, "vocalizer playback write failed");
 			slot.take();
@@ -238,12 +240,10 @@ async fn worker(rx: Receiver<Job>, synth: Arc<dyn SpeechSynth>, shared: Arc<Shar
 			},
 			Job::End { .. } => {
 				shared.drain().await;
-				let _ = shared.open.compare_exchange(
-					generation,
-					0,
-					Ordering::AcqRel,
-					Ordering::Acquire,
-				);
+				let _ =
+					shared
+						.open
+						.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire);
 			},
 		}
 	}
@@ -406,7 +406,8 @@ impl Vocalizer {
 	#[must_use]
 	pub fn speaking(&self) -> bool {
 		!self.rx.is_empty()
-			|| self.shared.open.load(Ordering::Acquire) == self.shared.generation.load(Ordering::Acquire)
+			|| self.shared.open.load(Ordering::Acquire)
+				== self.shared.generation.load(Ordering::Acquire)
 	}
 
 	fn push_delta(&self, delta: &str) {
@@ -516,7 +517,9 @@ mod tests {
 	}
 
 	fn spoken_contains(spoken: &[Str], needle: &str) -> bool {
-		spoken.iter().any(|segment| segment.as_str().contains(needle))
+		spoken
+			.iter()
+			.any(|segment| segment.as_str().contains(needle))
 	}
 
 	const TEXT: &str = "Hello there, this is a spoken sentence. ";
@@ -586,9 +589,9 @@ mod tests {
 	async fn clear_drops_queued_segments_and_bumps_generation() {
 		let synth = FakeSynth::new();
 		let mut vocalizer = Vocalizer::new(synth.clone());
-		let paragraph = "First sentence of a long reply. Second sentence follows it. \
-		                 Third sentence keeps going. Fourth sentence is here too. \
-		                 Fifth sentence ends the paragraph. ";
+		let paragraph = "First sentence of a long reply. Second sentence follows it. Third sentence \
+		                 keeps going. Fourth sentence is here too. Fifth sentence ends the \
+		                 paragraph. ";
 		vocalizer.push_text(SpeechMode::Assistant, paragraph);
 		assert!(vocalizer.speaking(), "segments are queued before the worker runs");
 		let before = vocalizer.shared.generation.load(Ordering::Acquire);

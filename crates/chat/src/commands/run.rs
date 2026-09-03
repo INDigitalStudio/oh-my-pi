@@ -9,8 +9,7 @@ use omp_core::{Str, StrMut};
 use omp_dom::{Dom, Handle, KnownTag, PropId, PropKey, Tag, Value};
 
 use super::{
-	CommandAction, CompactionMethod, GoalOp, Selector, SessionOp, TodoOp,
-	plan::DEFAULT_PLAN,
+	CommandAction, CompactionMethod, GoalOp, Selector, SessionOp, TodoOp, plan::DEFAULT_PLAN,
 };
 use crate::{
 	actions::HostAction,
@@ -29,7 +28,8 @@ const EXIT_VIBE_FIRST: &str = "Exit vibe mode first.";
 /// pi `builtin-lifecycle.ts` streaming guards.
 const WAIT_BEFORE_HANDOFF: &str =
 	"Wait for the current response to finish or abort it before handing off.";
-const WAIT_BEFORE_FORK: &str = "Wait for the current response to finish or abort it before forking.";
+const WAIT_BEFORE_FORK: &str =
+	"Wait for the current response to finish or abort it before forking.";
 const WAIT_BEFORE_FRESH: &str =
 	"Wait for the current response to finish or abort it before refreshing provider state.";
 const WAIT_BEFORE_RESET: &str =
@@ -39,8 +39,8 @@ const WAIT_BEFORE_WORKTREE: &str =
 	"Wait for the current response to finish or abort it before creating a worktree.";
 /// pi `/jobs` empty notice.
 const NO_JOBS: &str = "No background jobs running. (Background jobs run async tools — e.g. \
-                       long-running bash, debug, or task subagents that would otherwise tie up \
-                       a turn. They appear here while alive and for ~5 minutes after.)";
+                       long-running bash, debug, or task subagents that would otherwise tie up a \
+                       turn. They appear here while alive and for ~5 minutes after.)";
 /// pi `prompts/goals/guided-goal-interview.md`.
 const GUIDED_GOAL_INTERVIEW: &str = include_str!("../../prompts/guided-goal-interview.md");
 /// pi `prompts/system/omfg-user.md`, reduced to the steering rule the
@@ -66,14 +66,10 @@ pub fn director_active(dom: &Dom, family: &str) -> bool {
 /// The active frame of one Director family.
 #[must_use]
 pub fn director_frame(dom: &Dom, family: &str) -> Option<Handle> {
-	let directors = dom
-		.children(dom.meta())
-		.iter()
-		.copied()
-		.find(|handle| {
-			dom.get(*handle)
-				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Directors))
-		})?;
+	let directors = dom.children(dom.meta()).iter().copied().find(|handle| {
+		dom.get(*handle)
+			.is_some_and(|node| node.tag == Tag::Known(KnownTag::Directors))
+	})?;
 	let mut stack = vec![directors];
 	while let Some(parent) = stack.pop() {
 		for child in dom.children(parent).iter().copied() {
@@ -121,7 +117,9 @@ impl Presenter {
 		Ok(match action {
 			CommandAction::Plan { prompt } => self.plan(prompt),
 			CommandAction::PlanReview => self.plan_review()?,
-			CommandAction::PlanApprove { role, compact, keep } => self.plan_approve(role, compact, keep),
+			CommandAction::PlanApprove { role, compact, keep } => {
+				self.plan_approve(role, compact, keep)
+			},
 			CommandAction::Vibe { prompt } => self.vibe(prompt),
 			CommandAction::Goal(op) => self.goal(op)?,
 			CommandAction::GuidedGoal { initial } => self.guided_goal(initial),
@@ -175,12 +173,16 @@ impl Presenter {
 				Routed::Repaint
 			},
 			CommandAction::Resume { id } => self.resume(id)?,
-			CommandAction::Select(Selector::Rewind) => self.act(HostAction::Open(PanelOpener::new(
-				|cx| RewindPanel::open(cx).map(|panel| Box::new(panel) as Box<_>),
-			)))?,
-			CommandAction::Select(Selector::Tree) => self.act(HostAction::Open(PanelOpener::new(
-				|cx| TreePanel::open(cx).map(|panel| Box::new(panel) as Box<_>),
-			)))?,
+			CommandAction::Select(Selector::Rewind) => {
+				self.act(HostAction::Open(PanelOpener::new(|cx| {
+					RewindPanel::open(cx).map(|panel| Box::new(panel) as Box<_>)
+				})))?
+			},
+			CommandAction::Select(Selector::Tree) => {
+				self.act(HostAction::Open(PanelOpener::new(|cx| {
+					TreePanel::open(cx).map(|panel| Box::new(panel) as Box<_>)
+				})))?
+			},
 			CommandAction::Fork { target } => {
 				if self.turn_active {
 					return Ok(self.notice(WAIT_BEFORE_FORK));
@@ -208,7 +210,9 @@ impl Presenter {
 				Routed::Repaint
 			},
 			CommandAction::Rename { title } => {
-				let _ = self.commands.send(HostCommand::Rename { title: title.clone() });
+				let _ = self
+					.commands
+					.send(HostCommand::Rename { title: title.clone() });
 				self.notice(format!("Session renamed to \"{title}\"."))
 			},
 			CommandAction::Session(op) => self.session(op)?,
@@ -270,7 +274,9 @@ impl Presenter {
 				let branch = branch.unwrap_or_else(super::workspace::default_worktree_branch);
 				match self.services.create_worktree(branch.as_str()) {
 					Ok(worktree) => {
-						let _ = self.commands.send(HostCommand::Move { path: worktree.path.clone() });
+						let _ = self
+							.commands
+							.send(HostCommand::Move { path: worktree.path.clone() });
 						self.notice(format!(
 							"Moved to worktree {} on branch {} (checked out, uncommitted changes carried \
 							 over).",
@@ -331,7 +337,7 @@ impl Presenter {
 		}
 		let _ = self.commands.send(HostCommand::PlanMode { engage: false });
 		if let Some(role) = role
-			&& let Some((_, model, _)) = self.cycle.iter().find(|(name, _, _)| *name == role)
+			&& let Some((_, model, _)) = self.cycle.iter().find(|(name, ..)| *name == role)
 			&& let Err(error) = omp_con::AI_MODEL.set(&self.con, model.clone())
 		{
 			return self.notice(format!("Could not switch to the {role} model: {error}"));
@@ -339,7 +345,9 @@ impl Presenter {
 		if compact {
 			let _ = self.commands.send(HostCommand::Compact {
 				method: CompactionMethod::Compact,
-				hint:   Some(Str::new_static("Keep every decision and open question from the approved plan.")),
+				hint:   Some(Str::new_static(
+					"Keep every decision and open question from the approved plan.",
+				)),
 			});
 		}
 		let prompt = if keep {
@@ -383,11 +391,8 @@ impl Presenter {
 
 	fn goal(&mut self, op: GoalOp) -> Result<Routed, HostError> {
 		let frame = director_frame(&self.replica, GOAL);
-		let engage = |args: Vec<Str>| HostCommand::Director {
-			id: Str::new_static(GOAL),
-			engage: true,
-			args,
-		};
+		let engage =
+			|args: Vec<Str>| HostCommand::Director { id: Str::new_static(GOAL), engage: true, args };
 		Ok(match op {
 			GoalOp::Menu => match frame {
 				Some(_) => self.goal_show(),
@@ -400,7 +405,9 @@ impl Presenter {
 				if director_active(&self.replica, VIBE) {
 					return Ok(self.notice(EXIT_VIBE_FIRST));
 				}
-				let _ = self.commands.send(engage(vec![Str::new_static("set"), objective.clone()]));
+				let _ = self
+					.commands
+					.send(engage(vec![Str::new_static("set"), objective.clone()]));
 				self.notice(if frame.is_some() {
 					format!("Goal replaced: {objective}")
 				} else {
@@ -412,8 +419,7 @@ impl Presenter {
 				None => self.notice("No active goal."),
 			},
 			GoalOp::Pause | GoalOp::Resume => self.notice(
-				"Goal pause/resume is not journaled on this kernel; drop the goal or let it \
-				 complete.",
+				"Goal pause/resume is not journaled on this kernel; drop the goal or let it complete.",
 			),
 			GoalOp::Drop => match frame {
 				Some(_) => {
@@ -476,8 +482,9 @@ impl Presenter {
 			return self.notice(EXIT_VIBE_FIRST);
 		}
 		if director_active(&self.replica, GOAL) {
-			return self
-				.notice("Goal mode is already active. Use /goal to manage it, or /goal drop to start over.");
+			return self.notice(
+				"Goal mode is already active. Use /goal to manage it, or /goal drop to start over.",
+			);
 		}
 		let mut prompt = StrMut::new(GUIDED_GOAL_INTERVIEW.trim_end());
 		if let Some(initial) = initial {
@@ -543,7 +550,9 @@ impl Presenter {
 			CompactionMethod::Shake if count == 0 => return self.notice("Nothing to shake."),
 			_ => {},
 		}
-		let _ = self.commands.send(HostCommand::Compact { method, hint: focus });
+		let _ = self
+			.commands
+			.send(HostCommand::Compact { method, hint: focus });
 		self.notice(match method {
 			CompactionMethod::Compact => "Compacting context... (esc to cancel)",
 			CompactionMethod::Handoff => "Generating handoff… (esc to cancel)",
@@ -642,7 +651,8 @@ impl Presenter {
 				Ok(self.notice("Copied todos to clipboard"))
 			},
 			TodoOp::Export(path) => {
-				let path = path.map_or_else(|| PathBuf::from("TODO.md"), |path| PathBuf::from(path.as_str()));
+				let path =
+					path.map_or_else(|| PathBuf::from("TODO.md"), |path| PathBuf::from(path.as_str()));
 				let body = todo_markdown(&self.replica);
 				match std::fs::write(&path, body.as_bytes()) {
 					Ok(()) => Ok(self.notice(format!("Exported todos to {}", path.display()))),
@@ -667,7 +677,9 @@ fn conversation_context(dom: &Dom) -> Str {
 	let turns = dom.children(dom.body());
 	for turn in turns.iter().rev().take(TURNS).rev() {
 		for handle in dom.children(*turn) {
-			let Some(node) = dom.get(*handle) else { continue };
+			let Some(node) = dom.get(*handle) else {
+				continue;
+			};
 			let role = match node.tag {
 				Tag::Known(KnownTag::User) => "user",
 				Tag::Known(KnownTag::Assistant) => "assistant",
@@ -746,14 +758,10 @@ fn session_info(dom: &Dom, services: &dyn crate::overlays::Services) -> Str {
 
 /// pi `/jobs` report from `<meta><jobs>`; `None` when there are no jobs.
 fn jobs_report(dom: &Dom) -> Option<Str> {
-	let jobs = dom
-		.children(dom.meta())
-		.iter()
-		.copied()
-		.find(|handle| {
-			dom.get(*handle)
-				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Jobs))
-		})?;
+	let jobs = dom.children(dom.meta()).iter().copied().find(|handle| {
+		dom.get(*handle)
+			.is_some_and(|node| node.tag == Tag::Known(KnownTag::Jobs))
+	})?;
 	let rows = dom
 		.children(jobs)
 		.iter()
@@ -798,27 +806,32 @@ fn jobs_report(dom: &Dom) -> Option<Str> {
 /// writes: one `## phase` heading per phase, `- [ ]`/`- [x]`/`- [-]` rows.
 #[must_use]
 pub fn todo_markdown(dom: &Dom) -> Str {
-	let Some(todo) = dom
-		.children(dom.meta())
-		.iter()
-		.copied()
-		.find(|handle| {
-			dom.get(*handle)
-				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Todo))
-		})
-	else {
+	let Some(todo) = dom.children(dom.meta()).iter().copied().find(|handle| {
+		dom.get(*handle)
+			.is_some_and(|node| node.tag == Tag::Known(KnownTag::Todo))
+	}) else {
 		return Str::new_static("");
 	};
 	let mut out = StrMut::new("");
 	let mut phase = None::<Str>;
 	for handle in dom.children(todo) {
-		let Some(node) = dom.get(*handle) else { continue };
+		let Some(node) = dom.get(*handle) else {
+			continue;
+		};
 		let item_phase = custom(node, "phase").unwrap_or_default();
 		if phase.as_deref() != Some(item_phase) {
 			if !out.is_empty() {
 				out.push('\n');
 			}
-			let _ = writeln!(out, "## {}", if item_phase.is_empty() { "Tasks" } else { item_phase });
+			let _ = writeln!(
+				out,
+				"## {}",
+				if item_phase.is_empty() {
+					"Tasks"
+				} else {
+					item_phase
+				}
+			);
 			phase = Some(Str::new(item_phase));
 		}
 		let label = node

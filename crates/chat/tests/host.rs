@@ -62,7 +62,9 @@ fn fixture() -> (Session, omp_journal::EntryId) {
 	let outcome = serde_json::value::to_raw_value(&serde_json::json!({"text":"hello from fixture"}))
 		.expect("outcome");
 	session.settle(call, outcome).expect("tool result");
-	session.receipt(omp_journal::data::TurnReceipt::tokens(12, 7, 0)).expect("receipt");
+	session
+		.receipt(omp_journal::data::TurnReceipt::tokens(12, 7, 0))
+		.expect("receipt");
 	(session, genesis)
 }
 
@@ -189,10 +191,7 @@ fn pending_approval_projects_overlay_and_hotkeys() {
 		},
 		Size::new(80, 24),
 	);
-	assert_eq!(
-		host.key(Key::Char('x')).expect("non-choice approval key"),
-		NativeEffect::Consumed
-	);
+	assert_eq!(host.key(Key::Char('x')).expect("non-choice approval key"), NativeEffect::Consumed);
 	assert_eq!(host.composer_text(), "", "non-choice keys never reach the hidden composer");
 	assert!(command_rx.try_recv().is_err(), "non-choice key does not decide");
 	assert_eq!(host.key(Key::Esc).expect("deny approval"), NativeEffect::Consumed);
@@ -271,7 +270,9 @@ fn ctrl_c_reads_turn_activity_from_the_tree_through_receipts_and_notices() {
 		.call("bash", 1, "slow-shell", None, Some(args), None)
 		.expect("tool call");
 	session.assistant_end("tool_calls").expect("assistant end");
-	session.receipt(omp_journal::data::TurnReceipt::tokens(0, 0, 0)).expect("receipt");
+	session
+		.receipt(omp_journal::data::TurnReceipt::tokens(0, 0, 0))
+		.expect("receipt");
 	let turn = *session
 		.dom()
 		.children(session.dom().body())
@@ -284,8 +285,8 @@ fn ctrl_c_reads_turn_activity_from_the_tree_through_receipts_and_notices() {
 			label: None,
 			ops: vec![Op::Ins {
 				parent: turn,
-				after: session.dom().children(turn).last().copied(),
-				node: NodeSpec::new(KnownTag::Notice)
+				after:  session.dom().children(turn).last().copied(),
+				node:   NodeSpec::new(KnownTag::Notice)
 					.with_prop(PropId::Kind, Value::Str(omp_core::Str::new_static("info")))
 					.with_content(omp_core::Str::new_static("still working")),
 			}],
@@ -333,11 +334,9 @@ fn ctrl_c_reads_turn_activity_from_the_tree_through_receipts_and_notices() {
 
 fn empty_host(resuming: bool, quiet: bool) -> NativeHost {
 	let directory = tempdir().expect("temp directory");
-	let mut session = Session::create(
-		directory.path().join("empty.oms"),
-		ComponentRegistry::standard(),
-	)
-	.expect("empty session");
+	let mut session =
+		Session::create(directory.path().join("empty.oms"), ComponentRegistry::standard())
+			.expect("empty session");
 	let (snapshot, dom_events) = session.subscribe();
 	let (_, kernel_events) = flume::unbounded();
 	let (commands, _) = flume::unbounded();
@@ -390,7 +389,10 @@ fn explicit_resume_suppresses_intro_even_for_an_empty_journal() {
 
 	let quiet = empty_host(false, true);
 	assert!(
-		quiet.blocks().into_iter().all(|block| block.kind != BlockKind::Welcome),
+		quiet
+			.blocks()
+			.into_iter()
+			.all(|block| block.kind != BlockKind::Welcome),
 		"quiet startup omits the welcome"
 	);
 }
@@ -418,8 +420,7 @@ fn alt_p_opens_the_model_picker_and_enter_sets_ai_model_for_the_session() {
 	other.provider_id = "other".into();
 	other.provider = "Other Provider".into();
 	other.context = Some(321_000);
-	let (mut host, commands) =
-		bound_host(vec![row("test/model", &["low", "high"]), other]);
+	let (mut host, commands) = bound_host(vec![row("test/model", &["low", "high"]), other]);
 	assert!(!host.overlay_open());
 	assert_eq!(host.key(Key::Alt('p')).expect("alt+p"), NativeEffect::Consumed);
 	assert!(host.overlay_open(), "alt+p opens the picker");
@@ -514,12 +515,8 @@ fn thinking_toggle_changes_projection_without_touching_dom() {
 
 /// A host over a fresh fixture session with a live kernel-event feed and
 /// pi's default retry/interrupt binds.
-fn kernel_host() -> (
-	NativeHost,
-	flume::Receiver<HostCommand>,
-	flume::Sender<omp_agent::KernelEvent>,
-	Session,
-) {
+fn kernel_host()
+-> (NativeHost, flume::Receiver<HostCommand>, flume::Sender<omp_agent::KernelEvent>, Session) {
 	let (mut session, _) = fixture();
 	let (snapshot, dom_events) = session.subscribe();
 	let (kernel_tx, kernel_events) = flume::unbounded();
@@ -616,9 +613,12 @@ fn retry_loader_appears_on_inference_retry_and_clears_on_the_next_inference_star
 		.call("read", 1, "call-2", None, Some(args), None)
 		.expect("tool call");
 	session.assistant_end("error").expect("assistant end");
-	let fault = serde_json::value::to_raw_value(&serde_json::json!({"kind":"error"})).expect("fault");
+	let fault =
+		serde_json::value::to_raw_value(&serde_json::json!({"kind":"error"})).expect("fault");
 	let parts = serde_json::value::to_raw_value(&serde_json::json!([])).expect("parts");
-	session.fail_projected(call, fault, parts).expect("synthetic failure");
+	session
+		.fail_projected(call, fault, parts)
+		.expect("synthetic failure");
 	append_notice(&mut session, "error", "http 529 overloaded");
 	host.poll().expect("apply dom events");
 	assert!(host.retrying().is_none());
@@ -806,7 +806,12 @@ fn hook_message_is_a_journaled_notice_that_replays_rewinds_and_copies() {
 	// Rewinding past the notice removes it from every observer.
 	session.rewind(before).expect("rewind");
 	host.poll().expect("apply reset");
-	assert!(!host.blocks().iter().any(|block| block.text.contains("lint ok")));
+	assert!(
+		!host
+			.blocks()
+			.iter()
+			.any(|block| block.text.contains("lint ok"))
+	);
 	assert!(!text_of(host.frame()).contains("lint ok"));
 }
 
@@ -926,9 +931,9 @@ fn ask_dialog_escape_cancels_the_call() {
 	let (mut host, commands, _session) = ask_host();
 	host.key(Key::Esc).expect("esc");
 	assert_eq!(host.overlay_id(), None);
-	let cancelled = commands.try_iter().any(|command| {
-		matches!(command, HostCommand::AskAnswer { ref id, answers: None } if id == "ask-7")
-	});
+	let cancelled = commands.try_iter().any(
+		|command| matches!(command, HostCommand::AskAnswer { ref id, answers: None } if id == "ask-7"),
+	);
 	assert!(cancelled, "Esc sends the cancel reply");
 }
 
@@ -983,7 +988,10 @@ fn local_prefixes_are_refused_while_a_subagent_is_focused_and_keep_the_draft() {
 		host.key(Key::Enter).expect("submit");
 		assert_eq!(host.composer_text(), line, "the draft is preserved");
 		assert!(!host.turn_active(), "no optimistic activity edge");
-		assert_eq!(host.notice(), Some("Commands run in the main session — press ←← to return first"));
+		assert_eq!(
+			host.notice(),
+			Some("Commands run in the main session — press ←← to return first")
+		);
 		assert!(commands.try_recv().is_err(), "nothing runs in the main session");
 		host.console("cl_clear").expect("clear draft");
 		commands.try_iter().for_each(drop);
@@ -995,7 +1003,9 @@ fn local_prefixes_are_refused_while_a_subagent_is_focused_and_keep_the_draft() {
 #[test]
 fn local_prefixes_are_refused_for_a_collab_guest() {
 	let (mut host, commands) = bound_host(vec![row("test/model", &[])]);
-	host.act(omp_chat::HostAction::CollabGuest(true)).expect("guest");
+	host
+		.act(omp_chat::HostAction::CollabGuest(true))
+		.expect("guest");
 	type_line(&mut host, "!rm -rf build");
 	host.key(Key::Enter).expect("submit");
 	assert!(commands.try_recv().is_err(), "the guest never runs a local tool");
@@ -1010,7 +1020,8 @@ fn local_prefixes_are_refused_for_a_collab_guest() {
 fn a_second_local_command_while_one_runs_is_handed_back_to_the_composer() {
 	let (mut host, commands, mut session) = bound_host_with_session(vec![row("test/model", &[])]);
 	session.begin_turn().expect("begin turn");
-	let args = serde_json::value::to_raw_value(&serde_json::json!({"command":"sleep 30"})).expect("args");
+	let args =
+		serde_json::value::to_raw_value(&serde_json::json!({"command":"sleep 30"})).expect("args");
 	session
 		.call("bash", 1, "local-1", None, Some(args), None)
 		.expect("running local call");

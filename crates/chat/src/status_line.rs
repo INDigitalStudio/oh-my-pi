@@ -42,8 +42,7 @@ impl StatusLine {
 	/// the terminal title).
 	#[must_use]
 	pub fn name(dom: &Dom) -> Option<Str> {
-		dom
-			.get(dom.meta())
+		dom.get(dom.meta())
 			.and_then(|meta| meta.prop(&PropId::Name.into()))
 			.and_then(Value::as_str)
 			.filter(|title| !title.is_empty())
@@ -233,10 +232,7 @@ fn custom_str<'a>(node: &'a omp_dom::Node, key: &'static str) -> Option<&'a str>
 }
 
 fn custom_bool(node: &omp_dom::Node, key: &'static str) -> bool {
-	matches!(
-		node.prop(&PropKey::Custom(Str::new_static(key))),
-		Some(Value::Bool(true))
-	)
+	matches!(node.prop(&PropKey::Custom(Str::new_static(key))), Some(Value::Bool(true)))
 }
 
 fn custom_int(node: &omp_dom::Node, key: &'static str) -> Option<i64> {
@@ -317,14 +313,8 @@ mod tests {
 			})
 			.expect("standard registry materializes directors");
 		let mut node = NodeSpec::new(KnownTag::Director)
-			.with_prop(
-				PropKey::Custom(Str::new_static("family")),
-				Value::Str(Str::new(family)),
-			)
-			.with_prop(
-				PropKey::Custom(Str::new_static("status")),
-				Value::Str(Str::new(status)),
-			);
+			.with_prop(PropKey::Custom(Str::new_static("family")), Value::Str(Str::new(family)))
+			.with_prop(PropKey::Custom(Str::new_static("status")), Value::Str(Str::new(status)));
 		for (key, value) in state {
 			node = node.with_prop(PropKey::Custom(Str::new(*key)), value.clone());
 		}
@@ -335,7 +325,7 @@ mod tests {
 				label: None,
 				ops: vec![Op::Ins {
 					parent: directors,
-					after:  session.dom().children(directors).last().copied(),
+					after: session.dom().children(directors).last().copied(),
 					node,
 				}],
 			})
@@ -367,16 +357,10 @@ mod tests {
 		);
 		assert_eq!(mode("vibe", "active", &[]), Some(ModeChip::Vibe));
 		assert_eq!(
-			mode("loop", "active", &[
-				("state/count", Value::Int(5)),
-				("state/used", Value::Int(2)),
-			]),
+			mode("loop", "active", &[("state/count", Value::Int(5)), ("state/used", Value::Int(2)),]),
 			Some(ModeChip::Loop { limit: Some((3, 5)) })
 		);
-		assert_eq!(
-			mode("loop", "paused", &[]),
-			Some(ModeChip::LoopPaused { limit: None })
-		);
+		assert_eq!(mode("loop", "paused", &[]), Some(ModeChip::LoopPaused { limit: None }));
 		assert_eq!(mode("goal", "queued", &[]), None, "queued frames stay hidden");
 	}
 

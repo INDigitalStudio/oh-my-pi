@@ -64,9 +64,16 @@ enum Segment {
 	User(Str),
 	Thinking(Str),
 	Assistant(Str),
-	Tool { name: Str, status: Str, output: Str },
+	Tool {
+		name:   Str,
+		status: Str,
+		output: Str,
+	},
 	/// A journaled extension or hook message (`<notice kind=custom|hook>`).
-	Message { name: Option<Str>, body: Str },
+	Message {
+		name: Option<Str>,
+		body: Str,
+	},
 }
 
 /// One selectable transcript message (pi `OutlineTarget`): a user prompt,
@@ -127,11 +134,17 @@ impl CopySelector {
 	pub fn hint(&self) -> Str {
 		match self.block_selected {
 			Some(index) => {
-				let total = self.targets.get(self.selected).map_or(0, |target| target.blocks.len());
+				let total = self
+					.targets
+					.get(self.selected)
+					.map_or(0, |target| target.blocks.len());
 				sf!("{}/{total}  ↑/↓ block  ←/esc back  enter copy", index + 1)
 			},
 			None => {
-				let blocks = self.targets.get(self.selected).map_or(0, |target| target.blocks.len());
+				let blocks = self
+					.targets
+					.get(self.selected)
+					.map_or(0, |target| target.blocks.len());
 				let mut hint = StrMut::new("");
 				if !self.targets.is_empty() {
 					hint.push_str(sf!("{}/{}  ", self.selected + 1, self.targets.len()).as_str());
@@ -149,7 +162,10 @@ impl CopySelector {
 	fn move_vertical(&mut self, delta: isize) -> PanelEvent {
 		match self.block_selected {
 			Some(index) => {
-				let total = self.targets.get(self.selected).map_or(0, |target| target.blocks.len());
+				let total = self
+					.targets
+					.get(self.selected)
+					.map_or(0, |target| target.blocks.len());
 				if let Some(next) = index.checked_add_signed(delta).filter(|next| *next < total) {
 					self.block_selected = Some(next);
 					self.rebuild(self.width, self.rows);
@@ -439,14 +455,14 @@ impl Panel for CopySelector {
 	}
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
-		let event =
-			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		if report.kind == omp_tui::Mouse::Click
-			&& let Some(index) = self
-				.ui
-				.focused_id()
-				.and_then(|id| id.strip_prefix("turn-").and_then(|index| index.parse().ok()))
-			&& index < self.targets.len()
+			&& let Some(index) = self.ui.focused_id().and_then(|id| {
+				id.strip_prefix("turn-")
+					.and_then(|index| index.parse().ok())
+			}) && index < self.targets.len()
 			&& index != self.selected
 		{
 			self.selected = index;
@@ -487,7 +503,10 @@ impl Panel for CopySelector {
 pub fn collect_targets(dom: &Dom, show_thinking: bool) -> Vec<CopyTarget> {
 	let mut targets = Vec::new();
 	for turn in dom.children(dom.body()) {
-		if dom.get(*turn).is_none_or(|node| node.tag != Tag::Known(KnownTag::Turn)) {
+		if dom
+			.get(*turn)
+			.is_none_or(|node| node.tag != Tag::Known(KnownTag::Turn))
+		{
 			continue;
 		}
 		let mut open: Option<CopyTarget> = None;
@@ -555,7 +574,8 @@ pub fn collect_targets(dom: &Dom, show_thinking: bool) -> Vec<CopyTarget> {
 					let Some(input) = child(dom, *handle, KnownTag::Input) else {
 						continue;
 					};
-					let status = prop_text(node, PropId::Status).unwrap_or_else(|| Str::new_static("running"));
+					let status =
+						prop_text(node, PropId::Status).unwrap_or_else(|| Str::new_static("running"));
 					let result = child(dom, *handle, KnownTag::Result).and_then(result_text);
 					let target = open.get_or_insert_with(|| CopyTarget {
 						label:    Str::new_static("turn content"),
@@ -624,7 +644,11 @@ pub fn last_code_block(dom: &Dom) -> Option<CopyBlock> {
 			};
 			let mut blocks = Vec::new();
 			push_markdown_blocks(&mut blocks, text.as_str());
-			if let Some(block) = blocks.into_iter().rev().find(|block| block.language.is_some() || block.label.ends_with("code")) {
+			if let Some(block) = blocks
+				.into_iter()
+				.rev()
+				.find(|block| block.language.is_some() || block.label.ends_with("code"))
+			{
 				last = Some(block);
 			}
 		}
@@ -785,8 +809,7 @@ fn push_markdown_blocks(blocks: &mut Vec<CopyBlock>, text: &str) {
 }
 
 fn child<'a>(dom: &'a Dom, parent: omp_dom::Handle, tag: KnownTag) -> Option<&'a Node> {
-	dom
-		.children(parent)
+	dom.children(parent)
 		.iter()
 		.filter_map(|handle| dom.get(*handle))
 		.find(|node| node.tag == Tag::Known(tag))
@@ -821,7 +844,8 @@ mod tests {
 	}
 
 	fn point(text: &str, needle: &str) -> (u16, u16) {
-		text.lines()
+		text
+			.lines()
 			.enumerate()
 			.find_map(|(row, line)| {
 				let byte = line.find(needle)?;
@@ -872,8 +896,8 @@ mod tests {
 			let call = session
 				.call("bash", 1, "call-1", Some("run tests".into()), Some(args), None)
 				.expect("call");
-			let outcome = serde_json::value::to_raw_value(&serde_json::json!({"output":"ok"}))
-				.expect("outcome");
+			let outcome =
+				serde_json::value::to_raw_value(&serde_json::json!({"output":"ok"})).expect("outcome");
 			session.settle(call, outcome).expect("settle");
 		}
 		session
@@ -887,7 +911,10 @@ mod tests {
 		assert_eq!(panel.target_count(), 2);
 		let text = frame_text(panel.frame(Size { width: 80, height: 24 }));
 		assert!(text.contains("pick what to put on the clipboard"), "header missing:\n{text}");
-		assert!(text.contains("2/2  ↑/↓ step  → blocks  enter copy  ctrl+o expand  esc close"), "hint:\n{text}");
+		assert!(
+			text.contains("2/2  ↑/↓ step  → blocks  enter copy  ctrl+o expand  esc close"),
+			"hint:\n{text}"
+		);
 		assert_eq!(panel.key(Key::Right), PanelEvent::Consumed);
 		let text = frame_text(panel.frame(Size { width: 80, height: 24 }));
 		assert!(text.contains("1/1 · rust code · 3 lines"), "block caption missing:\n{text}");
@@ -959,9 +986,13 @@ mod tests {
 	fn markdown_blocks_extract_fences_and_quotes_in_order() {
 		let mut blocks = Vec::new();
 		push_markdown_blocks(&mut blocks, "> quoted\n> lines\n\n```\nplain\n```\n```py\nx = 1\n```");
-		assert_eq!(blocks.iter().map(|block| block.label.as_str()).collect::<Vec<_>>(), [
-			"quote", "code", "py code"
-		]);
+		assert_eq!(
+			blocks
+				.iter()
+				.map(|block| block.label.as_str())
+				.collect::<Vec<_>>(),
+			["quote", "code", "py code"]
+		);
 		assert_eq!(blocks[0].content, "quoted\nlines");
 		assert_eq!(blocks[1].content, "plain");
 		assert_eq!(blocks[2].content, "x = 1");

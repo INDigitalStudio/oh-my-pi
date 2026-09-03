@@ -494,10 +494,15 @@ mod tests {
 
 		let mut builder = ResolverTable::builder();
 		builder
-			.register(super::super::local_scheme_entry(), LocalResolver::open(sessions).expect("resolver"))
+			.register(
+				super::super::local_scheme_entry(),
+				LocalResolver::open(sessions).expect("resolver"),
+			)
 			.expect("local registers once");
 		let table = builder.build();
-		let entry = table.entry(Scheme::Local).expect("local entry is installed");
+		let entry = table
+			.entry(Scheme::Local)
+			.expect("local entry is installed");
 		assert!(entry.readable, "local:// must be readable");
 		assert!(!entry.mintable, "local:// is never model-minted");
 

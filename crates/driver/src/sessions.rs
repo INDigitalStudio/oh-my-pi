@@ -207,8 +207,7 @@ fn live_metadata(entries: &[omp_journal::Entry]) -> (Option<Str>, u32) {
 		} else if entry.kind == assistant {
 			messages = messages.saturating_add(1);
 		} else if entry.kind == patch
-			&& let Ok(payload) =
-				serde_json::from_str::<omp_journal::data::Patch>(entry.data.as_str())
+			&& let Ok(payload) = serde_json::from_str::<omp_journal::data::Patch>(entry.data.as_str())
 			&& let Ok(ops) = serde_json::from_str::<Vec<Op>>(payload.ops.get())
 		{
 			for op in ops {
@@ -399,7 +398,12 @@ mod tests {
 	fn recent_orders_newest_first_and_excludes_the_open_journal() {
 		let scratch = tempfile::tempdir().expect("tempdir");
 		let root = scratch.path();
-		let oldest = write_journal(root, "old", Some("  Fix the parser\nsecond line"), Duration::from_secs(300));
+		let oldest = write_journal(
+			root,
+			"old",
+			Some("  Fix the parser\nsecond line"),
+			Duration::from_secs(300),
+		);
 		let current = write_journal(root, "current", Some("live prompt"), Duration::from_secs(0));
 		let middle = write_journal(root, "mid", None, Duration::from_secs(60));
 		let control = write_journal(root, "ctl", Some("\u{7}\t\n"), Duration::from_secs(120));
@@ -407,14 +411,23 @@ mod tests {
 		let index = SessionIndex::open(root).expect("index");
 		let recent = index.recent(Some(&current), 2);
 		assert_eq!(
-			recent.iter().map(|row| row.path.clone()).collect::<Vec<_>>(),
+			recent
+				.iter()
+				.map(|row| row.path.clone())
+				.collect::<Vec<_>>(),
 			[middle.clone(), control.clone()]
 		);
 		assert_eq!(recent[0].display_name().as_str(), "mid", "no prompt falls back to the id");
-		assert_eq!(recent[1].display_name().as_str(), "ctl", "control-only prompt falls back to the id");
+		assert_eq!(
+			recent[1].display_name().as_str(),
+			"ctl",
+			"control-only prompt falls back to the id"
+		);
 
 		let all = index.recent(Some(&current), 8);
-		assert_eq!(all.iter().map(|row| row.path.clone()).collect::<Vec<_>>(), [middle, control, oldest]);
+		assert_eq!(all.iter().map(|row| row.path.clone()).collect::<Vec<_>>(), [
+			middle, control, oldest
+		]);
 		assert_eq!(all[2].display_name().as_str(), "Fix the parser");
 		assert_eq!(all[2].messages, 1);
 		assert!(index.recent(None, 8).iter().any(|row| row.path == current));
@@ -433,24 +446,28 @@ mod tests {
 				cause,
 				label: Some(Str::new_static("rename")),
 				ops: vec![Op::Set {
-					h: session.dom().meta(),
-					prop: PropId::Name.into(),
+					h:     session.dom().meta(),
+					prop:  PropId::Name.into(),
 					value: omp_dom::Value::Str(Str::new_static("Live title")),
 				}],
 			})
 			.expect("live rename");
 		session.begin_turn().expect("live turn");
-		let live = session.user("live prompt", Vec::new()).expect("live prompt");
+		let live = session
+			.user("live prompt", Vec::new())
+			.expect("live prompt");
 		session.begin_turn().expect("abandoned turn");
-		session.user("abandoned prompt", Vec::new()).expect("abandoned prompt");
+		session
+			.user("abandoned prompt", Vec::new())
+			.expect("abandoned prompt");
 		let cause = session.head().expect("abandoned head");
 		session
 			.patch(omp_dom::Txn {
 				cause,
 				label: Some(Str::new_static("rename")),
 				ops: vec![Op::Set {
-					h: session.dom().meta(),
-					prop: PropId::Name.into(),
+					h:     session.dom().meta(),
+					prop:  PropId::Name.into(),
 					value: omp_dom::Value::Str(Str::new_static("Abandoned title")),
 				}],
 			})

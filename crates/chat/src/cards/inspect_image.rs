@@ -68,7 +68,11 @@ impl Card for InspectImageCard {
 		let image = (!path.is_empty() && inline_images(ui)).then(|| {
 			let src = Str::new(path.as_str());
 			let filename = path.rsplit('/').next().filter(|name| !name.is_empty());
-			let mime = if mime.is_empty() { "image" } else { mime.as_str() };
+			let mime = if mime.is_empty() {
+				"image"
+			} else {
+				mime.as_str()
+			};
 			result_image(&src, mime, filename, ui)
 		});
 		dom! {

@@ -23,18 +23,14 @@ use omp_core::{IntoStr, Str, sf};
 use omp_dom::Dom;
 use omp_tui::{
 	Color, DiffActionKind, DiffBuildOptions, DiffDocument, DiffPane, DiffPaneState, DiffPatchTarget,
-	DiffTarget, DiffWhitespaceMode, Frame, Icon, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent,
-	ViewMode,
-	cell_width,
+	DiffTarget, DiffWhitespaceMode, Frame, Icon, Key, MouseReport, Prop, Size, Ui, UiContext,
+	UiEvent, ViewMode, cell_width,
 	components::{Col, EditInput, EditorPane, Tree, TreeAnnotation, TreeNode},
 	dom,
 };
 use omp_vcs::{DiffOptions, StatusOptions, UntrackedMode, git::GitRepo};
 
-use super::{
-	Outcome, Panel, PanelAnchor, PanelCx, PanelEvent, PanelNote,
-	services::ServiceResult,
-};
+use super::{Outcome, Panel, PanelAnchor, PanelCx, PanelEvent, PanelNote, services::ServiceResult};
 use crate::host::HostCommand;
 
 /// pi `REFRESH_MS`: how often the on-disk fingerprint is re-checked.
@@ -50,7 +46,8 @@ const MIN_TREE_ROWS: u16 = 6;
 const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 /// pi diff-focus hint.
-const DIFF_HINT: &str = "alt+↓/↑ hunk · ]/[ file · shift+↑/↓ select · s/u stage · x discard · v view · c commit · q quit";
+const DIFF_HINT: &str = "alt+↓/↑ hunk · ]/[ file · shift+↑/↓ select · s/u stage · x discard · v \
+                         view · c commit · q quit";
 /// pi sidebar-focus hint.
 const SIDEBAR_HINT: &str =
 	"↑/↓ move · ←/→ fold · space stage · enter open · alt+↓/↑ hunk · c commit · t tree · q quit";
@@ -536,9 +533,11 @@ fn select_lines(raw: &str, old: (u32, u32), new: (u32, u32), reverse: bool) -> O
 		let target_start = u32::try_from(target_start.max(0)).unwrap_or_default();
 		let (old_count, new_count) = (kept.old_count, kept.new_count);
 		if reverse {
-			let _ = writeln!(out, "@@ -{target_start},{old_count} +{source_start},{new_count} @@{suffix}");
+			let _ =
+				writeln!(out, "@@ -{target_start},{old_count} +{source_start},{new_count} @@{suffix}");
 		} else {
-			let _ = writeln!(out, "@@ -{source_start},{old_count} +{target_start},{new_count} @@{suffix}");
+			let _ =
+				writeln!(out, "@@ -{source_start},{old_count} +{target_start},{new_count} @@{suffix}");
 		}
 		delta += i64::from(new_count) - i64::from(old_count);
 		out.push_str(&kept.text);
@@ -552,9 +551,11 @@ fn select_lines(raw: &str, old: (u32, u32), new: (u32, u32), reverse: bool) -> O
 	let partial = selected_total != change_total;
 	let mut result = String::with_capacity(header.len() + out.len());
 	if partial && (header.contains("\n--- /dev/null") || header.contains("\n+++ /dev/null")) {
-		let file = header
-			.lines()
-			.find_map(|line| line.strip_prefix("+++ b/").or_else(|| line.strip_prefix("--- a/")))?;
+		let file = header.lines().find_map(|line| {
+			line
+				.strip_prefix("+++ b/")
+				.or_else(|| line.strip_prefix("--- a/"))
+		})?;
 		let _ = write!(result, "diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n");
 	} else {
 		result.push_str(header);
@@ -1161,7 +1162,12 @@ impl GitWorkbench {
 		}
 	}
 
-	fn stage_directory(&mut self, area: GitArea, directory: &str, group: SidebarGroup) -> PanelEvent {
+	fn stage_directory(
+		&mut self,
+		area: GitArea,
+		directory: &str,
+		group: SidebarGroup,
+	) -> PanelEvent {
 		let files = match area {
 			GitArea::Unstaged => &self.snapshot.unstaged,
 			GitArea::Staged => &self.snapshot.staged,
@@ -1283,11 +1289,7 @@ impl GitWorkbench {
 			sf!("{summary}\n\n{body}")
 		};
 		let stage_all = self.snapshot.staged.is_empty();
-		PanelEvent::Command(HostCommand::Git(GitOp::Commit {
-			message,
-			amend: self.amend,
-			stage_all,
-		}))
+		PanelEvent::Command(HostCommand::Git(GitOp::Commit { message, amend: self.amend, stage_all }))
 	}
 
 	fn request_diff_action(&mut self, action: DiffActionKind) -> PanelEvent {
@@ -1418,20 +1420,11 @@ impl GitWorkbench {
 		};
 		match target {
 			DiffTarget::File => match action {
-				GitPatchAction::Stage | GitPatchAction::Unstage => {
-					self.stage_paths(area, vec![path])
-				},
+				GitPatchAction::Stage | GitPatchAction::Unstage => self.stage_paths(area, vec![path]),
 				GitPatchAction::Discard => PanelEvent::Consumed,
 			},
 			DiffTarget::Lines { old, new } => {
-				self.request_patch(
-					action,
-					GitPatchScope::Selection,
-					path.as_str(),
-					old,
-					new,
-					true,
-				)
+				self.request_patch(action, GitPatchScope::Selection, path.as_str(), old, new, true)
 			},
 			DiffTarget::Hunk(index) => {
 				let ranges = self
@@ -1447,14 +1440,7 @@ impl GitWorkbench {
 				let Some((old, new)) = ranges else {
 					return PanelEvent::Consumed;
 				};
-				self.request_patch(
-					action,
-					GitPatchScope::Hunk,
-					path.as_str(),
-					old,
-					new,
-					false,
-				)
+				self.request_patch(action, GitPatchScope::Hunk, path.as_str(), old, new, false)
 			},
 		}
 	}
@@ -2016,13 +2002,10 @@ impl GitWorkbench {
 			.status
 			.as_ref()
 			.map_or(self.ctx.theme.muted, |status| status.color);
-		let encoding = self.contents.as_ref().map_or("UTF-8", |contents| {
-			if contents.binary {
-				"Binary"
-			} else {
-				"UTF-8"
-			}
-		});
+		let encoding = self
+			.contents
+			.as_ref()
+			.map_or("UTF-8", |contents| if contents.binary { "Binary" } else { "UTF-8" });
 		let selected_area = self.selected.as_ref().map(|(area, _)| *area);
 		let scope = self.scope_label();
 		let scope_color = match selected_area {
@@ -2168,16 +2151,14 @@ impl GitWorkbench {
 		let disabled = !self.commit_enabled_with(summary, description);
 		let commit_label = self.commit_button_label();
 		let commit_text = sf!("{} {commit_label}", self.ctx.charset.icon(Icon::CommitNode));
-		let description_editor = EditorPane::new()
-			.with(Prop::Id, DESCRIPTION_PANE_ID)
-			.input(
-				EditInput::new()
-					.with(Prop::Id, DESCRIPTION_ID)
-					.with(Prop::Value, description)
-					.with(Prop::Rail, true)
-					.with(Prop::Placeholder, "Description")
-					.with(Prop::MaxRows, 5_u16),
-			);
+		let description_editor = EditorPane::new().with(Prop::Id, DESCRIPTION_PANE_ID).input(
+			EditInput::new()
+				.with(Prop::Id, DESCRIPTION_ID)
+				.with(Prop::Value, description)
+				.with(Prop::Rail, true)
+				.with(Prop::Placeholder, "Description")
+				.with(Prop::MaxRows, 5_u16),
+		);
 		dom! {
 			<col w={width}>
 				<row h=1 gap=1>
@@ -2226,8 +2207,9 @@ impl Panel for GitWorkbench {
 	}
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
-		let event =
-			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		self.sync_control_values();
 		self.route_ui(event)
 	}
@@ -2307,13 +2289,17 @@ fn commit_view(
 	let author = head.author_name.clone();
 	let email = head.author_email.clone();
 	let authored = authored_age(head.author_date.as_str());
-	let parents = head.parents.iter().map(short_sha).fold(String::new(), |mut output, parent| {
-		if !output.is_empty() {
-			output.push(' ');
-		}
-		output.push_str(parent.as_str());
-		output
-	});
+	let parents = head
+		.parents
+		.iter()
+		.map(short_sha)
+		.fold(String::new(), |mut output, parent| {
+			if !output.is_empty() {
+				output.push(' ');
+			}
+			output.push_str(parent.as_str());
+			output
+		});
 	let additions = head
 		.files
 		.iter()
@@ -2395,8 +2381,9 @@ fn sidebar_rows(snapshot: &GitSnapshot, tree: bool, ctx: &UiContext) -> Vec<Side
 		.cloned()
 		.map(|file| (GitArea::Unstaged, file))
 		.collect::<Vec<_>>();
-	let (additions, changes): (Vec<_>, Vec<_>) =
-		unstaged.into_iter().partition(|(_, file)| is_addition(file));
+	let (additions, changes): (Vec<_>, Vec<_>) = unstaged
+		.into_iter()
+		.partition(|(_, file)| is_addition(file));
 	append_files(&mut rows, &changes, tree, ctx, SidebarGroup::Changes);
 	append_files(&mut rows, &additions, tree, ctx, SidebarGroup::Additions);
 	rows.push(action_row(
@@ -2752,7 +2739,8 @@ mod tests {
 	use super::*;
 
 	fn point(text: &str, needle: &str) -> (u16, u16) {
-		text.lines()
+		text
+			.lines()
 			.enumerate()
 			.find_map(|(row, line)| {
 				let byte = line.find(needle)?;
@@ -2825,7 +2813,8 @@ mod tests {
 					.as_ref()
 					.map(|paths| paths.iter().map(ToString::to_string).collect::<Vec<_>>())
 					.unwrap_or_default();
-				repo.stage_files(&paths)
+				repo
+					.stage_files(&paths)
 					.map(|()| match paths.as_slice() {
 						[] => Str::new_static("Staged all changes"),
 						[path] => sf!("Staged {path}"),
@@ -2838,7 +2827,8 @@ mod tests {
 					.as_ref()
 					.map(|paths| paths.iter().map(ToString::to_string).collect::<Vec<_>>())
 					.unwrap_or_default();
-				repo.unstage(&paths)
+				repo
+					.unstage(&paths)
 					.map(|()| match paths.as_slice() {
 						[] => Str::new_static("Unstaged all changes"),
 						[path] => sf!("Unstaged {path}"),
@@ -2848,12 +2838,13 @@ mod tests {
 			},
 			GitOp::Apply { patch, action, scope } => {
 				let options = ApplyOptions {
-					cached: *action != GitPatchAction::Discard,
+					cached:     *action != GitPatchAction::Discard,
 					index_path: None,
-					reverse: *action != GitPatchAction::Stage,
-					three_way: false,
+					reverse:    *action != GitPatchAction::Stage,
+					three_way:  false,
 				};
-				repo.apply_patch(patch.as_str(), &options)
+				repo
+					.apply_patch(patch.as_str(), &options)
 					.map(|()| {
 						let verb = match action {
 							GitPatchAction::Stage => "Staged",
@@ -2884,7 +2875,11 @@ mod tests {
 					})
 					.map(|sha| {
 						let short = &sha[..sha.len().min(7)];
-						if *amend { sf!("Amended {short}") } else { sf!("Committed {short}") }
+						if *amend {
+							sf!("Amended {short}")
+						} else {
+							sf!("Committed {short}")
+						}
 					})
 					.map_err(super::super::services::ServiceError::failed)
 			},
@@ -2950,9 +2945,9 @@ mod tests {
 		let event = panel.key(Key::Space);
 		assert_eq!(
 			event,
-			PanelEvent::Command(HostCommand::Git(GitOp::Stage(Some(vec![
-				Str::new_static("src/lib.rs"),
-			]))))
+			PanelEvent::Command(HostCommand::Git(GitOp::Stage(Some(vec![Str::new_static(
+				"src/lib.rs"
+			),]))))
 		);
 		assert!(status(root).contains(" M src/lib.rs"), "actor mutated the index: {}", status(root));
 		settle_command(&mut panel, root, event);
@@ -2973,16 +2968,18 @@ mod tests {
 		assert_eq!(
 			event,
 			PanelEvent::Command(HostCommand::Git(GitOp::Commit {
-				message: Str::new_static("tweak b"),
-				amend: false,
+				message:   Str::new_static("tweak b"),
+				amend:     false,
 				stage_all: false,
 			}))
 		);
-		assert!(GitRepo::require(root)
-			.expect("repo")
-			.log_onelines(1)
-			.expect("log before outcome")[0]
-			.ends_with("initial"));
+		assert!(
+			GitRepo::require(root)
+				.expect("repo")
+				.log_onelines(1)
+				.expect("log before outcome")[0]
+				.ends_with("initial")
+		);
 		settle_command(&mut panel, root, event);
 		assert!(panel.status_text().starts_with("Committed "), "status: {}", panel.status_text());
 		let log = GitRepo::require(root)
@@ -3151,19 +3148,22 @@ mod tests {
 		assert!(text.contains("lib.rs"), "commit file missing:\n{text}");
 	}
 
-	const RAW: &str = "diff --git a/f.txt b/f.txt\nindex 1..2 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,4 @@\n a\n-b\n+b2\n c\n+d\n";
+	const RAW: &str = "diff --git a/f.txt b/f.txt\nindex 1..2 100644\n--- a/f.txt\n+++ b/f.txt\n@@ \
+	                   -1,3 +1,4 @@\n a\n-b\n+b2\n c\n+d\n";
 
 	#[test]
 	fn select_lines_keeps_only_the_chosen_changes() {
 		let forward = select_lines(RAW, (0, 0), (4, 4), false).expect("patch");
 		assert_eq!(
 			forward,
-			"diff --git a/f.txt b/f.txt\nindex 1..2 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,4 @@\n a\n b\n c\n+d\n"
+			"diff --git a/f.txt b/f.txt\nindex 1..2 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,4 \
+			 @@\n a\n b\n c\n+d\n"
 		);
 		let reverse = select_lines(RAW, (2, 2), (0, 0), true).expect("patch");
 		assert_eq!(
 			reverse,
-			"diff --git a/f.txt b/f.txt\nindex 1..2 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,5 +1,4 @@\n a\n-b\n b2\n c\n d\n"
+			"diff --git a/f.txt b/f.txt\nindex 1..2 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,5 +1,4 \
+			 @@\n a\n-b\n b2\n c\n d\n"
 		);
 		assert_eq!(select_lines(RAW, (0, 0), (0, 0), false), None);
 		assert_eq!(select_lines(RAW, (1, 1), (1, 1), false), None);

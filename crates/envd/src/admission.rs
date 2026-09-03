@@ -10,7 +10,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use flume::Receiver;
-use omp_agent::{ApprovalRoute, ApprovalSpec, ApprovalSource as DecisionSource};
+use omp_agent::{ApprovalRoute, ApprovalSource as DecisionSource, ApprovalSpec};
 use omp_core::{Str, sf};
 use omp_proto::{
 	env::v1::{Admission, AdmitInvocation},
@@ -292,19 +292,19 @@ impl DynamicAdmission {
 			.request_cancellable(
 				Some(invocation_id),
 				vec![ApprovalSpec {
-					title: sf!("Approve dynamic target"),
-					body: sf!("Allow dynamic target `{target}`?"),
-					subject: target.clone(),
-					kind: Str::new_static(tier),
-					scopes: vec![sf!("once")],
-					default: None,
-					route: sf!("user"),
-					approver: None,
-					timeout_ms: 0,
-					unreachable: sf!("fail_closed"),
+					title:         sf!("Approve dynamic target"),
+					body:          sf!("Allow dynamic target `{target}`?"),
+					subject:       target.clone(),
+					kind:          Str::new_static(tier),
+					scopes:        vec![sf!("once")],
+					default:       None,
+					route:         sf!("user"),
+					approver:      None,
+					timeout_ms:    0,
+					unreachable:   sf!("fail_closed"),
 					require_human: false,
-					pattern: None,
-					evidence: vec![sf!("invocation_source={origin}")],
+					pattern:       None,
+					evidence:      vec![sf!("invocation_source={origin}")],
 				}],
 				epoch_millis(),
 				cancellation.clone(),
@@ -998,10 +998,9 @@ mod tests {
 					let resolved = result.expect("target policy allows");
 					assert_eq!(resolved.tier, ApprovalTier::Exec);
 				},
-				"prompt_unavailable" => assert!(matches!(
-					result,
-					Err(DynamicAdmissionError::ApprovalUnavailable { .. })
-				)),
+				"prompt_unavailable" => {
+					assert!(matches!(result, Err(DynamicAdmissionError::ApprovalUnavailable { .. })))
+				},
 				"deny" => assert!(matches!(result, Err(DynamicAdmissionError::Denied { .. }))),
 				_ => unreachable!("table contains only known outcomes"),
 			}
@@ -1030,7 +1029,10 @@ mod tests {
 				)
 				.await
 		});
-		let request = inbox.recv().await.expect("dynamic approval prompt dispatched");
+		let request = inbox
+			.recv()
+			.await
+			.expect("dynamic approval prompt dispatched");
 		assert_eq!(request.ticket.invocation_id.as_deref(), Some("dyn-approval"));
 		assert_eq!(request.ticket.reasons[0].subject, "github");
 		assert_eq!(request.ticket.reasons[0].kind, "exec");
@@ -1103,7 +1105,7 @@ mod tests {
 			let maximum = Effects {
 				exec: Some(ToolExecEffects {
 					commands: Arc::from([sf!("curl")]),
-					network: maximum_network,
+					network:  maximum_network,
 				}),
 				..Effects::empty()
 			};

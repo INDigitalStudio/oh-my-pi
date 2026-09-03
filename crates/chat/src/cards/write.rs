@@ -57,7 +57,15 @@ fn render_progress(
 	let lines: Vec<&str> = content.lines().collect();
 	let full = number_lines(&lines.join("\n"), 1);
 	let skipped = lines.len().saturating_sub(12);
-	let middle = number_lines(&lines.iter().skip(skipped).copied().collect::<Vec<_>>().join("\n"), skipped + 1);
+	let middle = number_lines(
+		&lines
+			.iter()
+			.skip(skipped)
+			.copied()
+			.collect::<Vec<_>>()
+			.join("\n"),
+		skipped + 1,
+	);
 	let line_count = lines.len();
 	let title = sf!("Write: {} {path}", icon(ui, "typescript"));
 	dom! {

@@ -159,7 +159,8 @@ pub struct ToolSettings {
 	/// Global ceiling for tool deadlines.
 	#[serde(skip_serializing_if = "Option::is_none", with = "optional_duration")]
 	pub max_timeout:          Option<Duration>,
-	/// Optional pinned edit revision (`rep.2`, `patch.2`, or `hl.1`) for this client.
+	/// Optional pinned edit revision (`rep.2`, `patch.2`, or `hl.1`) for this
+	/// client.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub edit_dialect:         Option<Str>,
 	/// Optional JSONL destination for edit black-box diagnostics.
@@ -271,41 +272,43 @@ impl ToolSettings {
 		}
 		Self {
 			enabled,
-			max_timeout:          SV_TOOLS_MAX_TIMEOUT.get(ctx).as_finite(),
-			edit_dialect:         nonempty_str(SV_TOOLS_EDIT_DIALECT.get(ctx)),
-			edit_blackbox_path:   SV_TOOLS_EDIT_BLACKBOX_ENABLED.get(ctx).then(|| {
-				nonempty_str(SV_TOOLS_EDIT_BLACKBOX_PATH.get(ctx))
-					.map_or_else(|| PathBuf::from("edit-blackbox.jsonl"), |value| PathBuf::from(value.as_str()))
+			max_timeout: SV_TOOLS_MAX_TIMEOUT.get(ctx).as_finite(),
+			edit_dialect: nonempty_str(SV_TOOLS_EDIT_DIALECT.get(ctx)),
+			edit_blackbox_path: SV_TOOLS_EDIT_BLACKBOX_ENABLED.get(ctx).then(|| {
+				nonempty_str(SV_TOOLS_EDIT_BLACKBOX_PATH.get(ctx)).map_or_else(
+					|| PathBuf::from("edit-blackbox.jsonl"),
+					|value| PathBuf::from(value.as_str()),
+				)
 			}),
-			edit_auto_repair:     SV_TOOLS_EDIT_AUTO_REPAIR.get(ctx),
+			edit_auto_repair: SV_TOOLS_EDIT_AUTO_REPAIR.get(ctx),
 			edit_streaming_abort: SV_TOOLS_EDIT_STREAMING_ABORT.get(ctx),
-			fetch_enabled:        omp_tools::settings::SV_FETCH_ENABLED.get(ctx),
-			render_markdown:      omp_tools::settings::CL_READ_RENDER_MARKDOWN.get(ctx),
-			auto_resize_images:   omp_tools::settings::SV_IMAGES_AUTO_RESIZE.get(ctx),
-			format_policy:        if lsp.format_on_write {
+			fetch_enabled: omp_tools::settings::SV_FETCH_ENABLED.get(ctx),
+			render_markdown: omp_tools::settings::CL_READ_RENDER_MARKDOWN.get(ctx),
+			auto_resize_images: omp_tools::settings::SV_IMAGES_AUTO_RESIZE.get(ctx),
+			format_policy: if lsp.format_on_write {
 				FormatPolicy::BestEffort
 			} else {
 				FormatPolicy::Disabled
 			},
 			diagnostics_on_write: lsp.diagnostics_on_write,
-			diagnostics_on_edit:  lsp.diagnostics_on_edit,
-			diagnostic_dedup:     lsp.diagnostics_deduplicate,
-			approval_mode:        SV_TOOLS_APPROVAL_MODE.get(ctx),
-			approval:             approval_map(SV_TOOLS_APPROVAL.get(ctx)),
-			edit_fuzzy:           SV_TOOLS_EDIT_FUZZY.get(ctx),
+			diagnostics_on_edit: lsp.diagnostics_on_edit,
+			diagnostic_dedup: lsp.diagnostics_deduplicate,
+			approval_mode: SV_TOOLS_APPROVAL_MODE.get(ctx),
+			approval: approval_map(SV_TOOLS_APPROVAL.get(ctx)),
+			edit_fuzzy: SV_TOOLS_EDIT_FUZZY.get(ctx),
 			edit_fuzzy_threshold: omp_tools::pi_settings::SV_EDIT_FUZZY_THRESHOLD.get(ctx),
-			edit_require_seen:    SV_TOOLS_EDIT_REQUIRE_SEEN.get(ctx),
+			edit_require_seen: SV_TOOLS_EDIT_REQUIRE_SEEN.get(ctx),
 			edit_guard_generated: SV_TOOLS_EDIT_GUARD_GENERATED.get(ctx),
-			read_max_bytes:       SV_TOOLS_READ_MAX_BYTES.get(ctx) as u64,
-			read_summarize:       SV_TOOLS_READ_SUMMARIZE.get(ctx),
-			read_line_numbers:    SV_TOOLS_READ_LINE_NUMBERS.get(ctx),
-			grep_context_before:  SV_TOOLS_GREP_CONTEXT_BEFORE.get(ctx),
-			grep_context_after:   SV_TOOLS_GREP_CONTEXT_AFTER.get(ctx),
-			eval_interpreters:    string_map(SV_TOOLS_EVAL_INTERPRETERS.get(ctx)),
-			output_spill_bytes:   SV_TOOLS_OUTPUT_SPILL_BYTES.get(ctx) as u64,
-			output_max_bytes:     SV_TOOLS_OUTPUT_MAX_BYTES.get(ctx) as u64,
-			intent_tracing:       SV_TOOLS_INTENT_TRACING.get(ctx),
-			loop_guard_limit:     SV_TOOLS_LOOP_GUARD_LIMIT.get(ctx),
+			read_max_bytes: SV_TOOLS_READ_MAX_BYTES.get(ctx) as u64,
+			read_summarize: SV_TOOLS_READ_SUMMARIZE.get(ctx),
+			read_line_numbers: SV_TOOLS_READ_LINE_NUMBERS.get(ctx),
+			grep_context_before: SV_TOOLS_GREP_CONTEXT_BEFORE.get(ctx),
+			grep_context_after: SV_TOOLS_GREP_CONTEXT_AFTER.get(ctx),
+			eval_interpreters: string_map(SV_TOOLS_EVAL_INTERPRETERS.get(ctx)),
+			output_spill_bytes: SV_TOOLS_OUTPUT_SPILL_BYTES.get(ctx) as u64,
+			output_max_bytes: SV_TOOLS_OUTPUT_MAX_BYTES.get(ctx) as u64,
+			intent_tracing: SV_TOOLS_INTENT_TRACING.get(ctx),
+			loop_guard_limit: SV_TOOLS_LOOP_GUARD_LIMIT.get(ctx),
 		}
 	}
 
@@ -461,14 +464,21 @@ mod tests {
 		let ctx = Ctx::new();
 		assert_eq!(ToolSettings::from_con(&ctx), ToolSettings::default());
 		ctx.run("sv_fetch_enabled false").expect("fetch policy");
-		ctx.run("cl_read_render_markdown true").expect("markdown policy");
-		ctx.run("sv_images_auto_resize false").expect("image policy");
-		ctx.run("sv_lsp_format_on_write true").expect("format policy");
-		ctx.run("sv_lsp_diagnostics_on_edit true").expect("diagnostics policy");
-		ctx.run("sv_lsp_diagnostics_deduplicate false").expect("dedup policy");
+		ctx.run("cl_read_render_markdown true")
+			.expect("markdown policy");
+		ctx.run("sv_images_auto_resize false")
+			.expect("image policy");
+		ctx.run("sv_lsp_format_on_write true")
+			.expect("format policy");
+		ctx.run("sv_lsp_diagnostics_on_edit true")
+			.expect("diagnostics policy");
+		ctx.run("sv_lsp_diagnostics_deduplicate false")
+			.expect("dedup policy");
 		ctx.run("sv_eval_py false").expect("eval policy");
-		ctx.run("sv_ast_grep_enabled false").expect("ast-grep policy");
-		ctx.run("sv_edit_fuzzy_threshold 0.87").expect("fuzzy threshold");
+		ctx.run("sv_ast_grep_enabled false")
+			.expect("ast-grep policy");
+		ctx.run("sv_edit_fuzzy_threshold 0.87")
+			.expect("fuzzy threshold");
 		assert_eq!(ToolSettings::from_con(&ctx), ToolSettings {
 			fetch_enabled: false,
 			render_markdown: true,

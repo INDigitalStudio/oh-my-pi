@@ -119,7 +119,7 @@ use super::{
 	tool_url::{UrlResolver, production_url_resolvers},
 	vault::VaultService,
 	worker::{
-		ExtHostSupervisor, OwnedToolDecl, SealedRegistryEvidence, SealedRegistryEvidenceError,
+		ExtHostSupervisor, SealedRegistryEvidence, SealedRegistryEvidenceError,
 		seal_registry_evidence,
 	},
 	workspace::WorkspaceHost,
@@ -3678,23 +3678,11 @@ fn environment_declarations(
 		declarations.push(EnvironmentDeclaration { spec, presentation, claims });
 	};
 	if browser_settings.enabled && tool_settings.enabled("browser") {
-		push(
-			omp_tools::browser::spec(),
-			long_tail_presentation(policy),
-			builtin_device_claims(),
-		);
+		push(omp_tools::browser::spec(), long_tail_presentation(policy), builtin_device_claims());
 	}
-	push(
-		omp_tools::computer::spec(),
-		long_tail_presentation(policy),
-		builtin_device_claims(),
-	);
+	push(omp_tools::computer::spec(), long_tail_presentation(policy), builtin_device_claims());
 	if tool_settings.enabled("security_scan") {
-		push(
-			omp_tools::security_scan::spec(),
-			Presentation::Device,
-			builtin_device_claims(),
-		);
+		push(omp_tools::security_scan::spec(), Presentation::Device, builtin_device_claims());
 	}
 	if inputs.memory.writable {
 		push(
@@ -3716,11 +3704,7 @@ fn environment_declarations(
 		);
 	}
 	if inputs.memory.editable {
-		push(
-			omp_tools::memory_edit::spec(),
-			long_tail_presentation(policy),
-			builtin_device_claims(),
-		);
+		push(omp_tools::memory_edit::spec(), long_tail_presentation(policy), builtin_device_claims());
 	}
 	if inputs.managed_skills {
 		push(
@@ -3729,11 +3713,7 @@ fn environment_declarations(
 			builtin_device_claims(),
 		);
 		if inputs.memory.writable {
-			push(
-				omp_tools::learn::spec(),
-				long_tail_presentation(policy),
-				builtin_device_claims(),
-			);
+			push(omp_tools::learn::spec(), long_tail_presentation(policy), builtin_device_claims());
 		}
 	}
 	if tool_settings.enabled("read") {
@@ -3759,11 +3739,7 @@ fn environment_declarations(
 		}
 	}
 	if tool_settings.enabled("write") {
-		push(
-			omp_tools::write::spec(),
-			long_tail_presentation(policy),
-			long_tail_claims(policy),
-		);
+		push(omp_tools::write::spec(), long_tail_presentation(policy), long_tail_claims(policy));
 	}
 	if tool_settings.enabled("lsp") {
 		push(omp_tools::lsp::spec(), long_tail_presentation(policy), long_tail_claims(policy));
@@ -3772,32 +3748,16 @@ fn environment_declarations(
 		push(omp_tools::debug::spec(), long_tail_presentation(policy), long_tail_claims(policy));
 	}
 	if tool_settings.enabled("grep") {
-		push(
-			omp_tools::grep::spec(),
-			essential_presentation(policy),
-			core_claims(),
-		);
+		push(omp_tools::grep::spec(), essential_presentation(policy), core_claims());
 	}
 	if tool_settings.enabled("glob") {
-		push(
-			omp_tools::glob::spec(),
-			essential_presentation(policy),
-			core_claims(),
-		);
+		push(omp_tools::glob::spec(), essential_presentation(policy), core_claims());
 	}
 	if tool_settings.enabled("ast_grep") {
-		push(
-			omp_tools::ast_grep::spec(),
-			long_tail_presentation(policy),
-			long_tail_claims(policy),
-		);
+		push(omp_tools::ast_grep::spec(), long_tail_presentation(policy), long_tail_claims(policy));
 	}
 	if tool_settings.enabled("ast_edit") {
-		push(
-			omp_tools::ast_edit::spec(),
-			long_tail_presentation(policy),
-			long_tail_claims(policy),
-		);
+		push(omp_tools::ast_edit::spec(), long_tail_presentation(policy), long_tail_claims(policy));
 	}
 	if tool_settings.enabled("eval") {
 		if let Some(description) = &inputs.eval_description {
@@ -3810,11 +3770,7 @@ fn environment_declarations(
 	}
 	if tool_settings.enabled("bash") {
 		if let Some(snapshot) = &inputs.shell_snapshot {
-			push(
-				omp_tools::shell::spec(snapshot),
-				bash_presentation(policy),
-				core_claims(),
-			);
+			push(omp_tools::shell::spec(snapshot), bash_presentation(policy), core_claims());
 		}
 	}
 	declarations
@@ -4183,12 +4139,7 @@ pub(crate) fn production_registry<
 		},
 	);
 	if tool_settings.enabled("read") {
-		environment_registry(
-			&mut registry,
-			read,
-			essential_presentation(policy),
-			core_claims(),
-		)?;
+		environment_registry(&mut registry, read, essential_presentation(policy), core_claims())?;
 	}
 	let edit_repair = tool_settings.edit_auto_repair.then(|| {
 		edit_repair
@@ -4415,21 +4366,11 @@ pub(crate) fn production_registry<
 		u32::from(tool_settings.grep_context_after),
 	);
 	if tool_settings.enabled("grep") {
-		environment_registry(
-			&mut registry,
-			grep,
-			essential_presentation(policy),
-			core_claims(),
-		)?;
+		environment_registry(&mut registry, grep, essential_presentation(policy), core_claims())?;
 	}
 	let glob = omp_tools::glob::tool(search, read_blobs);
 	if tool_settings.enabled("glob") {
-		environment_registry(
-			&mut registry,
-			glob,
-			essential_presentation(policy),
-			core_claims(),
-		)?;
+		environment_registry(&mut registry, glob, essential_presentation(policy), core_claims())?;
 	}
 	if tool_settings.enabled("ast_grep") {
 		environment_registry(
@@ -4503,11 +4444,7 @@ pub(crate) fn production_registry<
 			Arc::clone(&hooks),
 			blobs.clone(),
 			mcp_manager,
-			DynamicAdmission::new(
-				tool_settings.approval_mode,
-				tool_settings.approval.clone(),
-				None,
-			),
+			DynamicAdmission::new(tool_settings.approval_mode, tool_settings.approval.clone(), None),
 		)));
 	}
 	if tool_settings.enabled("bash") && shell_settings.enabled {
@@ -4555,12 +4492,7 @@ pub(crate) fn production_registry<
 			shell_settings.auto_background.enabled,
 			time::Duration::from_millis(shell_settings.auto_background.threshold_ms),
 		);
-		environment_registry(
-			&mut registry,
-			shell,
-			bash_presentation(policy),
-			core_claims(),
-		)?;
+		environment_registry(&mut registry, shell, bash_presentation(policy), core_claims())?;
 	}
 	register_session_workers(&mut registry, workers, policy)?;
 	let registry = Arc::new(registry);
@@ -4682,14 +4614,12 @@ impl omp_tools::checkpoint::CheckpointControl for AgentCheckpointControl {
 		&self,
 		report: Str,
 	) -> Result<omp_tools::checkpoint::RewindAck, omp_tools::checkpoint::CheckpointFault> {
-		let token = self
-			.active_checkpoint
-			.read()
-			.clone()
-			.ok_or_else(|| omp_tools::checkpoint::CheckpointFault {
+		let token = self.active_checkpoint.read().clone().ok_or_else(|| {
+			omp_tools::checkpoint::CheckpointFault {
 				code:    checkpoint::FaultCode::NoActive,
 				message: sf!("no active checkpoint"),
-			})?;
+			}
+		})?;
 		let receipt = sf!("rewind-{}", token);
 		let ack =
 			omp_tools::checkpoint::RewindAck { token: token.clone(), receipt: receipt.clone() };
@@ -4774,7 +4704,11 @@ const fn core_claims() -> Claims {
 /// Claims for a long-tail tool: core precedence only while it rides the wire
 /// roster as a slot; the registry refuses devices at core precedence.
 const fn long_tail_claims(policy: ToolsPolicy) -> Claims {
-	if matches!(policy, ToolsPolicy::ToolOnly) { core_claims() } else { builtin_device_claims() }
+	if matches!(policy, ToolsPolicy::ToolOnly) {
+		core_claims()
+	} else {
+		builtin_device_claims()
+	}
 }
 
 const fn builtin_device_claims() -> Claims {
@@ -5114,7 +5048,7 @@ mod tests {
 				description: "worker tool".to_owned(),
 				input:       Some(tool_def::Input::JsonSchema(
 					omp_proto::inference::v1::tool_def::JsonSchema {
-					schema_json: bytes::Bytes::from_static(schema),
+						schema_json: bytes::Bytes::from_static(schema),
 						strict:      Some(true),
 					},
 				)),
@@ -5208,7 +5142,9 @@ mod tests {
 			managed_skills:   false,
 		};
 		let mut tool_settings = ToolSettings::default();
-		tool_settings.enabled.insert(Str::new_static("ast_grep"), true);
+		tool_settings
+			.enabled
+			.insert(Str::new_static("ast_grep"), true);
 		let declarations = environment_declarations(
 			&tool_settings,
 			&BrowserSettings::default(),
@@ -5543,12 +5479,10 @@ mod tests {
 	fn worker_constraint_preserves_registration_fallback() {
 		let declaration = ToolDecl {
 			constraint: Some(omp_proto::toolhost::v1::ToolConstraint {
-				kind: Some(tool_constraint::Kind::Schema(
-					omp_proto::toolhost::v1::SchemaConstraint {
+				kind: Some(tool_constraint::Kind::Schema(omp_proto::toolhost::v1::SchemaConstraint {
 					priority:       73,
-						on_unsupported: omp_proto::inference::v1::Fallback::Error as i32,
-					},
-				)),
+					on_unsupported: omp_proto::inference::v1::Fallback::Error as i32,
+				})),
 			}),
 			..ToolDecl::default()
 		};

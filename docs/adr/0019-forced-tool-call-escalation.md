@@ -61,7 +61,7 @@ invariant; inference chooses how to satisfy it.
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/agent/src/directors/force_tool.rs`. Forced calls escalate from prompt to capability-safe native choice with bounded retries.
+**Implemented.** Primary implementation: `crates/agent/src/directors/force_tool.rs`. Forced calls escalate from prompt to capability-safe native choice with bounded retries. The ladder itself is `crates/inference/src/plan.rs::forced_call_ladder`, applied per attempt by `crates/inference/src/provider/builtin.rs::forced_call_operation`. Its inputs are compiled by `crates/catalog/src/compile.rs`: `tool_feature_bits` derives `NAMED_CHOICE`/`REQUIRED_CHOICE` from the model's compiled tool policy (affirmative facts only), and the host-declared `forced_tool_choice_penalty` (provider `compat`) is inherited by every model the provider serves unless a more specific rule declares one.
 
 ## References
 

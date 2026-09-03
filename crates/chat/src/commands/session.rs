@@ -63,7 +63,8 @@ pub fn compact_focus(words: Option<Str>) -> Result<Option<Str>, ConError> {
 	if COMPACT_MODES.contains(&first) {
 		if first == "snapcompact" && !remainder.is_empty() {
 			return Err(usage(
-				"/compact snapcompact does not take focus instructions (it archives history without an LLM summary).",
+				"/compact snapcompact does not take focus instructions (it archives history without \
+				 an LLM summary).",
 			));
 		}
 		return Ok((!remainder.is_empty()).then(|| Str::new(remainder)));
@@ -127,9 +128,7 @@ pub fn todo_op(words: Option<Str>) -> Result<TodoOp, ConError> {
 		"export" => TodoOp::Export(optional()),
 		"import" => TodoOp::Import(optional()),
 		_ => {
-			return Err(usage(
-				"Usage: /todo [append|start|done|drop|rm|copy|export|import] [args]",
-			));
+			return Err(usage("Usage: /todo [append|start|done|drop|rm|copy|export|import] [args]"));
 		},
 	})
 }
@@ -273,7 +272,9 @@ mod tests {
 		assert_eq!(shake_mode(None).unwrap(), ShakeMode::Elide);
 		assert_eq!(shake_mode(Some(Str::new_static("Images"))).unwrap(), ShakeMode::Images);
 		assert_eq!(
-			shake_mode(Some(Str::new_static("bogus"))).unwrap_err().to_string(),
+			shake_mode(Some(Str::new_static("bogus")))
+				.unwrap_err()
+				.to_string(),
 			"Unknown /shake mode \"bogus\". Use elide, images, or thinking."
 		);
 	}

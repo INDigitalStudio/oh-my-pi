@@ -284,11 +284,7 @@ impl GithubService {
 					fault("github_invalid_response", "GitHub compare response has no commit list")
 				})?
 				.iter()
-				.filter_map(|commit| {
-					commit
-						.pointer("/commit/message")
-						.and_then(Value::as_str)
-				})
+				.filter_map(|commit| commit.pointer("/commit/message").and_then(Value::as_str))
 				.collect::<Vec<_>>();
 			fill_from_commits(head, &messages)?
 		} else {
@@ -319,9 +315,7 @@ impl GithubService {
 			.value
 			.get("number")
 			.and_then(Value::as_u64)
-			.ok_or_else(|| {
-				fault("github_invalid_response", "created pull request has no number")
-			})?;
+			.ok_or_else(|| fault("github_invalid_response", "created pull request has no number"))?;
 		for (endpoint, body) in metadata.requests(repo.slug(), number) {
 			self
 				.request(repo.host(), Method::Post, &endpoint, Some(&body), cancellation)
@@ -684,7 +678,11 @@ impl GithubService {
 				);
 			}
 			let failed = if state == ActionsState::Failure {
-				Some(self.failed_job_logs(&repo, &response.value, tail, cancellation).await?)
+				Some(
+					self
+						.failed_job_logs(&repo, &response.value, tail, cancellation)
+						.await?,
+				)
 			} else {
 				None
 			};
@@ -1140,11 +1138,7 @@ fn run_jobs_endpoint(repo: &str, run_id: u64, page: u32) -> String {
 	format!("/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100&page={page}")
 }
 fn compare_endpoint(repo: &str, base: &str, head: &str) -> String {
-	format!(
-		"/repos/{repo}/compare/{}...{}",
-		encode_path_segment(base),
-		encode_path_segment(head)
-	)
+	format!("/repos/{repo}/compare/{}...{}", encode_path_segment(base), encode_path_segment(head))
 }
 /// Reads a response body under the 16 MiB ceiling, observing cancellation
 /// between chunks.
@@ -1177,9 +1171,7 @@ fn fill_from_commits(head: &str, messages: &[&str]) -> Result<(String, String), 
 			"fill requires at least one commit between base and head",
 		)),
 		[message] => {
-			let (subject, body) = message
-				.split_once('\n')
-				.unwrap_or((message, ""));
+			let (subject, body) = message.split_once('\n').unwrap_or((message, ""));
 			Ok((subject.trim().to_owned(), body.trim().to_owned()))
 		},
 		_ => {
@@ -1689,9 +1681,11 @@ mod tests {
 			serde_json::from_value(json!({ "op": "pr_create", "head": "h", "title": "t" }))
 				.expect("params");
 		assert!(PrMetadata::from_params(&bare).is_empty());
-		assert!(PrMetadata::from_params(&bare)
-			.requests("owner/repo", 7)
-			.is_empty());
+		assert!(
+			PrMetadata::from_params(&bare)
+				.requests("owner/repo", 7)
+				.is_empty()
+		);
 	}
 
 	#[test]

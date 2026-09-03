@@ -84,28 +84,28 @@ struct NotePrompt {
 
 /// Retained `ask` dialog.
 pub struct AskDialog {
-	id:         Str,
-	questions:  Vec<Question>,
-	states:     Vec<QuestionState>,
-	tab:        usize,
-	note:       Option<NotePrompt>,
-	expanded:   bool,
-	ui:         Ui,
-	ctx:        UiContext,
-	width:      u16,
-	rows:       u16,
-	dirty:      bool,
+	id:             Str,
+	questions:      Vec<Question>,
+	states:         Vec<QuestionState>,
+	tab:            usize,
+	note:           Option<NotePrompt>,
+	expanded:       bool,
+	ui:             Ui,
+	ctx:            UiContext,
+	width:          u16,
+	rows:           u16,
+	dirty:          bool,
 	/// Whether the current question's `Other` row owns keyboard input.
 	custom_editing: bool,
 	/// Countdown: total, its deadline on the presentation clock, the
 	/// seconds the title last showed, and the newest clock reading the host
 	/// handed to `tick` (keys restart the countdown from it).
-	timeout:    Option<Duration>,
-	deadline:   Duration,
-	shown_secs: u64,
-	now_hint:   Duration,
+	timeout:        Option<Duration>,
+	deadline:       Duration,
+	shown_secs:     u64,
+	now_hint:       Duration,
 	/// Timed-out submission waiting for the host's `settled()` poll.
-	settled:    Option<PanelEvent>,
+	settled:        Option<PanelEvent>,
 }
 
 impl AskDialog {
@@ -163,8 +163,7 @@ impl AskDialog {
 	/// terminal; the select scrolls inside that.
 	fn body_rows(viewport: Size) -> u16 {
 		let cap = (viewport.height * HEIGHT_RATIO.0 / HEIGHT_RATIO.1).max(MIN_DIALOG_ROWS);
-		cap
-			.saturating_sub(CHROME_ROWS + MAX_HEADER_ROWS + 1)
+		cap.saturating_sub(CHROME_ROWS + MAX_HEADER_ROWS + 1)
 			.max(MIN_BODY_ROWS)
 	}
 
@@ -289,7 +288,11 @@ impl AskDialog {
 			return Str::new_static("Enter save note · Esc back");
 		}
 		let expand = if self.header_overflows() {
-			if self.expanded { " · Ctrl+O collapse" } else { " · Ctrl+O expand" }
+			if self.expanded {
+				" · Ctrl+O collapse"
+			} else {
+				" · Ctrl+O expand"
+			}
 		} else {
 			""
 		};
@@ -297,13 +300,21 @@ impl AskDialog {
 			return sf!("Enter submit · ↑/↓ scroll · Esc cancel{expand}");
 		}
 		let question = &self.questions[self.current()];
-		let next = if self.questions.len() > 1 { "next" } else { "submit" };
+		let next = if self.questions.len() > 1 {
+			"next"
+		} else {
+			"submit"
+		};
 		let action = if question.multi {
 			sf!("Space toggle · Enter {next}")
 		} else {
 			Str::new_static("Enter select · n note")
 		};
-		let tabs = if self.has_submit_tab() { " · Tab/←/→" } else { "" };
+		let tabs = if self.has_submit_tab() {
+			" · Tab/←/→"
+		} else {
+			""
+		};
 		sf!("{action} · ↑/↓ move{tabs} · Esc cancel{expand}")
 	}
 
@@ -350,8 +361,9 @@ impl AskDialog {
 				.enumerate()
 				.map(|(index, (question, state))| {
 					let (answer, answered) = Self::summary(question, state);
-					let note = Self::submitted_note(question, state)
-						.map(|note| sf!("   Note: {}", note.split_whitespace().collect::<Vec<_>>().join(" ")));
+					let note = Self::submitted_note(question, state).map(|note| {
+						sf!("   Note: {}", note.split_whitespace().collect::<Vec<_>>().join(" "))
+					});
 					(sf!("{}. {}:", index + 1, Self::tab_label(question, index)), answer, answered, note)
 				})
 				.collect::<Vec<_>>();
@@ -490,7 +502,14 @@ impl AskDialog {
 			RowKey::Other => Str::new_static(OTHER_OPTION),
 			RowKey::Option(index) => Self::option_label(question, *index),
 		};
-		sf!("Note for {row}: {}", question.question.split_whitespace().collect::<Vec<_>>().join(" "))
+		sf!(
+			"Note for {row}: {}",
+			question
+				.question
+				.split_whitespace()
+				.collect::<Vec<_>>()
+				.join(" ")
+		)
 	}
 
 	fn sync(&mut self) {
@@ -848,7 +867,11 @@ impl Panel for AskDialog {
 		// The next whole-second flip of the title, never past the deadline.
 		let left = self.deadline.saturating_sub(self.now_hint);
 		let sub = Duration::from_millis(u64::try_from(left.as_millis() % 1000).unwrap_or(0));
-		let step = if sub.is_zero() { Duration::from_secs(1) } else { sub };
+		let step = if sub.is_zero() {
+			Duration::from_secs(1)
+		} else {
+			sub
+		};
 		Some(self.now_hint.saturating_add(step.min(left)))
 	}
 
@@ -865,23 +888,27 @@ mod tests {
 
 	const VIEWPORT: Size = Size { width: 80, height: 20 };
 	const LONG_QUESTION: &str = concat!(
-		"A long question that deliberately wraps over many rows so Ctrl+O is a valid dialog shortcut. ",
-		"A long question that deliberately wraps over many rows so Ctrl+O is a valid dialog shortcut. ",
-		"A long question that deliberately wraps over many rows so Ctrl+O is a valid dialog shortcut. ",
-		"A long question that deliberately wraps over many rows so Ctrl+O is a valid dialog shortcut. ",
+		"A long question that deliberately wraps over many rows so Ctrl+O is a valid dialog \
+		 shortcut. ",
+		"A long question that deliberately wraps over many rows so Ctrl+O is a valid dialog \
+		 shortcut. ",
+		"A long question that deliberately wraps over many rows so Ctrl+O is a valid dialog \
+		 shortcut. ",
+		"A long question that deliberately wraps over many rows so Ctrl+O is a valid dialog \
+		 shortcut. ",
 	);
 
 	fn question(prompt: &'static str) -> Question {
 		Question {
-			id: Str::new_static("choice"),
-			question: Str::new_static(prompt),
-			header: Some(Str::new_static("Choice")),
-			options: vec![OptionItem {
-				label: Str::new_static("Default"),
+			id:          Str::new_static("choice"),
+			question:    Str::new_static(prompt),
+			header:      Some(Str::new_static("Choice")),
+			options:     vec![OptionItem {
+				label:       Str::new_static("Default"),
 				description: None,
-				preview: None,
+				preview:     None,
 			}],
-			multi: false,
+			multi:       false,
 			recommended: Some(0),
 		}
 	}
@@ -941,13 +968,12 @@ mod tests {
 
 	#[test]
 	fn expanded_header_borrows_from_body_without_growing_dialog() {
-		let prompt = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty ".repeat(8);
+		let prompt = "one two three four five six seven eight nine ten eleven twelve thirteen \
+		              fourteen fifteen sixteen seventeen eighteen nineteen twenty "
+			.repeat(8);
 		let mut dialog = AskDialog::open(
 			Str::new_static("call"),
-			vec![Question {
-				question: Str::new(prompt),
-				..question("placeholder")
-			}],
+			vec![Question { question: Str::new(prompt), ..question("placeholder") }],
 			None,
 			Duration::ZERO,
 			VIEWPORT,

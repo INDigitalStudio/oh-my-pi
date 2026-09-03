@@ -39,7 +39,8 @@ const DEVICE_HINT: &str = "Enter the code at the link above.";
 const LOGOUT_HINT: &str = "↑/↓ select · ↵ log out account · Esc cancel";
 const LOGOUT_EMPTY: &str = "No stored accounts to log out";
 const PROVIDER_LOGIN_HINT: &str = "↑/↓ providers · Enter login · type to search · Esc close";
-const PROVIDER_LOGOUT_HINT: &str = "↑/↓ providers · Enter choose account · type to search · Esc close";
+const PROVIDER_LOGOUT_HINT: &str =
+	"↑/↓ providers · Enter choose account · type to search · Esc close";
 const NO_LOGIN_PROVIDERS: &str = "No OAuth providers available";
 const NO_LOGOUT_PROVIDERS: &str = "No stored provider credentials to log out";
 /// Border, title rule, hint, and blank rows around a list.
@@ -299,7 +300,8 @@ impl Panel for LoginDialog {
 				self.prompt = None;
 			},
 			Err(flume::TryRecvError::Disconnected) => {
-				self.outcome = Some(Err(sf!("Login to {} ended without a result", self.flow.provider_name)));
+				self.outcome =
+					Some(Err(sf!("Login to {} ended without a result", self.flow.provider_name)));
 				self.prompt = None;
 			},
 			Err(flume::TryRecvError::Empty) => {},
@@ -342,25 +344,21 @@ fn escape_quoted(text: &str) -> Str {
 /// `LogoutAccountSelectorComponent`): circular ↑/↓, PgUp/PgDn by a page,
 /// Enter asks the controller to delete the highlighted account.
 pub struct LogoutSelector {
-	provider:  Str,
-	accounts:  Vec<AccountRow>,
-	selected:  usize,
-	status:    Option<Str>,
-	pending:   Option<(usize, Mutation)>,
-	ui:        Ui,
-	ctx:       UiContext,
-	width:     u16,
+	provider: Str,
+	accounts: Vec<AccountRow>,
+	selected: usize,
+	status:   Option<Str>,
+	pending:  Option<(usize, Mutation)>,
+	ui:       Ui,
+	ctx:      UiContext,
+	width:    u16,
 }
 
 impl LogoutSelector {
 	/// Opens the selector over `accounts` of one provider; the active
 	/// account is preselected.
 	#[must_use]
-	pub fn open(
-		provider_name: impl Into<Str>,
-		accounts: Vec<AccountRow>,
-		ctx: &UiContext,
-	) -> Self {
+	pub fn open(provider_name: impl Into<Str>, accounts: Vec<AccountRow>, ctx: &UiContext) -> Self {
 		let selected = accounts
 			.iter()
 			.position(|account| account.active)
@@ -616,8 +614,12 @@ impl ProviderPicker {
 	fn rebuild(&mut self, width: u16) {
 		self.width = width;
 		let (title, hint, empty) = match self.mode {
-			ProviderMode::Login => ("Select provider to login", PROVIDER_LOGIN_HINT, NO_LOGIN_PROVIDERS),
-			ProviderMode::Logout => ("Select provider to logout", PROVIDER_LOGOUT_HINT, NO_LOGOUT_PROVIDERS),
+			ProviderMode::Login => {
+				("Select provider to login", PROVIDER_LOGIN_HINT, NO_LOGIN_PROVIDERS)
+			},
+			ProviderMode::Logout => {
+				("Select provider to logout", PROVIDER_LOGOUT_HINT, NO_LOGOUT_PROVIDERS)
+			},
 		};
 		let seed = self.query.clone();
 		let height = self.list_rows.saturating_add(1);
@@ -692,8 +694,9 @@ impl Panel for ProviderPicker {
 	}
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
-		let event =
-			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		self.route(event)
 	}
 
@@ -762,7 +765,10 @@ mod tests {
 
 		channels
 			.events
-			.send(LoginEvent::OpenUrl { url: sf!("https://auth.example/authorize?x=1"), launched: true })
+			.send(LoginEvent::OpenUrl {
+				url:      sf!("https://auth.example/authorize?x=1"),
+				launched: true,
+			})
 			.unwrap();
 		assert!(dialog.tick(Duration::ZERO), "a new event repaints");
 		assert_eq!(dialog.next_wake(), Some(POLL));
@@ -783,7 +789,10 @@ mod tests {
 		let rendered = text(&mut dialog);
 		assert!(rendered.contains("Paste the redirect URL"), "{rendered}");
 		assert!(rendered.contains(SUBMIT_HINT), "{rendered}");
-		assert!(rendered.contains("https://auth.example/authorize?x=1"), "the URL stays visible:\n{rendered}");
+		assert!(
+			rendered.contains("https://auth.example/authorize?x=1"),
+			"the URL stays visible:\n{rendered}"
+		);
 
 		for ch in "abc".chars() {
 			assert_eq!(dialog.key(Key::Char(ch)), PanelEvent::Consumed);
@@ -818,7 +827,10 @@ mod tests {
 		assert!(rendered.contains("https://device.example/activate"), "{rendered}");
 		assert!(rendered.contains(DEVICE_HINT), "{rendered}");
 
-		channels.done.send(Ok(sf!("Successfully logged in to Anthropic"))).unwrap();
+		channels
+			.done
+			.send(Ok(sf!("Successfully logged in to Anthropic")))
+			.unwrap();
 		assert!(dialog.tick(POLL));
 		assert_eq!(dialog.outcome(), Some(Ok("Successfully logged in to Anthropic")));
 		assert_eq!(dialog.next_wake(), None);
@@ -841,12 +853,12 @@ mod tests {
 
 	fn account(id: &'static str, active: bool) -> AccountRow {
 		AccountRow {
-			id:            Str::new_static(id),
-			provider:      sf!("anthropic"),
+			id: Str::new_static(id),
+			provider: sf!("anthropic"),
 			provider_name: sf!("Anthropic"),
-			label:         sf!("{id}@example.com"),
-			detail:        sf!("stored oauth"),
-			kind:          sf!("oauth"),
+			label: sf!("{id}@example.com"),
+			detail: sf!("stored oauth"),
+			kind: sf!("oauth"),
 			active,
 		}
 	}
@@ -930,7 +942,8 @@ mod tests {
 	#[test]
 	fn provider_picker_in_logout_mode_runs_logout() {
 		let ctx = UiContext::default();
-		let mut picker = ProviderPicker::open(vec![provider("openai", "OpenAI", true)], ProviderMode::Logout, &ctx);
+		let mut picker =
+			ProviderPicker::open(vec![provider("openai", "OpenAI", true)], ProviderMode::Logout, &ctx);
 		assert!(text(&mut picker).contains("Select provider to logout"));
 		assert_eq!(picker.key(Key::Enter), PanelEvent::Finish(sf!("logout openai")));
 	}

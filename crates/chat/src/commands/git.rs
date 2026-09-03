@@ -19,10 +19,11 @@ use crate::{
 };
 
 /// Palette icons for this module's commands.
-pub const PALETTE: &[PaletteEntry] = &[
-	PaletteEntry { name: "git", icon: Icon::Branch },
-	PaletteEntry { name: "copy", icon: Icon::Copy },
-];
+pub const PALETTE: &[PaletteEntry] =
+	&[PaletteEntry { name: "git", icon: Icon::Branch }, PaletteEntry {
+		name: "copy",
+		icon: Icon::Copy,
+	}];
 
 /// `/copy` argument forms.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

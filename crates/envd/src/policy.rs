@@ -785,9 +785,8 @@ impl PolicyControlOwner {
 		}
 		let decision: Decision = serde_json::from_value(value)
 			.map_err(|error| PolicyControlFailure::Invalid(Str::from(error.to_string())))?;
-		let source = ApprovalSource::from_str(decision.source.as_str()).map_err(|_| {
-			PolicyControlFailure::Invalid(Str::new_static("unknown approval source"))
-		})?;
+		let source = ApprovalSource::from_str(decision.source.as_str())
+			.map_err(|_| PolicyControlFailure::Invalid(Str::new_static("unknown approval source")))?;
 		let scope = match decision.scope {
 			PolicyScope::Once => Str::new_static("once"),
 			PolicyScope::Call => Str::new_static("call"),

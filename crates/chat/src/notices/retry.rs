@@ -39,16 +39,20 @@ pub struct RetryState {
 impl RetryState {
 	/// Records a retry whose backoff started at presentation time `now`.
 	#[must_use]
-	pub const fn new(attempt: u32, max_attempts: u32, delay: Duration, reason: Str, now: Duration) -> Self {
+	pub const fn new(
+		attempt: u32,
+		max_attempts: u32,
+		delay: Duration,
+		reason: Str,
+		now: Duration,
+	) -> Self {
 		Self { attempt, max_attempts, delay, reason, started: now }
 	}
 
 	/// Backoff still to wait at `now`; pi `Math.max(0, delayMs - elapsed)`.
 	#[must_use]
 	pub const fn remaining(&self, now: Duration) -> Duration {
-		self
-			.delay
-			.saturating_sub(now.saturating_sub(self.started))
+		self.delay.saturating_sub(now.saturating_sub(self.started))
 	}
 
 	/// Whether the backoff has fully elapsed.
@@ -92,8 +96,13 @@ impl RetryState {
 		if remaining.is_zero() {
 			return None;
 		}
-		let into_second = Duration::from_nanos(u64::try_from(remaining.as_nanos() % 1_000_000_000).unwrap_or(0));
-		let step = if into_second.is_zero() { Duration::from_secs(1) } else { into_second };
+		let into_second =
+			Duration::from_nanos(u64::try_from(remaining.as_nanos() % 1_000_000_000).unwrap_or(0));
+		let step = if into_second.is_zero() {
+			Duration::from_secs(1)
+		} else {
+			into_second
+		};
 		Some(now.saturating_add(step))
 	}
 }
@@ -277,12 +286,22 @@ mod tests {
 			state.label(Duration::from_millis(10_000), true),
 			"Retrying (1/3) in 3.0s… (esc to cancel)"
 		);
-		assert_eq!(state.label(Duration::from_millis(11_200), true), "Retrying (1/3) in 1.8s… (esc to cancel)");
-		assert_eq!(state.label(Duration::from_millis(13_500), true), "Retrying (1/3) in 0ms… (esc to cancel)");
+		assert_eq!(
+			state.label(Duration::from_millis(11_200), true),
+			"Retrying (1/3) in 1.8s… (esc to cancel)"
+		);
+		assert_eq!(
+			state.label(Duration::from_millis(13_500), true),
+			"Retrying (1/3) in 0ms… (esc to cancel)"
+		);
 		assert_eq!(state.label(Duration::from_secs(10), false), "Retrying (1/3) in 3.0s…");
 		assert!(!state.expired(Duration::from_millis(12_999)));
 		assert!(state.expired(Duration::from_secs(13)));
-		assert_eq!(state.remaining(Duration::from_secs(5)), Duration::from_secs(3), "pre-start clock saturates");
+		assert_eq!(
+			state.remaining(Duration::from_secs(5)),
+			Duration::from_secs(3),
+			"pre-start clock saturates"
+		);
 	}
 
 	#[test]
@@ -299,7 +318,11 @@ mod tests {
 	fn retry_loader_paints_spinner_and_label_and_reschedules() {
 		let mut ui = Ui::from_root(RetryLoader::new(state(2_500, 0)), 60, UiContext::default());
 		assert_eq!(frame_text(ui.frame()), "⠋ Retrying (1/3) in 2.5s… (esc to cancel)");
-		assert_eq!(ui.next_wake(), Some(Duration::from_millis(80)), "spinner frame precedes the second");
+		assert_eq!(
+			ui.next_wake(),
+			Some(Duration::from_millis(80)),
+			"spinner frame precedes the second"
+		);
 
 		assert!(ui.tick(Duration::from_millis(80)));
 		assert_eq!(frame_text(ui.frame()), "⠙ Retrying (1/3) in 2.4s… (esc to cancel)");
@@ -340,15 +363,18 @@ mod tests {
 	#[test]
 	fn superseded_keys_pick_never_ran_failures() {
 		let directory = tempfile::tempdir().expect("temp directory");
-		let mut session = Session::create(directory.path().join("retry.oms"), ComponentRegistry::standard())
-			.expect("session");
+		let mut session =
+			Session::create(directory.path().join("retry.oms"), ComponentRegistry::standard())
+				.expect("session");
 		session.begin_turn().expect("turn");
 		session.user("hello", Vec::new()).expect("user");
 		let turn = last_turn(session.dom()).expect("turn handle");
 		let ok = session
 			.call("read", 1, "call-ok", None, Some(raw("{}")), None)
 			.expect("call");
-		session.settle(ok, raw("{\"text\":\"done\"}")).expect("settle");
+		session
+			.settle(ok, raw("{\"text\":\"done\"}"))
+			.expect("settle");
 		session
 			.call("bash", 1, "call-aborted", None, Some(raw("{}")), None)
 			.expect("call");
@@ -373,15 +399,18 @@ mod tests {
 	#[test]
 	fn superseded_keys_skip_failures_that_ran() {
 		let directory = tempfile::tempdir().expect("temp directory");
-		let mut session = Session::create(directory.path().join("retry.oms"), ComponentRegistry::standard())
-			.expect("session");
+		let mut session =
+			Session::create(directory.path().join("retry.oms"), ComponentRegistry::standard())
+				.expect("session");
 		session.begin_turn().expect("turn");
 		session.user("hello", Vec::new()).expect("user");
 		let turn = last_turn(session.dom()).expect("turn handle");
 		let call = session
 			.call("bash", 1, "call-failed", None, Some(raw("{}")), None)
 			.expect("call");
-		session.fail(call, raw("{\"error\":\"exit 1\"}")).expect("fail");
+		session
+			.fail(call, raw("{\"error\":\"exit 1\"}"))
+			.expect("fail");
 		append_notice(&mut session, turn, "warn", "Turn interrupted");
 
 		assert_eq!(superseded_notice_keys(session.dom()), []);

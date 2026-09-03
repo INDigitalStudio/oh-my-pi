@@ -64,7 +64,9 @@ pub fn resolve_launch_roles(
 	let slow = resolve_selected(slow, "OMP_SLOW_MODEL", "slow")?;
 	let plan = resolve_selected(plan, "OMP_PLAN_MODEL", "plan")?;
 	Ok(LaunchRoles {
-		primary_thinking: primary.as_ref().and_then(|selected| selected.thinking.clone()),
+		primary_thinking: primary
+			.as_ref()
+			.and_then(|selected| selected.thinking.clone()),
 		primary:          primary.map(|selected| selected.model),
 		smol_thinking:    smol.as_ref().and_then(|selected| selected.thinking.clone()),
 		smol:             smol.map(|selected| selected.model),
@@ -214,12 +216,9 @@ mod tests {
 			Some(selector),
 		)
 		.expect("annotated roles");
-		for thinking in [
-			launch.primary_thinking,
-			launch.smol_thinking,
-			launch.slow_thinking,
-			launch.plan_thinking,
-		] {
+		for thinking in
+			[launch.primary_thinking, launch.smol_thinking, launch.slow_thinking, launch.plan_thinking]
+		{
 			assert_eq!(thinking.as_deref(), Some("high"));
 		}
 	}

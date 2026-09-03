@@ -12,8 +12,7 @@ use std::{sync::Arc, time::Duration};
 use omp_core::{Str, sf};
 use omp_tui::{
 	Component, Frame, IntoComponent as _, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent,
-	cell_width,
-	components::Tabs, dom,
+	cell_width, components::Tabs, dom,
 };
 
 use super::{
@@ -23,8 +22,8 @@ use super::{
 use crate::host::HostCommand;
 
 /// pi `extFooter()` with `expandKeyHint()` resolved to the Ctrl+O chord.
-const FOOTER: &str =
-	" ↑/↓: navigate · Space: toggle · ←/→: provider · PgUp/PgDn: inspector · ctrl+o: expand · Esc: close";
+const FOOTER: &str = " ↑/↓: navigate · Space: toggle · ←/→: provider · PgUp/PgDn: inspector · \
+                      ctrl+o: expand · Esc: close";
 /// pi `expandKeyHint()`.
 const EXPAND_HINT: &str = "ctrl+o";
 /// Border rows, tab bar and its rule, list search row and its blank, the
@@ -77,20 +76,20 @@ impl ExtensionsDashboard {
 	pub fn open(services: &Arc<dyn Services>, ctx: &UiContext) -> Result<Self, Str> {
 		let rows = services.extensions().map_err(|error| sf!("{error}"))?;
 		let mut panel = Self {
-			services: Arc::clone(services),
-			rows: Vec::new(),
-			tabs: Vec::new(),
-			tab: 0,
-			query: String::new(),
-			items: Vec::new(),
-			selected: 0,
-			scroll: 0,
-			expanded: false,
+			services:  Arc::clone(services),
+			rows:      Vec::new(),
+			tabs:      Vec::new(),
+			tab:       0,
+			query:     String::new(),
+			items:     Vec::new(),
+			selected:  0,
+			scroll:    0,
+			expanded:  false,
 			list_rows: 10,
-			ui: Ui::from_root(dom! { <col/> }, 80, ctx.clone()),
-			ctx: ctx.clone(),
-			width: 80,
-			height: 24,
+			ui:        Ui::from_root(dom! { <col/> }, 80, ctx.clone()),
+			ctx:       ctx.clone(),
+			width:     80,
+			height:    24,
 			next_wake: None,
 		};
 		panel.replace_rows(rows);
@@ -141,7 +140,9 @@ impl ExtensionsDashboard {
 	/// leaves the cursor on the same extension when it survives (a data
 	/// refresh); pi resets it to the first row on tab and query changes.
 	fn reflow_items(&mut self, keep: bool) {
-		let keep = keep.then(|| self.selected().map(|row| row.id.clone())).flatten();
+		let keep = keep
+			.then(|| self.selected().map(|row| row.id.clone()))
+			.flatten();
 		let kind = self.tabs.get(self.tab).copied().flatten();
 		let query = self.query.to_lowercase();
 		let matches = |row: &ExtensionRow| {
@@ -280,10 +281,7 @@ impl ExtensionsDashboard {
 		let inner = self.width.saturating_sub(4).max(1);
 		let left = inner / 2;
 		let right = inner.saturating_sub(left + 3).max(1);
-		let content_rows = self
-			.height
-			.saturating_sub(CHROME_ROWS)
-			.max(5);
+		let content_rows = self.height.saturating_sub(CHROME_ROWS).max(5);
 		let list_rows = usize::from(content_rows.saturating_sub(2).max(3));
 		if list_rows != self.list_rows {
 			self.list_rows = list_rows;
@@ -435,13 +433,16 @@ impl ExtensionsDashboard {
 		let (icon, icon_fg) = state_icon(row);
 		let label = Str::new_static(status_label(row));
 		let version = row.version.clone().unwrap_or_default();
-		lines.push(dom! {
-			<row gap=1>
-				<icon name={icon} fg={icon_fg}/>
-				<text fg={icon_fg}>{label}</text>
-				<text fg=muted truncate>{version}</text>
-			</row>
-		}.into_component());
+		lines.push(
+			dom! {
+				<row gap=1>
+					<icon name={icon} fg={icon_fg}/>
+					<text fg={icon_fg}>{label}</text>
+					<text fg=muted truncate>{version}</text>
+				</row>
+			}
+			.into_component(),
+		);
 		lines.push(dom! { <text>{" "}</text> }.into_component());
 		if let Some(description) = row.description.as_deref().filter(|text| !text.is_empty()) {
 			let budget = usize::from(width.max(8)) * COLLAPSED_DESC_LINES;
@@ -465,11 +466,9 @@ impl ExtensionsDashboard {
 		lines.push(dom! { <text fg=muted>{"Origin:"}</text> }.into_component());
 		lines.push(dom! { <text italic truncate>{origin}</text> }.into_component());
 		lines.push(dom! { <text>{" "}</text> }.into_component());
-		for (heading, entries) in [
-			("Tools", &row.tools),
-			("Resources", &row.resources),
-			("Prompts", &row.prompts),
-		] {
+		for (heading, entries) in
+			[("Tools", &row.tools), ("Resources", &row.resources), ("Prompts", &row.prompts)]
+		{
 			if entries.is_empty() {
 				continue;
 			}
@@ -573,8 +572,9 @@ impl Panel for ExtensionsDashboard {
 	}
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
-		let event =
-			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		if event == UiEvent::Cancel {
 			return PanelEvent::Close;
 		}
@@ -806,7 +806,8 @@ mod tests {
 	}
 
 	fn point(text: &str, needle: &str) -> (u16, u16) {
-		text.lines()
+		text
+			.lines()
 			.enumerate()
 			.find_map(|(row, line)| {
 				let byte = line.find(needle)?;
@@ -828,17 +829,17 @@ mod tests {
 
 	fn row(id: &str, kind: ExtensionKind, status: ExtensionStatus) -> ExtensionRow {
 		ExtensionRow {
-			id:          Str::new(id),
-			name:        Str::new(id.split_once(':').map_or(id, |(_, name)| name)),
+			id: Str::new(id),
+			name: Str::new(id.split_once(':').map_or(id, |(_, name)| name)),
 			kind,
 			status,
-			enabled:     status != ExtensionStatus::Disabled,
-			version:     Some(Str::new_static("1.2.0")),
+			enabled: status != ExtensionStatus::Disabled,
+			version: Some(Str::new_static("1.2.0")),
 			description: Some(Str::new_static("Reads GitHub issues and pull requests.")),
-			tools:       vec![Str::new_static("issue_read"), Str::new_static("pr_list")],
-			resources:   Vec::new(),
-			prompts:     Vec::new(),
-			error:       None,
+			tools: vec![Str::new_static("issue_read"), Str::new_static("pr_list")],
+			resources: Vec::new(),
+			prompts: Vec::new(),
+			error: None,
 		}
 	}
 
@@ -919,7 +920,8 @@ mod tests {
 		let mut panel = open(&feed);
 		panel.frame(Size { width: 120, height: 24 });
 		panel.key(Key::Right);
-		let expected = Mutation::SetExtensionEnabled { id: Str::new_static("mcp:github"), enabled: false };
+		let expected =
+			Mutation::SetExtensionEnabled { id: Str::new_static("mcp:github"), enabled: false };
 		assert_eq!(
 			panel.key(Key::Space),
 			PanelEvent::Command(HostCommand::Service(expected.clone())),
@@ -941,8 +943,12 @@ mod tests {
 		let text = omp_tui::frame_text(panel.frame(Size { width: 120, height: 24 }));
 		assert!(text.contains("inactive"), "disabled hint missing:\n{text}");
 		assert!(text.contains("Disabled (manually disabled)"), "badge missing:\n{text}");
-		let expected = Mutation::SetExtensionEnabled { id: Str::new_static("mcp:github"), enabled: true };
-		assert_eq!(panel.key(Key::Enter), PanelEvent::Command(HostCommand::Service(expected.clone())));
+		let expected =
+			Mutation::SetExtensionEnabled { id: Str::new_static("mcp:github"), enabled: true };
+		assert_eq!(
+			panel.key(Key::Enter),
+			PanelEvent::Command(HostCommand::Service(expected.clone()))
+		);
 		let outcome = settle(&feed, &expected);
 		assert_eq!(
 			panel.notify(PanelNote::Outcome(&outcome)),
@@ -962,14 +968,21 @@ mod tests {
 		});
 		assert_eq!(panel.notify(PanelNote::Outcome(&foreign)), PanelEvent::Ignored);
 		let failed = Outcome::Service(ServiceOutcome {
-			mutation: Mutation::SetExtensionEnabled { id: Str::new_static("mcp:github"), enabled: false },
+			mutation: Mutation::SetExtensionEnabled {
+				id:      Str::new_static("mcp:github"),
+				enabled: false,
+			},
 			result:   Err(crate::overlays::services::ServiceError::Unavailable("extensions")),
 		});
 		assert!(matches!(
 			panel.notify(PanelNote::Outcome(&failed)),
 			PanelEvent::Notice(text) if text.contains("unavailable")
 		));
-		assert_eq!(panel.selected().map(|row| row.enabled), Some(true), "a failed toggle leaves the row");
+		assert_eq!(
+			panel.selected().map(|row| row.enabled),
+			Some(true),
+			"a failed toggle leaves the row"
+		);
 	}
 
 	#[test]

@@ -109,24 +109,23 @@ pub fn register_extension_setting_convars(
 			key:       key.clone(),
 		})?;
 		let name = extension_setting_convar_name(extension, key);
-		ctx
-			.register_dynamic_var(DynamicVarSpec {
-				name: name.clone(),
-				desc: schema
-					.description
-					.clone()
-					.unwrap_or_else(|| sf!("Setting {key} declared by extension {extension}")),
-				ty: convar_type(schema),
-				flags: VarFlags::ARCHIVE
-					.with(VarFlags::SESSION)
-					.with(VarFlags::REPLICATED),
-				default: baseline.clone(),
-			})
-			.map_err(|source| ExtensionConvarError::Control {
-				extension: Str::new(extension),
-				key:       key.clone(),
-				source,
-			})?;
+		ctx.register_dynamic_var(DynamicVarSpec {
+			name:    name.clone(),
+			desc:    schema
+				.description
+				.clone()
+				.unwrap_or_else(|| sf!("Setting {key} declared by extension {extension}")),
+			ty:      convar_type(schema),
+			flags:   VarFlags::ARCHIVE
+				.with(VarFlags::SESSION)
+				.with(VarFlags::REPLICATED),
+			default: baseline.clone(),
+		})
+		.map_err(|source| ExtensionConvarError::Control {
+			extension: Str::new(extension),
+			key: key.clone(),
+			source,
+		})?;
 		if let Some(effective) = effective {
 			let effective =
 				convar_value(schema, effective).ok_or_else(|| ExtensionConvarError::InvalidValue {
@@ -134,11 +133,10 @@ pub fn register_extension_setting_convars(
 					key:       key.clone(),
 				})?;
 			if effective != baseline {
-				ctx
-					.set(name.as_str(), effective, Origin::Session)
+				ctx.set(name.as_str(), effective, Origin::Session)
 					.map_err(|source| ExtensionConvarError::Control {
 						extension: Str::new(extension),
-						key:       key.clone(),
+						key: key.clone(),
 						source,
 					})?;
 			}
@@ -650,19 +648,11 @@ default = "warning"
 		let ctx = Ctx::new();
 		let writes = ctx.subscribe_session_writes();
 
-		register_extension_setting_convars(
-			&ctx,
-			manifest.id.as_str(),
-			&manifest.settings,
-			&resolved,
-		)
-		.expect("register dynamic convars");
+		register_extension_setting_convars(&ctx, manifest.id.as_str(), &manifest.settings, &resolved)
+			.expect("register dynamic convars");
 
 		assert_eq!(ctx.get("ext::demo::verbose"), Some(ConValue::Bool(true)));
-		assert_eq!(
-			ctx.get("ext::demo::severity"),
-			Some(ConValue::Str("warning".into())),
-		);
+		assert_eq!(ctx.get("ext::demo::severity"), Some(ConValue::Str("warning".into())),);
 		assert_eq!(
 			writes.try_recv().expect("effective override"),
 			("ext::demo::verbose".into(), ConValue::Bool(true)),

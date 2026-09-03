@@ -404,8 +404,8 @@ impl PlanReviewPanel {
 	/// Scrolls the body by `delta` rows through the scroll widget, keeping
 	/// the mirrored offset in step.
 	fn scroll_by(&mut self, delta: i32) {
-		let next = (i64::from(self.offset) + i64::from(delta))
-			.clamp(0, i64::from(self.max_offset())) as u16;
+		let next =
+			(i64::from(self.offset) + i64::from(delta)).clamp(0, i64::from(self.max_offset())) as u16;
 		if next == self.offset {
 			return;
 		}
@@ -757,7 +757,11 @@ impl PlanReviewPanel {
 			.map(|(_, model)| model.clone())
 			.unwrap_or_default();
 		let left_fg = if self.slider > 0 { "accent" } else { "muted" };
-		let right_fg = if self.slider + 1 < self.cycle.len() { "accent" } else { "muted" };
+		let right_fg = if self.slider + 1 < self.cycle.len() {
+			"accent"
+		} else {
+			"muted"
+		};
 		let roles = self
 			.cycle
 			.iter()
@@ -883,10 +887,7 @@ impl PlanReviewPanel {
 		let slots = usize::from(self.rows);
 		let total = self.toc.len();
 		let start = if total > slots {
-			self
-				.toc_cursor
-				.saturating_sub(slots / 2)
-				.min(total - slots)
+			self.toc_cursor.saturating_sub(slots / 2).min(total - slots)
 		} else {
 			0
 		};
@@ -1014,8 +1015,9 @@ impl Panel for PlanReviewPanel {
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
 		self.sync();
-		let event =
-			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		let routed = self.route_ui(event);
 		if self.annotating.is_none() {
 			self.sync_pointer_tier();
@@ -1163,7 +1165,9 @@ fn strip_links(text: &mut String) {
 			tail[1..].find(']').and_then(|close| {
 				let label = &tail[1..1 + close];
 				let after = &tail[1 + close + 1..];
-				let target = after.strip_prefix('(').map(|inner| (')', inner))
+				let target = after
+					.strip_prefix('(')
+					.map(|inner| (')', inner))
 					.or_else(|| after.strip_prefix('[').map(|inner| (']', inner)))?;
 				let end = target.1.find(target.0)?;
 				Some((label, 1 + close + 1 + 1 + end + 1))
@@ -1227,7 +1231,8 @@ fn parse_sections(text: &str) -> Vec<(u8, Str, Str)> {
 			},
 			Some((ch, run)) => {
 				if let Some((close_ch, close_run, blank)) = fence
-					&& close_ch == ch && close_run >= run
+					&& close_ch == ch
+					&& close_run >= run
 					&& blank
 				{
 					open_fence = None;
@@ -1344,7 +1349,8 @@ mod tests {
 
 	impl Services for NoPlan {}
 
-	const PLAN: &str = "# Auth plan\n\nIntro paragraph.\n\n## Goal\n\nShip **login**.\n\n## Steps\n\n1. one\n2. two\n\n### Detail\n\nmore\n\n## Risks\n\nnone\n";
+	const PLAN: &str = "# Auth plan\n\nIntro paragraph.\n\n## Goal\n\nShip **login**.\n\n## \
+	                    Steps\n\n1. one\n2. two\n\n### Detail\n\nmore\n\n## Risks\n\nnone\n";
 
 	fn roster(roles: &[&str]) -> Vec<(Str, Str)> {
 		roles
@@ -1357,11 +1363,21 @@ mod tests {
 		Arc::new(Plan(Str::new_static(PLAN)))
 	}
 
-	fn open(services: Arc<dyn Services>, roles: &[&str], size: Size) -> Result<PlanReviewPanel, Str> {
+	fn open(
+		services: Arc<dyn Services>,
+		roles: &[&str],
+		size: Size,
+	) -> Result<PlanReviewPanel, Str> {
 		let dom = Dom::new();
 		let con = Ctx::new();
 		let ui = UiContext::default();
-		let cx = PanelCx { dom: &dom, con: &con, ui: &ui, viewport: size, services: &services };
+		let cx = PanelCx {
+			dom:      &dom,
+			con:      &con,
+			ui:       &ui,
+			viewport: size,
+			services: &services,
+		};
 		PlanReviewPanel::open(&cx, &roster(roles))
 	}
 
@@ -1374,7 +1390,8 @@ mod tests {
 	}
 
 	fn point(text: &str, needle: &str) -> (u16, u16) {
-		text.lines()
+		text
+			.lines()
 			.enumerate()
 			.find_map(|(row, line)| {
 				let byte = line.find(needle)?;
@@ -1402,10 +1419,16 @@ mod tests {
 		}
 		// The 57-cell help exceeds the 56 inner cells of a 60-column overlay,
 		// so it truncates exactly like pi's `fit(content, width - 4)`.
-		assert!(text.contains("↑↓ select · ⏎ confirm · c copy · tab regions · esc canc…"), "help missing:\n{text}");
+		assert!(
+			text.contains("↑↓ select · ⏎ confirm · c copy · tab regions · esc canc…"),
+			"help missing:\n{text}"
+		);
 		assert!(!text.contains("continue with"), "lone role must not show the slider:\n{text}");
 		let wide = self::text(&mut panel, WIDE);
-		assert!(wide.contains("↑↓ select · ⏎ confirm · c copy · tab regions · esc cancel"), "help missing:\n{wide}");
+		assert!(
+			wide.contains("↑↓ select · ⏎ confirm · c copy · tab regions · esc cancel"),
+			"help missing:\n{wide}"
+		);
 	}
 
 	#[test]
@@ -1464,12 +1487,19 @@ mod tests {
 			PanelEvent::Finish(Str::new_static("plan_approve default compact"))
 		);
 		panel.key(Key::Down);
-		assert_eq!(panel.key(Key::Enter), PanelEvent::Finish(Str::new_static("plan_approve default keep")));
+		assert_eq!(
+			panel.key(Key::Enter),
+			PanelEvent::Finish(Str::new_static("plan_approve default keep"))
+		);
 		panel.key(Key::Down);
 		assert_eq!(panel.key(Key::Enter), PanelEvent::Recall(Str::new_static(REFINE_SEED)));
 		panel.key(Key::Down);
 		panel.key(Key::Down);
-		assert_eq!(panel.key(Key::Enter), PanelEvent::Finish(Str::new_static("plan")), "cursor clamps at the last option");
+		assert_eq!(
+			panel.key(Key::Enter),
+			PanelEvent::Finish(Str::new_static("plan")),
+			"cursor clamps at the last option"
+		);
 	}
 
 	#[test]
@@ -1498,11 +1528,17 @@ mod tests {
 		panel.key(Key::Up);
 		assert_eq!(panel.focus, Focus::Body);
 		let body = text(&mut panel, WIDE);
-		assert!(body.contains("↑↓ scroll · ⇧ faster · pgup/pgdn · g/G ends · a annotate"), "body help:\n{body}");
+		assert!(
+			body.contains("↑↓ scroll · ⇧ faster · pgup/pgdn · g/G ends · a annotate"),
+			"body help:\n{body}"
+		);
 		panel.key(Key::Up);
 		assert_eq!(panel.focus, Focus::Toc, "scrolling off the top steps into the sidebar");
 		let toc = text(&mut panel, WIDE);
-		assert!(toc.contains("↑↓ section · ⏎ open · a annotate · d delete · u undo"), "toc help:\n{toc}");
+		assert!(
+			toc.contains("↑↓ section · ⏎ open · a annotate · d delete · u undo"),
+			"toc help:\n{toc}"
+		);
 		panel.key(Key::Tab);
 		assert_eq!(panel.focus, Focus::Body);
 		panel.key(Key::Tab);
@@ -1537,7 +1573,10 @@ mod tests {
 		assert!(!panel.plan().contains("### Detail"), "nested section removed too");
 		assert_eq!(panel.toc.len(), 2);
 		let feedback = panel.feedback();
-		assert_eq!(feedback.as_str(), "Refinement feedback on the plan:\n\nRemove these sections:\n- Steps\n- Detail\n");
+		assert_eq!(
+			feedback.as_str(),
+			"Refinement feedback on the plan:\n\nRemove these sections:\n- Steps\n- Detail\n"
+		);
 		panel.key(Key::Tab);
 		panel.key(Key::Tab);
 		assert_eq!(panel.focus, Focus::Actions);
@@ -1569,7 +1608,10 @@ mod tests {
 		assert_eq!(panel.key(Key::Enter), PanelEvent::Consumed);
 		assert!(panel.annotating.is_none());
 		assert_eq!(panel.sections[1].annotations, vec![Str::new_static("too vague")]);
-		assert_eq!(panel.feedback().as_str(), "Refinement feedback on the plan:\n\n## Goal\n- too vague\n");
+		assert_eq!(
+			panel.feedback().as_str(),
+			"Refinement feedback on the plan:\n\n## Goal\n- too vague\n"
+		);
 		let marked = text(&mut panel, WIDE);
 		assert!(marked.contains("Goal ✎"), "annotated entry is marked:\n{marked}");
 		panel.key(Key::Char('a'));
@@ -1610,15 +1652,23 @@ mod tests {
 		}
 		let jumped = text(&mut panel, WIDE);
 		assert_eq!(panel.sections[panel.toc[panel.toc_cursor]].title.as_str(), "Tail");
-		assert_eq!(panel.offset, panel.section_offsets[panel.toc[panel.toc_cursor]].min(panel.max_offset()));
+		assert_eq!(
+			panel.offset,
+			panel.section_offsets[panel.toc[panel.toc_cursor]].min(panel.max_offset())
+		);
 		assert!(jumped.contains("end"), "jump lands on the tail section:\n{jumped}");
 		panel.key(Key::Down);
-		assert_eq!(panel.focus, Focus::Actions, "Down past the last section falls through to the actions");
+		assert_eq!(
+			panel.focus,
+			Focus::Actions,
+			"Down past the last section falls through to the actions"
+		);
 	}
 
 	#[test]
 	fn parses_sections_with_fences_and_strips_inline_markdown() {
-		let text = "pre\n\n# Top\n\n```\n# not a heading\n```\n\n## **Bold** [link](x) `code`\n\nbody\n";
+		let text =
+			"pre\n\n# Top\n\n```\n# not a heading\n```\n\n## **Bold** [link](x) `code`\n\nbody\n";
 		let sections = parse_sections(text);
 		let titles = sections
 			.iter()
@@ -1634,7 +1684,10 @@ mod tests {
 
 	#[test]
 	fn plan_title_prefers_heading_then_stem() {
-		assert_eq!(plan_title("# My feature plan\n", "local://x-plan.md").as_str(), "My-feature-plan");
+		assert_eq!(
+			plan_title("# My feature plan\n", "local://x-plan.md").as_str(),
+			"My-feature-plan"
+		);
 		assert_eq!(plan_title("no heading\n", "local://auth-plan.md").as_str(), "auth-plan");
 		assert_eq!(plan_title("# ../bad\n", "local://???.md").as_str(), "plan");
 	}

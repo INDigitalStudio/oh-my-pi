@@ -81,7 +81,10 @@ impl SecurityScanService {
 	/// Opens the project security authority under the environment state root.
 	pub fn new(root: PathBuf, state_dir: &Path) -> Self {
 		let workspace = Hash32::sum(root.to_string_lossy().as_bytes()).to_hex();
-		let state_path = state_dir.join("security").join(workspace.as_str()).join("state.json");
+		let state_path = state_dir
+			.join("security")
+			.join(workspace.as_str())
+			.join("state.json");
 		let state = if !state_path.exists() {
 			Ok(State::default())
 		} else {
@@ -91,9 +94,9 @@ impl SecurityScanService {
 				.ok_or(())
 		};
 		Self {
-			root: Arc::new(root),
+			root:       Arc::new(root),
 			state_path: Arc::new(state_path),
-			state: Arc::new(Mutex::new(state)),
+			state:      Arc::new(Mutex::new(state)),
 		}
 	}
 
@@ -119,8 +122,14 @@ impl SecurityScanService {
 		}
 		let ref_supported = match target {
 			TargetKind::RefDiff => {
-				params.base_revision.as_ref().is_some_and(|value| !value.trim().is_empty())
-					&& params.head_revision.as_ref().is_some_and(|value| !value.trim().is_empty())
+				params
+					.base_revision
+					.as_ref()
+					.is_some_and(|value| !value.trim().is_empty())
+					&& params
+						.head_revision
+						.as_ref()
+						.is_some_and(|value| !value.trim().is_empty())
 			},
 			_ => true,
 		};
@@ -156,9 +165,10 @@ impl SecurityScanService {
 		Ok(Payload {
 			action: Action::Preflight,
 			output: Str::from(format!(
-				"Security plan {id} is ready. Fingerprint: {fingerprint}. Start it with action=start and plan_id={id}."
+				"Security plan {id} is ready. Fingerprint: {fingerprint}. Start it with action=start \
+				 and plan_id={id}."
 			)),
-			data: json!({"plan": {"id": id, "fingerprint": fingerprint}}),
+			data:   json!({"plan": {"id": id, "fingerprint": fingerprint}}),
 		})
 	}
 
@@ -182,16 +192,18 @@ impl SecurityScanService {
 		let operation_id = Str::from(format!("operation-{}", &plan.fingerprint[..16]));
 		let scan = Scan { id: scan_id.clone(), plan_id: plan.id.clone(), findings };
 		let operation = Operation {
-			id: operation_id.clone(),
-			scan_id: scan_id.clone(),
-			phase: Str::new_static("completed"),
+			id:            operation_id.clone(),
+			scan_id:       scan_id.clone(),
+			phase:         Str::new_static("completed"),
 			finding_count: scan.findings.len(),
 		};
 		let finding_count = operation.finding_count;
 		let mut state = self.state.lock();
 		let state = state.as_mut().map_err(|()| Fault::Storage)?;
 		state.scans.insert(scan_id.clone(), scan.clone());
-		state.operations.insert(operation_id.clone(), operation.clone());
+		state
+			.operations
+			.insert(operation_id.clone(), operation.clone());
 		self.persist(state)?;
 		if let Some(output_root) = plan.output_root {
 			self.write_result(&output_root, &scan)?;
@@ -201,7 +213,7 @@ impl SecurityScanService {
 			output: Str::from(format!(
 				"Security scan {scan_id} completed as {operation_id}; {finding_count} finding(s)."
 			)),
-			data: json!({"operation": operation, "scan": {"id": scan_id, "finding_count": finding_count}}),
+			data:   json!({"operation": operation, "scan": {"id": scan_id, "finding_count": finding_count}}),
 		})
 	}
 
@@ -221,7 +233,7 @@ impl SecurityScanService {
 				"Security scan {}: {}; {} finding(s).",
 				operation.scan_id, operation.phase, operation.finding_count
 			)),
-			data: json!({"operation": operation}),
+			data:   json!({"operation": operation}),
 		})
 	}
 
@@ -229,7 +241,10 @@ impl SecurityScanService {
 		let operation_id = required(params.operation_id)?;
 		let mut state = self.state.lock();
 		let state = state.as_mut().map_err(|()| Fault::Storage)?;
-		let operation = state.operations.get_mut(&operation_id).ok_or(Fault::NotFound)?;
+		let operation = state
+			.operations
+			.get_mut(&operation_id)
+			.ok_or(Fault::NotFound)?;
 		let cancelled = operation.phase == "running";
 		if cancelled {
 			operation.phase = Str::new_static("cancelled");
@@ -242,7 +257,7 @@ impl SecurityScanService {
 			} else {
 				format!("No running operation {operation_id}.")
 			}),
-			data: json!({"operation_id": operation_id, "cancelled": cancelled}),
+			data:   json!({"operation_id": operation_id, "cancelled": cancelled}),
 		})
 	}
 
@@ -268,7 +283,7 @@ impl SecurityScanService {
 		Ok(Payload {
 			action: Action::Validate,
 			output: Str::from(format!("Finding {finding_id} validation is now {:?}.", status)),
-			data: json!({"finding": {"id": finding_id, "validation_status": status}}),
+			data:   json!({"finding": {"id": finding_id, "validation_status": status}}),
 		})
 	}
 
@@ -291,10 +306,7 @@ impl SecurityScanService {
 }
 
 impl SecurityScanControl for SecurityScanService {
-	fn execute(
-		&self,
-		params: Params,
-	) -> impl Future<Output = Result<Payload, Fault>> + Send + '_ {
+	fn execute(&self, params: Params) -> impl Future<Output = Result<Payload, Fault>> + Send + '_ {
 		let service = self.clone();
 		async move {
 			tokio::task::spawn_blocking(move || service.execute_sync(params))
@@ -305,7 +317,9 @@ impl SecurityScanControl for SecurityScanService {
 }
 
 fn required(value: Option<Str>) -> Result<Str, Fault> {
-	value.filter(|value| !value.trim().is_empty()).ok_or(Fault::InvalidArguments)
+	value
+		.filter(|value| !value.trim().is_empty())
+		.ok_or(Fault::InvalidArguments)
 }
 
 fn clean_paths(paths: Vec<Str>) -> Result<Vec<Str>, Fault> {
@@ -322,7 +336,9 @@ fn checked_relative(path: &str) -> Result<&Path, Fault> {
 	let path = Path::new(path);
 	if path.as_os_str().is_empty()
 		|| path.is_absolute()
-		|| path.components().any(|component| matches!(component, std::path::Component::ParentDir))
+		|| path
+			.components()
+			.any(|component| matches!(component, std::path::Component::ParentDir))
 	{
 		return Err(Fault::InvalidArguments);
 	}
@@ -337,11 +353,18 @@ fn scan_workspace(root: &Path, plan: &Plan) -> Result<Vec<Finding>, Fault> {
 		let relative = path.strip_prefix(root).map_err(|_| Fault::Storage)?;
 		let relative_text = relative.to_string_lossy();
 		if !plan.include_paths.is_empty()
-			&& !plan.include_paths.iter().any(|include| relative.starts_with(include.as_str()))
+			&& !plan
+				.include_paths
+				.iter()
+				.any(|include| relative.starts_with(include.as_str()))
 		{
 			continue;
 		}
-		if plan.exclude_paths.iter().any(|exclude| relative.starts_with(exclude.as_str())) {
+		if plan
+			.exclude_paths
+			.iter()
+			.any(|exclude| relative.starts_with(exclude.as_str()))
+		{
 			continue;
 		}
 		let metadata = fs::metadata(&path).map_err(|_| Fault::Storage)?;
@@ -349,7 +372,9 @@ fn scan_workspace(root: &Path, plan: &Plan) -> Result<Vec<Finding>, Fault> {
 			continue;
 		}
 		let bytes = fs::read(&path).map_err(|_| Fault::Storage)?;
-		let Ok(text) = std::str::from_utf8(&bytes) else { continue };
+		let Ok(text) = std::str::from_utf8(&bytes) else {
+			continue;
+		};
 		for (index, line) in text.lines().enumerate() {
 			let rule = if line.contains("-----BEGIN PRIVATE KEY-----") {
 				Some(("private-key", "Private key material is committed to the repository"))
@@ -358,15 +383,17 @@ fn scan_workspace(root: &Path, plan: &Plan) -> Result<Vec<Finding>, Fault> {
 			} else {
 				None
 			};
-			let Some((rule, summary)) = rule else { continue };
+			let Some((rule, summary)) = rule else {
+				continue;
+			};
 			let identity = format!("{relative_text}:{}:{rule}", index + 1);
 			let digest = Hash32::sum(identity.as_bytes()).to_hex();
 			findings.push(Finding {
-				id: Str::from(format!("finding-{}", &digest[..16])),
-				path: Str::from(relative_text.as_ref()),
-				line: index + 1,
-				rule: Str::new_static(rule),
-				summary: Str::new_static(summary),
+				id:         Str::from(format!("finding-{}", &digest[..16])),
+				path:       Str::from(relative_text.as_ref()),
+				line:       index + 1,
+				rule:       Str::new_static(rule),
+				summary:    Str::new_static(summary),
 				validation: None,
 			});
 		}
@@ -415,7 +442,10 @@ mod tests {
 	use super::*;
 
 	fn fixture() -> (PathBuf, PathBuf) {
-		let unique = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+		let unique = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("clock")
+			.as_nanos();
 		let root = std::env::temp_dir().join(format!("omp-security-{unique}"));
 		let state = std::env::temp_dir().join(format!("omp-security-state-{unique}"));
 		fs::create_dir_all(&root).expect("fixture root");
@@ -425,8 +455,7 @@ mod tests {
 	#[test]
 	fn preflight_start_status_and_validate_use_persistent_authority_state() {
 		let (root, state_dir) = fixture();
-		fs::write(root.join("leak.txt"), "-----BEGIN PRIVATE KEY-----\n")
-			.expect("security fixture");
+		fs::write(root.join("leak.txt"), "-----BEGIN PRIVATE KEY-----\n").expect("security fixture");
 		let service = SecurityScanService::new(root.clone(), &state_dir);
 		let preflight = service
 			.preflight(Params {
@@ -440,7 +469,9 @@ mod tests {
 			.start(Params { plan_id: Some(Str::new(plan_id)), ..empty_params(Action::Start) })
 			.expect("start");
 		assert_eq!(started.data["scan"]["finding_count"], 1);
-		let operation_id = started.data["operation"]["id"].as_str().expect("operation id");
+		let operation_id = started.data["operation"]["id"]
+			.as_str()
+			.expect("operation id");
 		let status = service
 			.status(Params {
 				operation_id: Some(Str::new(operation_id)),
@@ -457,11 +488,7 @@ mod tests {
 		assert_eq!(cancelled.data["cancelled"], false);
 		let scan_id = started.data["scan"]["id"].as_str().expect("scan id");
 		let persisted = service.state.lock();
-		let finding_id = persisted
-			.as_ref()
-			.expect("state")
-			.scans[scan_id]
-			.findings[0]
+		let finding_id = persisted.as_ref().expect("state").scans[scan_id].findings[0]
 			.id
 			.clone();
 		drop(persisted);
@@ -475,19 +502,20 @@ mod tests {
 			})
 			.expect("validate");
 		assert_eq!(validated.data["finding"]["validation_status"], "validated");
-		for action in [
-			Action::CloudScans,
-			Action::CloudStart,
-			Action::CloudStatus,
-			Action::CloudPull,
-		] {
-			assert!(matches!(
-				service.execute_sync(empty_params(action)),
-				Err(Fault::Unavailable)
-			));
+		for action in [Action::CloudScans, Action::CloudStart, Action::CloudStatus, Action::CloudPull]
+		{
+			assert!(matches!(service.execute_sync(empty_params(action)), Err(Fault::Unavailable)));
 		}
 		let reopened = SecurityScanService::new(root.clone(), &state_dir);
-		assert!(reopened.state.lock().as_ref().expect("reopened state").scans.contains_key(scan_id));
+		assert!(
+			reopened
+				.state
+				.lock()
+				.as_ref()
+				.expect("reopened state")
+				.scans
+				.contains_key(scan_id)
+		);
 		fs::remove_dir_all(root).expect("remove fixture");
 		fs::remove_dir_all(state_dir).expect("remove state");
 	}

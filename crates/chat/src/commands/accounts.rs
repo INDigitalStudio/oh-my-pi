@@ -70,7 +70,10 @@ fn logout_providers(cx: &PanelCx<'_>) -> Result<Vec<ProviderRow>, Str> {
 	let accounts = cx.services.accounts().map_err(|error| sf!("{error}"))?;
 	let mut providers: Vec<ProviderRow> = Vec::new();
 	for account in &accounts {
-		if providers.iter().any(|provider| provider.id == account.provider) {
+		if providers
+			.iter()
+			.any(|provider| provider.id == account.provider)
+		{
 			continue;
 		}
 		providers.push(ProviderRow {
@@ -152,7 +155,7 @@ fn pin_session(cx: &PanelCx<'_>, id: Option<&str>) -> PanelEvent {
 		return PanelEvent::Notice(sf!("Session \"{id}\" not found."));
 	};
 	PanelEvent::Command(HostCommand::Service(Mutation::PinSession {
-		id: row.id.clone(),
+		id:     row.id.clone(),
 		pinned: !row.pinned,
 	}))
 }
@@ -187,7 +190,7 @@ fn pin_account(cx: &PanelCx<'_>, provider: &str, account: Option<&str>) -> Panel
 	};
 	PanelEvent::Command(HostCommand::Service(Mutation::PinAccount {
 		account: row.clone(),
-		pinned: true,
+		pinned:  true,
 	}))
 }
 
@@ -269,21 +272,23 @@ mod tests {
 	use super::*;
 
 	fn provider(id: &'static str) -> ProviderRow {
-		ProviderRow { id: Str::new_static(id), name: Str::new_static(id), oauth: true, logged_in: false }
+		ProviderRow {
+			id:        Str::new_static(id),
+			name:      Str::new_static(id),
+			oauth:     true,
+			logged_in: false,
+		}
 	}
 
 	#[test]
 	fn pin_target_distinguishes_sessions_from_provider_accounts() {
 		let providers = [provider("anthropic")];
 		assert_eq!(pin_target(None, &providers), PinTarget::CurrentSession);
-		assert_eq!(
-			pin_target(Some(sf!("01J0ABC")), &providers),
-			PinTarget::Session(sf!("01J0ABC"))
-		);
-		assert_eq!(
-			pin_target(Some(sf!("anthropic")), &providers),
-			PinTarget::Account { provider: sf!("anthropic"), account: None }
-		);
+		assert_eq!(pin_target(Some(sf!("01J0ABC")), &providers), PinTarget::Session(sf!("01J0ABC")));
+		assert_eq!(pin_target(Some(sf!("anthropic")), &providers), PinTarget::Account {
+			provider: sf!("anthropic"),
+			account:  None,
+		});
 		assert_eq!(
 			pin_target(Some(sf!("anthropic  me@example.com")), &providers),
 			PinTarget::Account { provider: sf!("anthropic"), account: Some(sf!("me@example.com")) }

@@ -77,9 +77,9 @@ pub fn cache_invalidations(dom: &Dom) -> Vec<(Handle, CacheInvalidation)> {
 	found
 }
 
-/// pi `CacheInvalidationMarkerComponent` (`cache-invalidation-marker.ts:67-105`):
-/// blank row, a ten-cell rule and muted label, blank row. Too narrow to
-/// frame, only the label paints.
+/// pi `CacheInvalidationMarkerComponent`
+/// (`cache-invalidation-marker.ts:67-105`): blank row, a ten-cell rule and
+/// muted label, blank row. Too narrow to frame, only the label paints.
 #[must_use]
 pub fn cache_miss_marker(info: &CacheInvalidation) -> Component {
 	Box::new(CacheMissMarker::new(*info))
@@ -178,11 +178,23 @@ mod tests {
 	use super::*;
 
 	fn warm() -> UsageFacts {
-		UsageFacts { input: 900, output: 300, cache_read: 40_000, cache_write: 0, ..UsageFacts::default() }
+		UsageFacts {
+			input: 900,
+			output: 300,
+			cache_read: 40_000,
+			cache_write: 0,
+			..UsageFacts::default()
+		}
 	}
 
 	fn cold() -> UsageFacts {
-		UsageFacts { input: 900, output: 300, cache_read: 0, cache_write: 50_000, ..UsageFacts::default() }
+		UsageFacts {
+			input: 900,
+			output: 300,
+			cache_read: 0,
+			cache_write: 50_000,
+			..UsageFacts::default()
+		}
 	}
 
 	#[test]
@@ -235,7 +247,11 @@ mod tests {
 
 		let width = cell_width(&label);
 		let framed = Ui::from_root(cache_miss_marker(&info), width + 4, ctx.clone());
-		let row = frame_text(framed.frame()).lines().nth(1).unwrap().to_owned();
+		let row = frame_text(framed.frame())
+			.lines()
+			.nth(1)
+			.unwrap()
+			.to_owned();
 		assert_eq!(row, format!("{} {label}", rule(3)), "{row}");
 
 		let bare = Ui::from_root(cache_miss_marker(&info), width + 1, ctx);

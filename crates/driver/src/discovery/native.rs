@@ -2,8 +2,8 @@
 //!
 //! Discovery is intentionally narrow: an extension is a Python distribution
 //! root with `omp.toml`, a wheel-style `*.dist-info/omp.toml`, or a
-//! `pyproject.toml` containing `[tool.omp]`. JavaScript and TypeScript files are
-//! never inspected or inferred as extensions.
+//! `pyproject.toml` containing `[tool.omp]`. JavaScript and TypeScript files
+//! are never inspected or inferred as extensions.
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
@@ -239,8 +239,10 @@ fn collect_explicit(
 	let root = if canonical.is_dir() {
 		canonical
 	} else if canonical.is_file()
-		&& matches!(canonical.file_name().and_then(|name| name.to_str()), Some("omp.toml" | "pyproject.toml"))
-	{
+		&& matches!(
+			canonical.file_name().and_then(|name| name.to_str()),
+			Some("omp.toml" | "pyproject.toml")
+		) {
 		canonical
 			.parent()
 			.expect("a canonical manifest path has a parent")
@@ -284,7 +286,7 @@ fn collect_automatic(
 			.map_err(|source| NativeExtensionError::Scan { path: child.clone(), source })?;
 		if !canonical.starts_with(&trusted) {
 			return Err(NativeExtensionError::UntrustedAutomaticRoot {
-				path: canonical,
+				path:      canonical,
 				container: trusted,
 			});
 		}
@@ -327,12 +329,15 @@ fn load_manifest(root: &Path) -> Result<Option<LoadedManifest>, NativeExtensionE
 	if !pyproject.is_file() {
 		return Ok(None);
 	}
-	let text = fs::read_to_string(&pyproject).map_err(|source| {
-		NativeExtensionError::ReadManifest { path: pyproject.clone(), source }
-	})?;
+	let text = fs::read_to_string(&pyproject)
+		.map_err(|source| NativeExtensionError::ReadManifest { path: pyproject.clone(), source })?;
 	let document = toml::from_str::<toml::Value>(&text)
 		.map_err(|source| NativeExtensionError::PyProject { path: pyproject.clone(), source })?;
-	let Some(projected) = document.get("tool").and_then(|tool| tool.get("omp")).cloned() else {
+	let Some(projected) = document
+		.get("tool")
+		.and_then(|tool| tool.get("omp"))
+		.cloned()
+	else {
 		return Ok(None);
 	};
 	let manifest = projected
@@ -400,7 +405,7 @@ fn lower_manifest(
 		})?;
 		if !canonical_entry.starts_with(&root) {
 			return Err(NativeExtensionError::UntrustedAutomaticRoot {
-				path: canonical_entry,
+				path:      canonical_entry,
 				container: root.clone(),
 			});
 		}
@@ -408,7 +413,11 @@ fn lower_manifest(
 	let tools = declarations.tools.iter().filter_map(|row| {
 		let rev = u16::try_from(row.api.max(1)).ok()?;
 		Some(ToolDeclarationKey::new(
-			if row.key.is_empty() { row.id.clone() } else { row.key.clone() },
+			if row.key.is_empty() {
+				row.id.clone()
+			} else {
+				row.key.clone()
+			},
 			row.properties
 				.get("family")
 				.and_then(serde_json::Value::as_str)
@@ -428,10 +437,7 @@ fn lower_manifest(
 	});
 	let runtime_declarations = DeclarationSet::new(tools, hooks);
 	let digest = ArtifactDigest::new(Hash32::sum(text.as_bytes()).into_bytes());
-	let publisher = sf!(
-		"unsigned:path:{}",
-		Hash32::sum(root.to_string_lossy().as_bytes()).to_hex()
-	);
+	let publisher = sf!("unsigned:path:{}", Hash32::sum(root.to_string_lossy().as_bytes()).to_hex());
 	let layer = origin.layer();
 	let provenance = Provenance::new(
 		publisher,
@@ -480,8 +486,8 @@ fn resolve_entry(
 	}
 	Err(NativeExtensionError::MissingEntryModule {
 		extension: extension.clone(),
-		module: module.clone(),
-		root: root.to_path_buf(),
+		module:    module.clone(),
+		root:      root.to_path_buf(),
 	})
 }
 
@@ -495,8 +501,7 @@ mod tests {
 
 	fn extension(root: &Path, id: &str, default: bool) {
 		fs::create_dir_all(root.join("src/demo")).expect("module directory");
-		fs::write(root.join("src/demo/__init__.py"), "# inert test extension\n")
-			.expect("module");
+		fs::write(root.join("src/demo/__init__.py"), "# inert test extension\n").expect("module");
 		fs::write(
 			root.join("omp.toml"),
 			format!(
@@ -522,16 +527,12 @@ default = {default}
 		extension(&explicit, "test.explicit", false);
 		extension(&configured, "test.configured", false);
 		fs::create_dir_all(&project).expect("project");
-		let admitted = admit_native_extensions(
-			&project,
-			&home,
-			NativeAdmissionOptions {
-				explicit_roots: &[explicit],
-				mode: NativeLoadMode::ExplicitOnly,
-				include_workspace: true,
-				setting_overrides: &[],
-			},
-		)
+		let admitted = admit_native_extensions(&project, &home, NativeAdmissionOptions {
+			explicit_roots:    &[explicit],
+			mode:              NativeLoadMode::ExplicitOnly,
+			include_workspace: true,
+			setting_overrides: &[],
+		})
 		.expect("admission");
 		assert_eq!(admitted.len(), 1);
 		assert_eq!(admitted[0].spec.key.extension().as_str(), "test.explicit");
@@ -548,16 +549,12 @@ default = {default}
 		extension(&automatic, "test.priority", true);
 		fs::create_dir_all(&project).expect("project");
 
-		let admitted = admit_native_extensions(
-			&project,
-			&home,
-			NativeAdmissionOptions {
-				explicit_roots: &[explicit],
-				mode: NativeLoadMode::Merge,
-				include_workspace: true,
-				setting_overrides: &[],
-			},
-		)
+		let admitted = admit_native_extensions(&project, &home, NativeAdmissionOptions {
+			explicit_roots:    &[explicit],
+			mode:              NativeLoadMode::Merge,
+			include_workspace: true,
+			setting_overrides: &[],
+		})
 		.expect("admission");
 		assert_eq!(admitted.len(), 1);
 		assert_eq!(admitted[0].root.file_name().and_then(|name| name.to_str()), Some("explicit"));
@@ -570,16 +567,12 @@ default = {default}
 		let home = tree.path().join("home");
 		let project = tree.path().join("project");
 		extension(&project.join(".omp/extensions/project-ext"), "test.project", false);
-		let admitted = admit_native_extensions(
-			&project,
-			&home,
-			NativeAdmissionOptions {
-				explicit_roots: &[],
-				mode: NativeLoadMode::Merge,
-				include_workspace: false,
-				setting_overrides: &[],
-			},
-		)
+		let admitted = admit_native_extensions(&project, &home, NativeAdmissionOptions {
+			explicit_roots:    &[],
+			mode:              NativeLoadMode::Merge,
+			include_workspace: false,
+			setting_overrides: &[],
+		})
 		.expect("admission");
 		assert!(admitted.is_empty());
 	}
@@ -597,16 +590,12 @@ default = {default}
 		let container = project.join(".omp/extensions");
 		fs::create_dir_all(&container).expect("container");
 		symlink(&outside, container.join("escape")).expect("symlink");
-		let error = admit_native_extensions(
-			&project,
-			&home,
-			NativeAdmissionOptions {
-				explicit_roots: &[],
-				mode: NativeLoadMode::Merge,
-				include_workspace: true,
-				setting_overrides: &[],
-			},
-		)
+		let error = admit_native_extensions(&project, &home, NativeAdmissionOptions {
+			explicit_roots:    &[],
+			mode:              NativeLoadMode::Merge,
+			include_workspace: true,
+			setting_overrides: &[],
+		})
 		.expect_err("escape rejected");
 		assert!(matches!(error, NativeExtensionError::UntrustedAutomaticRoot { .. }));
 	}
@@ -617,18 +606,14 @@ default = {default}
 		let project = tree.path().join("project");
 		let root = tree.path().join("extension");
 		extension(&root, "test.settings", false);
-		let override_value = CliSettingOverride::parse("test.settings.enabled=true")
-			.expect("override");
-		let admitted = admit_native_extensions(
-			&project,
-			tree.path(),
-			NativeAdmissionOptions {
-				explicit_roots: &[root],
-				mode: NativeLoadMode::ExplicitOnly,
-				include_workspace: false,
-				setting_overrides: &[override_value],
-			},
-		)
+		let override_value =
+			CliSettingOverride::parse("test.settings.enabled=true").expect("override");
+		let admitted = admit_native_extensions(&project, tree.path(), NativeAdmissionOptions {
+			explicit_roots:    &[root],
+			mode:              NativeLoadMode::ExplicitOnly,
+			include_workspace: false,
+			setting_overrides: &[override_value],
+		})
 		.expect("admission");
 		let spec = &admitted[0].spec;
 		let con = omp_con::Ctx::new();
@@ -639,10 +624,7 @@ default = {default}
 			&spec.settings,
 		)
 		.expect("register before activation");
-		assert_eq!(
-			con.get("ext::test.settings::enabled").expect("convar"),
-			ConValue::Bool(true)
-		);
+		assert_eq!(con.get("ext::test.settings::enabled").expect("convar"), ConValue::Bool(true));
 	}
 
 	#[test]
@@ -651,8 +633,7 @@ default = {default}
 		let project = tree.path().join("project");
 		let root = tree.path().join("source");
 		fs::create_dir_all(root.join("src/demo")).expect("module directory");
-		fs::write(root.join("src/demo/__init__.py"), "# inert test extension\n")
-			.expect("module");
+		fs::write(root.join("src/demo/__init__.py"), "# inert test extension\n").expect("module");
 		fs::write(
 			root.join("pyproject.toml"),
 			r#"[project]
@@ -669,16 +650,12 @@ entry = "demo"
 		fs::write(root.join("extension.ts"), "throw new Error('must never load');")
 			.expect("TS source");
 
-		let admitted = admit_native_extensions(
-			&project,
-			tree.path(),
-			NativeAdmissionOptions {
-				explicit_roots: &[root],
-				mode: NativeLoadMode::ExplicitOnly,
-				include_workspace: false,
-				setting_overrides: &[],
-			},
-		)
+		let admitted = admit_native_extensions(&project, tree.path(), NativeAdmissionOptions {
+			explicit_roots:    &[root],
+			mode:              NativeLoadMode::ExplicitOnly,
+			include_workspace: false,
+			setting_overrides: &[],
+		})
 		.expect("Python manifest admission");
 		assert_eq!(admitted.len(), 1);
 		assert_eq!(admitted[0].spec.manifest.entry, "demo");
@@ -688,16 +665,12 @@ entry = "demo"
 	fn missing_explicit_root_is_a_typed_error() {
 		let tree = tempfile::tempdir().expect("tree");
 		let missing = tree.path().join("missing");
-		let error = admit_native_extensions(
-			tree.path(),
-			tree.path(),
-			NativeAdmissionOptions {
-				explicit_roots: &[missing],
-				mode: NativeLoadMode::ExplicitOnly,
-				include_workspace: false,
-				setting_overrides: &[],
-			},
-		)
+		let error = admit_native_extensions(tree.path(), tree.path(), NativeAdmissionOptions {
+			explicit_roots:    &[missing],
+			mode:              NativeLoadMode::ExplicitOnly,
+			include_workspace: false,
+			setting_overrides: &[],
+		})
 		.expect_err("missing root");
 		assert!(matches!(error, NativeExtensionError::MissingExplicitRoot { .. }));
 	}

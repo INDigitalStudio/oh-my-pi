@@ -120,7 +120,11 @@ fn output_preview(output: &str, expanded: bool) -> String {
 	}
 	let lines = output.lines().collect::<Vec<_>>();
 	let skipped = lines.len().saturating_sub(20);
-	let tail = lines.into_iter().skip(skipped).collect::<Vec<_>>().join("\n");
+	let tail = lines
+		.into_iter()
+		.skip(skipped)
+		.collect::<Vec<_>>()
+		.join("\n");
 	if skipped == 0 {
 		tail
 	} else {

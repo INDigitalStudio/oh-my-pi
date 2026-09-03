@@ -595,13 +595,12 @@ fn inference_settings(
 		.unwrap_or_default();
 	let home = env::var_os("HOME").map_or_else(|| cwd.clone(), std::path::PathBuf::from);
 	omp_inference::InferenceSettings {
-		retry:     omp_inference::settings::RetrySettings::from_con(ctx),
-		sampling:  omp_inference::settings::SamplingSettings::from_con(ctx),
-		providers: omp_inference::settings::ProviderRuntimeSettings::from_con(ctx),
-		model:     omp_catalog::settings::ModelSettings::from_con(ctx)
+		retry:                     omp_inference::settings::RetrySettings::from_con(ctx),
+		sampling:                  omp_inference::settings::SamplingSettings::from_con(ctx),
+		providers:                 omp_inference::settings::ProviderRuntimeSettings::from_con(ctx),
+		model:                     omp_catalog::settings::ModelSettings::from_con(ctx)
 			.resolve_path_scopes(&cwd, &home),
-		context_promotion_enabled:
-			omp_inference::pi_settings::AI_CONTEXT_PROMOTION_ENABLED.get(ctx),
+		context_promotion_enabled: omp_inference::pi_settings::AI_CONTEXT_PROMOTION_ENABLED.get(ctx),
 	}
 }
 

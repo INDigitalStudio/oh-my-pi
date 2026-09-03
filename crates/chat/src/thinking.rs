@@ -221,7 +221,10 @@ mod tests {
 	fn fence_close_requires_same_char_and_length() {
 		let text = "a\n````\ncode\n```\nstill code\n````\nb";
 		assert_eq!(format_thinking(text, true), "a...\nb");
-		assert_eq!(format_thinking("a\n``` has `tick`\nnot a fence", true), "a\n``` has `tick`\nnot a fence");
+		assert_eq!(
+			format_thinking("a\n``` has `tick`\nnot a fence", true),
+			"a\n``` has `tick`\nnot a fence"
+		);
 	}
 
 	#[test]

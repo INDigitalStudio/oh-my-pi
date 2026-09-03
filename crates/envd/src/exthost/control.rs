@@ -1525,7 +1525,9 @@ impl ConvarControlFactory {
 			let sequence = observer.sequence.fetch_add(1, Ordering::AcqRel) + 1;
 			let name = Str::new(name);
 			observer.latest.lock().insert(name.clone(), sequence);
-			let _ = observer.changes.send(ConvarChange { sequence, name, value: value.clone() });
+			let _ = observer
+				.changes
+				.send(ConvarChange { sequence, name, value: value.clone() });
 		});
 		Self { ctx, broker }
 	}
@@ -1553,10 +1555,7 @@ struct ConvarControlAuthority {
 #[async_trait]
 impl ControlAuthority for ConvarControlAuthority {
 	fn handles(&self, operation: &str) -> bool {
-		matches!(
-			operation,
-			"omp.convars.declare" | "omp.convars.get" | "omp.convars.observe"
-		)
+		matches!(operation, "omp.convars.declare" | "omp.convars.get" | "omp.convars.observe")
 	}
 
 	fn authorize(
@@ -1588,10 +1587,9 @@ impl ControlAuthority for ConvarControlAuthority {
 				self.snapshot(name)
 			},
 			"omp.convars.observe" => self.observe(&arguments).await,
-			_ => Err(ControlProtocolError::new(
-				"InvalidOperation",
-				"unknown convar CONTROL operation",
-			)),
+			_ => {
+				Err(ControlProtocolError::new("InvalidOperation", "unknown convar CONTROL operation"))
+			},
 		}
 	}
 
@@ -1627,8 +1625,7 @@ impl ConvarControlAuthority {
 			)
 		})?;
 		let (ty, default) = declaration_value(kind, default, arguments.get("values"))?;
-		let name =
-			omp_ext::config::extension_setting_convar_name(&self.identity.extension, key);
+		let name = omp_ext::config::extension_setting_convar_name(&self.identity.extension, key);
 		let spec = DynamicVarSpec {
 			name: name.clone(),
 			desc: arguments
@@ -1685,11 +1682,13 @@ impl ConvarControlAuthority {
 				},
 				Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {},
 				Err(broadcast::error::RecvError::Closed) => {
-					return Err(ControlProtocolError::new(
-						"ConvarObservationClosed",
-						"the convar observation stream closed",
-					)
-					.retryable(true));
+					return Err(
+						ControlProtocolError::new(
+							"ConvarObservationClosed",
+							"the convar observation stream closed",
+						)
+						.retryable(true),
+					);
 				},
 			}
 		}
@@ -1738,14 +1737,12 @@ fn declaration_value(
 			.ok_or_else(invalid),
 		"enum" => {
 			let default = default.as_str().ok_or_else(invalid)?;
-			let values = values
-				.and_then(Value::as_array)
-				.ok_or_else(|| {
-					ControlProtocolError::new(
-						"InvalidConvarDeclaration",
-						"enum convar declarations require a values array",
-					)
-				})?;
+			let values = values.and_then(Value::as_array).ok_or_else(|| {
+				ControlProtocolError::new(
+					"InvalidConvarDeclaration",
+					"enum convar declarations require a values array",
+				)
+			})?;
 			if !values.iter().any(|value| value.as_str() == Some(default)) {
 				return Err(ControlProtocolError::new(
 					"InvalidConvarDeclaration",
@@ -1754,10 +1751,9 @@ fn declaration_value(
 			}
 			Ok((TypeSpec::STR, ConValue::Str(Str::new(default))))
 		},
-		_ => Err(ControlProtocolError::new(
-			"InvalidConvarDeclaration",
-			"unknown extension convar kind",
-		)),
+		_ => {
+			Err(ControlProtocolError::new("InvalidConvarDeclaration", "unknown extension convar kind"))
+		},
 	}
 }
 
@@ -1786,9 +1782,7 @@ fn convar_json(value: &ConValue) -> Result<Value, ControlProtocolError> {
 					"non-finite convar values cannot cross CONTROL",
 				)
 			}),
-		ConValue::Str(value) | ConValue::Enum(value) => {
-			Ok(Value::String(value.to_string()))
-		},
+		ConValue::Str(value) | ConValue::Enum(value) => Ok(Value::String(value.to_string())),
 		ConValue::Duration(value) => Ok(Value::String(value.to_string())),
 		ConValue::List(values) => values
 			.iter()
@@ -1821,10 +1815,9 @@ fn control_convar_error(source: omp_con::ConError) -> ControlProtocolError {
 					"got": got,
 				}))
 		},
-		_ => ControlProtocolError::new(
-			"ConvarError",
-			"the control plane rejected the convar operation",
-		),
+		_ => {
+			ControlProtocolError::new("ConvarError", "the control plane rejected the convar operation")
+		},
 	}
 }
 
@@ -3102,11 +3095,7 @@ mod convar_tests {
 	}
 
 	fn context(identity: &Arc<ControlConnectionIdentity>, request_id: u64) -> ControlRequestContext {
-		ControlRequestContext {
-			connection: Arc::clone(identity),
-			request_id,
-			invocation: None,
-		}
+		ControlRequestContext { connection: Arc::clone(identity), request_id, invocation: None }
 	}
 
 	fn routed_authority(
@@ -3114,10 +3103,7 @@ mod convar_tests {
 		identity: Arc<ControlConnectionIdentity>,
 	) -> Arc<dyn ControlAuthority> {
 		let convars = factory.bind(identity).expect("bind convar authority");
-		Arc::new(CompositeControlAuthority::new(
-			[Arc::clone(&convars)],
-			convars,
-		))
+		Arc::new(CompositeControlAuthority::new([Arc::clone(&convars)], convars))
 	}
 
 	#[tokio::test]
@@ -3143,10 +3129,7 @@ mod convar_tests {
 			.await
 			.expect("declare convar");
 		assert_eq!(declared["name"], "ext::dev.example.demo::enabled");
-		assert_eq!(
-			ctx.get("ext::dev.example.demo::enabled"),
-			Some(ConValue::Bool(false)),
-		);
+		assert_eq!(ctx.get("ext::dev.example.demo::enabled"), Some(ConValue::Bool(false)),);
 
 		let observed = authority.request(
 			context(&identity, 2),
@@ -3158,12 +3141,7 @@ mod convar_tests {
 		);
 		let update = async {
 			tokio::task::yield_now().await;
-			ctx
-				.set(
-					"ext::dev.example.demo::enabled",
-					ConValue::Bool(true),
-					Origin::Session,
-				)
+			ctx.set("ext::dev.example.demo::enabled", ConValue::Bool(true), Origin::Session)
 				.expect("change convar");
 		};
 		let (observed, ()) = tokio::join!(observed, update);

@@ -35,11 +35,7 @@ fn output_tail(output: &str, expanded: bool) -> Option<(Option<String>, String)>
 	);
 	// `lines()` strips `\n` and `\r\n` alike, so the window is rejoined from
 	// the logical lines rather than sliced at a computed byte offset.
-	let tail = output
-		.lines()
-		.skip(skipped)
-		.collect::<Vec<_>>()
-		.join("\n");
+	let tail = output.lines().skip(skipped).collect::<Vec<_>>().join("\n");
 	Some((Some(marker), tail))
 }
 
@@ -69,7 +65,9 @@ impl Card for BashCard {
 		let failed = view
 			.fault::<omp_tools::shell::Fault>()
 			.and_then(|fault| match fault {
-				omp_tools::shell::Fault::CommandFailed { payload } => serde_json::to_value(payload).ok(),
+				omp_tools::shell::Fault::CommandFailed { payload } => {
+					serde_json::to_value(payload).ok()
+				},
 				_ => None,
 			});
 		let result = failed.or_else(|| typed_result::<omp_tools::shell::Payload>(view));
@@ -237,7 +235,11 @@ mod tests {
 	}
 
 	fn rows(view: &CardView<'_>, expanded: bool) -> Vec<String> {
-		let ui = Ui::from_root(BashCard.render(view, expanded, &UiContext::default()), 100, UiContext::default());
+		let ui = Ui::from_root(
+			BashCard.render(view, expanded, &UiContext::default()),
+			100,
+			UiContext::default(),
+		);
 		(0..ui.frame().size().height)
 			.map(|y| frame_row_text(ui.frame(), y))
 			.collect()
@@ -320,7 +322,10 @@ mod tests {
 			started: None,
 		};
 		let collapsed = rows_join(&view, false);
-		assert!(collapsed.contains("… (15 earlier lines, showing 10 of 25) (ctrl+o to expand)"), "{collapsed}");
+		assert!(
+			collapsed.contains("… (15 earlier lines, showing 10 of 25) (ctrl+o to expand)"),
+			"{collapsed}"
+		);
 		assert!(collapsed.contains("line 25") && !collapsed.contains("line 15 "), "{collapsed}");
 		assert!(collapsed.contains("Wall: 0.18s"), "{collapsed}");
 		let expanded = rows_join(&view, true);

@@ -123,15 +123,15 @@ impl SubagentSpawner for DriverSubagentSpawner {
 			let handle = prepared.handle;
 			let id = prepared.id.clone();
 			let fallback = ChildResult {
-				id: id.clone(),
-				agent: prepared.agent.clone(),
-				text: Str::default(),
+				id:           id.clone(),
+				agent:        prepared.agent.clone(),
+				text:         Str::default(),
 				session_path: Str::new(prepared.session_path.to_string_lossy()),
-				tokens_in: 0,
-				tokens_out: 0,
-				output: None,
-				workspace: None,
-				error: None,
+				tokens_in:    0,
+				tokens_out:   0,
+				output:       None,
+				workspace:    None,
+				error:        None,
 			};
 			let factory = move |cancel| spawn_child_task(prepared.clone(), cancel);
 			if !self.jobs.attach_restartable(parent.dom(), handle, factory) {
@@ -145,7 +145,8 @@ impl SubagentSpawner for DriverSubagentSpawner {
 		for (id, mut fallback) in pending {
 			let record = {
 				let mut parent = self.parent.lock().await;
-				self.jobs
+				self
+					.jobs
 					.wait(&mut parent, Some(std::slice::from_ref(&id)))
 					.await
 					.map_err(|source| TaskFault { message: Str::new(source.to_string()) })?
@@ -275,7 +276,10 @@ impl SessionTool for TaskSessionTool {
 				let agent = prepared.agent.clone();
 				let session_path = prepared.session_path.clone();
 				let factory = move |cancel| spawn_child_task(prepared.clone(), cancel);
-				if !cx.jobs.attach_restartable(cx.session.dom(), handle, factory) {
+				if !cx
+					.jobs
+					.attach_restartable(cx.session.dom(), handle, factory)
+				{
 					let fault = serde_json::value::to_raw_value(&TaskFault {
 						message: Str::new_static("subagent job could not be attached"),
 					})?;
@@ -400,9 +404,8 @@ pub async fn spawn_child(
 			message: Str::new_static("subagent job disappeared before settlement"),
 		})?;
 	if let Some(output) = record.output {
-		return serde_json::from_str(output.get()).map_err(|source| SpawnError::Workspace {
-			message: Str::new(source.to_string()),
-		});
+		return serde_json::from_str(output.get())
+			.map_err(|source| SpawnError::Workspace { message: Str::new(source.to_string()) });
 	}
 	Err(SpawnError::Workspace {
 		message: record
@@ -485,7 +488,7 @@ fn prepare_child(
 		&& parent_depth >= u32::try_from(parent_settings.max_recursion_depth).unwrap_or(u32::MAX)
 	{
 		return Err(SpawnError::RecursionDepth {
-			depth: parent_depth,
+			depth:   parent_depth,
 			maximum: i32::from(parent_settings.max_recursion_depth),
 		});
 	}
@@ -537,11 +540,11 @@ fn prepare_child(
 		.to_string();
 	let cause = parent.head().ok_or(SpawnError::MissingParentHead)?;
 	let txn = jobs::insert(parent.dom(), cause, JobSpec {
-		id: id.clone(),
-		kind: Str::new_static("subagent"),
-		owner: Str::new(request.owner),
+		id:      id.clone(),
+		kind:    Str::new_static("subagent"),
+		owner:   Str::new(request.owner),
 		started: Str::new(started),
-		agent: Some(agent.clone()),
+		agent:   Some(agent.clone()),
 	})
 	.ok_or(SpawnError::MissingJobs)?;
 	parent.patch(txn)?;
@@ -578,13 +581,13 @@ fn spawn_child_task(
 		match run_child(prepared).await {
 			Ok(execution) => JobSettlement {
 				status: execution.status,
-				error: execution.result.error.clone(),
+				error:  execution.result.error.clone(),
 				output: serde_json::value::to_raw_value(&execution.result).ok(),
 			},
 			Err(source) => JobSettlement {
 				status: Str::new_static("failed"),
 				output: None,
-				error: Some(Str::new(source.to_string())),
+				error:  Some(Str::new(source.to_string())),
 			},
 		}
 	})
@@ -603,7 +606,11 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 			session: Some(prepared.session_path.clone()),
 			sessions_dir: Some(prepared.sessions_dir.clone()),
 			sessions: Some(Arc::clone(&prepared.sessions)),
-			session_name: prepared.child.name.clone().or_else(|| Some(prepared.id.clone())),
+			session_name: prepared
+				.child
+				.name
+				.clone()
+				.or_else(|| Some(prepared.id.clone())),
 			model_override: true,
 			output_schema: prepared.child.output_schema.clone(),
 			schema_mode: prepared.child.schema_mode,
@@ -653,16 +660,16 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 	};
 	let (output, schema_error) =
 		structured_output(&prepared.child, &child_session, turn.assistant_text.as_str());
-	let cancelled = (turn.stop == TurnStop::Cancelled)
-		.then(|| Str::new_static("subagent was cancelled"));
+	let cancelled =
+		(turn.stop == TurnStop::Cancelled).then(|| Str::new_static("subagent was cancelled"));
 	let error = cancelled.or(schema_error);
 	let workspace = match isolation {
 		Some(isolation) if error.is_some() => {
 			Some(discard_isolation(&prepared.env, isolation).await?)
 		},
-		Some(isolation) => Some(
-			finish_isolation(&prepared.env, isolation, &prepared.settings).await?,
-		),
+		Some(isolation) => {
+			Some(finish_isolation(&prepared.env, isolation, &prepared.settings).await?)
+		},
 		None => None,
 	};
 	let status = child_status(turn.stop, error.as_ref());
@@ -690,11 +697,11 @@ struct IsolationRun {
 async fn create_isolation(env: &EnvClient, id: &Str) -> Result<IsolationRun, SpawnError> {
 	let result = env
 		.create_worktree(CreateWorktree {
-			name: format!("subagent-{id}"),
-			base: None,
-			paths: Vec::new(),
+			name:      format!("subagent-{id}"),
+			base:      None,
+			paths:     Vec::new(),
 			owner_pid: std::process::id(),
-			props: None,
+			props:     None,
 		})
 		.await?;
 	let worktree = result.worktree.ok_or_else(|| SpawnError::Workspace {
@@ -720,10 +727,10 @@ async fn finish_isolation(
 	};
 	let result = env
 		.merge_worktree(MergeWorktree {
-			id: isolation.id.to_string(),
+			id:      isolation.id.to_string(),
 			dry_run: !settings.isolation.apply,
-			mode: mode as i32,
-			props: None,
+			mode:    mode as i32,
+			props:   None,
 		})
 		.await?;
 	let patch = (!result.artifact_hash.is_empty()).then(|| {
@@ -746,13 +753,7 @@ async fn finish_isolation(
 	if settings.isolation.merge == TaskIsolationMerge::Patch {
 		destroy_isolation(env, isolation.id.as_str()).await?;
 	}
-	Ok(WorkspaceOutcome {
-		worktree: isolation.id,
-		patch,
-		branch,
-		applied,
-		conflicts,
-	})
+	Ok(WorkspaceOutcome { worktree: isolation.id, patch, branch, applied, conflicts })
 }
 
 async fn discard_isolation(
@@ -761,21 +762,17 @@ async fn discard_isolation(
 ) -> Result<WorkspaceOutcome, SpawnError> {
 	destroy_isolation(env, isolation.id.as_str()).await?;
 	Ok(WorkspaceOutcome {
-		worktree: isolation.id,
-		patch: None,
-		branch: None,
-		applied: false,
+		worktree:  isolation.id,
+		patch:     None,
+		branch:    None,
+		applied:   false,
 		conflicts: Vec::new(),
 	})
 }
 
 async fn destroy_isolation(env: &EnvClient, id: &str) -> Result<(), SpawnError> {
-	env.destroy_worktree(DestroyWorktree {
-		id: id.to_owned(),
-		force: true,
-		props: None,
-	})
-	.await?;
+	env.destroy_worktree(DestroyWorktree { id: id.to_owned(), force: true, props: None })
+		.await?;
 	Ok(())
 }
 
@@ -932,7 +929,10 @@ fn structured_output(
 	}
 }
 
-fn terminal_yield(session: &Session, last_turn: &str) -> (Option<serde_json::Value>, Option<String>) {
+fn terminal_yield(
+	session: &Session,
+	last_turn: &str,
+) -> (Option<serde_json::Value>, Option<String>) {
 	let mut terminal = None;
 	for handle in session.dom().handles() {
 		let Some(node) = session.dom().get(handle) else {
@@ -952,10 +952,11 @@ fn terminal_yield(session: &Session, last_turn: &str) -> (Option<serde_json::Val
 		}) else {
 			continue;
 		};
-		let raw = input
-			.content
-			.as_deref()
-			.or_else(|| input.prop(&PropKey::from(PropId::Text)).and_then(Value::as_str));
+		let raw = input.content.as_deref().or_else(|| {
+			input
+				.prop(&PropKey::from(PropId::Text))
+				.and_then(Value::as_str)
+		});
 		let Some(raw) = raw else { continue };
 		let Ok(params) = serde_json::from_str::<YieldParams>(raw) else {
 			continue;
@@ -969,10 +970,9 @@ fn terminal_yield(session: &Session, last_turn: &str) -> (Option<serde_json::Val
 			ResultEnvelope::LastTurn {} if !last_turn.is_empty() => {
 				(Some(serde_json::Value::String(last_turn.to_owned())), None)
 			},
-			ResultEnvelope::LastTurn {} => (
-				None,
-				Some(super::yield_driver::WARNING_NULL_YIELD.to_owned()),
-			),
+			ResultEnvelope::LastTurn {} => {
+				(None, Some(super::yield_driver::WARNING_NULL_YIELD.to_owned()))
+			},
 		});
 	}
 	terminal.unwrap_or((None, None))
@@ -1062,17 +1062,17 @@ mod tests {
 
 	fn request_with_schema(mode: SchemaMode) -> ChildRequest {
 		ChildRequest {
-			task: Str::new_static("return an object"),
-			name: None,
-			agent: None,
-			effort: None,
+			task:          Str::new_static("return an object"),
+			name:          None,
+			agent:         None,
+			effort:        None,
 			output_schema: Some(serde_json::json!({
 				"type": "object",
 				"required": ["ok"],
 				"properties": {"ok": {"type": "boolean"}},
 			})),
-			schema_mode: Some(mode),
-			isolated: None,
+			schema_mode:   Some(mode),
+			isolated:      None,
 		}
 	}
 
@@ -1083,13 +1083,13 @@ mod tests {
 			.set(&ctx, vec![Str::new_static("review")])
 			.expect("disabled agents");
 		let children = vec![ChildRequest {
-			task: Str::new_static("work"),
-			name: None,
-			agent: Some(Str::new_static("Review")),
-			effort: None,
+			task:          Str::new_static("work"),
+			name:          None,
+			agent:         Some(Str::new_static("Review")),
+			effort:        None,
 			output_schema: None,
-			schema_mode: None,
-			isolated: None,
+			schema_mode:   None,
+			isolated:      None,
 		}];
 		assert!(matches!(
 			admit_batch(&ctx, &JobBoard::new(), &children),
@@ -1104,13 +1104,13 @@ mod tests {
 			.set(&ctx, 1)
 			.expect("concurrency");
 		let child = ChildRequest {
-			task: Str::new_static("work"),
-			name: None,
-			agent: None,
-			effort: None,
+			task:          Str::new_static("work"),
+			name:          None,
+			agent:         None,
+			effort:        None,
 			output_schema: None,
-			schema_mode: None,
-			isolated: None,
+			schema_mode:   None,
+			isolated:      None,
 		};
 		assert!(matches!(
 			admit_batch(&ctx, &JobBoard::new(), &[child.clone(), child]),
@@ -1121,11 +1121,9 @@ mod tests {
 	#[test]
 	fn strict_schema_turn_without_yield_is_a_failed_child() {
 		let temp = tempfile::tempdir().expect("temporary directory");
-		let session = Session::create(
-			temp.path().join("child.oms"),
-			omp_session::ComponentRegistry::standard(),
-		)
-		.expect("child session");
+		let session =
+			Session::create(temp.path().join("child.oms"), omp_session::ComponentRegistry::standard())
+				.expect("child session");
 		let (output, error) =
 			structured_output(&request_with_schema(SchemaMode::Strict), &session, "plain text");
 		assert_eq!(output.expect("schema verdict").status, OutputStatus::Invalid);
@@ -1135,16 +1133,11 @@ mod tests {
 	#[test]
 	fn permissive_schema_turn_keeps_invalid_verdict_without_failing_child() {
 		let temp = tempfile::tempdir().expect("temporary directory");
-		let session = Session::create(
-			temp.path().join("child.oms"),
-			omp_session::ComponentRegistry::standard(),
-		)
-		.expect("child session");
-		let (output, error) = structured_output(
-			&request_with_schema(SchemaMode::Permissive),
-			&session,
-			"plain text",
-		);
+		let session =
+			Session::create(temp.path().join("child.oms"), omp_session::ComponentRegistry::standard())
+				.expect("child session");
+		let (output, error) =
+			structured_output(&request_with_schema(SchemaMode::Permissive), &session, "plain text");
 		assert_eq!(output.expect("schema verdict").status, OutputStatus::Invalid);
 		assert!(error.is_none());
 	}
@@ -1158,15 +1151,12 @@ mod tests {
 		omp_con::AI_THINKING
 			.set(&ctx, Str::new_static("xhigh"))
 			.expect("thinking");
-		let mut settings = TaskSettings {
-			max_effort: TaskEffortCeiling::Low,
-			..TaskSettings::default()
-		};
+		let mut settings =
+			TaskSettings { max_effort: TaskEffortCeiling::Low, ..TaskSettings::default() };
 		settings
 			.agent_model_overrides
 			.insert(Str::new_static("Review"), Str::new_static("agent/model"));
-		configure_child_route(&ctx, &settings, "review", Some(TaskEffort::Hi))
-			.expect("child route");
+		configure_child_route(&ctx, &settings, "review", Some(TaskEffort::Hi)).expect("child route");
 		assert_eq!(omp_con::AI_MODEL.get(&ctx).as_str(), "agent/model");
 		assert_eq!(omp_con::AI_THINKING.get(&ctx).as_str(), "low");
 	}
@@ -1174,23 +1164,18 @@ mod tests {
 	#[tokio::test]
 	async fn idle_ttl_zero_keeps_child_live_and_nonzero_reaps_after_boundary() {
 		let temp = tempfile::tempdir().expect("tempdir");
-		let session = Session::create(
-			temp.path().join("idle.oms"),
-			omp_session::ComponentRegistry::standard(),
-		)
-		.expect("session");
+		let session =
+			Session::create(temp.path().join("idle.oms"), omp_session::ComponentRegistry::standard())
+				.expect("session");
 		let registry = Arc::new(crate::sessions::SessionRegistry::new());
 		let (up, _) = flume::unbounded();
 		let register = |id: &'static str| {
-			registry.register(
-				Str::new_static(id),
-				crate::sessions::KernelHandle {
-					id: crate::sessions::SessionId::new(Str::new_static(id)),
-					name: Str::new_static(id),
-					up: up.clone(),
-					snapshot: Arc::new(parking_lot::RwLock::new(session.dom().snapshot())),
-				},
-			);
+			registry.register(Str::new_static(id), crate::sessions::KernelHandle {
+				id:       crate::sessions::SessionId::new(Str::new_static(id)),
+				name:     Str::new_static(id),
+				up:       up.clone(),
+				snapshot: Arc::new(parking_lot::RwLock::new(session.dom().snapshot())),
+			});
 		};
 		register("kept");
 		schedule_idle_park(
@@ -1205,8 +1190,16 @@ mod tests {
 			1,
 		);
 		tokio::time::sleep(Duration::from_millis(10)).await;
-		assert!(registry.lookup(crate::sessions::SessionId::from_ref("kept")).is_some());
-		assert!(registry.lookup(crate::sessions::SessionId::from_ref("reaped")).is_none());
+		assert!(
+			registry
+				.lookup(crate::sessions::SessionId::from_ref("kept"))
+				.is_some()
+		);
+		assert!(
+			registry
+				.lookup(crate::sessions::SessionId::from_ref("reaped"))
+				.is_none()
+		);
 		assert_eq!(idle_park_delay(420_000), Some(Duration::from_secs(420)));
 	}
 
