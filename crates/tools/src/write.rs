@@ -2,9 +2,8 @@
 
 use std::{
 	collections::BTreeMap,
-	fmt::{self, Display, Write as _},
+	fmt::Write as _,
 	future,
-	future::Future,
 	sync::{
 		Arc,
 		atomic::{AtomicU8, Ordering},
@@ -256,20 +255,28 @@ pub struct Payload {
 }
 
 /// Durable typed `write@1` failure.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, thiserror::Error)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fault {
 	/// A URI scheme has no writable resource implementation yet.
+	#[error("{scheme}:// targets are not supported yet")]
 	UnsupportedScheme {
 		/// Lowercase URI scheme without punctuation.
 		scheme: Str,
 	},
 	/// A malformed URI-like path was refused instead of becoming a local file.
+	#[error("{message}")]
 	UriLikeTarget {
 		/// Exact model-facing diagnostic.
 		message: Str,
 	},
 	/// An empty write was accidentally addressed to a read range.
+	#[error(
+		"write target '{target}' ends with a read-tool selector ':{selector}' and no such file \
+		 exists — refusing to create a literal file by that name. If you meant to read it, use \
+		 read({{ path: \"{target}\" }}). If you truly intend to create this file, pass its contents \
+		 in `content` (a non-empty write is never blocked)."
+	)]
 	ReadSelectorMisfire {
 		/// Original authored target.
 		target:   Str,
@@ -277,6 +284,11 @@ pub enum Fault {
 		selector: Str,
 	},
 	/// A semicolon-joined multi-read expression was passed as one write target.
+	#[error(
+		"write target '{target}' is a semicolon-joined list of {count} read-tool selectors, not a \
+		 filesystem path — refusing to create it. write creates a single file; issue one read() per \
+		 path to read these ranges (e.g. read({{ path: \"<one path>:<range>\" }}))."
+	)]
 	ReadSelectorListMisfire {
 		/// Original authored target.
 		target: Str,
@@ -284,37 +296,11 @@ pub enum Fault {
 		count:  usize,
 	},
 	/// The document resource rejected the request without changing the target.
+	#[error("{message}")]
 	Document {
 		/// Exact resource-owned explanation.
 		message: Str,
 	},
-}
-
-impl Display for Fault {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::UnsupportedScheme { scheme } => {
-				write!(formatter, "{scheme}:// targets are not supported yet")
-			},
-			Self::UriLikeTarget { message } | Self::Document { message } => {
-				formatter.write_str(message)
-			},
-			Self::ReadSelectorMisfire { target, selector } => write!(
-				formatter,
-				"write target '{target}' ends with a read-tool selector ':{selector}' and no such \
-				 file exists — refusing to create a literal file by that name. If you meant to read \
-				 it, use read({{ path: \"{target}\" }}). If you truly intend to create this file, \
-				 pass its contents in `content` (a non-empty write is never blocked)."
-			),
-			Self::ReadSelectorListMisfire { target, count } => write!(
-				formatter,
-				"write target '{target}' is a semicolon-joined list of {count} read-tool selectors, \
-				 not a filesystem path — refusing to create it. write creates a single file; issue \
-				 one read() per path to read these ranges (e.g. read({{ path: \"<one path>:<range>\" \
-				 }}))."
-			),
-		}
-	}
 }
 
 /// Resource failure classification for the effectful whole-file transaction.

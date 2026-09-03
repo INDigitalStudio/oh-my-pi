@@ -1,12 +1,6 @@
 //! Interactive question selection with a host-provided presentation seam.
 
-use std::{
-	collections::HashSet,
-	future,
-	future::Future,
-	pin::Pin,
-	sync::Arc,
-};
+use std::{collections::HashSet, future, future::Future, pin::Pin, sync::Arc};
 
 use async_stream::stream;
 use async_trait::async_trait;

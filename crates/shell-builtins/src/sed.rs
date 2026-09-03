@@ -5029,13 +5029,9 @@ pub mod error_handling {
 	// SPDX-License-Identifier: MIT
 	// Copyright (c) 2025 Diomidis Spinellis
 
-	use std::{
-		error,
-		fmt::{self, Display},
-		io, num,
-		rc::Rc,
-		str, string,
-	};
+	use std::{io, num, rc::Rc, str, string};
+
+	use thiserror::Error;
 
 	use crate::sed::{
 		command::ProcessingContext, script_char_provider::ScriptCharProvider,
@@ -5043,64 +5039,102 @@ pub mod error_handling {
 	};
 
 	/// Error reported while compiling or executing a sed program.
-	#[derive(Debug)]
-	pub struct SedError {
-		code:    i32,
-		message: String,
+	#[derive(Debug, Error)]
+	pub enum SedError {
+		/// A message produced by sed's parser or evaluator.
+		#[error("{message}")]
+		Message { code: i32, message: String },
+		/// A direct I/O failure.
+		#[error("{source}")]
+		Io {
+			#[source]
+			source: io::Error,
+		},
+		/// An I/O failure whose observable message is already contextual.
+		#[error("{message}")]
+		ContextualIo {
+			message: String,
+			#[source]
+			source:  io::Error,
+		},
+		/// Invalid UTF-8 input.
+		#[error("{source}")]
+		Utf8 {
+			#[source]
+			source: str::Utf8Error,
+		},
+		/// Invalid owned UTF-8 input.
+		#[error("{source}")]
+		FromUtf8 {
+			#[source]
+			source: string::FromUtf8Error,
+		},
+		/// Invalid integer input.
+		#[error("{source}")]
+		ParseInt {
+			#[source]
+			source: num::ParseIntError,
+		},
+		/// Invalid regular expression.
+		#[error("{source}")]
+		Regex {
+			#[source]
+			source: fancy_regex::Error,
+		},
 	}
 
 	impl SedError {
 		/// Creates an error carrying sed's observable exit status.
 		pub fn new(code: i32, message: impl ToString) -> Self {
-			Self { code, message: message.to_string() }
+			Self::Message { code, message: message.to_string() }
 		}
 
 		/// Creates an I/O error while retaining its descriptive context.
-		pub fn io(_kind: io::ErrorKind, message: impl ToString) -> Self {
-			Self::new(2, message)
+		pub fn io(message: impl ToString, source: io::Error) -> Self {
+			Self::ContextualIo { message: message.to_string(), source }
 		}
 
 		/// Returns the exit status associated with this failure.
 		pub const fn code(&self) -> i32 {
-			self.code
+			match self {
+				Self::Message { code, .. } => *code,
+				Self::ParseInt { .. } => 1,
+				Self::Io { .. }
+				| Self::ContextualIo { .. }
+				| Self::Utf8 { .. }
+				| Self::FromUtf8 { .. }
+				| Self::Regex { .. } => 2,
+			}
 		}
 	}
-
-	impl Display for SedError {
-		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-			f.write_str(&self.message)
-		}
-	}
-
-	impl error::Error for SedError {}
 
 	impl From<io::Error> for SedError {
-		fn from(error: io::Error) -> Self {
-			Self::new(2, error)
+		fn from(source: io::Error) -> Self {
+			Self::Io { source }
 		}
 	}
 
 	impl From<str::Utf8Error> for SedError {
-		fn from(error: str::Utf8Error) -> Self {
-			Self::new(2, error)
+		fn from(source: str::Utf8Error) -> Self {
+			Self::Utf8 { source }
 		}
 	}
 
 	impl From<string::FromUtf8Error> for SedError {
-		fn from(error: string::FromUtf8Error) -> Self {
-			Self::new(2, error)
+		fn from(source: string::FromUtf8Error) -> Self {
+			Self::FromUtf8 { source }
 		}
 	}
 
 	impl From<num::ParseIntError> for SedError {
-		fn from(error: num::ParseIntError) -> Self {
-			Self::new(1, error)
+		fn from(source: num::ParseIntError) -> Self {
+			Self::ParseInt { source }
 		}
 	}
 
 	impl From<fancy_regex::Error> for SedError {
-		fn from(error: fancy_regex::Error) -> Self {
-			Self::new(2, error)
+		fn from(source: fancy_regex::Error) -> Self {
+			Self::Regex { source }
 		}
 	}
 
@@ -5115,7 +5149,31 @@ pub mod error_handling {
 
 	impl<T> IoContext<T> for io::Result<T> {
 		fn map_err_context(self, context: impl FnOnce() -> String) -> SedResult<T> {
-			self.map_err(|error| SedError::new(2, format!("{}: {error}", context())))
+			self.map_err(|source| SedError::ContextualIo {
+				message: format!("{}: {source}", context()),
+				source,
+			})
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::error::Error as _;
+
+		use super::*;
+
+		#[test]
+		fn sed_errors_preserve_messages_codes_and_typed_sources() {
+			let direct = SedError::from(io::Error::new(io::ErrorKind::NotFound, "missing input"));
+			assert_eq!(direct.to_string(), "missing input");
+			assert_eq!(direct.code(), 2);
+			assert_eq!(direct.source().map(ToString::to_string).as_deref(), Some("missing input"));
+
+			let contextual = Err::<(), _>(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+				.map_err_context(|| "opening source".to_owned())
+				.expect_err("contextual I/O failure");
+			assert_eq!(contextual.to_string(), "opening source: denied");
+			assert_eq!(contextual.source().map(ToString::to_string).as_deref(), Some("denied"));
 		}
 	}
 
@@ -7558,12 +7616,12 @@ pub mod in_place {
 				Ok(_) => {},
 				Err(e) => {
 					return Err(SedError::io(
-						e.error.kind(),
 						format!(
 							"error persisting temporary file {} to {}",
 							e.file.path().quote(),
 							orig.quote()
 						),
+						e.error,
 					));
 				},
 			}

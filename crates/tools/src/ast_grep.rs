@@ -80,14 +80,14 @@ pub struct Advisory {
 /// Paginated structural-search result returned to the agent.
 pub struct Payload {
 	/// Current page of matches in stable path and source order.
-	pub matches:    Vec<Match>,
+	pub matches:        Vec<Match>,
 	/// Per-file failures that did not prevent other targets from being searched.
-	pub advisories: Vec<Advisory>,
+	pub advisories:     Vec<Advisory>,
 	/// Number of matches across all targets before pagination.
-	pub total:      usize,
+	pub total:          usize,
 	/// `skip` value that resumes at the next page, or `None` when this is the
 	/// final page.
-	pub next_skip:  Option<usize>,
+	pub next_skip:      Option<usize>,
 	/// Files the search opened, including those that produced an advisory
 	/// (pi `filesSearched`); lifted `@1` calls did not record it.
 	#[serde(default)]
@@ -263,10 +263,10 @@ fn lift_cursor_to_skip(from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall>
 	let raw_args = serde_json::to_vec(&raw_args).ok()?;
 	let verdict = match serde_json::from_slice::<CallOutcome<PayloadV1, Fault>>(call.verdict).ok()? {
 		CallOutcome::Ok(payload) => serde_json::to_vec(&CallOutcome::<Payload, Fault>::Ok(Payload {
-			matches:    payload.matches,
-			advisories: payload.advisories,
-			total:      payload.total,
-			next_skip:  payload.next_cursor,
+			matches:        payload.matches,
+			advisories:     payload.advisories,
+			total:          payload.total,
+			next_skip:      payload.next_cursor,
 			files_searched: 0,
 		}))
 		.ok()?,

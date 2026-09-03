@@ -1673,14 +1673,13 @@ pub(crate) fn mv_builtin<SE: ShellExtensions>() -> Registration<SE> {
 #[cfg(unix)]
 mod hardlink {
 	use std::{
-		error,
-		fmt::{self, Display},
 		fs,
 		io::{self, Write},
 		path::{Path, PathBuf},
 	};
 
 	use omp_core::FastHashMap;
+	use thiserror::Error;
 
 	use super::Host;
 	use crate::support::quote::Quotable;
@@ -1712,49 +1711,28 @@ mod hardlink {
 	}
 
 	/// Errors that can occur during hardlink operations
-	#[derive(Debug)]
+	#[derive(Debug, Error)]
 	pub enum HardlinkError {
 		/// An underlying filesystem operation failed.
-		Io(io::Error),
+		#[error("I/O error during hardlink operation: {0}")]
+		Io(#[from] io::Error),
 		/// Pre-scanning a hardlink group failed.
+		#[error("Failed to scan files for hardlinks: {0}")]
 		Scan(String),
 		/// Recreating a hardlink at its destination failed.
-		Preservation { source: PathBuf, target: PathBuf },
+		#[error(
+			"Failed to preserve hardlink: {} -> {}",
+			.source_path.quote(),
+			.target_path.quote()
+		)]
+		Preservation { source_path: PathBuf, target_path: PathBuf },
 		/// Metadata for a candidate hardlink could not be read.
-		Metadata { path: PathBuf, error: io::Error },
-	}
-
-	impl Display for HardlinkError {
-		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-			match self {
-				Self::Io(e) => write!(f, "I/O error during hardlink operation: {e}"),
-				Self::Scan(msg) => {
-					write!(f, "Failed to scan files for hardlinks: {msg}")
-				},
-				Self::Preservation { source, target } => {
-					write!(f, "Failed to preserve hardlink: {} -> {}", source.quote(), target.quote())
-				},
-				Self::Metadata { path, error } => {
-					write!(f, "Metadata access error for {}: {error}", path.quote())
-				},
-			}
-		}
-	}
-
-	impl error::Error for HardlinkError {
-		fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-			match self {
-				Self::Io(e) => Some(e),
-				Self::Metadata { error, .. } => Some(error),
-				_ => None,
-			}
-		}
-	}
-
-	impl From<io::Error> for HardlinkError {
-		fn from(error: io::Error) -> Self {
-			Self::Io(error)
-		}
+		#[error("Metadata access error for {}: {source}", .path.quote())]
+		Metadata {
+			path:   PathBuf,
+			#[source]
+			source: io::Error,
+		},
 	}
 
 	impl From<HardlinkError> for io::Error {
@@ -1762,14 +1740,13 @@ mod hardlink {
 			match error {
 				HardlinkError::Io(e) => e,
 				HardlinkError::Scan(msg) => Self::other(msg),
-				HardlinkError::Preservation { source, target } => Self::other(format!(
+				HardlinkError::Preservation { source_path, target_path } => Self::other(format!(
 					"Failed to preserve hardlink: {} -> {}",
-					source.quote(),
-					target.quote()
+					source_path.quote(),
+					target_path.quote()
 				)),
-
-				HardlinkError::Metadata { path, error } => {
-					Self::other(format!("Metadata access error for {}: {error}", path.quote(),))
+				HardlinkError::Metadata { path, source } => {
+					Self::other(format!("Metadata access error for {}: {source}", path.quote(),))
 				},
 			}
 		}

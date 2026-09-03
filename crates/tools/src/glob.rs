@@ -611,6 +611,23 @@ mod tests {
 	}
 
 	#[test]
+	fn fault_messages_remain_stable_under_thiserror() {
+		assert_eq!(
+			Fault::PathNotFound { paths: vec![Str::new_static("a"), Str::new_static("b")] }
+				.to_string(),
+			"Path not found: a, b"
+		);
+		assert_eq!(
+			Fault::InvalidPattern {
+				pattern: Str::new_static("["),
+				message: Str::new_static("unclosed class"),
+			}
+			.to_string(),
+			"invalid glob pattern [: unclosed class"
+		);
+	}
+
+	#[test]
 	fn renderer_scope_is_the_literal_directory_prefix() {
 		assert_eq!(display_scope("packages/**/*.{test,spec}.ts"), "packages");
 		assert_eq!(display_scope("src/foo*.rs"), "src");

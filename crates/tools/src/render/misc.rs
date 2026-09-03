@@ -753,6 +753,10 @@ mod tests {
 		let fault = BrowserFault {
 			code:    Str::new_static("browser_timeout"),
 			message: Str::new_static("TimeoutError: selector <missing>"),
+			name:    Some(Str::new_static("docs")),
+			url:     Some(Str::new_static("https://bun.sh/docs")),
+			title:   None,
+			browser: Some(Str::new_static("headless")),
 		};
 		let rendered = BrowserRenderer
 			.view(&state, Some(&CallOutcome::Faulted(fault)))
@@ -773,6 +777,7 @@ mod tests {
 			name:      Str::new_static("main"),
 			url:       Some(Str::new_static("https://example.test")),
 			title:     Some(Str::new_static("Example")),
+			display:   Vec::new(),
 			result:    Some(serde_json::json!({
 				"display_outputs": [{"value": "<shown>"}],
 				"return_value": true
@@ -794,6 +799,7 @@ mod tests {
 			name:      Str::new_static("docs"),
 			url:       Some(Str::new_static("https://example.test/docs")),
 			title:     Some(Str::new_static("Documentation")),
+			display:   Vec::new(),
 			result:    Some(serde_json::json!({"ready": true, "status": "<loaded>"})),
 			artifacts: Vec::new(),
 			browser:   None,

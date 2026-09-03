@@ -2,11 +2,8 @@
 
 use std::{
 	collections::{HashMap, HashSet},
-	error,
-	fmt::{self, Display, Write as _},
-	future,
-	future::Future,
-	mem,
+	fmt::Write as _,
+	future, mem,
 	sync::Arc,
 };
 
@@ -278,78 +275,66 @@ pub struct Payload {
 pub enum Update {}
 
 /// Durable typed `grep@1` failure.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, thiserror::Error)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fault {
 	/// The expression was empty or whitespace-only.
+	#[error("Pattern must not be empty")]
 	EmptyPattern,
 	/// The requested file offset was negative or not finite.
+	#[error("Skip must be a non-negative number")]
 	InvalidSkip,
 	/// A path selector was invalid for grep.
+	#[error("{message}")]
 	InvalidSelector {
 		/// Exact model-facing diagnostic.
 		message: Str,
 	},
 	/// A URI target uses a backend that has not landed yet.
+	#[error("{message}")]
 	UnsupportedTarget {
 		/// Exact model-facing diagnostic.
 		message: Str,
 	},
 	/// Neither the Rust regex engine nor PCRE2 accepted the expression.
+	#[error("Invalid regex: {message}")]
 	InvalidRegex {
 		/// Parser detail without the `Invalid regex:` prefix.
 		message: Str,
 	},
 	/// The fixed 30-second native deadline elapsed.
+	#[error("Grep timed out after 30s; narrow paths or pattern, or scope with `glob` first")]
 	TimedOut,
 	/// Every submitted path was missing.
+	#[error(
+		"Path not found: {}; list each target in the semicolon-delimited `path`",
+		join_strs(.paths)
+	)]
 	AllPathsMissing {
 		/// Missing paths in caller order.
 		paths: Vec<Str>,
 	},
 	/// The workspace owner rejected or failed the request.
+	#[error("{message}")]
 	Workspace {
 		/// Stable resource-owned explanation.
 		message: Str,
 	},
 	/// Durable blob storage failed while preserving complete output.
+	#[error("{message}")]
 	Blob {
 		/// Stable blob-owned explanation.
 		message: Str,
 	},
 	/// The resource itself observed cancellation without an invocation
 	/// interrupt.
+	#[error("workspace search was cancelled: {reason}")]
 	Cancelled {
 		/// Stable resource-owned cancellation reason.
 		reason: Str,
 	},
 }
 
-impl Display for Fault {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::EmptyPattern => formatter.write_str("Pattern must not be empty"),
-			Self::InvalidSkip => formatter.write_str("Skip must be a non-negative number"),
-			Self::InvalidSelector { message }
-			| Self::UnsupportedTarget { message }
-			| Self::Workspace { message }
-			| Self::Blob { message } => formatter.write_str(message),
-			Self::InvalidRegex { message } => write!(formatter, "Invalid regex: {message}"),
-			Self::TimedOut => formatter.write_str(
-				"Grep timed out after 30s; narrow paths or pattern, or scope with `glob` first",
-			),
-			Self::AllPathsMissing { paths } => write!(
-				formatter,
-				"Path not found: {}; list each target in the semicolon-delimited `path`",
-				join_strs(paths)
-			),
-			Self::Cancelled { reason } => {
-				write!(formatter, "workspace search was cancelled: {reason}")
-			},
-		}
-	}
-}
-impl error::Error for Fault {}
 /// Zero-box workspace traversal boundary shared by `grep@1` and `glob@1`.
 pub trait WorkspaceSearch: Send + Sync + 'static {
 	/// Execute a native regex search and return revision-pinned snapshot

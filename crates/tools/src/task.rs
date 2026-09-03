@@ -220,6 +220,21 @@ pub struct WorkspaceOutcome {
 	pub conflicts: Vec<Str>,
 }
 
+/// Presentation-safe accounting retained for one settled child.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ChildStats {
+	/// Provider requests completed across the child run.
+	pub requests:       u32,
+	/// Largest prompt context observed.
+	pub context_tokens: u64,
+	/// Model context capacity used for the percentage badge.
+	pub context_window: u64,
+	/// Billed cost in nano-US dollars.
+	pub cost_nano_usd:  u64,
+	/// Wall-clock runtime.
+	pub duration_ms:    u64,
+}
+
 /// One settled child result.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct ChildResult {
@@ -229,6 +244,16 @@ pub struct ChildResult {
 	pub agent:        Str,
 	/// Final assistant text.
 	pub text:         Str,
+	/// Tiny-model presentation label generated from the assignment, when
+	/// available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub description:  Option<Str>,
+	/// Exact assignment handed to the child.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub assignment:   Option<Str>,
+	/// Presentation-safe request, context, cost, and timing accounting.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stats:        Option<ChildStats>,
 	/// Child `.oms` journal path.
 	pub session_path: Str,
 	/// Input tokens consumed by the child.
@@ -267,7 +292,10 @@ pub enum Payload {
 	/// Every child settled within this call.
 	Settled {
 		/// Results in request order.
-		children: Vec<ChildResult>,
+		children:    Vec<ChildResult>,
+		/// Whole batch wall-clock duration including admission and teardown.
+		#[serde(default)]
+		duration_ms: u64,
 	},
 	/// Every child was admitted as a detached runtime job.
 	Started {
@@ -388,7 +416,7 @@ impl<S: SubagentSpawner> Tool for Task<S> {
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, _caps: &PromptCaps) -> Vec<Part> {
 		match view {
-			Ok(Payload::Settled { children }) => children.iter().map(child_part).collect(),
+			Ok(Payload::Settled { children, .. }) => children.iter().map(child_part).collect(),
 			Ok(Payload::Started { jobs }) => started_parts(jobs),
 			Err(fault) => vec![Part::Text { text: fault.message.clone() }],
 		}

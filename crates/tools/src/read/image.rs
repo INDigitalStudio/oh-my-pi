@@ -2,8 +2,7 @@
 
 use std::{
 	collections::HashMap,
-	env, error, fmt,
-	fmt::Display,
+	env,
 	io::{self, Cursor, Read as _},
 	path::Path,
 	sync::LazyLock,
@@ -182,13 +181,20 @@ pub struct ProcessedImage {
 }
 
 /// Typed image-processing failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ImageFault {
 	/// The string is an image data URL but its header is malformed.
+	#[error("Invalid image data URL.")]
 	InvalidDataUrl,
 	/// The data URL payload is not valid padded standard Base64.
+	#[error("Invalid Base64 image data.")]
 	InvalidBase64,
 	/// The encoded input exceeds the hard read limit.
+	#[error(
+		"Image file too large: {actual} exceeds {maximum} limit.",
+		actual = format_bytes(*bytes),
+		maximum = format_bytes(*max_bytes)
+	)]
 	TooLarge {
 		/// Actual encoded byte count.
 		bytes:     usize,
@@ -197,6 +203,7 @@ pub enum ImageFault {
 	},
 	/// A WebP image required by an STB-backed model could not be decoded and
 	/// converted to PNG.
+	#[error("WebP image could not be converted for this model.")]
 	WebpConversionFailed,
 }
 
@@ -235,14 +242,6 @@ impl ImageFault {
 		}
 	}
 }
-
-impl Display for ImageFault {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(self.message().as_ref())
-	}
-}
-
-impl error::Error for ImageFault {}
 
 /// Returns whether a path has one of the supported image extensions.
 ///
