@@ -127,10 +127,9 @@ impl InferenceLedger {
 		let receipt = context.receipt();
 		let charge = InferenceSpend {
 			input_tokens: receipt.usage.input_tokens,
-			output_tokens: receipt
-				.usage
-				.output_tokens
-				.saturating_add(receipt.usage.reasoning_tokens),
+			// `output_tokens` already includes the reasoning subset; adding
+			// `reasoning_tokens` again would bill thinking twice.
+			output_tokens: receipt.usage.output_tokens,
 			wall_time: context.elapsed(),
 			micro_usd: receipt.cost.micro_usd,
 			..InferenceSpend::default()
@@ -330,7 +329,8 @@ mod tests {
 			Target,
 		},
 		id::{PrincipalId, RequestId},
-		receipt::ExecutionBudget,
+		layer::LayerCall,
+		receipt::{ExecutionBudget, Usage},
 	};
 
 	fn call() -> Call {
@@ -380,5 +380,41 @@ mod tests {
 		assert_eq!(calls.load(Ordering::Relaxed), 1);
 		assert_eq!(error.kind, ErrorKind::BudgetExhausted);
 		assert_eq!(error.code.as_ref().map(|code| code.as_str()), Some("inference.budget_exhausted"));
+	}
+
+	#[tokio::test]
+	async fn reasoning_tokens_are_not_billed_twice_against_output_budget() {
+		// `Usage::output_tokens` already contains the reasoning subset; the
+		// ledger must charge it once. 1000 output (800 of them reasoning)
+		// against a 1500 cap must leave headroom for a second request.
+		let ledger = InferenceLedger::default();
+		ledger.set_policy(omp_core::sf!("extension"), InferenceBudgetPolicy {
+			per_turn:    InferenceBudget {
+				max_output_tokens: Some(1500),
+				..InferenceBudget::default()
+			},
+			per_session: InferenceBudget::default(),
+		});
+		let inner = service_fn(move |call: LayerCall<Call>| {
+			call.context.with_receipt(|receipt| {
+				receipt.usage = Usage {
+					output_tokens: 1000,
+					reasoning_tokens: 800,
+					..Usage::default()
+				};
+			});
+			async { Ok::<_, Error>(()) }
+		});
+		let mut service = OverallBudgetLayer::new(ledger.clone()).layer(inner);
+		service.call(call()).await.unwrap();
+		service
+			.call(call())
+			.await
+			.expect("1000 billed output tokens must not exhaust a 1500 token budget");
+		let error = service
+			.call(call())
+			.await
+			.expect_err("2000 billed output tokens must exhaust a 1500 token budget");
+		assert_eq!(error.kind, ErrorKind::BudgetExhausted);
 	}
 }

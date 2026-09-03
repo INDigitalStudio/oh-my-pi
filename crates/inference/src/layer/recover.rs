@@ -723,7 +723,8 @@ fn finalize_completion(
 		}) {
 		return Err(recovery_error("completion.character-usage-unavailable", context));
 	}
-	let usage = terminal.usage;
+	let mut usage = terminal.usage;
+	usage.premium_requests_millionths = context.premium_requests_millionths();
 	let dimensions = billable_dimensions(&usage);
 	let nanos = price_usage(&model.pricing, dimensions, service_tier)
 		.map_err(|_| recovery_error("completion.pricing-overflow", context))?

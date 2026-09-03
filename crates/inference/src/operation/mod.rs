@@ -24,7 +24,7 @@ use omp_core::Str;
 
 use crate::{
 	answer::{Answer, AnswerBody, ResponseMeta},
-	call::{Call, InferenceAttribution, OperationCall, SessionRequest, Target},
+	call::{Call, CallAffinity, InferenceAttribution, OperationCall, SessionRequest, Target},
 	catalog::{ModelKey, OperationKind, ProviderId, RouteId},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	id::RequestId,
@@ -71,6 +71,8 @@ pub struct OperationRequest<T> {
 	pub budget:         ExecutionBudget,
 	/// Optional conversation state.
 	pub session:        Option<SessionRequest>,
+	/// Session-independent prompt-cache and provider-session identities.
+	pub affinity:       CallAffinity,
 	/// Bitmap-gated provider request/response hook sink.
 	pub response_hooks: crate::codec::ProviderResponseHooks,
 	/// Principal and extension charged for this request.
@@ -91,6 +93,7 @@ impl<T> OperationRequest<T> {
 			deadline: call.deadline,
 			budget: call.budget.clone(),
 			session: call.session.clone(),
+			affinity: call.affinity.clone(),
 			response_hooks: call.response_hooks.clone(),
 			attribution: call.attribution.clone(),
 			execution: call.execution.clone(),
@@ -107,6 +110,7 @@ impl<T> OperationRequest<T> {
 			deadline:       self.deadline,
 			budget:         self.budget,
 			session:        self.session,
+			affinity:       self.affinity,
 			response_hooks: self.response_hooks,
 			attribution:    self.attribution,
 			execution:      self.execution,

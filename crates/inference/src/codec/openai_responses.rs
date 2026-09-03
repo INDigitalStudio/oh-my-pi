@@ -3199,8 +3199,9 @@ impl OpenAiResponsesCodec {
 			None
 		} else {
 			context
-				.session
-				.and_then(|session| session.prompt_cache_affinity.clone())
+				.affinity
+				.prompt_cache
+				.clone()
 				.or_else(|| self.options.prompt_cache_key.clone())
 		};
 		let service_tier = match &request.service_tier {
@@ -4180,9 +4181,7 @@ impl Codec for OpenAiResponsesCodec {
 		];
 		if let Some(header) = prompt_cache_session_header(
 			context.policy.headers.prompt_cache_session,
-			context
-				.session
-				.and_then(|session| session.prompt_cache_affinity.clone()),
+			context.affinity.prompt_cache.clone(),
 		) {
 			headers.push(header);
 		}
@@ -4239,19 +4238,18 @@ mod tests {
 		encode_provider_proof, hoist_interleaved_tool_batch_messages,
 	};
 	use crate::{
-		TurnId,
 		answer::GenerationEvent,
 		call::{
-			Background, ChatRequest, ContentPart, ContextStrategy, Dimensions, ImageFormat,
+			Background, CallAffinity, ChatRequest, ContentPart, Dimensions, ImageFormat,
 			ImageQuality, ImageRequest, MediaInput, Message, NegotiationPolicy, OpaqueJson,
 			OperationCall, ProviderProof, ReasoningRequest, ReasoningVisibility, Role, Sampling,
-			SessionRequest, Setting, StructuredOutput, ToolChoice, ToolDefinition, ToolGrammar,
-			ToolGrammarSyntax, ToolInputConstraint, ToolResultContent,
+			Setting, StructuredOutput, ToolChoice, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
+			ToolInputConstraint, ToolResultContent,
 		},
 		catalog::{ProviderId, RouteId},
 		codec::{Codec as _, Decoder as _, EncodeContext, RawEvent},
 		event::{ChatEvent, FinishReason},
-		id::{ConversationId, RequestId, Revision, ToolCallId},
+		id::{RequestId, ToolCallId},
 		receipt::Usage,
 		transport::{Frame, SseEvent},
 	};
@@ -4397,15 +4395,11 @@ mod tests {
 		let policy = catalog
 			.wire_policy(&model.wire_policy)
 			.expect("embedded Responses wire policy");
-		let session = SessionRequest {
-			conversation:          ConversationId::new("cache-conversation"),
-			revision:              Revision::new("cache-revision"),
-			turn:                  TurnId::new("cache-turn"),
-			strategy:              ContextStrategy::Replay,
-			prompt_cache_affinity: Some(sf!("invocation-cache")),
-			append_only:           true,
-			provider_reset:        false,
-			forked:                false,
+		// No provider conversation is bound: the invocation key must still
+		// reach the wire from the session-independent call affinity.
+		let affinity = CallAffinity {
+			prompt_cache:     Some(sf!("invocation-cache")),
+			provider_session: None,
 		};
 		let request_id = RequestId::new("responses-cache-encoding");
 		let context = EncodeContext {
@@ -4413,7 +4407,7 @@ mod tests {
 			route: &route,
 			target: Some(&target),
 			policy,
-			session: Some(&session),
+			affinity: &affinity,
 			..EncodeContext::default()
 		};
 		OpenAiResponsesCodec::default()
@@ -4540,7 +4534,7 @@ mod tests {
 	}
 
 	#[test]
-	fn session_cache_affinity_lowers_only_on_compatible_route() {
+	fn call_cache_affinity_lowers_without_a_bound_conversation_only_on_compatible_route() {
 		assert_eq!(encode_cache_affinity(false).as_deref(), Some("invocation-cache"));
 		assert_eq!(encode_cache_affinity(true), None);
 	}

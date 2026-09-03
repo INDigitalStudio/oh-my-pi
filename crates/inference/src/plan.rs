@@ -309,6 +309,13 @@ pub fn forced_call_ladder(
 }
 
 /// Applies a forced-call decision to canonical chat input before encoding.
+///
+/// The soft prompt is the last message of the transcript, as a user turn
+/// (pi `google-gemini-cli.ts` restates the forced choice the same way).
+/// Anything earlier — a leading system message, or a system message
+/// hoisted into Anthropic's `system` array — rewrites the cached prefix and
+/// re-bills the whole conversation, the very cost ADR 0019 keeps the soft
+/// rung free of. Codecs merge the turn into a trailing user message.
 pub fn apply_forced_call_decision(
 	request: &ChatRequest,
 	decision: &ForcedCallDecision,
@@ -316,12 +323,12 @@ pub fn apply_forced_call_decision(
 	let mut adjusted = request.clone();
 	if decision.soft_prompt {
 		let mut messages = Vec::with_capacity(request.messages.len().saturating_add(1));
+		messages.extend(request.messages.iter().cloned());
 		messages.push(Message {
-			role:    Role::System,
+			role:    Role::User,
 			content: Arc::from([ContentPart::Text { text: sf!(FORCED_CALL_DIRECTIVE), proof: None }]),
 			name:    None,
 		});
-		messages.extend(request.messages.iter().cloned());
 		adjusted.messages = messages.into();
 		if !decision.native_choice {
 			adjusted.tool_choice = Setting::Prefer(ToolChoice::Auto);
@@ -922,6 +929,57 @@ mod tests {
 			escalated.escalation,
 			Some(Adjustment::Escalated { penalty: Penalty::CacheInvalidated, .. })
 		));
+	}
+
+	#[test]
+	fn soft_prompt_is_appended_after_the_transcript_not_prepended_to_system() {
+		let text = |role, body: &str| Message {
+			role,
+			content: Arc::from([ContentPart::Text { text: Str::new(body), proof: None }]),
+			name: None,
+		};
+		let request = ChatRequest {
+			messages:          Arc::from([
+				text(Role::System, "You are omp."),
+				text(Role::User, "Look up x."),
+				text(Role::Assistant, "Sure."),
+			]),
+			tools:             Arc::from([]),
+			hosted_tools:      Arc::from([]),
+			tool_choice:       CallSetting::Require(CallToolChoice::Named(sf!("lookup"))),
+			output:            CallSetting::Unset,
+			reasoning:         CallSetting::Unset,
+			verbosity:         CallSetting::Unset,
+			cache_retention:   CallSetting::Unset,
+			service_tier:      CallSetting::Unset,
+			sampling:          crate::call::Sampling::default(),
+			max_output_tokens: None,
+			top_logprobs:      None,
+			safety:            Arc::from([]),
+			negotiation:       crate::call::NegotiationPolicy::default(),
+			forced_call:       None,
+		};
+		let decision =
+			ForcedCallDecision { soft_prompt: true, native_choice: false, escalation: None };
+		let adjusted = apply_forced_call_decision(&request, &decision);
+
+		// The cached prefix — every original message, in order — is untouched.
+		assert_eq!(adjusted.messages.len(), request.messages.len() + 1);
+		let text_of = |message: &Message| match message.content.as_ref() {
+			[ContentPart::Text { text, .. }] => text.clone(),
+			other => panic!("fixture parts are text: {other:?}"),
+		};
+		for (original, kept) in request.messages.iter().zip(adjusted.messages.iter()) {
+			assert_eq!(original.role, kept.role);
+			assert_eq!(text_of(original), text_of(kept));
+		}
+		let tail = adjusted.messages.last().expect("directive appended");
+		assert_eq!(tail.role, Role::User);
+		assert!(matches!(
+			tail.content.as_ref(),
+			[ContentPart::Text { text, .. }] if text.as_str() == FORCED_CALL_DIRECTIVE
+		));
+		assert!(matches!(adjusted.tool_choice, CallSetting::Prefer(CallToolChoice::Auto)));
 	}
 
 	#[test]

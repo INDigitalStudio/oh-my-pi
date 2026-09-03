@@ -1032,7 +1032,25 @@ impl Codec for OpenAiCodexCodec {
 				CodexTransportPreference::WebsocketPreferred => CodexWireTransport::WebSocket,
 				CodexTransportPreference::HttpOnly => CodexWireTransport::Http,
 			});
-		if let Some(identity) = &self.options.identity {
+		// Codec options pin an identity for hosts that own the session; a bare
+		// call still names its session through the call affinity, with the
+		// request id as the retry-stable turn.
+		let affinity_identity = context
+			.affinity
+			.provider_session
+			.clone()
+			.map(|session_id| CodexRequestIdentity {
+				session_id,
+				turn_id: Str::new(context.request_id.as_str()),
+				account_id: None,
+				originator: Some(Str::new(CODEX_ORIGINATOR)),
+			});
+		if let Some(identity) = self
+			.options
+			.identity
+			.as_ref()
+			.or(affinity_identity.as_ref())
+		{
 			apply_codex_client_metadata(
 				&mut request,
 				identity,

@@ -1175,6 +1175,7 @@ fn lower_count_tokens(
 			provider,
 			codec,
 			policy.image.strip_input == Some(true),
+			policy.tool.requires_result_id == Some(true),
 		)?;
 		match message.role {
 			Role::System | Role::Developer => body.system.extend(blocks),
@@ -1374,6 +1375,7 @@ pub fn lower_chat(
 			provider,
 			codec,
 			policy.image.strip_input == Some(true),
+			policy.tool.requires_result_id == Some(true),
 		)?;
 		match message.role {
 			Role::System | Role::Developer => body.system.extend(blocks),
@@ -1426,12 +1428,25 @@ pub fn lower_chat(
 		}
 	}
 	body.tool_choice = lower_tool_choice(&request.tool_choice);
-	body.thinking = lower_thinking(
-		thinking_mode,
-		thinking_selection,
-		&request.reasoning,
-		policy.reasoning.disable_adaptive == Some(true),
+	let disable_adaptive = policy.reasoning.disable_adaptive == Some(true);
+	// Pi baseline for `anthropic-messages` is `supportsOutputEffort: true`;
+	// only an explicit rule (Vertex rawPredict) turns the field off.
+	let supports_output_effort = policy.reasoning.supports_output_effort != Some(false);
+	let forced_tool_choice = matches!(
+		body.tool_choice,
+		Some(WireToolChoice::Any { .. } | WireToolChoice::Tool { .. })
 	);
+	body.thinking = (!forced_tool_choice)
+		.then(|| {
+			lower_thinking(
+				thinking_mode,
+				thinking_selection,
+				&request.reasoning,
+				disable_adaptive,
+				policy.reasoning.requires_enabled == Some(true),
+			)
+		})
+		.flatten();
 	if policy.context.supports_management != Some(false)
 		&& matches!(body.thinking, Some(Thinking::Enabled { .. } | Thinking::Adaptive { .. }))
 	{
@@ -1451,7 +1466,9 @@ pub fn lower_chat(
 		thinking_mode,
 		thinking_selection,
 		&request.output,
-		policy.reasoning.supports_output_effort == Some(true),
+		supports_output_effort,
+		disable_adaptive,
+		forced_tool_choice,
 	)?;
 	if let Some(tier) = setting_value(&request.service_tier) {
 		lower_service_tier(&mut body, tier)?;
@@ -1484,6 +1501,7 @@ fn lower_parts(
 	provider: &ProviderId<str>,
 	codec: &CodecId<str>,
 	strip_images: bool,
+	tool_result_id: bool,
 ) -> Result<Vec<ContentBlock>, Error> {
 	let mut blocks = Vec::with_capacity(parts.len());
 	for part in parts {
@@ -1538,9 +1556,11 @@ fn lower_parts(
 				} else {
 					ToolResultWireContent::Blocks(blocks)
 				};
+				// Pi `requiresToolResultId`: strict Anthropic-compatible
+				// endpoints (Z.AI GLM) also want the id aliased on `id`.
 				ContentBlock::ToolResult {
 					tool_use_id: Str::new(call.as_str()),
-					id: None,
+					id: tool_result_id.then(|| Str::new(call.as_str())),
 					is_error: *is_error,
 					content,
 					cache_control: cache.clone(),
@@ -1682,16 +1702,32 @@ fn lower_tool_choice(setting: &Setting<ToolChoice>) -> Option<WireToolChoice> {
 	})
 }
 
+/// Pi `isAdaptiveOnlyThinking`: adaptive Claude models (Opus 4.6+, Sonnet
+/// 4.6+, Fable/Mythos 5) reject `thinking.type: "disabled"`. Thinking is
+/// switched off by omitting the field and pinning the cheapest adaptive
+/// effort; a bare omission defaults to adaptive thinking ON. MiniMax drives
+/// adaptive thinking through the `thinking.type` tag itself and is excluded.
+const fn adaptive_only(
+	mode: Option<ThinkingMode>,
+	selection: &ThinkingSelection,
+	disable_adaptive: bool,
+) -> bool {
+	matches!(mode, Some(ThinkingMode::AnthropicAdaptive))
+		&& !disable_adaptive
+		&& !selection.adaptive_tag_only
+}
+
+/// Pi's default `budget_tokens` when a route insists on thinking
+/// (`requiresThinkingEnabled`) and nothing resolved a budget.
+const REQUIRED_THINKING_BUDGET: u64 = 1_024;
+
 fn lower_thinking(
 	mode: Option<ThinkingMode>,
 	selection: Option<&ThinkingSelection>,
 	request: &Setting<ReasoningRequest>,
 	disable_adaptive: bool,
+	requires_enabled: bool,
 ) -> Option<Thinking> {
-	let selection = selection?;
-	if selection.effort == ThinkingEffort::Off {
-		return (!selection.suppress_when_off).then_some(Thinking::Disabled);
-	}
 	let display = setting_value(request).and_then(|reasoning| {
 		(reasoning.visibility != ReasoningVisibility::Visible)
 			.then(|| sf!(<&'static str>::from(reasoning.visibility)))
@@ -1699,12 +1735,28 @@ fn lower_thinking(
 	// Adaptive models reject `thinking.type: enabled`; a resolved budget only
 	// applies to them when the rule set explicitly disables adaptive thinking.
 	let adaptive = mode == Some(ThinkingMode::AnthropicAdaptive) && !disable_adaptive;
+	let Some(selection) = selection.filter(|selection| selection.effort != ThinkingEffort::Off)
+	else {
+		// Pi `requiresThinkingEnabled`: the endpoint rejects requests without a
+		// thinking block, so an unrequested or switched-off request still
+		// carries one at the default budget.
+		if requires_enabled {
+			return Some(if adaptive {
+				Thinking::Adaptive { display }
+			} else {
+				Thinking::Enabled { budget_tokens: REQUIRED_THINKING_BUDGET, display }
+			});
+		}
+		let selection = selection?;
+		let omit = selection.suppress_when_off || adaptive_only(mode, selection, disable_adaptive);
+		return (!omit).then_some(Thinking::Disabled);
+	};
 	if adaptive {
 		Some(Thinking::Adaptive { display })
 	} else if let Some(tokens) = selection.budget {
 		Some(Thinking::Enabled { budget_tokens: tokens, display })
 	} else if mode == Some(ThinkingMode::AnthropicAdaptive) {
-		Some(Thinking::Enabled { budget_tokens: 1_024, display })
+		Some(Thinking::Enabled { budget_tokens: REQUIRED_THINKING_BUDGET, display })
 	} else {
 		Some(Thinking::Adaptive { display })
 	}
@@ -1730,11 +1782,19 @@ const fn anthropic_thinking_effort(effort: ThinkingEffort) -> AnthropicThinkingE
 	}
 }
 
+/// Effort pinned when adaptive thinking must be switched off on a model that
+/// rejects `thinking.type: "disabled"`.
+const ADAPTIVE_OFF_EFFORT: &str = "low";
+/// Native effort spelling that is a `thinking.type` tag, not an effort value.
+const ADAPTIVE_TAG: &str = "adaptive";
+
 fn lower_output_config(
 	mode: Option<ThinkingMode>,
 	selection: Option<&ThinkingSelection>,
 	output: &Setting<StructuredOutput>,
 	supports_output_effort: bool,
+	disable_adaptive: bool,
+	forced_tool_choice: bool,
 ) -> Result<Option<OutputConfig>, Error> {
 	let effort = (supports_output_effort && mode == Some(ThinkingMode::AnthropicAdaptive))
 		.then(|| selection)
@@ -1743,9 +1803,19 @@ fn lower_output_config(
 			if selection.effort == ThinkingEffort::Off && selection.suppress_when_off {
 				return None;
 			}
-			Some(selection.native_effort.clone().unwrap_or_else(|| {
+			// Thinking is off (explicitly, or because a forced tool choice
+			// dropped it): adaptive-only models get the cheapest effort
+			// pinned, every other model sends no effort at all.
+			if selection.effort == ThinkingEffort::Off || forced_tool_choice {
+				return adaptive_only(mode, selection, disable_adaptive)
+					.then(|| sf!(ADAPTIVE_OFF_EFFORT));
+			}
+			let native = selection.native_effort.clone().unwrap_or_else(|| {
 				sf!(<&'static str>::from(anthropic_thinking_effort(selection.effort)))
-			}))
+			});
+			// The MiniMax `adaptive` tag is a `thinking.type` control, never
+			// an `output_config.effort` value.
+			(native.as_str() != ADAPTIVE_TAG).then_some(native)
 		});
 	let format = match setting_value(output) {
 		None => None,
@@ -1848,10 +1918,18 @@ fn extend_claude_code_headers(headers: &mut Vec<RequestHeader>, context: &Encode
 		RequestHeader { name: "connection".into(), value: "keep-alive".into() },
 		RequestHeader { name: "accept-encoding".into(), value: "gzip, deflate, br, zstd".into() },
 	]);
-	if let Some(session) = context.session {
+	// The caller's session identity wins; a bound provider conversation is
+	// the fallback so headless calls without a conversation store still
+	// carry a stable session.
+	if let Some(session) = context
+		.affinity
+		.provider_session
+		.as_deref()
+		.or_else(|| context.session.map(|session| session.conversation.as_str()))
+	{
 		headers.push(RequestHeader {
 			name:  "x-claude-code-session-id".into(),
-			value: session.conversation.as_str().into(),
+			value: session.into(),
 		});
 	}
 }
@@ -3163,8 +3241,8 @@ mod tests {
 			HeaderPlacement, KeyPlacement, LeaseMeta,
 		},
 		call::{
-			ContentPart as CanonicalContentPart, Message as CanonicalMessage, NegotiationPolicy,
-			OpaqueJson, Sampling, ToolDefinition, ToolInputConstraint,
+			CallAffinity, ContentPart as CanonicalContentPart, Message as CanonicalMessage,
+			NegotiationPolicy, OpaqueJson, Sampling, ToolDefinition, ToolInputConstraint,
 		},
 		id::{AccountId, PrincipalId, RequestId},
 		transport::{EventStreamDecoder, SseEvent},
@@ -3224,17 +3302,169 @@ mod tests {
 }
 	}
 
+	/// `canonical_chat` forces a named tool; thinking tests need an open tool
+	/// choice because forced tool use always drops thinking (pi
+	/// `disableThinkingIfToolChoiceForced`).
+	fn thinking_chat() -> ChatRequest {
+		let mut request = canonical_chat(&[]);
+		request.tool_choice = Setting::Require(ToolChoice::Auto);
+		request
+	}
+
 	fn resolved_thinking(mode: ThinkingMode) -> ThinkingSelection {
+		resolved_thinking_effort(mode, ThinkingEffort::High)
+	}
+
+	fn resolved_thinking_effort(mode: ThinkingMode, effort: ThinkingEffort) -> ThinkingSelection {
 		let policy = ThinkingPolicy::new(mode, [ThinkingEffort::High])
 			.expect("valid Anthropic thinking policy");
 		ThinkingRouting::default()
-			.resolve(&policy, Some(ThinkingEffort::High), WireModelId::from_ref("claude-test"))
+			.resolve(&policy, Some(effort), WireModelId::from_ref("claude-test"))
 			.expect("thinking selection resolves")
+	}
+
+	fn output_effort(body: &MessagesRequest) -> Option<&str> {
+		body
+			.output_config
+			.as_ref()
+			.and_then(|config| config.effort.as_deref())
+	}
+
+	#[test]
+	fn adaptive_only_thinking_off_omits_thinking_and_pins_low_effort() {
+		// Pi anthropic.ts `isAdaptiveOnlyThinking`: Opus/Sonnet 4.6+ reject
+		// `thinking.type: "disabled"`; off = omit `thinking` + effort "low".
+		let off = resolved_thinking_effort(ThinkingMode::AnthropicAdaptive, ThinkingEffort::Off);
+		let body = lower_with_policy(
+			&thinking_chat(),
+			&WirePolicy::baseline(),
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&off),
+		);
+		assert!(body.thinking.is_none(), "{:?}", body.thinking);
+		assert!(body.context_management.is_none());
+		assert_eq!(output_effort(&body), Some("low"));
+
+		// Vertex rawPredict cannot carry the effort beta: no pin, still no
+		// `disabled` block.
+		let mut vertex = WirePolicy::baseline();
+		vertex.reasoning.supports_output_effort = Some(false);
+		let body = lower_with_policy(
+			&thinking_chat(),
+			&vertex,
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&off),
+		);
+		assert!(body.thinking.is_none());
+		assert!(output_effort(&body).is_none());
+
+		// Budget-mode models still take the explicit disable block.
+		let off = resolved_thinking_effort(ThinkingMode::Budget, ThinkingEffort::Off);
+		let body = lower_with_policy(
+			&thinking_chat(),
+			&WirePolicy::baseline(),
+			Some(ThinkingMode::Budget),
+			Some(&off),
+		);
+		assert!(matches!(body.thinking, Some(Thinking::Disabled)));
+		assert!(output_effort(&body).is_none());
+
+		// `disable-adaptive-thinking` routes are budget models in disguise.
+		let off = resolved_thinking_effort(ThinkingMode::AnthropicAdaptive, ThinkingEffort::Off);
+		let mut disabled = WirePolicy::baseline();
+		disabled.reasoning.disable_adaptive = Some(true);
+		let body = lower_with_policy(
+			&thinking_chat(),
+			&disabled,
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&off),
+		);
+		assert!(matches!(body.thinking, Some(Thinking::Disabled)));
+		assert!(output_effort(&body).is_none());
+	}
+
+	#[test]
+	fn adaptive_tag_only_models_keep_the_disable_block_and_never_send_effort() {
+		// MiniMax on Anthropic-shaped routes maps every effort onto the
+		// `adaptive` tag: `thinking.type` is the control, `output_config.effort`
+		// is never sent, and off is a plain `disabled` block.
+		let mut thinking =
+			ThinkingPolicy::new(ThinkingMode::AnthropicAdaptive, [ThinkingEffort::High])
+				.expect("valid MiniMax thinking policy");
+		thinking
+			.effort_map
+			.insert(ThinkingEffort::High, sf!("adaptive"));
+		let mut routing = ThinkingRouting::default();
+		routing.effort_map.clone_from(&thinking.effort_map);
+		let on = routing
+			.resolve(&thinking, Some(ThinkingEffort::High), WireModelId::from_ref("minimax"))
+			.expect("tag-only selection resolves");
+		let body = lower_with_policy(
+			&thinking_chat(),
+			&WirePolicy::baseline(),
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&on),
+		);
+		assert!(matches!(body.thinking, Some(Thinking::Adaptive { .. })));
+		assert!(output_effort(&body).is_none());
+
+		let off = routing
+			.resolve(&thinking, Some(ThinkingEffort::Off), WireModelId::from_ref("minimax"))
+			.expect("tag-only off resolves");
+		let body = lower_with_policy(
+			&thinking_chat(),
+			&WirePolicy::baseline(),
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&off),
+		);
+		assert!(matches!(body.thinking, Some(Thinking::Disabled)));
+		assert!(output_effort(&body).is_none());
+	}
+
+	#[test]
+	fn forced_tool_choice_drops_thinking_and_pins_low_effort_on_adaptive_models() {
+		// Pi `disableThinkingIfToolChoiceForced`: any/tool choices delete
+		// `thinking` and `context_management`; adaptive-only models pin
+		// effort "low", everything else drops the effort too.
+		let high = resolved_thinking(ThinkingMode::AnthropicAdaptive);
+		let body = lower_with_policy(
+			&canonical_chat(&[]),
+			&WirePolicy::baseline(),
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&high),
+		);
+		assert!(matches!(body.tool_choice, Some(WireToolChoice::Tool { .. })));
+		assert!(body.thinking.is_none(), "{:?}", body.thinking);
+		assert!(body.context_management.is_none());
+		assert_eq!(output_effort(&body), Some("low"));
+
+		let mut required = canonical_chat(&[]);
+		required.tool_choice = Setting::Require(ToolChoice::Required);
+		let budget = resolved_thinking(ThinkingMode::Budget);
+		let body = lower_with_policy(
+			&required,
+			&WirePolicy::baseline(),
+			Some(ThinkingMode::Budget),
+			Some(&budget),
+		);
+		assert!(matches!(body.tool_choice, Some(WireToolChoice::Any { .. })));
+		assert!(body.thinking.is_none());
+		assert!(output_effort(&body).is_none());
+
+		// Auto keeps thinking intact.
+		let body = lower_with_policy(
+			&thinking_chat(),
+			&WirePolicy::baseline(),
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&high),
+		);
+		assert!(matches!(body.thinking, Some(Thinking::Adaptive { .. })));
+		assert_eq!(output_effort(&body), Some("high"));
 	}
 
 	#[test]
 	fn effort_is_gated_by_catalog_thinking_mode() {
-		let request = canonical_chat(&[]);
+		let request = thinking_chat();
 		let adaptive = resolved_thinking(ThinkingMode::AnthropicAdaptive);
 		let mut policy = WirePolicy::baseline();
 		policy.reasoning.supports_output_effort = Some(true);
@@ -3294,18 +3524,12 @@ mod tests {
 		let mut policy = WirePolicy::baseline();
 		policy.reasoning.supports_output_effort = Some(true);
 		let body = lower_with_policy(
-			&canonical_chat(&[]),
+			&thinking_chat(),
 			&policy,
 			Some(ThinkingMode::AnthropicAdaptive),
 			Some(&selection),
 		);
-		assert_eq!(
-			body
-				.output_config
-				.as_ref()
-				.and_then(|config| config.effort.as_deref()),
-			Some("provider-high"),
-		);
+		assert_eq!(output_effort(&body), Some("provider-high"));
 	}
 
 	#[test]
@@ -3374,6 +3598,85 @@ mod tests {
 	}
 
 	#[test]
+	fn requires_tool_result_id_aliases_the_call_id_onto_the_result_block() {
+		// Pi `requiresToolResultId` (Z.AI GLM, #814): the compat axis makes
+		// tool results carry `id` next to `tool_use_id`; the official API
+		// keeps the block minimal.
+		let mut request = thinking_chat();
+		request.messages = Arc::from([
+			CanonicalMessage {
+				role:    Role::Assistant,
+				content: Arc::from([CanonicalContentPart::ToolCall {
+					call:      ToolCallId::new("toolu_1"),
+					name:      sf!("read"),
+					arguments: OpaqueJson::new(serde_json::json!({})),
+					proof:     None,
+				}]),
+				name:    None,
+			},
+			CanonicalMessage {
+				role:    Role::Tool,
+				content: Arc::from([CanonicalContentPart::ToolResult {
+					call:     ToolCallId::new("toolu_1"),
+					name:     None,
+					content:  vec![ToolResultContent::Text(sf!("ok"))].into(),
+					is_error: false,
+				}]),
+				name:    None,
+			},
+		]);
+		let result_id = |body: &MessagesRequest| {
+			body.messages.iter().find_map(|message| {
+				message.content.iter().find_map(|block| match block {
+					ContentBlock::ToolResult { tool_use_id, id, .. } => {
+						Some((tool_use_id.clone(), id.clone()))
+					},
+					_ => None,
+				})
+			})
+		};
+		let official = lower_with_policy(&request, &WirePolicy::baseline(), None, None);
+		assert_eq!(result_id(&official), Some((sf!("toolu_1"), None)));
+
+		let mut policy = WirePolicy::baseline();
+		policy.tool.requires_result_id = Some(true);
+		let strict = lower_with_policy(&request, &policy, None, None);
+		assert_eq!(result_id(&strict), Some((sf!("toolu_1"), Some(sf!("toolu_1")))));
+	}
+
+	#[test]
+	fn requires_thinking_enabled_sends_a_thinking_block_when_none_was_requested() {
+		// Pi `model.compat.requiresThinkingEnabled`: the endpoint rejects a
+		// request without a thinking block, so an unrequested or switched-off
+		// request still enables thinking at the 1024 default budget.
+		let request = thinking_chat();
+		let mut policy = WirePolicy::baseline();
+		policy.reasoning.requires_enabled = Some(true);
+
+		let unrequested = lower_with_policy(&request, &policy, Some(ThinkingMode::Budget), None);
+		assert!(
+			matches!(unrequested.thinking, Some(Thinking::Enabled { budget_tokens: 1_024, .. })),
+			"{:?}",
+			unrequested.thinking
+		);
+		assert!(unrequested.context_management.is_some());
+
+		let off = resolved_thinking_effort(ThinkingMode::Budget, ThinkingEffort::Off);
+		let switched_off = lower_with_policy(&request, &policy, Some(ThinkingMode::Budget), Some(&off));
+		assert!(matches!(
+			switched_off.thinking,
+			Some(Thinking::Enabled { budget_tokens: 1_024, .. })
+		));
+
+		let adaptive = lower_with_policy(&request, &policy, Some(ThinkingMode::AnthropicAdaptive), None);
+		assert!(matches!(adaptive.thinking, Some(Thinking::Adaptive { .. })));
+
+		// Without the axis nothing changes: no selection means no block.
+		let baseline = lower_with_policy(&request, &WirePolicy::baseline(), Some(ThinkingMode::Budget), None);
+		assert!(baseline.thinking.is_none());
+	}
+
+	#[test]
 	fn disable_strict_tools_matches_pi_request_shape() {
 		let mut request = canonical_chat(&[]);
 		let mut tool = request.tools[0].clone();
@@ -3417,7 +3720,7 @@ mod tests {
 		let mut enabled = WirePolicy::baseline();
 		enabled.context.supports_management = Some(true);
 		let body = lower_with_policy(
-			&canonical_chat(&[]),
+			&thinking_chat(),
 			&enabled,
 			Some(ThinkingMode::AnthropicAdaptive),
 			Some(&selection),
@@ -3431,7 +3734,7 @@ mod tests {
 
 		enabled.context.supports_management = Some(false);
 		let body = lower_with_policy(
-			&canonical_chat(&[]),
+			&thinking_chat(),
 			&enabled,
 			Some(ThinkingMode::AnthropicAdaptive),
 			Some(&selection),
@@ -3445,18 +3748,22 @@ mod tests {
 		let mut policy = WirePolicy::baseline();
 		policy.reasoning.supports_output_effort = Some(false);
 		let body = lower_with_policy(
-			&canonical_chat(&[]),
+			&thinking_chat(),
 			&policy,
 			Some(ThinkingMode::AnthropicAdaptive),
 			Some(&selection),
 		);
-		assert!(
-			body
-				.output_config
-				.as_ref()
-				.and_then(|config| config.effort.as_ref())
-				.is_none()
+		assert!(output_effort(&body).is_none());
+
+		// Pi's `anthropic-messages` baseline is `supportsOutputEffort: true`:
+		// an unset axis must still ship the adaptive effort.
+		let body = lower_with_policy(
+			&thinking_chat(),
+			&WirePolicy::baseline(),
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&selection),
 		);
+		assert_eq!(output_effort(&body), Some("high"));
 	}
 
 	#[test]
@@ -3489,7 +3796,7 @@ mod tests {
 		let mut policy = WirePolicy::baseline();
 		policy.reasoning.disable_adaptive = Some(true);
 		let body = lower_with_policy(
-			&canonical_chat(&[]),
+			&thinking_chat(),
 			&policy,
 			Some(ThinkingMode::AnthropicAdaptive),
 			Some(&selection),
@@ -3503,7 +3810,7 @@ mod tests {
 		selection.budget = Some(8_192);
 		let policy = WirePolicy::baseline();
 		let body = lower_with_policy(
-			&canonical_chat(&[]),
+			&thinking_chat(),
 			&policy,
 			Some(ThinkingMode::AnthropicAdaptive),
 			Some(&selection),
@@ -3513,7 +3820,7 @@ mod tests {
 		let mut disabled = WirePolicy::baseline();
 		disabled.reasoning.disable_adaptive = Some(true);
 		let body = lower_with_policy(
-			&canonical_chat(&[]),
+			&thinking_chat(),
 			&disabled,
 			Some(ThinkingMode::AnthropicAdaptive),
 			Some(&selection),
@@ -3522,6 +3829,14 @@ mod tests {
 	}
 
 	fn encoded_anthropic(kind: CredentialKind, system: &[&str]) -> EncodedRequest {
+		encoded_anthropic_with_affinity(kind, system, &CallAffinity::none())
+	}
+
+	fn encoded_anthropic_with_affinity(
+		kind: CredentialKind,
+		system: &[&str],
+		affinity: &CallAffinity,
+	) -> EncodedRequest {
 		let catalog = Catalog::embedded();
 		let model = catalog
 			.models()
@@ -3569,12 +3884,39 @@ mod tests {
 			route,
 			target: Some(&target),
 			policy,
+			affinity,
 			..EncodeContext::default()
 		};
 		let codec = AnthropicCodec::direct().with_betas([sf!("route-beta")]);
 		codec
 			.encode(&context, &OperationCall::Chat(Arc::new(canonical_chat(system))))
 			.expect("Anthropic request encodes")
+	}
+
+	#[test]
+	fn call_provider_session_names_the_claude_code_session_without_a_conversation() {
+		// Headless OAuth calls bind no provider conversation; the caller's
+		// session identity must still reach the Claude Code session header.
+		let affinity = CallAffinity {
+			prompt_cache:     None,
+			provider_session: Some(sf!("caller-session")),
+		};
+		let encoded =
+			encoded_anthropic_with_affinity(CredentialKind::Bearer, &["caller system"], &affinity);
+		let header = encoded
+			.headers
+			.iter()
+			.find(|header| header.name.as_str() == "x-claude-code-session-id")
+			.expect("session header");
+		assert_eq!(header.value.as_str(), "caller-session");
+
+		let encoded = encoded_anthropic(CredentialKind::Bearer, &["caller system"]);
+		assert!(
+			!encoded
+				.headers
+				.iter()
+				.any(|header| header.name.as_str() == "x-claude-code-session-id")
+		);
 	}
 
 	fn finalize_auth(encoded: &EncodedRequest, kind: CredentialKind) -> Request<Bytes> {
@@ -4115,6 +4457,7 @@ mod tests {
 			&provider,
 			&codec,
 			false,
+			false,
 		)
 		.expect("tool results lower");
 		assert_eq!(
@@ -4466,6 +4809,7 @@ mod tests {
 			None,
 			&provider,
 			&codec,
+			false,
 			false,
 		)
 		.expect("same-provider opaque history replays");

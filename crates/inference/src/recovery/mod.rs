@@ -1,9 +1,6 @@
 //! Incremental, deterministic, bounded recovery stages.
 
-use std::{
-	error,
-	fmt::{self, Display},
-};
+use std::fmt;
 
 use bytes::Bytes;
 use omp_core::Str;
@@ -77,9 +74,10 @@ impl fmt::Debug for DiagnosticContext {
 }
 
 /// Typed failure from an incremental recovery stage.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RecoveryError {
 	/// A deterministic resource bound was exceeded.
+	#[error("{stage} recovery limit exceeded ({limit})")]
 	LimitExceeded {
 		/// Recovery stage which exceeded its resource bound.
 		stage: &'static str,
@@ -87,6 +85,7 @@ pub enum RecoveryError {
 		limit: usize,
 	},
 	/// Input was complete but invalid for the stage contract.
+	#[error("invalid {stage} recovery input: {reason}")]
 	InvalidInput {
 		/// Recovery stage which rejected the input.
 		stage:  &'static str,
@@ -94,6 +93,7 @@ pub enum RecoveryError {
 		reason: Str,
 	},
 	/// Invalid input with an explicitly bounded byte diagnostic.
+	#[error("invalid {stage} recovery document: {reason}")]
 	InvalidDocument {
 		/// Recovery stage which rejected the document.
 		stage:      &'static str,
@@ -103,11 +103,13 @@ pub enum RecoveryError {
 		diagnostic: DiagnosticContext,
 	},
 	/// End of input arrived while a required construct remained incomplete.
+	#[error("incomplete {stage} recovery input")]
 	Incomplete {
 		/// Recovery stage with incomplete terminal input.
 		stage: &'static str,
 	},
 	/// Recovery was available but forbidden by strict enforcement.
+	#[error("{stage} repair rejected by strict enforcement")]
 	RepairRejected {
 		/// Recovery stage whose repair was rejected.
 		stage:      &'static str,
@@ -115,28 +117,6 @@ pub enum RecoveryError {
 		diagnostic: DiagnosticContext,
 	},
 }
-
-impl Display for RecoveryError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::LimitExceeded { stage, limit } => {
-				write!(formatter, "{stage} recovery limit exceeded ({limit})")
-			},
-			Self::InvalidInput { stage, reason } => {
-				write!(formatter, "invalid {stage} recovery input: {reason}")
-			},
-			Self::InvalidDocument { stage, reason, .. } => {
-				write!(formatter, "invalid {stage} recovery document: {reason}")
-			},
-			Self::Incomplete { stage } => write!(formatter, "incomplete {stage} recovery input"),
-			Self::RepairRejected { stage, .. } => {
-				write!(formatter, "{stage} repair rejected by strict enforcement")
-			},
-		}
-	}
-}
-
-impl error::Error for RecoveryError {}
 
 pub mod dialect;
 pub mod empty;

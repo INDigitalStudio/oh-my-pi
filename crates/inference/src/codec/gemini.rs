@@ -2,8 +2,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	error,
-	fmt::{self, Display},
+	fmt,
 	str,
 	sync::Arc,
 	time,
@@ -1362,18 +1361,17 @@ enum GoogleThinkingLevel {
 	Medium,
 	#[strum(serialize = "HIGH")]
 	High,
-	#[strum(serialize = "THINKING_LEVEL_UNSPECIFIED")]
-	Unspecified,
 }
 
+/// Pi `mapEffortToGoogleThinkingLevel`: `HIGH` is Google's ceiling, so
+/// `xhigh` and `max` collapse onto it rather than an unspecified level.
 impl From<ReasoningEffort> for GoogleThinkingLevel {
 	fn from(effort: ReasoningEffort) -> Self {
 		match effort {
 			ReasoningEffort::Off | ReasoningEffort::Minimal => Self::Minimal,
 			ReasoningEffort::Low => Self::Low,
 			ReasoningEffort::Medium => Self::Medium,
-			ReasoningEffort::High | ReasoningEffort::Max => Self::High,
-			ReasoningEffort::Xhigh => Self::Unspecified,
+			ReasoningEffort::High | ReasoningEffort::Xhigh | ReasoningEffort::Max => Self::High,
 		}
 	}
 }
@@ -1384,8 +1382,7 @@ impl From<ThinkingEffort> for GoogleThinkingLevel {
 			ThinkingEffort::Off | ThinkingEffort::Minimal => Self::Minimal,
 			ThinkingEffort::Low => Self::Low,
 			ThinkingEffort::Medium => Self::Medium,
-			ThinkingEffort::High | ThinkingEffort::Max => Self::High,
-			ThinkingEffort::XHigh => Self::Unspecified,
+			ThinkingEffort::High | ThinkingEffort::XHigh | ThinkingEffort::Max => Self::High,
 		}
 	}
 }
@@ -1878,6 +1875,7 @@ impl GoogleUsageMetadata {
 			audio_output_ms:    0,
 			video_ms:           0,
 			search_calls:       0,
+			premium_requests_millionths: 0,
 			source:             UsageSource::Provider,
 		}
 	}
@@ -3136,7 +3134,8 @@ pub enum GoogleCodecErrorKind {
 }
 
 /// Typed, secret-free Google protocol failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("{detail}")]
 pub struct GoogleCodecError {
 	/// Stable category.
 	pub kind:           GoogleCodecErrorKind,
@@ -3294,14 +3293,6 @@ impl GoogleCodecError {
 			.detail(ErrorDetail::protocol(ReasonId(self.detail)))
 	}
 }
-
-impl Display for GoogleCodecError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(self.detail.as_str())
-	}
-}
-
-impl error::Error for GoogleCodecError {}
 
 #[cfg(test)]
 mod tests {
@@ -3981,6 +3972,7 @@ mod tests {
 				wire_model: omp_catalog::WireModelId::new("cca-wire-model"),
 				reasoning_mode: None,
 				suppress_when_off: false,
+				adaptive_tag_only: false,
 			};
 			let mut request = empty_chat_request();
 			request.reasoning = Setting::Require(ReasoningRequest {
@@ -4268,6 +4260,7 @@ mod tests {
 			wire_model:        omp_catalog::WireModelId::new("gemini-selected"),
 			reasoning_mode:    None,
 			suppress_when_off: false,
+			adaptive_tag_only: false,
 		};
 		let policy = ThinkingPolicy::new(ThinkingMode::GoogleLevel, [ThinkingEffort::High])
 			.expect("valid thinking policy");
@@ -4302,6 +4295,18 @@ mod tests {
 			.expect("thinking config");
 		assert_eq!(thinking.thinking_level.as_deref(), Some("HIGH"));
 		assert_eq!(thinking.thinking_budget, None);
+	}
+
+	#[test]
+	fn xhigh_and_max_efforts_spell_googles_high_ceiling() {
+		// Pi `mapEffortToGoogleThinkingLevel`: HIGH is the top level; the
+		// API treats THINKING_LEVEL_UNSPECIFIED as unset.
+		for effort in [ReasoningEffort::High, ReasoningEffort::Xhigh, ReasoningEffort::Max] {
+			assert_eq!(thinking_level(effort).as_str(), "HIGH", "{effort:?}");
+		}
+		for effort in [ThinkingEffort::High, ThinkingEffort::XHigh, ThinkingEffort::Max] {
+			assert_eq!(selection_thinking_level(effort).as_str(), "HIGH", "{effort:?}");
+		}
 	}
 
 	#[test]

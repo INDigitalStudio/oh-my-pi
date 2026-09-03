@@ -136,11 +136,6 @@ pub struct SessionRequest {
 	pub turn:                  TurnId,
 	/// Requested context transport strategy.
 	pub strategy:              ContextStrategy,
-	/// Invocation-scoped provider prompt-cache identity.
-	///
-	/// Compatible codecs lower this opaque value to their native cache-affinity
-	/// field; incompatible codecs ignore it.
-	pub prompt_cache_affinity: Option<Str>,
 	/// Preserve a byte-stable prefix and admit only newly appended messages.
 	pub append_only:           bool,
 	/// Discard provider-native affinity before selecting an account.
@@ -215,6 +210,28 @@ impl InferenceAttribution {
 	}
 }
 
+/// Caller-stable identities that ride on every call regardless of whether a
+/// provider conversation is bound.
+///
+/// Compatible codecs lower these opaque values to their native fields;
+/// incompatible codecs ignore them. Neither value is a secret.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CallAffinity {
+	/// Invocation-scoped provider prompt-cache identity (OpenAI
+	/// `prompt_cache_key`).
+	pub prompt_cache:     Option<Str>,
+	/// Caller session identity for provider-side attribution (Claude Code
+	/// session header, Codex `session_id` metadata).
+	pub provider_session: Option<Str>,
+}
+
+impl CallAffinity {
+	/// Affinity that names nothing.
+	pub const fn none() -> Self {
+		Self { prompt_cache: None, provider_session: None }
+	}
+}
+
 /// Shared metadata used to construct a closed call.
 #[derive(Clone, Debug)]
 pub struct CallMeta {
@@ -245,6 +262,8 @@ pub struct Call {
 	pub budget:         ExecutionBudget,
 	/// Optional append-only conversation context.
 	pub session:        Option<SessionRequest>,
+	/// Session-independent prompt-cache and provider-session identities.
+	pub affinity:       CallAffinity,
 	/// Bitmap-gated provider request/response hook sink.
 	pub response_hooks: crate::codec::ProviderResponseHooks,
 	/// Principal and extension charged for this request.
@@ -277,6 +296,7 @@ impl Call {
 			deadline: meta.deadline,
 			budget: meta.budget,
 			session: meta.session,
+			affinity: CallAffinity::none(),
 			response_hooks: meta.response_hooks,
 			attribution: InferenceAttribution::core(),
 			operation,
@@ -288,6 +308,13 @@ impl Call {
 	/// Replaces the default harness attribution before request dispatch.
 	pub fn with_attribution(mut self, attribution: InferenceAttribution) -> Self {
 		self.attribution = attribution;
+		self
+	}
+
+	/// Attaches session-independent prompt-cache and provider-session
+	/// identities.
+	pub fn with_affinity(mut self, affinity: CallAffinity) -> Self {
+		self.affinity = affinity;
 		self
 	}
 
@@ -688,9 +715,10 @@ pub fn media_from_thread(blob: &thread_pb::Blob) -> Result<MediaInput, ThreadPro
 		return Err(ThreadProjectionError::MissingBlobMediaType);
 	}
 	if !blob.inline.is_empty() {
+		// `inline` is already a shared buffer; the request borrows it.
 		return Ok(MediaInput::Bytes {
 			media_type: blob.mime.as_str().into(),
-			data:       Bytes::copy_from_slice(&blob.inline),
+			data:       blob.inline.clone(),
 		});
 	}
 	if blob.hash.is_empty() {

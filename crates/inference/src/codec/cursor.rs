@@ -2928,6 +2928,7 @@ mod tests {
 			wire_model:        target.wire_model.clone(),
 			reasoning_mode:    None,
 			suppress_when_off: false,
+			adaptive_tag_only: false,
 		};
 		let mut request = empty_chat_request();
 		request.messages = Arc::from([CallMessage {

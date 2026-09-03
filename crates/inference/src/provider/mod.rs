@@ -6,6 +6,7 @@ use tower::util::BoxCloneSyncService;
 use crate::{answer::Answer, call::Call, error::Error};
 
 pub mod builtin;
+pub mod copilot;
 pub(crate) mod http;
 
 #[cfg(any(test, feature = "test-support"))]

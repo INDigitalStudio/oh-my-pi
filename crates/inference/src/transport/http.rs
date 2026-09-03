@@ -1256,24 +1256,15 @@ fn classify_http_error_with_hint(
 	retry_hint: Option<time::Duration>,
 ) -> Error {
 	let (code, message) = provider_error_facts(body);
-	let account_exhausted = code
-		.as_deref()
-		.into_iter()
-		.chain(message.as_deref())
-		.any(|evidence| {
-			let evidence = evidence.to_ascii_lowercase();
-			evidence.contains("insufficient_quota")
-				|| evidence.contains("quota exhausted")
-				|| evidence.contains("insufficient balance")
-				|| evidence.contains("insufficient_balance")
-		});
+	let account_exhausted =
+		account_cap_exhausted(status, code.as_deref(), message.as_deref(), retry_hint);
 	let classified_rejection =
 		classify_provider_rejection(Some(status), message.as_deref(), None, None);
 	let transient_generation_fault = status == 400
 		&& message
 			.as_deref()
 			.is_some_and(is_transient_generation_fault);
-	let (kind, action) = if account_exhausted && matches!(status, 402 | 429) {
+	let (kind, action) = if account_exhausted {
 		let kind =
 			if status == 402 { ErrorKind::PaymentRequired } else { ErrorKind::RateLimited };
 		(kind, RetryAction::RotateAccount)
@@ -1306,6 +1297,120 @@ fn classify_http_error_with_hint(
 		.detail(ErrorDetail::provider(
 			message.unwrap_or_else(|| Str::new_static("Provider request failed")),
 		))
+}
+
+/// Pi `USAGE_LIMIT_PATTERN`, `CREDITS_EXHAUSTED_PATTERN`, `SPEND_LIMIT_PATTERN`,
+/// `ACCOUNT_RATE_LIMIT_PATTERN`, and `OPENROUTER_DAILY_FREE_LIMIT_PATTERN`:
+/// wording that names a persistent, account-local cap.
+static USAGE_LIMIT_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+	regex::Regex::new(concat!(
+		r"(?i)usage.?limit|usage_limit_reached|usage_not_included|limit_reached",
+		r"|quota.?(?:exceeded|reached|insufficient)|resource.?exhausted|exhausted your capacity",
+		r"|quota will reset|insufficient.?(?:balance|quota)|balance.?exhausted",
+		r"|run out of credits|out of credits|spending[- _]?limit|personal-team-blocked",
+		r"|clinepass limit|free limit reached on model",
+		r"|\b(?:exceed\w*|insufficient|not enough)\b[^\n]{0,40}\bcredits?\b",
+		r"|\bcredits?\b[^\n]{0,40}\b(?:exhausted|depleted)\b",
+		r"|spend.?limit",
+		r"|\baccount(?:'s)?\b[^\n]{0,80}\brate.?limit\b|\brate.?limit\b[^\n]{0,80}\baccount\b",
+		r"|\bfree[-_ ]models[-_ ]per[-_ ]day\b",
+	))
+	.expect("usage-limit pattern compiles")
+});
+/// Pi `SUBSCRIPTION_CAP_PATTERN`; only a cap when no per-interval throttle
+/// (`TRANSIENT_INTERVAL_RATE_LIMIT_PATTERN`) is named alongside it.
+static SUBSCRIPTION_CAP_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+	regex::Regex::new(concat!(
+		r"(?i)\b(?:subscription|plan|membership)\b[^\n]{0,80}\b(?:rate.?limits?|quota|cap)\b",
+		r"|\b(?:rate.?limits?|quota|cap)\b[^\n]{0,80}\b(?:subscription|plan|membership)\b",
+	))
+	.expect("subscription-cap pattern compiles")
+});
+static PER_INTERVAL_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+	regex::Regex::new(r"(?i)\bper\s+(?:second|minute)\b").expect("per-interval pattern compiles")
+});
+/// Pi `CONCURRENT_LIMIT_PATTERN`: a concurrency cap is shed-and-backoff on a
+/// 429 but an exhausted billing cap on a 402.
+static CONCURRENT_LIMIT_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+	regex::Regex::new(concat!(
+		r"(?i)\btoo many\s+concurren\w*\s+(?:requests?|invocations?)\b",
+		r"|\bconcurren\w*\b[^\n]{0,60}\b(?:limit|quota|exceed\w*|reach\w*)\b",
+		r"|\b(?:limit|quota|exceed\w*|reach\w*)\b[^\n]{0,60}\bconcurren\w*\b",
+		r"|\bconcurren[a-z]*[-_](?:[a-z]+[_-])*(?:limit|quota|exceed\w*|reach\w*)",
+	))
+	.expect("concurrent-limit pattern compiles")
+});
+/// Pi `STATUS_402_QUOTA_PATTERN`: billing wording that makes a 402 a cap.
+static STATUS_402_QUOTA_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+	regex::Regex::new(
+		r"(?i)\b(?:payment(?:\s+is)?[-_.\s]*required|deactivated_workspace|insufficient.?balance)\b",
+	)
+	.expect("402 quota pattern compiles")
+});
+/// Pi `isOpaqueStatusBody`: status digits, HTTP/JSON framing words, and
+/// punctuation carry no signal beyond the status itself.
+static STATUS_FRAMING_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+	regex::Regex::new(
+		r"(?i)\b(?:429|402|http|https|status|error|code|response|message)\b|\(?\bno body\b\)?",
+	)
+	.expect("status framing pattern compiles")
+});
+static INFORMATIVE_TEXT: LazyLock<regex::Regex> =
+	LazyLock::new(|| regex::Regex::new(r"(?i)[a-z\d]{3,}").expect("informative pattern compiles"));
+
+/// Pi `isUsageLimitOutcome` for HTTP 402/429: whether the response names an
+/// account-local cap a sibling credential could satisfy. Per-interval
+/// throttles, capacity shedding, and informative non-quota bodies stay on the
+/// same credential; a bare status rotates conservatively because the server
+/// gave nothing else to go on — except a bare 429 with a provider retry hint,
+/// which is the one extra fact pi's classifier never sees and names a
+/// transient wait, not an exhausted account.
+fn account_cap_exhausted(
+	status: u16,
+	code: Option<&str>,
+	message: Option<&str>,
+	retry_hint: Option<time::Duration>,
+) -> bool {
+	if !matches!(status, 402 | 429) {
+		return false;
+	}
+	let evidence = code
+		.into_iter()
+		.chain(message)
+		.collect::<Vec<_>>()
+		.join(" ");
+	if !INFORMATIVE_TEXT.is_match(&STATUS_FRAMING_TEXT.replace_all(&evidence, "")) {
+		return status == 402 || retry_hint.is_none();
+	}
+	if USAGE_LIMIT_TEXT.is_match(&evidence)
+		|| (SUBSCRIPTION_CAP_TEXT.is_match(&evidence) && !PER_INTERVAL_TEXT.is_match(&evidence))
+	{
+		return true;
+	}
+	if CONCURRENT_LIMIT_TEXT.is_match(&evidence) {
+		return status == 402;
+	}
+	if status == 402 && STATUS_402_QUOTA_TEXT.is_match(&evidence) {
+		return true;
+	}
+	// Pi `parseRateLimitReason` ordering: capacity shedding and per-interval
+	// throttles are transient; what remains of the quota vocabulary rotates.
+	let lower = evidence.to_ascii_lowercase();
+	if ["capacity", "overloaded", "529", "503"]
+		.iter()
+		.any(|word| lower.contains(word))
+	{
+		return false;
+	}
+	if ["per minute", "rate limit", "too many requests", "presque"]
+		.iter()
+		.any(|word| lower.contains(word))
+	{
+		return false;
+	}
+	["exhausted", "quota", "usage limit", "spending limit", "spending-limit"]
+		.iter()
+		.any(|word| lower.contains(word))
 }
 
 fn provider_error_facts(body: &[u8]) -> (Option<Str>, Option<Str>) {
@@ -2069,6 +2174,69 @@ mod tests {
 				"status {status}",
 			);
 		}
+	}
+
+	#[test]
+	fn billing_caps_and_opaque_usage_statuses_rotate_accounts_like_pi() {
+		// Pi `isUsageLimitOutcome`: credit exhaustion, bare 402/429 bodies,
+		// and 402 billing wording burn the credential and rotate.
+		for (status, body) in [
+			(
+				402,
+				br#"{"error":{"type":"invalid_request_error","message":"This request would exceed your available credits given your current in-flight requests"}}"#.as_slice(),
+			),
+			(402, br#"{"error":{"message":"Insufficient credits. Add more using https://openrouter.ai/credits"}}"#.as_slice()),
+			(429, br#"{"error":{"message":"credits exhausted"}}"#.as_slice()),
+			(402, b"".as_slice()),
+			(402, b"{}".as_slice()),
+			(429, b"".as_slice()),
+			(429, b"{}".as_slice()),
+			(402, br#"{"error":{"message":"Payment Required"}}"#.as_slice()),
+			(402, br#"{"error":{"message":"Too many concurrent requests"}}"#.as_slice()),
+			(429, br#"{"error":{"message":"Your account's rate limit has been reached; contact sales"}}"#.as_slice()),
+			(429, br#"{"error":{"message":"Rate limit exceeded: free-models-per-day"}}"#.as_slice()),
+		] {
+			let error = classify_http_error(status, body);
+			assert_eq!(error.action, RetryAction::RotateAccount, "status {status} {body:?}");
+			assert_eq!(
+				error.kind,
+				if status == 402 { ErrorKind::PaymentRequired } else { ErrorKind::RateLimited },
+			);
+		}
+
+		// Transient throttles, capacity shedding, and informative non-quota
+		// bodies stay on the same credential (or fail) instead of rotating.
+		for (status, body, action) in [
+			(
+				429,
+				br#"{"error":{"message":"Rate limit exceeded: 50 requests per minute"}}"#.as_slice(),
+				RetryAction::SameRoute { after: time::Duration::from_secs(30) },
+			),
+			(
+				429,
+				br#"{"error":{"message":"Too many concurrent requests"}}"#.as_slice(),
+				RetryAction::SameRoute { after: time::Duration::from_secs(30) },
+			),
+			(
+				429,
+				br#"{"error":{"message":"Service overloaded, retry later"}}"#.as_slice(),
+				RetryAction::SameRoute { after: time::Duration::from_secs(30) },
+			),
+			(
+				402,
+				br#"{"error":{"message":"A subscription is required for this endpoint"}}"#.as_slice(),
+				RetryAction::Never,
+			),
+		] {
+			assert_eq!(classify_http_error(status, body).action, action, "status {status} {body:?}");
+		}
+
+		// A bare 429 with a provider retry hint is a wait, not an exhausted
+		// account.
+		assert_eq!(
+			classify_http_error_with_hint(429, b"{}", Some(time::Duration::from_secs(2))).action,
+			RetryAction::SameRoute { after: time::Duration::from_secs(2) },
+		);
 	}
 
 	#[test]

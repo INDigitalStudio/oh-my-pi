@@ -11,7 +11,7 @@ use bytes::Bytes;
 use omp_catalog::{
 	Availability, ChatCapabilities, ClassId, DiscoveredModel, ModalityBits, ModelAvailability,
 	ModelCapabilities, OperationBits, OperationKind, PromptCacheMode, ReasoningEffort,
-	ThinkingEffort, ThinkingMode, ThinkingToolChoiceConflict, WireModelId,
+	ThinkingEffort, ThinkingMode, WireModelId,
 };
 use omp_core::{Str, encoding::base64, sf};
 use serde::{Deserialize, Serialize, Serializer};
@@ -516,24 +516,6 @@ fn encode_converse_request(
 	{
 		return Err(encoding_error(ErrorKind::CapabilityMismatch, "bedrock.sampling.unsupported"));
 	}
-	if setting_value(&request.reasoning).is_some()
-		&& matches!(
-			setting_value(&request.tool_choice),
-			Some(ToolChoice::Required | ToolChoice::Named(_))
-		) && (context.policy.tool.disable_reasoning_on_choice == Some(true)
-		|| matches!(
-			context.policy.tool.thinking_conflict,
-			Some(
-				ThinkingToolChoiceConflict::DropThinkingWhenForced
-					| ThinkingToolChoiceConflict::DropThinkingWhenAny
-					| ThinkingToolChoiceConflict::DropThinkingWhenEffort
-			)
-		)) {
-		return Err(encoding_error(
-			ErrorKind::CapabilityMismatch,
-			"bedrock.thinking.tool_choice_conflict",
-		));
-	}
 	if !request.sampling.temperature.is_none_or(f32::is_finite)
 		|| !request.sampling.top_p.is_none_or(f32::is_finite)
 	{
@@ -580,8 +562,27 @@ fn encode_converse_request(
 	}
 
 	let inference_config = inference_config(request);
-	let tool_config = tool_config(request, history_has_tools, context)?;
-	let additional_model_request_fields = reasoning_config(request, context)?;
+	let mut tool_config = tool_config(request, history_has_tools, context)?;
+	let mut additional_model_request_fields = reasoning_config(request, context)?;
+	// Pi `amazon-bedrock.ts`: Converse rejects thinking together with a
+	// forced (`any`/`tool`) choice. Prefix-bound models (Fable 5.1+) cannot
+	// switch thinking off, so their forced choice downgrades to `auto`;
+	// every other model drops thinking so the forced call proceeds.
+	if additional_model_request_fields.is_some()
+		&& let Some(config) = tool_config.as_mut()
+		&& matches!(
+			config.tool_choice,
+			Some(ToolChoiceEnvelope::Any { .. } | ToolChoiceEnvelope::Tool { .. })
+		) {
+		if context
+			.thinking_policy
+			.is_some_and(|policy| policy.prefix_binding == Some(true))
+		{
+			config.tool_choice = Some(ToolChoiceEnvelope::Auto { auto: EmptyObject {} });
+		} else {
+			additional_model_request_fields = None;
+		}
+	}
 	let guardrail_config = options.guardrail.as_ref().map(|guardrail| GuardrailConfig {
 		guardrail_identifier:   guardrail.identifier.clone(),
 		guardrail_version:      guardrail.version.clone(),
@@ -2313,6 +2314,17 @@ mod tests {
 		interleaved: bool,
 		configure: impl FnOnce(&mut WirePolicy),
 	) -> Bytes {
+		encode_fixture_full(request, options, mode, interleaved, false, configure)
+	}
+
+	fn encode_fixture_full(
+		request: &ChatRequest,
+		options: &BedrockOptions,
+		mode: ThinkingMode,
+		interleaved: bool,
+		prefix_binding: bool,
+		configure: impl FnOnce(&mut WirePolicy),
+	) -> Bytes {
 		let catalog = Catalog::embedded();
 		let fixture_model = if mode == ThinkingMode::AnthropicAdaptive {
 			"amazon-bedrock/eu.anthropic.claude-opus-4-7"
@@ -2350,6 +2362,9 @@ mod tests {
 			.cloned();
 		if let Some(thinking) = &mut explicit_thinking_policy {
 			thinking.mode = mode;
+			if prefix_binding {
+				thinking.prefix_binding = Some(true);
+			}
 			if setting_value(&request.reasoning).is_some() {
 				thinking.supports_display = Some(true);
 			}
@@ -2517,6 +2532,61 @@ mod tests {
 				.get("thinking")
 				.is_none()
 		);
+	}
+
+	#[test]
+	fn forced_tool_choice_with_thinking_downgrades_instead_of_failing() {
+		// Pi `amazon-bedrock.ts`: Converse rejects thinking + `any`/`tool`.
+		// Prefix-bound models keep thinking and fall back to `auto`; every
+		// other model keeps the forced choice and drops thinking.
+		let mut request = base_request(vec![text_message(Role::User, "Calculate 2 + 2.")]);
+		request.tools = vec![ToolDefinition {
+			name:        sf!("calculator"),
+			description: None,
+			input:       ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(
+					serde_json::from_str(r#"{"type":"object","properties":{}}"#).expect("schema"),
+				),
+				strict:     false,
+			},
+		}]
+		.into();
+		request.tool_choice = Setting::Require(ToolChoice::Named(sf!("calculator")));
+		request.reasoning = Setting::Require(ReasoningRequest {
+			visibility:          ReasoningVisibility::Summary,
+			effort:              Some(ReasoningEffort::High),
+			max_tokens:          None,
+			preserve_signatures: true,
+		});
+
+		let bound: Value = serde_json::from_slice(&encode_fixture_full(
+			&request,
+			&BedrockOptions::default(),
+			ThinkingMode::AnthropicAdaptive,
+			false,
+			true,
+			|_| {},
+		))
+		.expect("prefix-bound request is JSON");
+		assert_eq!(bound["toolConfig"]["toolChoice"], serde_json::json!({"auto": {}}));
+		assert_eq!(bound["additionalModelRequestFields"]["thinking"]["type"], "adaptive");
+
+		request.tool_choice = Setting::Require(ToolChoice::Required);
+		request.reasoning = Setting::Require(ReasoningRequest {
+			visibility:          ReasoningVisibility::Hidden,
+			effort:              Some(ReasoningEffort::High),
+			max_tokens:          Some(4_096),
+			preserve_signatures: true,
+		});
+		let unbound: Value = serde_json::from_slice(&encode_fixture_with_thinking(
+			&request,
+			&BedrockOptions::default(),
+			ThinkingMode::Budget,
+			false,
+		))
+		.expect("budget request is JSON");
+		assert_eq!(unbound["toolConfig"]["toolChoice"], serde_json::json!({"any": {}}));
+		assert!(unbound.get("additionalModelRequestFields").is_none(), "{unbound}");
 	}
 
 	#[test]

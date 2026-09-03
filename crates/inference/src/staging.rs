@@ -2058,6 +2058,7 @@ fn encode_usage(usage: Usage, out: &mut Vec<u8>) {
 		usage.audio_input_ms,
 		usage.audio_output_ms,
 		usage.video_ms,
+		usage.premium_requests_millionths,
 	] {
 		put_u64(out, value);
 	}
@@ -2208,6 +2209,7 @@ impl<'a> GateCursor<'a> {
 			audio_input_ms:     self.u64()?,
 			audio_output_ms:    self.u64()?,
 			video_ms:           self.u64()?,
+			premium_requests_millionths: self.u64()?,
 			images:             self.u32()?,
 			search_calls:       self.u32()?,
 			source:             match self.u8()? {

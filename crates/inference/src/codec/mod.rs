@@ -31,7 +31,7 @@ use crate::{
 	},
 	auth::{AuthScheme, BodyPlacement, CredentialApplyError, lease::AppliedCredentials},
 	body::{AttemptEvidenceHandle, BodySource},
-	call::{AccountRoutingContext, OperationCall, SessionRequest},
+	call::{AccountRoutingContext, CallAffinity, OperationCall, SessionRequest},
 	error::Error,
 	event::{ChatEvent, FinishReason, WorkflowResponse},
 	id::{AccountId, PrincipalId, RequestId, ToolCallId},
@@ -326,6 +326,8 @@ pub struct EncodeContext<'a> {
 	pub thinking_selection: Option<&'a ThinkingSelection>,
 	/// Optional canonical session identity and revision.
 	pub session:            Option<&'a SessionRequest>,
+	/// Session-independent prompt-cache and provider-session identities.
+	pub affinity:           &'a CallAffinity,
 	/// Compatible typed provider-side state selected by session planning.
 	pub server_state:       Option<&'a ServerStateBinding>,
 	/// Non-secret account/project/tenant routing metadata.
@@ -335,6 +337,7 @@ pub struct EncodeContext<'a> {
 }
 
 static DEFAULT_REQUEST_ID: RequestId = RequestId::empty();
+static DEFAULT_AFFINITY: CallAffinity = CallAffinity::none();
 static DEFAULT_WIRE_POLICY: WirePolicy = WirePolicy::baseline();
 /// Neutral deny-everything route placeholder backing
 /// [`EncodeContext::default`].
@@ -388,6 +391,7 @@ impl Default for EncodeContext<'_> {
 			thinking_policy:    None,
 			thinking_selection: None,
 			session:            None,
+			affinity:           &DEFAULT_AFFINITY,
 			server_state:       None,
 			account:            None,
 			attempt:            EncodeAttempt::default(),

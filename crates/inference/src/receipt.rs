@@ -157,11 +157,20 @@ pub struct Usage {
 	pub video_ms:           u64,
 	/// Standalone or hosted search calls made.
 	pub search_calls:       u32,
+	/// Premium requests consumed, scaled by one million (pi
+	/// `usage.premiumRequests`): GitHub Copilot bills each user-initiated
+	/// request at the model's premium multiplier and agent-initiated
+	/// continuations at zero.
+	#[serde(default)]
+	pub premium_requests_millionths: u64,
 	/// Provenance of the accumulated values.
 	pub source:             UsageSource,
 }
 
 impl Usage {
+	/// Fixed-point scale of `premium_requests_millionths`: one premium request.
+	pub const PREMIUM_REQUEST_SCALE: u64 = 1_000_000;
+
 	/// Adds all dimensions with saturation and preserves mixed provenance.
 	pub fn accumulate(&mut self, other: Self) {
 		self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
@@ -178,6 +187,9 @@ impl Usage {
 		self.audio_output_ms = self.audio_output_ms.saturating_add(other.audio_output_ms);
 		self.video_ms = self.video_ms.saturating_add(other.video_ms);
 		self.search_calls = self.search_calls.saturating_add(other.search_calls);
+		self.premium_requests_millionths = self
+			.premium_requests_millionths
+			.saturating_add(other.premium_requests_millionths);
 		self.source = match (self.source, other.source) {
 			(UsageSource::Unknown, source) | (source, UsageSource::Unknown) => source,
 			(left, right) if left == right => left,
@@ -615,6 +627,7 @@ mod tests {
 			audio_output_ms:    7,
 			video_ms:           8,
 			search_calls:       1,
+			premium_requests_millionths: 330_000,
 			source:             UsageSource::Provider,
 		};
 		usage += Usage {
@@ -628,6 +641,7 @@ mod tests {
 			audio_output_ms:    70,
 			video_ms:           80,
 			search_calls:       2,
+			premium_requests_millionths: 1_000_000,
 			source:             UsageSource::Estimated,
 		};
 		assert_eq!((usage.input_tokens, usage.output_tokens, usage.reasoning_tokens), (11, 22, 33));
@@ -636,6 +650,7 @@ mod tests {
 			(usage.audio_input_ms, usage.audio_output_ms, usage.video_ms, usage.search_calls),
 			(66, 77, 88, 3)
 		);
+		assert_eq!(usage.premium_requests_millionths, 1_330_000);
 		assert_eq!(usage.source, UsageSource::Mixed);
 		let mut cost = Cost::from_micro_usd(125);
 		cost += Cost::from_micro_usd(75);

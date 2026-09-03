@@ -91,6 +91,7 @@ struct ExecutionState {
 	input_tokens:            AtomicU64,
 	output_tokens:           AtomicU64,
 	provisional_bytes:       AtomicU64,
+	premium_requests:        AtomicU64,
 	cost_micro_usd:          Mutex<i128>,
 	receipt:                 Mutex<ExecutionReceipt>,
 	body:                    Mutex<Option<AttemptBodyEvidence>>,
@@ -122,6 +123,7 @@ impl ExecutionContext {
 			input_tokens: AtomicU64::new(0),
 			output_tokens: AtomicU64::new(0),
 			provisional_bytes: AtomicU64::new(0),
+			premium_requests: AtomicU64::new(0),
 			sign_budget_exhaustions: AtomicU32::new(0),
 			cost_micro_usd: Mutex::new(0),
 			receipt: Mutex::new(ExecutionReceipt::default()),
@@ -235,6 +237,18 @@ impl ExecutionContext {
 	/// Returns the compatible provider-side state selected for encoding.
 	pub fn session_state(&self) -> Option<ServerStateBinding> {
 		self.0.session_state.lock().clone()
+	}
+
+	/// Stores the premium requests (millionths) the current attempt is
+	/// billed by the provider's plan; decided at encode time, charged to the
+	/// attempt's usage when the completion settles.
+	pub fn set_premium_requests_millionths(&self, millionths: u64) {
+		self.0.premium_requests.store(millionths, Ordering::Release);
+	}
+
+	/// Premium requests (millionths) the current attempt is billed.
+	pub fn premium_requests_millionths(&self) -> u64 {
+		self.0.premium_requests.load(Ordering::Acquire)
 	}
 
 	/// Stores the trust boundary of the endpoint used by the current attempt.

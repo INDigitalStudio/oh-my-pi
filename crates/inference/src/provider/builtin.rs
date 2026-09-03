@@ -1447,6 +1447,7 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			thinking_policy: plan.thinking_policy.as_deref(),
 			thinking_selection: plan.thinking_selection.as_ref(),
 			session: call.session.as_ref(),
+			affinity: &call.affinity,
 			server_state: server_state.as_ref(),
 			account: account.as_ref(),
 			attempt: EncodeAttempt::default()
@@ -1500,6 +1501,25 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			execution,
 		)?;
 		merge_static_headers(&mut encoded.headers, &self.headers, execution)?;
+		// Copilot bills by initiator (pi `buildCopilotDynamicHeaders`): the
+		// headers declare it and the attempt's usage charges it.
+		let premium_requests_millionths = if super::copilot::is_copilot(&route.provider)
+			&& let OperationCall::Chat(request) = operation
+		{
+			let dynamics = super::copilot::dynamics(
+				request,
+				&self.headers,
+				plan
+					.policy_model
+					.as_ref()
+					.and_then(|model| model.premium_multiplier_millionths),
+			);
+			merge_static_headers(&mut encoded.headers, &dynamics.headers, execution)?;
+			dynamics.premium_requests_millionths
+		} else {
+			0
+		};
+		execution.set_premium_requests_millionths(premium_requests_millionths);
 		apply_before_request_mutation(&mut encoded, mutation, execution)?;
 		let header_names = encoded
 			.headers
@@ -2782,6 +2802,134 @@ mod tests {
 	}
 
 	#[test]
+	fn copilot_requests_declare_the_initiator_and_charge_premium_requests() {
+		// Pi `buildCopilotDynamicHeaders` + `getCopilotPremiumRequests`: a user
+		// turn on a 0.33× model bills 0.33 premium requests and says so on the
+		// wire; the tool-result continuation is agent-initiated and free.
+		let catalog = Catalog::embedded();
+		let model = catalog
+			.models()
+			.iter()
+			.find(|model| model.key.as_str() == "github-copilot/claude-haiku-4.5")
+			.expect("embedded Copilot Haiku model");
+		assert_eq!(
+			model.premium_multiplier_millionths,
+			Some(omp_catalog::PremiumMultiplier::from_millionths(330_000)),
+		);
+		let (mut encoder, mut call, ..) = discovery_fixture();
+		let route = model
+			.routes
+			.iter()
+			.filter_map(|route| catalog.route(route))
+			.find(|route| route.provider.as_str() == super::super::copilot::PROVIDER)
+			.expect("Haiku is served by a Copilot route")
+			.clone();
+		encoder.route = route.clone();
+		let wire_model = model
+			.wire_ids
+			.iter()
+			.find(|(candidate, _)| candidate == &route.id)
+			.map(|(_, wire_model)| wire_model.clone())
+			.expect("Copilot wire model");
+		let binding = codec_binding(&route, &test_cca(), false, false, None, None)
+			.expect("Copilot codec binding");
+		encoder.codec = binding.primary;
+		let plan = Arc::make_mut(call.execution.as_mut().expect("execution plan"));
+		plan.operation = OperationKind::Chat;
+		plan.model = Some(model.key.clone());
+		plan.policy_model = Some(Arc::new(PolicyModel::from(model)));
+		plan.wire_policy = Arc::new(
+			catalog
+				.wire_policy(&model.wire_policy)
+				.expect("Copilot wire policy")
+				.clone(),
+		);
+		plan.provider = route.provider.clone();
+		plan.route = route.id.clone();
+		plan.codec = route.codec.clone();
+		plan.wire_target = Some(WireTarget {
+			route: route.id.clone(),
+			codec: route.codec.clone(),
+			endpoint: route.endpoint.clone(),
+			wire_model,
+		});
+		let text = |role, body: &str| Message {
+			role,
+			content: Arc::from([ContentPart::Text { text: Str::new(body), proof: None }]),
+			name: None,
+		};
+		let mut chat = request_hook_chat();
+		chat.hosted_tools = Arc::from([]);
+		chat.tool_choice = Setting::Unset;
+		chat.messages = Arc::from([text(Role::User, "Read the file.")]);
+		call.operation = OperationCall::Chat(Arc::new(chat.clone()));
+
+		let header = |encoded: &TransportRequest, name: &str| {
+			encoded
+				.encoded
+				.headers
+				.iter()
+				.find(|header| header.name.eq_ignore_ascii_case(name))
+				.map(|header| header.value.clone())
+		};
+		let user_context = ExecutionContext::new(ExecutionBudget::default());
+		let user_turn = encoder
+			.encode(
+				&call,
+				&None,
+				&BeforeRequestMutation::default(),
+				&user_context,
+				0,
+				false,
+				Cancellation::default(),
+			)
+			.expect("user turn encodes");
+		assert_eq!(header(&user_turn, "X-Initiator").as_deref(), Some("user"));
+		assert_eq!(header(&user_turn, "X-Interaction-Type").as_deref(), Some("conversation-user"));
+		assert_eq!(user_context.premium_requests_millionths(), 330_000);
+
+		chat.messages = Arc::from([
+			text(Role::User, "Read the file."),
+			Message {
+				role:    Role::Assistant,
+				content: Arc::from([ContentPart::ToolCall {
+					call:      ToolCallId::new("call_1"),
+					name:      sf!("read"),
+					arguments: OpaqueJson::new(json!({"path": "note.txt"})),
+					proof:     None,
+				}]),
+				name:    None,
+			},
+			Message {
+				role:    Role::Tool,
+				content: Arc::from([ContentPart::ToolResult {
+					call:     ToolCallId::new("call_1"),
+					name:     Some(sf!("read")),
+					content:  vec![crate::call::ToolResultContent::Text(sf!("hello"))].into(),
+					is_error: false,
+				}]),
+				name:    None,
+			},
+		]);
+		call.operation = OperationCall::Chat(Arc::new(chat));
+		let agent_context = ExecutionContext::new(ExecutionBudget::default());
+		let agent_turn = encoder
+			.encode(
+				&call,
+				&None,
+				&BeforeRequestMutation::default(),
+				&agent_context,
+				0,
+				false,
+				Cancellation::default(),
+			)
+			.expect("agent continuation encodes");
+		assert_eq!(header(&agent_turn, "X-Initiator").as_deref(), Some("agent"));
+		assert_eq!(header(&agent_turn, "X-Interaction-Type").as_deref(), Some("conversation-agent"));
+		assert_eq!(agent_context.premium_requests_millionths(), 0);
+	}
+
+	#[test]
 	fn endpoint_api_version_is_appended_without_overwriting_query() {
 		let context = ExecutionContext::new(ExecutionBudget::default());
 		let mut uri = sf!("https://example.azure.com/openai/responses?trace=1");
@@ -2907,6 +3055,7 @@ mod tests {
 			deadline: None,
 			budget,
 			session: None,
+			affinity: Default::default(),
 			response_hooks: Default::default(),
 			attribution: InferenceAttribution::core(),
 			execution: Some(Arc::new(plan)),

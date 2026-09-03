@@ -125,10 +125,11 @@ impl<O: Operation> PlannedOperation<O> {
 /// Typed facade over one Tower inference service and one side-effect-free
 /// planner.
 pub struct Client<S, P> {
-	service: S,
-	planner: P,
-	meta:    CallMeta,
-	staging: Option<crate::call::StagingRequest>,
+	service:  S,
+	planner:  P,
+	meta:     CallMeta,
+	affinity: crate::call::CallAffinity,
+	staging:  Option<crate::call::StagingRequest>,
 }
 
 impl<S, P> Client<S, P>
@@ -138,7 +139,19 @@ where
 	/// Creates a client with a clone-cheap planner and caller-supplied metadata
 	/// defaults.
 	pub const fn new(service: S, planner: P, meta: CallMeta) -> Self {
-		Self { service, planner, meta, staging: None }
+		Self { service, planner, meta, affinity: crate::call::CallAffinity::none(), staging: None }
+	}
+
+	/// Attaches session-independent prompt-cache and provider-session
+	/// identities to every subsequent call.
+	pub fn with_affinity(mut self, affinity: crate::call::CallAffinity) -> Self {
+		self.affinity = affinity;
+		self
+	}
+
+	/// Borrows the affinity attached to subsequent calls.
+	pub const fn affinity(&self) -> &crate::call::CallAffinity {
+		&self.affinity
 	}
 
 	/// Borrows the underlying service.
@@ -186,6 +199,7 @@ where
 	/// service.
 	pub fn plan<O: Operation>(&self, operation: &O) -> Result<PlannedOperation<O>, Error> {
 		let mut call = operation.to_call(self.meta.clone());
+		call.affinity = self.affinity.clone();
 		call.staging = self.staging.clone();
 		let plan = Arc::new(self.planner.plan(&mut call, Instant::now())?);
 		if plan.operation != O::KIND {

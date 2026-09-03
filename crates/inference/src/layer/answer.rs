@@ -727,7 +727,6 @@ mod tests {
 					revision:              root.revision().to_owned(),
 					turn:                  turn.clone(),
 					strategy:              ContextStrategy::Replay,
-					prompt_cache_affinity: None,
 					append_only:           true,
 					provider_reset:        false,
 					forked:                true,

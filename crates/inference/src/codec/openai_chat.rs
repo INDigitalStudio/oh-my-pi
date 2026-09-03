@@ -664,9 +664,7 @@ impl Codec for OpenAiChatCodec {
 		let mut selected = self.clone();
 		selected.profile.apply_policy(context.policy);
 		if !context.route.capability_limits.disable_prompt_caching
-			&& let Some(key) = context
-				.session
-				.and_then(|session| session.prompt_cache_affinity.as_ref())
+			&& let Some(key) = context.affinity.prompt_cache.as_ref()
 			&& let Some(OpenAiChatAdapterOptions::OpenAi(options)) = selected.adapter.as_mut()
 		{
 			options.prompt_cache_key = Some(key.clone());
@@ -2903,16 +2901,16 @@ mod tests {
 	use serde::Deserialize;
 
 	use super::{
-		ErrorCode, OpenAiChatCodec, OpenAiChatDecoder, OpenAiChatProfile, ReasoningWireFormat,
-		ToolIdWireProfile, WireError, WireFinishReason, WireUsage, classify_error,
-		flatten_exclusive_required_root_union,
+		ErrorCode, OpenAiChatAdapterOptions, OpenAiChatCodec, OpenAiChatDecoder,
+		OpenAiChatProfile, OpenAiOptions, ReasoningWireFormat, ToolIdWireProfile, WireError,
+		WireFinishReason, WireUsage, classify_error, flatten_exclusive_required_root_union,
 	};
 	use crate::{
 		body::BodySource,
 		call::{
-			ChatRequest, ContentPart, MediaInput, Message, NegotiationPolicy, OpaqueJson,
-			OperationCall, ReasoningRequest, ReasoningVisibility, Role, Sampling, Setting,
-			ToolChoice, ToolDefinition, ToolInputConstraint, ToolResultContent,
+			CallAffinity, ChatRequest, ContentPart, MediaInput, Message, NegotiationPolicy,
+			OpaqueJson, OperationCall, ReasoningRequest, ReasoningVisibility, Role, Sampling,
+			Setting, ToolChoice, ToolDefinition, ToolInputConstraint, ToolResultContent,
 		},
 		catalog::ReasoningEffort,
 		codec::{Codec, Decoder, EncodeContext, RawEvent},
@@ -3372,6 +3370,34 @@ mod tests {
 			})
 			.expect("completion");
 		assert_eq!(finish, &FinishReason::ContentFilter);
+	}
+
+	#[test]
+	fn partial_usage_chunks_without_reasoning_details_keep_earlier_reasoning_tokens() {
+		// Hosts that stream usage per chunk omit `completion_tokens_details`
+		// on most chunks; a zero there is absence, not a reset.
+		let events = decode_fixture(concat!(
+			"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",",
+			"\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"},\"finish_reason\":null}],",
+			"\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,",
+			"\"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n",
+			"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",",
+			"\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"},\"finish_reason\":\"stop\"}],",
+			"\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n",
+			"data: [DONE]\n\n",
+		))
+		.expect("stream decodes");
+		let usage = events
+			.iter()
+			.filter_map(|event| match event {
+				RawEvent::Chat(ChatEvent::Usage(update)) => Some(update.usage),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(usage.len(), 2);
+		assert_eq!(usage[0].reasoning_tokens, 2);
+		assert_eq!(usage[1].output_tokens, 4);
+		assert_eq!(usage[1].reasoning_tokens, 2, "later chunk without details must not zero reasoning");
 	}
 
 	#[test]
@@ -4792,6 +4818,16 @@ mod tests {
 		maximum_output_tokens: Option<u64>,
 		request: ChatRequest,
 	) -> serde_json::Value {
+		encode_embedded(policy, maximum_output_tokens, request, &CallAffinity::none(), None)
+	}
+
+	fn encode_embedded(
+		policy: &policy::WirePolicy,
+		maximum_output_tokens: Option<u64>,
+		request: ChatRequest,
+		affinity: &CallAffinity,
+		adapter: Option<OpenAiChatAdapterOptions>,
+	) -> serde_json::Value {
 		let catalog = Catalog::embedded();
 		let model = catalog
 			.models()
@@ -4832,9 +4868,10 @@ mod tests {
 			target: Some(&target),
 			policy_model: Some(&policy_model),
 			policy,
+			affinity,
 			..EncodeContext::default()
 		};
-		let encoded = OpenAiChatCodec::new(OpenAiChatProfile::default(), None)
+		let encoded = OpenAiChatCodec::new(OpenAiChatProfile::default(), adapter)
 			.encode(&context, &OperationCall::Chat(Arc::new(request)))
 			.expect("request encodes");
 		let BodySource::Bytes(body) = encoded.body else {
@@ -4848,6 +4885,33 @@ mod tests {
 		request.max_output_tokens = Some(max_output_tokens);
 		request
 }
+
+	#[test]
+	fn call_cache_affinity_lowers_prompt_cache_key_without_a_bound_conversation() {
+		// Headless calls carry no provider conversation; the invocation key
+		// still has to reach `prompt_cache_key` (pi `getOpenAIPromptCacheKey`).
+		let affinity = CallAffinity {
+			prompt_cache:     Some(omp_core::sf!("invocation-cache")),
+			provider_session: None,
+		};
+		let wire = encode_embedded(
+			&policy::WirePolicy::baseline(),
+			None,
+			request(Arc::from([text_message("hello")])),
+			&affinity,
+			Some(OpenAiChatAdapterOptions::OpenAi(OpenAiOptions::default())),
+		);
+		assert_eq!(wire["prompt_cache_key"], "invocation-cache");
+
+		let wire = encode_embedded(
+			&policy::WirePolicy::baseline(),
+			None,
+			request(Arc::from([text_message("hello")])),
+			&CallAffinity::none(),
+			Some(OpenAiChatAdapterOptions::OpenAi(OpenAiOptions::default())),
+		);
+		assert!(wire.get("prompt_cache_key").is_none());
+	}
 
 	#[test]
 	fn clamp_output_to_model_max_matches_pi_request_shape() {
