@@ -42,7 +42,7 @@ pub struct DynHost {
 impl DynHost {
 	/// Binds one live device catalog, worker dispatcher, proposal registry, and
 	/// session hook gate.
-	pub fn new(
+	pub(crate) fn new(
 		catalog: DeviceCatalog,
 		invoker: Arc<dyn ErasedDeviceInvoker>,
 		proposals: StagedProposalRegistry,

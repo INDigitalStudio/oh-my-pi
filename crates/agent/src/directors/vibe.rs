@@ -6,8 +6,8 @@ use omp_dom::Node;
 use crate::director::{BindValue, Director, Slot};
 
 const CLAIMS: &[Slot] = &[Slot::Mode, Slot::Loop];
-/// Tools the vibe coordinator may use: inspection, tracking, the vibe
-/// orchestration device, and peer coordination; never direct mutation.
+/// Tools the vibe coordinator may use: inspection, tracking, and the real
+/// `task`/`hub` session orchestration primitives; never direct mutation.
 pub const VIBE_TOOLS: &[&str] = &[
 	"read",
 	"grep",
@@ -15,12 +15,7 @@ pub const VIBE_TOOLS: &[&str] = &[
 	"todo",
 	"think",
 	"ask",
-	"vibe",
-	"vibe_spawn",
-	"vibe_send",
-	"vibe_wait",
-	"vibe_kill",
-	"vibe_list",
+	"task",
 	"hub",
 	"yield",
 ];
@@ -64,7 +59,7 @@ impl Director for Vibe {
 	}
 
 	fn state(&self) -> Vec<(Str, BindValue)> {
-		vec![(Str::new_static("tool"), BindValue::Str(Str::new_static("vibe_spawn")))]
+		vec![(Str::new_static("tool"), BindValue::Str(Str::new_static("task")))]
 	}
 }
 
