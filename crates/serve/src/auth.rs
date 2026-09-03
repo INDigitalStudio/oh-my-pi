@@ -310,6 +310,7 @@ impl AuthRpc {
 				deadline:       None,
 				budget:         ExecutionBudget::default(),
 				session:        None,
+				debug_session:  None,
 				response_hooks: Default::default(),
 			},
 		)

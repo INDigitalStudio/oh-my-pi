@@ -211,11 +211,11 @@ where
 				// pi `auto_retry_start`: `attempt` counts retries (1 = first retry)
 				// against `maxAttempts` = the retry cap, never the initial try.
 				request.context.notify_retry(RetryNotice {
-					attempt:      retry_attempt,
+					attempt: retry_attempt,
 					max_attempts: max_retries,
 					delay,
-					kind:         error.kind,
-					message:      Str::new(error.to_string()),
+					kind: error.kind,
+					message: Str::new(error.to_string()),
 				});
 				if !delay.is_zero() {
 					wait_retry_delay(request.context.clone(), delay).await?;

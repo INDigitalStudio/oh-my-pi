@@ -344,6 +344,7 @@ mod tests {
 				deadline:       None,
 				budget:         ExecutionBudget::default(),
 				session:        None,
+				debug_session:  None,
 				response_hooks: Default::default(),
 			},
 			OperationCall::CountTokens(Arc::new(CountTokensRequest {
@@ -397,11 +398,8 @@ mod tests {
 		});
 		let inner = service_fn(move |call: LayerCall<Call>| {
 			call.context.with_receipt(|receipt| {
-				receipt.usage = Usage {
-					output_tokens: 1000,
-					reasoning_tokens: 800,
-					..Usage::default()
-				};
+				receipt.usage =
+					Usage { output_tokens: 1000, reasoning_tokens: 800, ..Usage::default() };
 			});
 			async { Ok::<_, Error>(()) }
 		});

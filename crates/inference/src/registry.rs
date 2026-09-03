@@ -1242,6 +1242,7 @@ mod tests {
 			deadline:       None,
 			budget:         budget.clone(),
 			session:        None,
+			debug_session:  None,
 			affinity:       Default::default(),
 			response_hooks: Default::default(),
 			attribution:    CallInferenceAttribution::core(),

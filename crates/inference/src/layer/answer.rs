@@ -723,14 +723,15 @@ mod tests {
 				deadline: None,
 				budget,
 				session: Some(SessionRequest {
-					conversation:          root.conversation().to_owned(),
-					revision:              root.revision().to_owned(),
-					turn:                  turn.clone(),
-					strategy:              ContextStrategy::Replay,
-					append_only:           true,
-					provider_reset:        false,
-					forked:                true,
+					conversation:   root.conversation().to_owned(),
+					revision:       root.revision().to_owned(),
+					turn:           turn.clone(),
+					strategy:       ContextStrategy::Replay,
+					append_only:    true,
+					provider_reset: false,
+					forked:         true,
 				}),
+				debug_session: None,
 				response_hooks: Default::default(),
 			},
 			OperationCall::Chat(Arc::new(ChatRequest {
@@ -748,8 +749,8 @@ mod tests {
 				top_logprobs:      None,
 				safety:            Arc::from([]),
 				negotiation:       NegotiationPolicy::default(),
-	forced_call: None,
-})),
+				forced_call:       None,
+			})),
 		);
 		call.execution = Some(Arc::new(plan));
 		let context = ExecutionContext::new(ExecutionBudget::default());

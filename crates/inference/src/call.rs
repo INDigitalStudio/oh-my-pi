@@ -119,19 +119,19 @@ pub enum Target {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRequest {
 	/// Conversation to append or query.
-	pub conversation:          ConversationId,
+	pub conversation:   ConversationId,
 	/// Immutable base revision.
-	pub revision:              Revision,
+	pub revision:       Revision,
 	/// Idempotency identity for the new turn.
-	pub turn:                  TurnId,
+	pub turn:           TurnId,
 	/// Requested context transport strategy.
-	pub strategy:              ContextStrategy,
+	pub strategy:       ContextStrategy,
 	/// Preserve a byte-stable prefix and admit only newly appended messages.
-	pub append_only:           bool,
+	pub append_only:    bool,
 	/// Discard provider-native affinity before selecting an account.
-	pub provider_reset:        bool,
+	pub provider_reset: bool,
 	/// Whether the caller deliberately forked from an earlier revision.
-	pub forked:                bool,
+	pub forked:         bool,
 }
 
 /// Determines how canonical conversation context reaches a provider.
@@ -235,6 +235,8 @@ pub struct CallMeta {
 	pub budget:         ExecutionBudget,
 	/// Optional append-only conversation context.
 	pub session:        Option<SessionRequest>,
+	/// Observer-only session identity for bounded private wire capture.
+	pub debug_session:  Option<Str>,
 	/// Bitmap-gated provider request/response hook sink.
 	pub response_hooks: crate::codec::ProviderResponseHooks,
 }
@@ -252,6 +254,8 @@ pub struct Call {
 	pub budget:         ExecutionBudget,
 	/// Optional append-only conversation context.
 	pub session:        Option<SessionRequest>,
+	/// Observer-only session identity for bounded private wire capture.
+	pub debug_session:  Option<Str>,
 	/// Session-independent prompt-cache and provider-session identities.
 	pub affinity:       CallAffinity,
 	/// Bitmap-gated provider request/response hook sink.
@@ -286,6 +290,7 @@ impl Call {
 			deadline: meta.deadline,
 			budget: meta.budget,
 			session: meta.session,
+			debug_session: meta.debug_session,
 			affinity: CallAffinity::none(),
 			response_hooks: meta.response_hooks,
 			attribution: InferenceAttribution::core(),

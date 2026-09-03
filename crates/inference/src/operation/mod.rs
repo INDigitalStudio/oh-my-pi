@@ -71,6 +71,8 @@ pub struct OperationRequest<T> {
 	pub budget:         ExecutionBudget,
 	/// Optional conversation state.
 	pub session:        Option<SessionRequest>,
+	/// Observer-only session identity for bounded private wire capture.
+	pub debug_session:  Option<Str>,
 	/// Session-independent prompt-cache and provider-session identities.
 	pub affinity:       CallAffinity,
 	/// Bitmap-gated provider request/response hook sink.
@@ -93,6 +95,7 @@ impl<T> OperationRequest<T> {
 			deadline: call.deadline,
 			budget: call.budget.clone(),
 			session: call.session.clone(),
+			debug_session: call.debug_session.clone(),
 			affinity: call.affinity.clone(),
 			response_hooks: call.response_hooks.clone(),
 			attribution: call.attribution.clone(),
@@ -110,6 +113,7 @@ impl<T> OperationRequest<T> {
 			deadline:       self.deadline,
 			budget:         self.budget,
 			session:        self.session,
+			debug_session:  self.debug_session,
 			affinity:       self.affinity,
 			response_hooks: self.response_hooks,
 			attribution:    self.attribution,

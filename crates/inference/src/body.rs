@@ -2,8 +2,7 @@
 
 use std::{
 	collections::VecDeque,
-	fmt,
-	future,
+	fmt, future,
 	future::Future,
 	pin::Pin,
 	sync::{

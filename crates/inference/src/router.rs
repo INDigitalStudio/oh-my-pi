@@ -1563,8 +1563,8 @@ mod tests {
 				top_logprobs:      None,
 				safety:            Arc::from([]),
 				negotiation:       NegotiationPolicy::default(),
-	forced_call: None,
-}))
+				forced_call:       None,
+			}))
 		};
 		let signed = vec![ContentPart::Reasoning { text: sf!("signed plan"), proof: Some(proof) }];
 		let unsigned = vec![ContentPart::Text { text: sf!("plain answer"), proof: None }];

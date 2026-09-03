@@ -29,10 +29,10 @@ use crate::{
 		Stage,
 		empty::{EmptyCompletionKind, EmptyCompletionStage, EmptyEvent, EmptyInput},
 		json::{JsonEnforcement, JsonRepairLimits, JsonRepairStage},
-		reasoning::{ReasoningLimits, ReasoningObservation, ReasoningStallGuard},
 		projection::{
 			DialectRecoveryConfig, DialectRecoveryPipeline, ProjectionBatch, ProjectionFailure,
 		},
+		reasoning::{ReasoningLimits, ReasoningObservation, ReasoningStallGuard},
 		repetition::{
 			AttemptRepetitionGuard, LoopSignal, OutputVisibility, RepetitionLimits, recovery_record,
 		},
@@ -471,7 +471,7 @@ fn project_native_call(
 		}),
 		projection.push_native(ToolFragment::ArgumentsDelta {
 			source_index: index,
-			bytes: call.arguments,
+			bytes:        call.arguments,
 		}),
 		projection.push_native(ToolFragment::End { source_index: index }),
 	];
@@ -479,7 +479,10 @@ fn project_native_call(
 	for batch in batches {
 		events.extend(projection_events(batch, context)?);
 	}
-	if !events.iter().any(|event| matches!(event, ChatEvent::ToolCallReady { .. })) {
+	if !events
+		.iter()
+		.any(|event| matches!(event, ChatEvent::ToolCallReady { .. }))
+	{
 		return Err(recovery_error("tool.assembly-rejected", context));
 	}
 	Ok(events)
@@ -495,13 +498,7 @@ fn process_chat_event(
 	structured_index: &mut Option<u32>,
 	context: &ExecutionContext,
 ) -> Result<Option<ChatEvent>, Error> {
-	observe_reasoning(
-		reasoning_guard,
-		thinking_repetition,
-		text_repetition,
-		&event,
-		context,
-	)?;
+	observe_reasoning(reasoning_guard, thinking_repetition, text_repetition, &event, context)?;
 	let event = observe_empty(empty, event, context)?;
 	if let ChatEvent::TextDelta { index, text } = &event
 		&& let Some(stage) = json.as_mut()
@@ -792,19 +789,19 @@ fn price_usage(
 
 fn billable_dimensions(usage: &crate::receipt::Usage) -> UsageDimensions {
 	UsageDimensions {
-		input_tokens:       usage.input_tokens,
-		output_tokens:      usage.output_tokens,
-		cache_read_tokens:  usage.cache_read_tokens,
-		cache_write_tokens: usage.cache_write_tokens,
+		input_tokens:          usage.input_tokens,
+		output_tokens:         usage.output_tokens,
+		cache_read_tokens:     usage.cache_read_tokens,
+		cache_write_tokens:    usage.cache_write_tokens,
 		cache_write_1h_tokens: usage.cache_write_1h_tokens,
-		images:             u64::from(usage.images),
-		video_seconds:      usage.video_ms.div_ceil(1_000),
-		audio_seconds:      usage
+		images:                u64::from(usage.images),
+		video_seconds:         usage.video_ms.div_ceil(1_000),
+		audio_seconds:         usage
 			.audio_input_ms
 			.saturating_add(usage.audio_output_ms)
 			.div_ceil(1_000),
-		input_characters:   0,
-		requests:           1,
+		input_characters:      0,
+		requests:              1,
 	}
 }
 
@@ -923,9 +920,9 @@ mod tests {
 	#[test]
 	fn billable_dimensions_do_not_double_charge_cached_or_reasoning_subsets() {
 		let usage = crate::receipt::Usage {
-			input_tokens:      70,
-			output_tokens:     30,
-			reasoning_tokens:  20,
+			input_tokens: 70,
+			output_tokens: 30,
+			reasoning_tokens: 20,
 			cache_read_tokens: 40,
 			..Default::default()
 		};
@@ -938,10 +935,7 @@ mod tests {
 	#[test]
 	fn selected_service_tier_multiplier_applies_without_provider_branching() {
 		let pricing = omp_catalog::Pricing::new(
-			vec![omp_catalog::Price {
-				unit:      omp_catalog::PriceUnit::Request,
-				nanos_usd: 1_000,
-			}],
+			vec![omp_catalog::Price { unit: omp_catalog::PriceUnit::Request, nanos_usd: 1_000 }],
 			Vec::new(),
 		)
 		.expect("valid pricing")
@@ -967,14 +961,10 @@ mod tests {
 	#[test]
 	fn live_dialect_projection_suppresses_source_text_blocks_and_avoids_index_collisions() {
 		let mut policy = omp_catalog::WirePolicy::baseline();
-		policy.streaming.markup_healing_pattern =
-			Some(omp_catalog::StreamMarkupHealingPattern::Qwen);
+		policy.streaming.markup_healing_pattern = Some(omp_catalog::StreamMarkupHealingPattern::Qwen);
 		let definitions = [edit_grammar_definition()];
-		let config = DialectRecoveryConfig::from_wire_policy(
-			WirePolicyId::new("qwen-wire"),
-			&policy,
-			0,
-		);
+		let config =
+			DialectRecoveryConfig::from_wire_policy(WirePolicyId::new("qwen-wire"), &policy, 0);
 		let mut projection = Some(DialectRecoveryPipeline::new(&definitions, config));
 		let context = ExecutionContext::new(ExecutionBudget::default());
 		let thinking = project_source_chat_event(
@@ -983,10 +973,10 @@ mod tests {
 			&context,
 		)
 		.expect("thinking projects");
-		assert!(matches!(
-			thinking.as_slice(),
-			[ChatEvent::BlockStarted { index: 0, kind: BlockKind::Thinking }]
-		));
+		assert!(matches!(thinking.as_slice(), [ChatEvent::BlockStarted {
+			index: 0,
+			kind:  BlockKind::Thinking,
+		}]));
 		let source_text_start = project_source_chat_event(
 			&mut projection,
 			ChatEvent::BlockStarted { index: 1, kind: BlockKind::Text },
@@ -1012,9 +1002,13 @@ mod tests {
 		assert!(recovered.iter().any(
 			|event| matches!(event, ChatEvent::ToolCallReady { index: 1, call } if call.name == "edit")
 		));
-		assert!(context.receipt().recoveries.iter().any(
-			|record| record.rule.0.as_str() == "dialect/qwen-wire/qwen-xml"
-		));
+		assert!(
+			context
+				.receipt()
+				.recoveries
+				.iter()
+				.any(|record| record.rule.0.as_str() == "dialect/qwen-wire/qwen-xml")
+		);
 	}
 
 	#[test]
@@ -1048,9 +1042,13 @@ mod tests {
 				ChatEvent::ToolCallReady { index: 0, call }
 			] if call.arguments.as_value() == &serde_json::json!({"input": "x"})
 		));
-		assert!(context.receipt().recoveries.iter().any(
-			|record| record.rule.0.as_str() == "tool.complete-schema-valid"
-		));
+		assert!(
+			context
+				.receipt()
+				.recoveries
+				.iter()
+				.any(|record| record.rule.0.as_str() == "tool.complete-schema-valid")
+		);
 	}
 
 	#[test]

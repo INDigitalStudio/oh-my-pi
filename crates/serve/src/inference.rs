@@ -435,6 +435,7 @@ impl InferenceRpc {
 				deadline,
 				budget: ExecutionBudget::default(),
 				session: None,
+				debug_session: None,
 				response_hooks: self.response_hooks.clone(),
 			},
 		)
@@ -454,6 +455,9 @@ impl InferenceRpc {
 				target,
 				deadline: None,
 				budget: ExecutionBudget::default(),
+				debug_session: session
+					.as_ref()
+					.map(|session| Str::new(session.conversation.as_str())),
 				session,
 				response_hooks: self.response_hooks.clone(),
 			},
@@ -2448,8 +2452,8 @@ fn chat_request(
 			.and_then(|sampling| sampling.max_output_tokens),
 		top_logprobs: None,
 		safety: Arc::from([]),
-				negotiation:       NegotiationPolicy::default(),
-		forced_call:       None,
+		negotiation: NegotiationPolicy::default(),
+		forced_call: None,
 	})
 }
 

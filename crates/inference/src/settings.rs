@@ -498,13 +498,13 @@ impl ProviderRuntimeSettings {
 #[derive(Clone, Debug, Default)]
 pub struct InferenceSettings {
 	/// Retry and fallback policy.
-	pub retry:     RetrySettings,
+	pub retry:                     RetrySettings,
 	/// Chat sampling defaults.
-	pub sampling:  SamplingSettings,
+	pub sampling:                  SamplingSettings,
 	/// Provider admission and timeout policy.
-	pub providers: ProviderRuntimeSettings,
+	pub providers:                 ProviderRuntimeSettings,
 	/// Catalog/model policy.
-	pub model:     omp_catalog::settings::ModelSettings,
+	pub model:                     omp_catalog::settings::ModelSettings,
 	/// Whether context-overflow plans may promote to a larger compatible model.
 	pub context_promotion_enabled: bool,
 }
@@ -514,12 +514,11 @@ impl InferenceSettings {
 	#[must_use]
 	pub fn from_con(ctx: &Ctx) -> Self {
 		Self {
-			retry:     RetrySettings::from_con(ctx),
-			sampling:  SamplingSettings::from_con(ctx),
-			providers: ProviderRuntimeSettings::from_con(ctx),
-			model:     omp_catalog::settings::ModelSettings::from_con(ctx),
-			context_promotion_enabled:
-				crate::pi_settings::AI_CONTEXT_PROMOTION_ENABLED.get(ctx),
+			retry:                     RetrySettings::from_con(ctx),
+			sampling:                  SamplingSettings::from_con(ctx),
+			providers:                 ProviderRuntimeSettings::from_con(ctx),
+			model:                     omp_catalog::settings::ModelSettings::from_con(ctx),
+			context_promotion_enabled: crate::pi_settings::AI_CONTEXT_PROMOTION_ENABLED.get(ctx),
 		}
 	}
 
@@ -918,6 +917,7 @@ mod tests {
 				deadline:       None,
 				budget:         ExecutionBudget::default(),
 				session:        None,
+				debug_session:  None,
 				response_hooks: Default::default(),
 			},
 			OperationCall::Auth(sync::Arc::new(crate::call::AuthRequest::ListAccounts {

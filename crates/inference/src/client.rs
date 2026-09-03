@@ -495,6 +495,7 @@ mod tests {
 			deadline:       Some(Instant::now()),
 			budget:         ExecutionBudget::default(),
 			session:        None,
+			debug_session:  None,
 			response_hooks: Default::default(),
 		};
 		let mut client = Client::new(service, RejectingPlanner, call_meta.clone());
@@ -521,6 +522,7 @@ mod tests {
 			deadline:       None,
 			budget:         ExecutionBudget::default(),
 			session:        None,
+			debug_session:  None,
 			response_hooks: Default::default(),
 		};
 		let client = Client::new(service, RejectingPlanner, call_meta);

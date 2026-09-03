@@ -137,14 +137,14 @@ pub enum UsageSource {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Usage {
 	/// Input tokens consumed.
-	pub input_tokens:       u64,
+	pub input_tokens: u64,
 	/// Output tokens consumed, including any reasoning tokens.
-	pub output_tokens:      u64,
+	pub output_tokens: u64,
 	/// Reasoning subset of `output_tokens`; diagnostic only, never priced or
 	/// budgeted separately.
-	pub reasoning_tokens:   u64,
+	pub reasoning_tokens: u64,
 	/// Prompt-cache tokens read.
-	pub cache_read_tokens:  u64,
+	pub cache_read_tokens: u64,
 	/// Prompt-cache tokens written.
 	pub cache_write_tokens: u64,
 	/// Subset of `cache_write_tokens` written with one-hour retention (pi
@@ -153,15 +153,15 @@ pub struct Usage {
 	#[serde(default)]
 	pub cache_write_1h_tokens: u64,
 	/// Images processed or generated.
-	pub images:             u32,
+	pub images: u32,
 	/// Input audio duration in milliseconds.
-	pub audio_input_ms:     u64,
+	pub audio_input_ms: u64,
 	/// Output audio duration in milliseconds.
-	pub audio_output_ms:    u64,
+	pub audio_output_ms: u64,
 	/// Video duration in milliseconds.
-	pub video_ms:           u64,
+	pub video_ms: u64,
 	/// Standalone or hosted search calls made.
-	pub search_calls:       u32,
+	pub search_calls: u32,
 	/// Premium requests consumed, scaled by one million (pi
 	/// `usage.premiumRequests`): GitHub Copilot bills each user-initiated
 	/// request at the model's premium multiplier and agent-initiated
@@ -169,7 +169,7 @@ pub struct Usage {
 	#[serde(default)]
 	pub premium_requests_millionths: u64,
 	/// Provenance of the accumulated values.
-	pub source:             UsageSource,
+	pub source: UsageSource,
 }
 
 impl Usage {
@@ -625,34 +625,34 @@ mod tests {
 	#[test]
 	fn accumulates_every_usage_dimension_and_integer_cost() {
 		let mut usage = Usage {
-			input_tokens:       1,
-			output_tokens:      2,
-			reasoning_tokens:   3,
-			cache_read_tokens:  4,
+			input_tokens: 1,
+			output_tokens: 2,
+			reasoning_tokens: 3,
+			cache_read_tokens: 4,
 			cache_write_tokens: 5,
 			cache_write_1h_tokens: 2,
-			images:             1,
-			audio_input_ms:     6,
-			audio_output_ms:    7,
-			video_ms:           8,
-			search_calls:       1,
+			images: 1,
+			audio_input_ms: 6,
+			audio_output_ms: 7,
+			video_ms: 8,
+			search_calls: 1,
 			premium_requests_millionths: 330_000,
-			source:             UsageSource::Provider,
+			source: UsageSource::Provider,
 		};
 		usage += Usage {
-			input_tokens:       10,
-			output_tokens:      20,
-			reasoning_tokens:   30,
-			cache_read_tokens:  40,
+			input_tokens: 10,
+			output_tokens: 20,
+			reasoning_tokens: 30,
+			cache_read_tokens: 40,
 			cache_write_tokens: 50,
 			cache_write_1h_tokens: 20,
-			images:             2,
-			audio_input_ms:     60,
-			audio_output_ms:    70,
-			video_ms:           80,
-			search_calls:       2,
+			images: 2,
+			audio_input_ms: 60,
+			audio_output_ms: 70,
+			video_ms: 80,
+			search_calls: 2,
 			premium_requests_millionths: 1_000_000,
-			source:             UsageSource::Estimated,
+			source: UsageSource::Estimated,
 		};
 		assert_eq!((usage.input_tokens, usage.output_tokens, usage.reasoning_tokens), (11, 22, 33));
 		assert_eq!((usage.cache_read_tokens, usage.cache_write_tokens, usage.images), (44, 55, 3));

@@ -440,6 +440,7 @@ mod tests {
 			response_hooks: Default::default(),
 			attempt:        TransportAttempt {
 				request_id:          RequestId::from("request"),
+				session:             None,
 				provider:            omp_catalog::ProviderId::from("provider"),
 				model:               Some(omp_catalog::ModelKey::from("model")),
 				api:                 omp_core::Str::new_static("test"),
