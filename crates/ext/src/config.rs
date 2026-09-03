@@ -1186,6 +1186,77 @@ pub enum SettingType {
 	Enum,
 }
 
+/// Product settings tab available to an extension setting.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Eq,
+	PartialEq,
+	Deserialize,
+	Serialize,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum SettingUiTab {
+	/// Theme and terminal presentation.
+	Appearance,
+	/// Model behavior and sampling.
+	Model,
+	/// Input and session interaction.
+	Interaction,
+	/// Context collection and compaction.
+	Context,
+	/// Memory systems.
+	Memory,
+	/// File tools and language services.
+	Files,
+	/// Shell and runtime execution.
+	Shell,
+	/// Tool behavior.
+	Tools,
+	/// Task and subagent behavior.
+	Tasks,
+	/// Provider transports and services.
+	Providers,
+}
+
+/// One labeled choice in extension settings UI metadata.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct SettingUiOption {
+	/// Value written to the extension convar.
+	pub value:       Str,
+	/// Human option label.
+	pub label:       Str,
+	/// Optional explanatory copy.
+	#[serde(default)]
+	pub description: Str,
+}
+
+/// Optional curated settings projection declared by an extension manifest.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct SettingUiSchema {
+	/// Product tab.
+	pub tab:         SettingUiTab,
+	/// Existing product group within the tab.
+	pub group:       Str,
+	/// Human row label.
+	pub label:       Str,
+	/// Human explanatory copy.
+	pub description: Str,
+	/// Optional risk copy.
+	#[serde(default)]
+	pub warning:     Option<Str>,
+	/// Optional labeled choices. Empty means infer the widget from `type`.
+	#[serde(default)]
+	pub options:     Vec<SettingUiOption>,
+	/// Whether selected values have meaningful order.
+	#[serde(default)]
+	pub ordered:     bool,
+}
+
 /// Returns the canonical control-plane name for one extension setting.
 ///
 /// Extension identities remain visible in the name so independently admitted
@@ -1225,6 +1296,9 @@ pub struct SettingSchema {
 	/// Optional environment variable source.
 	#[serde(default)]
 	pub env:         Option<Str>,
+	/// Optional explicit product settings UI metadata.
+	#[serde(default)]
+	pub ui:          Option<SettingUiSchema>,
 }
 
 /// A generic command-line extension setting override.
@@ -2599,34 +2673,25 @@ default = "safe"
 			CliSettingOverride::parse("demo.limit=8.5").expect("number override"),
 			CliSettingOverride::parse("demo.mode=fast").expect("enum override"),
 		];
-		apply_resolved_setting_overrides(
-			"demo",
-			&manifest.settings,
-			&mut resolved,
-			&overrides,
-		)
-		.expect("typed overrides");
+		apply_resolved_setting_overrides("demo", &manifest.settings, &mut resolved, &overrides)
+			.expect("typed overrides");
 		assert_eq!(resolved["verbose"], serde_json::json!(true));
 		assert_eq!(resolved["limit"], serde_json::json!(8.5));
 		assert_eq!(resolved["mode"], serde_json::json!("fast"));
 
-		let error = apply_resolved_setting_overrides(
-			"demo",
-			&manifest.settings,
-			&mut resolved,
-			&[CliSettingOverride::parse("demo.unknown=true").expect("unknown override")],
-		)
+		let error = apply_resolved_setting_overrides("demo", &manifest.settings, &mut resolved, &[
+			CliSettingOverride::parse("demo.unknown=true").expect("unknown override"),
+		])
 		.expect_err("unknown setting");
 		assert!(error.to_string().contains("demo"));
 		assert!(error.to_string().contains("unknown"));
 
-		assert!(apply_resolved_setting_overrides(
-			"demo",
-			&manifest.settings,
-			&mut resolved,
-			&[CliSettingOverride::parse("demo.mode=invalid").expect("invalid enum")],
-		)
-		.is_err());
+		assert!(
+			apply_resolved_setting_overrides("demo", &manifest.settings, &mut resolved, &[
+				CliSettingOverride::parse("demo.mode=invalid").expect("invalid enum")
+			],)
+			.is_err()
+		);
 	}
 
 	#[test]

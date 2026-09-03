@@ -130,8 +130,8 @@ pub enum ThemeLoadError {
 /// a name the first source wins.
 #[derive(Clone, Debug, Default)]
 pub struct ThemeCatalog {
-	themes:   Vec<LoadedTheme>,
-	explicit: usize,
+	themes:       Vec<LoadedTheme>,
+	explicit:     usize,
 	/// Unreadable or malformed files inside discovered directories.
 	pub warnings: Vec<ThemeWarning>,
 }
@@ -173,10 +173,9 @@ impl ThemeCatalog {
 			for file in files {
 				match load_theme_file(&file) {
 					Ok(theme) => catalog.push(file, theme),
-					Err(error) => catalog.warnings.push(ThemeWarning {
-						path:    file,
-						message: Str::new(error_chain(&error)),
-					}),
+					Err(error) => catalog
+						.warnings
+						.push(ThemeWarning { path: file, message: Str::new(error_chain(&error)) }),
 				}
 			}
 		}
@@ -191,7 +190,9 @@ impl ThemeCatalog {
 		if self.get(&name).is_some() {
 			return;
 		}
-		self.themes.push(LoadedTheme { name, path, theme: Arc::new(theme) });
+		self
+			.themes
+			.push(LoadedTheme { name, path, theme: Arc::new(theme) });
 	}
 
 	/// The theme filed under `name` (its file stem), when loaded.
@@ -218,9 +219,10 @@ impl ThemeCatalog {
 }
 
 fn load_theme_file(path: &Path) -> Result<JsonTheme, ThemeLoadError> {
-	let source =
-		fs::read_to_string(path).map_err(|source| ThemeLoadError::Io { path: path.to_path_buf(), source })?;
-	JsonTheme::parse(&source).map_err(|source| ThemeLoadError::Theme { path: path.to_path_buf(), source })
+	let source = fs::read_to_string(path)
+		.map_err(|source| ThemeLoadError::Io { path: path.to_path_buf(), source })?;
+	JsonTheme::parse(&source)
+		.map_err(|source| ThemeLoadError::Theme { path: path.to_path_buf(), source })
 }
 
 /// Sorted `*.json` files directly below `dir`.
@@ -229,7 +231,9 @@ fn theme_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 		.filter_map(Result::ok)
 		.map(|entry| entry.path())
 		.filter(|path| {
-			path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+			path
+				.extension()
+				.is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
 				&& path.is_file()
 		})
 		.collect::<Vec<_>>();
@@ -294,22 +298,25 @@ enum ColorValue {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ThemePatch {
-	fg:          Option<String>,
-	accent:      Option<String>,
-	info:        Option<String>,
-	ok:          Option<String>,
-	warn:        Option<String>,
-	err:         Option<String>,
-	muted:       Option<String>,
-	border:      Option<String>,
-	code_border: Option<String>,
-	surface:     Option<String>,
-	hover:       Option<String>,
-	selection:   Option<String>,
-	shadow:      Option<String>,
-	panel:       Option<String>,
-	secondary:   Option<String>,
-	contrast:    Option<String>,
+	fg:            Option<String>,
+	accent:        Option<String>,
+	info:          Option<String>,
+	ok:            Option<String>,
+	warn:          Option<String>,
+	err:           Option<String>,
+	muted:         Option<String>,
+	dim:           Option<String>,
+	output:        Option<String>,
+	border:        Option<String>,
+	code_border:   Option<String>,
+	surface:       Option<String>,
+	hover:         Option<String>,
+	selection:     Option<String>,
+	shadow:        Option<String>,
+	panel:         Option<String>,
+	error_surface: Option<String>,
+	secondary:     Option<String>,
+	contrast:      Option<String>,
 }
 
 impl ThemePatch {
@@ -331,6 +338,8 @@ impl ThemePatch {
 		apply!(warn);
 		apply!(err);
 		apply!(muted);
+		apply!(dim);
+		apply!(output);
 		apply!(border);
 		apply!(code_border);
 		apply!(surface);
@@ -338,6 +347,7 @@ impl ThemePatch {
 		apply!(selection);
 		apply!(shadow);
 		apply!(panel);
+		apply!(error_surface);
 		apply!(secondary);
 		apply!(contrast);
 		Ok(theme)
@@ -360,10 +370,11 @@ fn apply_rich(
 			"mdCodeBlock" | "bashMode" | "statusLinePath" => theme.info = color,
 			"success" | "toolDiffAdded" | "statusLineGitClean" => theme.ok = color,
 			"warning" | "statusLineGitDirty" | "statusLineDirty" => theme.warn = color,
-			"error" | "toolDiffRemoved" | "toolErrorBg" => theme.err = color,
-			"muted" | "dim" | "thinkingText" | "toolOutput" | "toolDiffContext" | "statusLineSep" => {
-				theme.muted = color
-			},
+			"error" | "toolDiffRemoved" => theme.err = color,
+			"toolErrorBg" => theme.error_surface = color,
+			"muted" | "statusLineSep" => theme.muted = color,
+			"dim" => theme.dim = color,
+			"thinkingText" | "toolOutput" | "toolDiffContext" => theme.output = color,
 			"mdCodeBlockBorder" => theme.code_border = color,
 			"border" | "borderMuted" | "mdQuoteBorder" | "mdHr" => theme.border = color,
 			"selectedBg" => theme.selection = color,
@@ -701,10 +712,10 @@ mod tests {
 		fs::write(themes.join("broken.json"), "{").unwrap();
 		fs::write(themes.join("notes.txt"), "ignored").unwrap();
 
-		let catalog = ThemeCatalog::load(
-			std::slice::from_ref(&explicit),
-			&[themes.clone(), dir.path().join("missing")],
-		)
+		let catalog = ThemeCatalog::load(std::slice::from_ref(&explicit), &[
+			themes.clone(),
+			dir.path().join("missing"),
+		])
 		.unwrap();
 		let names = catalog
 			.themes()
@@ -713,7 +724,11 @@ mod tests {
 			.collect::<Vec<_>>();
 		assert_eq!(names, ["ocean", "forest"], "explicit file shadows the discovered one");
 		assert_eq!(
-			catalog.get("ocean").unwrap().for_appearance(Appearance::Dark).accent,
+			catalog
+				.get("ocean")
+				.unwrap()
+				.for_appearance(Appearance::Dark)
+				.accent,
 			Color::Rgb(0, 0, 255)
 		);
 		assert_eq!(catalog.first_explicit().unwrap().name, "Ocean");

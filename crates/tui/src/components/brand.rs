@@ -245,7 +245,8 @@ mod tests {
 
 	#[test]
 	fn quantized_theme_uses_the_256_ramp() {
-		let ctx = UiContext { theme: UiContext::default().theme.quantized_256(), ..UiContext::default() };
+		let ctx =
+			UiContext { theme: UiContext::default().theme.quantized_256(), ..UiContext::default() };
 		let ui = Ui::from_root(Brand::new(), 12, ctx);
 		assert_eq!(fg(&ui, 0, 0), Color::Indexed(206));
 		assert_eq!(fg(&ui, 8, 4), Color::Indexed(74));

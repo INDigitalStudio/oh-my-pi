@@ -94,7 +94,9 @@ pub use imagereg::bytes as image_bytes;
 /// Registers immutable renderer-local image bytes under an opaque TML source.
 pub use imagereg::register as register_image_source;
 /// Installs an application resolver for one `<img src>` URI scheme.
-pub use imagereg::{SourceResolver as ImageSourceResolver, register_scheme as register_image_scheme};
+pub use imagereg::{
+	SourceResolver as ImageSourceResolver, register_scheme as register_image_scheme,
+};
 pub use input::{
 	Chord, InputDecoder, InputEvent, Key, KeyEvent, Keymap, Mods, Mouse, MouseButton, MouseReport,
 	TerminalResponse, UiEvent, decode_keys,

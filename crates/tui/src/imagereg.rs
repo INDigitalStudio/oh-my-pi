@@ -236,7 +236,8 @@ mod tests {
 
 	#[test]
 	fn registered_scheme_resolves_sources_to_files() {
-		let path = env::temp_dir().join(format!("omp-tui-imagereg-scheme-{}.bin", std::process::id()));
+		let path =
+			env::temp_dir().join(format!("omp-tui-imagereg-scheme-{}.bin", std::process::id()));
 		fs::write(&path, b"payload").expect("fixture");
 		let resolved = path.clone();
 		register_scheme(

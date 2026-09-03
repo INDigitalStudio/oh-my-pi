@@ -99,10 +99,10 @@ pub struct Pulse {
 }
 
 impl Pulse {
-	/// Shortest facet dwell, at the cycle start.
-	pub const DWELL_MIN: Duration = Duration::from_millis(70);
 	/// Longest facet dwell, at the cycle midpoint.
 	pub const DWELL_MAX: Duration = Duration::from_millis(230);
+	/// Shortest facet dwell, at the cycle start.
+	pub const DWELL_MIN: Duration = Duration::from_millis(70);
 	/// Facets per revolution.
 	pub const FACETS: usize = 8;
 
@@ -280,7 +280,11 @@ impl Component for Pulse {
 		let (count, rate_text) = self.text.split_at(count_end);
 		column = pc.frame.put(column, rect.y, count, muted);
 		let accent = style.foreground_color();
-		let accent = if accent == Color::Default { theme.accent } else { accent };
+		let accent = if accent == Color::Default {
+			theme.accent
+		} else {
+			accent
+		};
 		let tint = Self::rate_color(rate, theme.muted, accent);
 		pc.frame.put(column, rect.y, rate_text, style.fg(tint));
 	}

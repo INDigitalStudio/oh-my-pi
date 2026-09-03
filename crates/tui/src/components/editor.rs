@@ -263,22 +263,21 @@ pub struct KeywordGradient {
 }
 
 impl KeywordGradient {
-	/// Color stops swept across the gradient (pi `stops: 14`).
-	pub const STOPS: usize = 14;
-	/// Time for the gradient to sweep one full cycle across each keyword
-	/// (pi `CustomEditor.SHIMMER_PERIOD_MS`).
-	pub const SHIMMER_PERIOD: Duration = Duration::from_millis(1800);
+	const LIGHTNESS: f32 = 0.62;
+	/// pi `orchestrate.ts`: green through blue to violet, `150 + t * 130`.
+	pub const ORCHESTRATE: Self = Self { hue_start: 150.0, hue_span: 130.0 };
+	const SATURATION: f32 = 0.90;
 	/// Repaint cadence while a keyword shimmers (pi
 	/// `CustomEditor.SHIMMER_FRAME_MS`): ~14 frames/s reads as motion without
 	/// flooding the renderer.
 	pub const SHIMMER_FRAME: Duration = Duration::from_millis(70);
-	const SATURATION: f32 = 0.90;
-	const LIGHTNESS: f32 = 0.62;
-
+	/// Time for the gradient to sweep one full cycle across each keyword
+	/// (pi `CustomEditor.SHIMMER_PERIOD_MS`).
+	pub const SHIMMER_PERIOD: Duration = Duration::from_millis(1800);
+	/// Color stops swept across the gradient (pi `stops: 14`).
+	pub const STOPS: usize = 14;
 	/// pi `ultrathink.ts`: the full rainbow, `t * 330`.
 	pub const ULTRATHINK: Self = Self { hue_start: 0.0, hue_span: 330.0 };
-	/// pi `orchestrate.ts`: green through blue to violet, `150 + t * 130`.
-	pub const ORCHESTRATE: Self = Self { hue_start: 150.0, hue_span: 130.0 };
 	/// pi `workflow.ts`: orange through green, `30 + t * 120`.
 	pub const WORKFLOWZ: Self = Self { hue_start: 30.0, hue_span: 120.0 };
 

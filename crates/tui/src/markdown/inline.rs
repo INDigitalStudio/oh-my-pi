@@ -487,9 +487,7 @@ fn span_style(mut style: Style, attrs: &str, theme: &MdTheme) -> Style {
 				style = style.bg(color);
 			}
 		} else if value.is_none() {
-			if let Some(color) = theme.semantic_color(key) {
-				style = style.fg(color);
-			} else if key.eq_ignore_ascii_case("bold") {
+			if key.eq_ignore_ascii_case("bold") {
 				style = style.bold();
 			} else if key.eq_ignore_ascii_case("dim") {
 				style = style.dim();
@@ -501,6 +499,8 @@ fn span_style(mut style: Style, attrs: &str, theme: &MdTheme) -> Style {
 				style = style.strikethrough();
 			} else if key.eq_ignore_ascii_case("reverse") {
 				style = style.reverse();
+			} else if let Some(color) = theme.semantic_color(key) {
+				style = style.fg(color);
 			} else if let Some(color) = Color::parse(key) {
 				// bare CSS color names color the foreground, like `<span cyan>`
 				style = style.fg(color);

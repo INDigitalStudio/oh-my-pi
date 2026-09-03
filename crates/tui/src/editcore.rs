@@ -1391,12 +1391,12 @@ static EMOJI_BUCKETS: LazyLock<EmojiBuckets> = LazyLock::new(|| {
 pub struct EditorOptions {
 	/// `:emoji` shortcode dropdown plus inline `:shortcode:` and
 	/// emoticon (`:-)`) expansion while typing.
-	pub emoji:   bool,
+	pub emoji:       bool,
 	/// Up/Down prompt history with draft restore below the newest entry.
-	pub history: bool,
+	pub history:     bool,
 	/// XML affordances: `</` completes the innermost open tag, and
 	/// renderers should apply structural markup highlighting.
-	pub xml:     bool,
+	pub xml:         bool,
 	/// Rows the completion dropdown shows at once (pi
 	/// `autocompleteMaxVisible`), clamped to `[3, 20]` on use.
 	pub picker_rows: usize,

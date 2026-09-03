@@ -497,10 +497,10 @@ pub struct Gradient {
 }
 
 impl Gradient {
-	/// RGB stops from magenta through violet to cyan.
-	pub const STOPS: [[u8; 3]; 3] = [[248, 79, 204], [147, 98, 244], [0, 219, 228]];
 	/// 256-color ramp sampled when the terminal lacks truecolor.
 	pub const RAMP_256: [u8; 7] = [206, 170, 134, 99, 69, 74, 44];
+	/// RGB stops from magenta through violet to cyan.
+	pub const STOPS: [[u8; 3]; 3] = [[248, 79, 204], [147, 98, 244], [0, 219, 228]];
 
 	/// A gradient shifted by `phase` (wrapped into `[0, 1)`).
 	#[must_use]
@@ -560,10 +560,10 @@ pub struct Intro;
 impl Intro {
 	/// Total length of the intro (pi `INTRO_MS`).
 	pub const DURATION: Duration = Duration::from_millis(3000);
-	/// Full gradient rotations before settling (pi `INTRO_SWEEPS`).
-	pub const SWEEPS: f32 = 2.5;
 	/// Shine crossings of the diagonal (pi `INTRO_SHINE_TRAVERSALS`).
 	pub const SHINE_TRAVERSALS: f32 = 3.0;
+	/// Full gradient rotations before settling (pi `INTRO_SWEEPS`).
+	pub const SWEEPS: f32 = 2.5;
 
 	/// Whether `elapsed` is past the intro: the resting frame from here on.
 	#[must_use]
@@ -617,7 +617,9 @@ impl Rainbow {
 	/// Bold style for glyph `index` of `count`.
 	#[must_use]
 	pub fn style(self, index: usize, count: usize) -> Style {
-		Style::new().fg(hsl(self.hue(index, count), 0.95, 0.60)).bold()
+		Style::new()
+			.fg(hsl(self.hue(index, count), 0.95, 0.60))
+			.bold()
 	}
 }
 
