@@ -2,8 +2,7 @@
 
 use std::{
 	collections::VecDeque,
-	error,
-	fmt::{self, Display},
+	fmt,
 	future,
 	future::Future,
 	pin::Pin,
@@ -300,25 +299,14 @@ pub enum NativeStreamDeclaration {
 }
 
 /// Error returned when a native declaration contradicts its physical source.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("native stream declaration {declared:?} contradicts {actual:?} body source")]
 pub struct NativeDeclarationError {
 	/// Replayability explicitly declared by the caller.
 	pub declared: NativeStreamDeclaration,
 	/// Replayability proved by the physical source.
 	pub actual:   Replayability,
 }
-
-impl Display for NativeDeclarationError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(
-			formatter,
-			"native stream declaration {:?} contradicts {:?} body source",
-			self.declared, self.actual
-		)
-	}
-}
-
-impl error::Error for NativeDeclarationError {}
 
 /// A native body coupled to its mandatory explicit replay declaration.
 #[derive(Clone, Debug)]
@@ -375,45 +363,23 @@ impl NativeBodySource {
 }
 
 /// Typed failure to acquire a body reader.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum BodyOpenError {
 	/// This attempt already tried to acquire its reader.
+	#[error("body attempt already tried to acquire a reader")]
 	AttemptAlreadyOpened,
 	/// Another one-shot reader is still active.
+	#[error("one-shot body already has an active reader")]
 	ConcurrentReader,
 	/// The one-shot source was already polled.
+	#[error("one-shot body has been consumed")]
 	Consumed,
 	/// An unread reader was dropped without an explicit reacquisition factory.
+	#[error("one-shot body cannot be safely reacquired")]
 	ReacquisitionUnavailable,
 	/// A deterministic factory failed before a reader was acquired.
-	Factory(Error),
-}
-
-impl Display for BodyOpenError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::AttemptAlreadyOpened => {
-				formatter.write_str("body attempt already tried to acquire a reader")
-			},
-			Self::ConcurrentReader => {
-				formatter.write_str("one-shot body already has an active reader")
-			},
-			Self::Consumed => formatter.write_str("one-shot body has been consumed"),
-			Self::ReacquisitionUnavailable => {
-				formatter.write_str("one-shot body cannot be safely reacquired")
-			},
-			Self::Factory(error) => write!(formatter, "body factory failed: {error}"),
-		}
-	}
-}
-
-impl error::Error for BodyOpenError {
-	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-		match self {
-			Self::Factory(error) => Some(error),
-			_ => None,
-		}
-	}
+	#[error("body factory failed: {0}")]
+	Factory(#[source] Error),
 }
 
 struct OneShotState {

@@ -2,8 +2,6 @@
 
 use std::{
 	collections::{BTreeMap, btree_map},
-	error,
-	fmt::{self, Display},
 	time::Duration,
 };
 
@@ -1156,32 +1154,21 @@ impl<'table> IntoIterator for &'table WirePolicyTable {
 }
 
 /// Static-header profile validation failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum HeaderPolicyError {
 	/// A name is empty or is not an HTTP token.
+	#[error("invalid static header name `{0}`")]
 	InvalidName(Str),
 	/// A value contains forbidden HTTP control bytes.
+	#[error("invalid static header value for `{0}`")]
 	InvalidValue(Str),
 	/// A credential-bearing, routing, or framing header was supplied.
+	#[error("unsafe credential, routing, or framing header `{0}`")]
 	UnsafeName(Str),
 	/// The profile contains the same case-insensitive name more than once.
+	#[error("duplicate static header name `{0}`")]
 	DuplicateName(Str),
 }
-
-impl Display for HeaderPolicyError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::InvalidName(name) => write!(formatter, "invalid static header name `{name}`"),
-			Self::InvalidValue(name) => write!(formatter, "invalid static header value for `{name}`"),
-			Self::UnsafeName(name) => {
-				write!(formatter, "unsafe credential, routing, or framing header `{name}`")
-			},
-			Self::DuplicateName(name) => write!(formatter, "duplicate static header name `{name}`"),
-		}
-	}
-}
-
-impl error::Error for HeaderPolicyError {}
 
 impl HeaderProfile {
 	/// Validates, lowercases, canonically orders, and interns static headers.

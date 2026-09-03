@@ -1,10 +1,6 @@
 //! Typed provider-side session bindings and deterministic reseed policy.
 
-use std::{
-	error,
-	fmt::{self, Display},
-	time::{Duration, SystemTime},
-};
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use omp_catalog::{
@@ -356,7 +352,8 @@ impl ServerStateBinding {
 }
 
 /// Structured session-expiry failure preserving committed-output evidence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("{}", if *committed { "provider session expired after output commit" } else { "provider session expired before output commit" })]
 pub struct SessionExpiryError {
 	/// Whether ordinary output had already become visible.
 	pub committed: bool,
@@ -375,18 +372,6 @@ impl SessionExpiryError {
 		Self { committed: true, decision: ProviderExpiryDecision::FailPartial }
 	}
 }
-
-impl Display for SessionExpiryError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		if self.committed {
-			formatter.write_str("provider session expired after output commit")
-		} else {
-			formatter.write_str("provider session expired before output commit")
-		}
-	}
-}
-
-impl error::Error for SessionExpiryError {}
 
 /// Outcome when a provider rejects server state during an attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

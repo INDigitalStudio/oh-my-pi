@@ -1,11 +1,7 @@
 //! Typed reasoning effort, budget, display, and wire-routing policies.
 
 #![allow(missing_docs, reason = "strum IntoStaticStr emits undocumented inherent methods")]
-use std::{
-	collections::{BTreeMap, btree_map},
-	error,
-	fmt::{self, Display},
-};
+use std::collections::{BTreeMap, btree_map};
 
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
@@ -544,67 +540,35 @@ pub struct ThinkingSelection {
 }
 
 /// Invalid structural reasoning profile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ThinkingPolicyError {
 	/// A reasoning profile advertised no effort.
+	#[error("thinking policy must advertise at least one effort")]
 	NoEfforts,
 	/// Off was incorrectly included in the advertised non-off effort list.
+	#[error("off is implicit and cannot be advertised as a non-off effort")]
 	OffAdvertised,
 	/// Efforts were duplicated or not ordered least-to-most.
+	#[error("thinking efforts must be unique and strictly ordered")]
 	EffortsNotStrictlyOrdered,
 	/// The default effort was not advertised.
+	#[error("default thinking effort `{0}` is not advertised")]
 	UnknownDefault(ThinkingEffort),
 	/// A budget referred to an unadvertised effort.
+	#[error("thinking budget effort `{0}` is not advertised")]
 	UnknownBudget(ThinkingEffort),
 }
 
-impl Display for ThinkingPolicyError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::NoEfforts => {
-				formatter.write_str("thinking policy must advertise at least one effort")
-			},
-			Self::OffAdvertised => {
-				formatter.write_str("off is implicit and cannot be advertised as a non-off effort")
-			},
-			Self::EffortsNotStrictlyOrdered => {
-				formatter.write_str("thinking efforts must be unique and strictly ordered")
-			},
-			Self::UnknownDefault(effort) => {
-				write!(formatter, "default thinking effort `{effort}` is not advertised")
-			},
-			Self::UnknownBudget(effort) => {
-				write!(formatter, "thinking budget effort `{effort}` is not advertised")
-			},
-		}
-	}
-}
-
-impl error::Error for ThinkingPolicyError {}
-
 /// Invalid reasoning selection or model-specific routing table.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ThinkingSelectionError {
 	/// A required effort was omitted.
+	#[error("this model requires an explicit reasoning effort")]
 	RequiredEffortMissing,
 	/// An effort is not supported by the structural profile.
+	#[error("reasoning effort `{0}` is not supported")]
 	UnsupportedEffort(ThinkingEffort),
 }
-
-impl Display for ThinkingSelectionError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::RequiredEffortMissing => {
-				formatter.write_str("this model requires an explicit reasoning effort")
-			},
-			Self::UnsupportedEffort(effort) => {
-				write!(formatter, "reasoning effort `{effort}` is not supported")
-			},
-		}
-	}
-}
-
-impl error::Error for ThinkingSelectionError {}
 
 /// Stable structural table that interns equal reasoning profiles once.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

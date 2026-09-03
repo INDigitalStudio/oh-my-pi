@@ -2,8 +2,6 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	error, fmt,
-	fmt::Display,
 	sync::Arc,
 	time::SystemTime,
 };
@@ -247,7 +245,8 @@ pub struct AccountSelectionRequest {
 
 /// Failure selecting an eligible account; always carries partial decision
 /// evidence.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("no eligible account")]
 pub struct AccountPoolError {
 	/// Complete evidence accumulated before failure.
 	pub receipt:        SelectionReceipt,
@@ -255,19 +254,12 @@ pub struct AccountPoolError {
 	pub reserve_policy: Option<QuotaReservePolicy>,
 }
 
-impl Display for AccountPoolError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str("no eligible account")
-	}
-}
-
-impl error::Error for AccountPoolError {}
-
 /// Failure registering metadata that would violate stable account routing
 /// identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AccountRegistrationError {
 	/// An existing account would be rebound to another principal.
+	#[error("account routing identity is inconsistent")]
 	PrincipalRebind {
 		/// Account whose stable identity would be violated.
 		account:   AccountId,
@@ -277,6 +269,7 @@ pub enum AccountRegistrationError {
 		attempted: PrincipalId,
 	},
 	/// An existing account would be rebound to another provider.
+	#[error("account routing identity is inconsistent")]
 	ProviderRebind {
 		/// Account whose provider ownership would be violated.
 		account:   AccountId,
@@ -286,6 +279,7 @@ pub enum AccountRegistrationError {
 		attempted: ProviderId,
 	},
 	/// Routing metadata names an account other than the containing record.
+	#[error("account routing identity is inconsistent")]
 	RoutingAccountMismatch {
 		/// Canonical record account.
 		account:         AccountId,
@@ -293,6 +287,7 @@ pub enum AccountRegistrationError {
 		routing_account: AccountId,
 	},
 	/// Routing metadata names a principal other than the containing record.
+	#[error("account routing identity is inconsistent")]
 	RoutingPrincipalMismatch {
 		/// Canonical record principal.
 		principal:         PrincipalId,
@@ -300,22 +295,12 @@ pub enum AccountRegistrationError {
 		routing_principal: PrincipalId,
 	},
 	/// Durable account-state storage failed before registration completed.
+	#[error("{summary}")]
 	StateStore {
 		/// Sanitized failure summary.
 		summary: Str,
 	},
 }
-
-impl Display for AccountRegistrationError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::StateStore { summary } => formatter.write_str(summary.as_str()),
-			_ => formatter.write_str("account routing identity is inconsistent"),
-		}
-	}
-}
-
-impl error::Error for AccountRegistrationError {}
 
 #[derive(Clone, Debug)]
 struct Cooldown {

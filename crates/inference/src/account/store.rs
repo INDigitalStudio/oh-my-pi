@@ -3,8 +3,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	error,
-	fmt::{self, Display},
+	fmt,
 	path::{Path, PathBuf},
 	str::FromStr,
 	sync::Arc,
@@ -88,16 +87,19 @@ pub struct PersistedAccountState {
 }
 
 /// Failure reading or writing secret-free account metadata.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AccountStateStoreError {
 	/// SQLite rejected a schema, query, or transaction operation.
+	#[error("account state database operation failed")]
 	Database {
 		/// Sanitized storage diagnostic.
 		summary: Str,
 	},
 	/// A timestamp or counter cannot be represented losslessly by SQLite.
+	#[error("account state value is out of range")]
 	OutOfRange,
 	/// A persisted enum value is not part of the current typed vocabulary.
+	#[error("invalid persisted account state {field}")]
 	InvalidVocabulary {
 		/// Name of the persisted field containing the invalid value.
 		field: &'static str,
@@ -105,23 +107,9 @@ pub enum AccountStateStoreError {
 		value: Str,
 	},
 	/// Existing static ownership does not match the attempted account record.
+	#[error("account static ownership is immutable")]
 	IdentityConflict,
 }
-
-impl Display for AccountStateStoreError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::Database { .. } => formatter.write_str("account state database operation failed"),
-			Self::OutOfRange => formatter.write_str("account state value is out of range"),
-			Self::InvalidVocabulary { field, .. } => {
-				write!(formatter, "invalid persisted account state {field}")
-			},
-			Self::IdentityConflict => formatter.write_str("account static ownership is immutable"),
-		}
-	}
-}
-
-impl error::Error for AccountStateStoreError {}
 
 impl From<rusqlite::Error> for AccountStateStoreError {
 	fn from(error: rusqlite::Error) -> Self {

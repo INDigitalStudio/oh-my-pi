@@ -2,8 +2,7 @@
 
 use std::{
 	collections::{HashMap, HashSet},
-	error,
-	fmt::{self, Display},
+	fmt,
 	hash::{DefaultHasher, Hash, Hasher},
 	sync::Arc,
 };
@@ -29,13 +28,16 @@ use crate::{
 };
 
 /// Structured conversation-store failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ConversationError {
 	/// The conversation does not exist.
+	#[error("unknown conversation {0}")]
 	UnknownConversation(ConversationId),
 	/// The supplied revision does not exist as a committed node.
+	#[error("unknown committed revision {0}")]
 	UnknownRevision(Revision),
 	/// A draft or fork did not use the branch's current committed head.
+	#[error("revision conflict: expected {expected}, got {actual}")]
 	RevisionConflict {
 		/// Revision that was current when the operation began.
 		expected: Revision,
@@ -43,55 +45,27 @@ pub enum ConversationError {
 		actual:   Revision,
 	},
 	/// A turn identity was reused with different atomic commit content.
+	#[error("turn identity {0} was reused with different content")]
 	TurnConflict(TurnId),
 	/// Stored history is corrupt or cannot be decoded.
+	#[error("conversation store is corrupt")]
 	CorruptStore,
 	/// SQLite persistence failed without exposing statement or credential text.
+	#[error("conversation persistence failed")]
 	Persistence,
 }
 
-impl Display for ConversationError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::UnknownConversation(id) => write!(formatter, "unknown conversation {id}"),
-			Self::UnknownRevision(id) => write!(formatter, "unknown committed revision {id}"),
-			Self::RevisionConflict { expected, actual } => {
-				write!(formatter, "revision conflict: expected {expected}, got {actual}")
-			},
-			Self::TurnConflict(id) => {
-				write!(formatter, "turn identity {id} was reused with different content")
-			},
-			Self::CorruptStore => formatter.write_str("conversation store is corrupt"),
-			Self::Persistence => formatter.write_str("conversation persistence failed"),
-		}
-	}
-}
-
-impl error::Error for ConversationError {}
-
 /// Why a canonical message cannot be durably committed without implicit
 /// buffering.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum MessagePersistenceError {
 	/// A live or factory-backed media body was not explicitly staged.
+	#[error("session media must be immutable bytes or an explicitly staged artifact")]
 	UnstagedBody,
 	/// Opaque JSON could not be encoded or decoded losslessly.
+	#[error("session opaque JSON could not be persisted losslessly")]
 	InvalidOpaqueJson,
 }
-
-impl Display for MessagePersistenceError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::UnstagedBody => formatter
-				.write_str("session media must be immutable bytes or an explicitly staged artifact"),
-			Self::InvalidOpaqueJson => {
-				formatter.write_str("session opaque JSON could not be persisted losslessly")
-			},
-		}
-	}
-}
-
-impl error::Error for MessagePersistenceError {}
 
 /// Postcard-safe canonical message persisted by durable conversation stores.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

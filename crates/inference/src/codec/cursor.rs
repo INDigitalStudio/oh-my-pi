@@ -8,8 +8,6 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	error, fmt,
-	fmt::Display,
 	sync::Arc,
 	time::Duration,
 };
@@ -132,7 +130,8 @@ pub enum CursorErrorKind {
 }
 
 /// Secret-free typed Cursor codec error.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("{reason}")]
 pub struct CursorProtocolError {
 	/// Stable error classification.
 	pub kind:      CursorErrorKind,
@@ -151,14 +150,6 @@ impl CursorProtocolError {
 		Self { kind, reason: sf!(reason), committed, status: None, diagnostic: None }
 	}
 }
-
-impl Display for CursorProtocolError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(self.reason.as_str())
-	}
-}
-
-impl error::Error for CursorProtocolError {}
 
 /// Maps an HTTP response status into Cursor's secret-free error vocabulary.
 pub const fn classify_http_status(status: u16) -> Option<CursorProtocolError> {

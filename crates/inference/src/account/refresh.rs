@@ -2,8 +2,6 @@
 
 use std::{
 	collections::BTreeMap,
-	error,
-	fmt::{self, Display},
 	future::Future,
 	mem,
 	pin::Pin,
@@ -83,27 +81,18 @@ impl Default for RefreshPolicy {
 }
 
 /// Invalid persistent-refresh timing policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RefreshPolicyError {
 	/// A lease with zero lifetime cannot fence a refresh.
+	#[error("refresh lease TTL must be nonzero")]
 	ZeroLeaseTtl,
 	/// A zero heartbeat interval would spin.
+	#[error("refresh renewal interval must be nonzero")]
 	ZeroRenewInterval,
 	/// Heartbeats must run before the lease can expire.
+	#[error("refresh renewal interval must be shorter than lease TTL")]
 	RenewalNotBeforeExpiry,
 }
-
-impl Display for RefreshPolicyError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(match self {
-			Self::ZeroLeaseTtl => "refresh lease TTL must be nonzero",
-			Self::ZeroRenewInterval => "refresh renewal interval must be nonzero",
-			Self::RenewalNotBeforeExpiry => "refresh renewal interval must be shorter than lease TTL",
-		})
-	}
-}
-
-impl error::Error for RefreshPolicyError {}
 
 /// Request to atomically acquire a metadata-only persistent refresh lease.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,21 +147,14 @@ pub enum RefreshLeaseWait {
 }
 
 /// Sanitized persistent-store coordination failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("refresh coordination {code}: {summary}")]
 pub struct RefreshStoreError {
 	/// Stable machine-readable classification.
 	pub code:    Str,
 	/// Bounded secret-free context.
 	pub summary: Str,
 }
-
-impl Display for RefreshStoreError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(formatter, "refresh coordination {}: {}", self.code, self.summary)
-	}
-}
-
-impl error::Error for RefreshStoreError {}
 
 /// Cold persistent lease boundary; implementations may box one I/O future per
 /// method.
@@ -227,21 +209,14 @@ pub struct RefreshedCredential {
 }
 
 /// Sanitized provider refresh-operation failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("credential refresh {code}: {summary}")]
 pub struct RefreshOperationError {
 	/// Stable machine-readable failure code.
 	pub code:    Str,
 	/// Bounded secret-free context.
 	pub summary: Str,
 }
-
-impl Display for RefreshOperationError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(formatter, "credential refresh {}: {}", self.code, self.summary)
-	}
-}
-
-impl error::Error for RefreshOperationError {}
 
 /// One observable step in refresh coordination.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -349,68 +324,52 @@ pub struct RefreshOutcome {
 }
 
 /// Refresh failure classification.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RefreshErrorKind {
 	/// Persistent lease storage failed.
+	#[error("{0}")]
 	Store(RefreshStoreError),
 	/// Credential refresh operation failed.
+	#[error("{0}")]
 	Operation(RefreshOperationError),
 	/// Refresh attempted to bind the account to another principal.
+	#[error("credential refresh changed principal")]
 	PrincipalChanged {
 		/// Principal returned by the refresh operation.
 		actual: PrincipalId,
 	},
 	/// Published credentials were not newer than the rejected generation.
+	#[error("credential refresh returned stale generation")]
 	StaleGeneration {
 		/// Credential generation returned by the refresh operation.
 		actual: u64,
 	},
 	/// Refresh operation returned metadata for another account.
+	#[error("credential refresh changed account")]
 	AccountChanged {
 		/// Account returned by the refresh operation.
 		actual: AccountId,
 	},
 	/// The persistent fencing lease was lost while refresh was still running.
+	#[error("persistent refresh lease lost")]
 	LeaseLost,
 	/// Persistent peer leases repeatedly expired without publishing.
+	#[error("refresh coordination exhausted")]
 	CoordinationExhausted,
 	/// The process leader was cancelled before sharing a result.
+	#[error("refresh leader cancelled")]
 	LeaderCancelled,
 }
 
 /// Cloneable refresh failure carrying every completed receipt step.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("{kind}")]
 pub struct RefreshError {
 	/// Failure classification.
 	pub kind:    RefreshErrorKind,
 	/// Partial coordination timeline.
 	pub receipt: Box<RefreshReceipt>,
 }
-
-impl Display for RefreshError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match &self.kind {
-			RefreshErrorKind::Store(error) => error.fmt(formatter),
-			RefreshErrorKind::Operation(error) => error.fmt(formatter),
-			RefreshErrorKind::PrincipalChanged { .. } => {
-				formatter.write_str("credential refresh changed principal")
-			},
-			RefreshErrorKind::StaleGeneration { .. } => {
-				formatter.write_str("credential refresh returned stale generation")
-			},
-			RefreshErrorKind::AccountChanged { .. } => {
-				formatter.write_str("credential refresh changed account")
-			},
-			RefreshErrorKind::CoordinationExhausted => {
-				formatter.write_str("refresh coordination exhausted")
-			},
-			RefreshErrorKind::LeaseLost => formatter.write_str("persistent refresh lease lost"),
-			RefreshErrorKind::LeaderCancelled => formatter.write_str("refresh leader cancelled"),
-		}
-	}
-}
-
-impl error::Error for RefreshError {}
 
 type SharedResult = Result<RefreshResult, RefreshError>;
 

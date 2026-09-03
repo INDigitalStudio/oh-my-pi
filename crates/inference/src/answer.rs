@@ -2,8 +2,7 @@
 
 use std::{
 	collections::BTreeMap,
-	error, fmt,
-	fmt::Display,
+	fmt,
 	pin::Pin,
 	sync::{
 		Arc,
@@ -592,19 +591,12 @@ impl<T> Stream for GenerationSession<T> {
 }
 
 /// Construction failure for an owned generation session.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum GenerationSessionError {
 	/// The event checkpoint and cancellation handle identify different jobs.
+	#[error("generation checkpoint and cancellation handle identify different jobs")]
 	JobMismatch,
 }
-
-impl Display for GenerationSessionError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str("generation checkpoint and cancellation handle identify different jobs")
-	}
-}
-
-impl error::Error for GenerationSessionError {}
 
 /// Final summary for a long-running generation.
 #[derive(Clone, Debug, Eq, PartialEq)]

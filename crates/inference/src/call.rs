@@ -1,8 +1,7 @@
 //! Clone-cheap request envelopes and the closed operation vocabulary.
 
 use std::{
-	error,
-	fmt::{self, Display},
+	fmt,
 	sync::Arc,
 	time::{Duration, Instant, SystemTime},
 };
@@ -81,24 +80,15 @@ impl fmt::Debug for RawJson {
 }
 
 /// Secret-free validation failure for exact native JSON bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RawJsonError {
 	/// Input exceeded the caller-provided size bound.
+	#[error("native JSON exceeds size bound")]
 	TooLarge,
 	/// Input was not exactly one complete JSON value.
+	#[error("invalid native JSON")]
 	Invalid,
 }
-
-impl Display for RawJsonError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(match self {
-			Self::TooLarge => "native JSON exceeds size bound",
-			Self::Invalid => "invalid native JSON",
-		})
-	}
-}
-
-impl error::Error for RawJsonError {}
 
 /// Selects the catalog domain within which routing must occur.
 #[derive(Clone, Debug, Eq, PartialEq)]
