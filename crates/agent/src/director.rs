@@ -380,6 +380,18 @@ pub trait ErasedInference: Send {
 		&'a mut self,
 		request: ChatRequest,
 	) -> BoxFut<'a, Result<ChatStream, omp_inference::Error>>;
+
+	/// Executes one isolated request on the model `selector` names (a
+	/// catalog key or `@role`), leaving the live route untouched; stacks
+	/// without a catalog run it on the live route.
+	fn execute_on<'a>(
+		&'a mut self,
+		selector: &str,
+		request: ChatRequest,
+	) -> BoxFut<'a, Result<ChatStream, omp_inference::Error>> {
+		let _ = selector;
+		self.execute(request)
+	}
 }
 
 impl<T> ErasedInference for T
@@ -391,6 +403,15 @@ where
 		request: ChatRequest,
 	) -> BoxFut<'a, Result<ChatStream, omp_inference::Error>> {
 		Box::pin(self.chat(request))
+	}
+
+	fn execute_on<'a>(
+		&'a mut self,
+		selector: &str,
+		request: ChatRequest,
+	) -> BoxFut<'a, Result<ChatStream, omp_inference::Error>> {
+		let selector = Str::new(selector);
+		Box::pin(async move { self.chat_on(selector.as_str(), request).await })
 	}
 }
 
@@ -428,6 +449,19 @@ pub trait Director: Send + Sync {
 
 	/// Refines a request synchronously. The stack walks outermost to innermost.
 	fn prepare_inference(&self, _cx: &DirectorCx<'_>, _req: &mut ChatRequest) {}
+
+	/// Runs a cold auxiliary operation at a candidate yield, before the stack
+	/// judges it (the advisor's second-model review). Same boxed cold-path
+	/// shape as [`Director::before_inference`]; the kernel drops the future
+	/// when the turn is interrupted, so a hook journals nothing it cannot
+	/// finish atomically.
+	fn before_yield<'a>(
+		&'a self,
+		_cx: &'a mut MutDirectorCx<'_>,
+		_turn: &'a TurnView,
+	) -> BoxFut<'a, Result<(), DirectorError>> {
+		Box::pin(future::ready(Ok(())))
+	}
 
 	/// Observes every completed turn, including turns containing tool calls.
 	fn observe_turn(&self, _dom: &Dom, _cx: &DirectorCx<'_>, _turn: &TurnView) -> Vec<StateUpdate> {
@@ -719,6 +753,21 @@ impl DirectorStack {
 		}
 		cx.director = None;
 		Ok(prepared)
+	}
+
+	/// Runs asynchronous candidate-yield hooks innermost to outermost (the
+	/// order [`DirectorStack::on_yield`] judges the same candidate).
+	pub async fn before_yield(
+		&self,
+		cx: &mut MutDirectorCx<'_>,
+		turn: &TurnView,
+	) -> Result<(), DirectorError> {
+		for frame in self.active.iter().rev() {
+			cx.director = Some(frame.handle);
+			frame.director.before_yield(cx, turn).await?;
+		}
+		cx.director = None;
+		Ok(())
 	}
 
 	/// Refines an inference request outermost to innermost.
@@ -1121,7 +1170,7 @@ fn custom(key: &str) -> PropKey {
 	PropKey::Custom(Str::new(key))
 }
 
-fn update_ops(handle: Handle, updates: Vec<StateUpdate>) -> Vec<Op> {
+pub(crate) fn update_ops(handle: Handle, updates: Vec<StateUpdate>) -> Vec<Op> {
 	updates
 		.into_iter()
 		.map(|update| Op::Set {
@@ -1132,7 +1181,11 @@ fn update_ops(handle: Handle, updates: Vec<StateUpdate>) -> Vec<Op> {
 		.collect()
 }
 
-fn patch(session: &mut Session, label: &'static str, ops: Vec<Op>) -> Result<(), DirectorError> {
+pub(crate) fn patch(
+	session: &mut Session,
+	label: &'static str,
+	ops: Vec<Op>,
+) -> Result<(), DirectorError> {
 	session.patch(Txn {
 		cause: session.head().ok_or(DirectorError::MissingDirectors)?,
 		label: Some(Str::new_static(label)),

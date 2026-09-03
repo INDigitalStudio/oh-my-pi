@@ -182,7 +182,7 @@ pub struct KernelOptions {
 
 /// Removes a no-session journal regardless of which presentation adapter or
 /// error path drops the composed kernel.
-struct EphemeralJournal {
+pub struct EphemeralJournal {
 	path: PathBuf,
 }
 
@@ -686,6 +686,52 @@ impl omp_agent::Inference for ProductionInference {
 		self.client.execute(request)
 	}
 
+	/// One isolated call on `selector` (a catalog model, alias, or `@role`
+	/// such as the advisor's `@advisor`): the client is re-targeted for the
+	/// plan only and restored to the live route afterwards, so the primary's
+	/// next request is untouched. An unresolvable selector is a planning
+	/// `TargetNotFound` (the advisor journals `no_model`).
+	fn chat_on(
+		&mut self,
+		selector: &str,
+		mut request: ChatRequest,
+	) -> impl Future<Output = Result<ChatStream, omp_inference::Error>> + Send {
+		let resolved = resolve_model_selector(self.catalog.as_ref(), selector).or_else(|_| {
+			let settings = omp_catalog::settings::ModelSettings::from_con(&self.con);
+			crate::discovery::roles::resolve_role_selector(self.catalog.as_ref(), &settings, selector)
+				.map(|selected| Str::new(selected.model.as_str()))
+				.map_err(|_| HeadlessError::UnknownModel { selector: Str::new(selector) })
+		});
+		async move {
+			let model = resolved.map_err(|_| {
+				omp_inference::Error::planning(
+					omp_inference::ErrorKind::TargetNotFound,
+					omp_inference::ErrorDetail::target(Str::new(selector)),
+					omp_inference::ExecutionReceipt::default(),
+				)
+			})?;
+			let key = omp_catalog::ModelKey::from(model.as_str());
+			if matches!(request.reasoning, omp_inference::Setting::Unset)
+				&& !omp_inference::pi_settings::AI_EXTERNAL_THINKING.get(&self.con)
+			{
+				let thinking = omp_con::AI_THINKING.get(&self.con);
+				request.reasoning = convar_reasoning(self.catalog.as_ref(), &key, &thinking);
+			}
+			let live = self.client.call_meta().clone();
+			let mut meta = self.meta.clone();
+			meta.target = match &self.meta.target {
+				Target::Provider { provider, .. } => {
+					Target::Provider { provider: provider.clone(), model: key }
+				},
+				_ => Target::Model(key),
+			};
+			self.client.set_call_meta(meta);
+			let result = self.client.execute(request).await;
+			self.client.set_call_meta(live);
+			result
+		}
+	}
+
 	fn install_retry_sink(&mut self, sink: omp_inference::RetrySink) {
 		// Both the launch metadata (the base every `ai_model` re-target copies)
 		// and the client's live copy carry the sink.
@@ -770,6 +816,19 @@ impl omp_agent::Inference for ComposedInference {
 			match self {
 				Self::Production(inference) => inference.chat(request).await,
 				Self::Gateway { inference, .. } => inference.chat(request).await,
+			}
+		}
+	}
+
+	fn chat_on(
+		&mut self,
+		selector: &str,
+		request: ChatRequest,
+	) -> impl Future<Output = Result<ChatStream, omp_inference::Error>> + Send {
+		async move {
+			match self {
+				Self::Production(inference) => inference.chat_on(selector, request).await,
+				Self::Gateway { inference, .. } => inference.chat_on(selector, request).await,
 			}
 		}
 	}

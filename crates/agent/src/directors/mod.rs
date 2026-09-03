@@ -1,5 +1,6 @@
 //! Built-in Director specifications.
 
+pub mod advisor;
 pub mod autoresearch;
 pub mod compaction;
 pub mod force_tool;
@@ -31,6 +32,7 @@ pub fn mode_prompt(mode: &str) -> Option<&'static str> {
 
 /// Registers every built-in Director constructor.
 pub fn register_standard(registry: &mut DirectorRegistry) {
+	registry.register(advisor::FAMILY, |node| Box::new(advisor::Advisor::from_node(node)));
 	registry.register("autoresearch", |node| Box::new(autoresearch::Autoresearch::from_node(node)));
 	registry.register("compaction", |_| Box::new(compaction::CompactionDirector::new()));
 	registry.register("force_tool", |node| Box::new(force_tool::ForceTool::from_node(node)));

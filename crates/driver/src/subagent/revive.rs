@@ -363,7 +363,8 @@ async fn idle(
 			() = &mut park => return Idle::Park,
 			message = inbox.recv_async() => match message {
 				Ok(Up::Steer { text, attachments }) => return Idle::Prompt(text, attachments),
-				Ok(Up::Peer(text) | Up::Queue(text)) => return Idle::Prompt(text, Vec::new()),
+				Ok(Up::Peer(text)) => return Idle::Prompt(text, Vec::new()),
+				Ok(Up::Queue { text, attachments }) => return Idle::Prompt(text, attachments),
 				Ok(Up::Subscribe(reply)) => {
 					let _ = reply.send(session.subscribe());
 				},

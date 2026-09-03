@@ -18,8 +18,8 @@ pub(crate) const EMPTY_OUTPUT_RETRY_CAP: u8 = 3;
 const EMPTY_OUTPUT_CAP_NOTICE: &str =
 	"Assistant returned no final output after retry cap; try switching models";
 
-/// A live actor subscription handed back through [`Up::Subscribe`].
-pub type Subscription = (omp_dom::Snapshot, flume::Receiver<omp_dom::Event>);
+/// A live DOM subscription handed back through [`Up::Subscribe`].
+pub type DomSubscription = (omp_dom::Snapshot, flume::Receiver<omp_dom::Event>);
 
 /// Control sent to a running kernel turn.
 #[derive(Clone, Debug)]
@@ -39,8 +39,14 @@ pub enum Up {
 	/// Queues a follow-up prompt behind the active turn (pi `followUp`):
 	/// journaled into `<queues><prompts>` at the drain that receives it; the
 	/// controller pops it when the turn yields. Never steering: it does not
-	/// re-run a safe point.
-	Queue(Str),
+	/// re-run a safe point. `attachments` are already in the session's blob
+	/// store and positional against `[Image #N]` in `text`.
+	Queue {
+		/// The follow-up prompt.
+		text:        Str,
+		/// Media journaled beside it.
+		attachments: Vec<Attachment>,
+	},
 	/// Hands back every steering aside not yet consumed at a safe point (pi
 	/// `app.message.dequeue`): the host restores them to its composer.
 	Unqueue(flume::Sender<Vec<Str>>),
@@ -64,7 +70,7 @@ pub enum Up {
 	/// Requests a live `(Snapshot, Receiver<Event>)` pair over the session the
 	/// kernel is driving (an actor rendering a child session never reads its
 	/// `.oms`, ADR 0005). Dropped silently when the requester is gone.
-	Subscribe(flume::Sender<Subscription>),
+	Subscribe(flume::Sender<DomSubscription>),
 }
 
 /// The `<queues><steering>` element.
@@ -131,26 +137,77 @@ pub(crate) fn queue_peer(session: &mut Session, text: Str) -> Result<(), Session
 }
 
 /// Journals one follow-up prompt as `<prompt kind=queued status=pending>`
-/// under `<queues><prompts>` (the controller's `queue.push` shape).
-pub(crate) fn queue_prompt(session: &mut Session, text: Str) -> Result<(), SessionError> {
+/// under `<queues><prompts>` (the controller's `queue.push` shape); its
+/// attachments ride the same `data` prop a `msg.user@1` fold writes, so the
+/// controller's pop hands them to the next turn typed.
+pub(crate) fn queue_prompt(
+	session: &mut Session,
+	text: Str,
+	attachments: &[Attachment],
+) -> Result<(), SessionError> {
 	let prompts = omp_session::components::prompts::prompts_handle(session.dom())
 		.ok_or(SessionError::NoActiveTurn)?;
 	let cause = session.head().ok_or(SessionError::NoActiveTurn)?;
 	let id = Str::new(format!("queued-{}", omp_core::Ulid::generate()));
+	let mut node = NodeSpec::new(KnownTag::Prompt)
+		.with_prop(PropId::Kind, Value::Str(Str::new_static("queued")))
+		.with_prop(PropId::Id, Value::Str(id))
+		.with_prop(PropId::Status, Value::Str(Str::new_static("pending")))
+		.with_content(text);
+	if !attachments.is_empty() {
+		node = node.with_prop(PropId::Data, Value::Json(serde_json::value::to_raw_value(attachments)?));
+	}
 	session.patch(Txn {
 		cause,
 		label: Some(Str::new_static("queue.push")),
 		ops: vec![Op::Ins {
 			parent: prompts,
-			after:  session.dom().children(prompts).last().copied(),
-			node:   NodeSpec::new(KnownTag::Prompt)
-				.with_prop(PropId::Kind, Value::Str(Str::new_static("queued")))
-				.with_prop(PropId::Id, Value::Str(id))
-				.with_prop(PropId::Status, Value::Str(Str::new_static("pending")))
-				.with_content(text),
+			after: session.dom().children(prompts).last().copied(),
+			node,
 		}],
 	})?;
 	Ok(())
+}
+
+/// Takes the oldest `<prompt kind=queued status=pending>` under
+/// `<queues><prompts>`, journaling it `sent` (the controller's `queue.pop`
+/// shape), and returns its text with the attachments [`queue_prompt`] stored.
+/// A follow-up runs "when the agent yields" (pi `followUp`), so hosts call
+/// this once a turn settles and start the next turn from the result.
+pub fn pop_queued_prompt(
+	session: &mut Session,
+) -> Result<Option<(Str, Vec<Attachment>)>, SessionError> {
+	let Some(prompts) = omp_session::components::prompts::prompts_handle(session.dom()) else {
+		return Ok(None);
+	};
+	let kind = PropKey::from(PropId::Kind);
+	let status = PropKey::from(PropId::Status);
+	let data = PropKey::from(PropId::Data);
+	let dom = session.dom();
+	let Some((handle, text)) = dom.children(prompts).iter().find_map(|handle| {
+		let node = dom.get(*handle)?;
+		let queued = node.tag == Tag::Known(KnownTag::Prompt)
+			&& node.prop(&kind).and_then(Value::as_str) == Some("queued")
+			&& node.prop(&status).and_then(Value::as_str) == Some("pending");
+		queued.then(|| (*handle, node.content.clone().unwrap_or_default()))
+	}) else {
+		return Ok(None);
+	};
+	let attachments = match dom.get(handle).and_then(|node| node.prop(&data)) {
+		Some(Value::Json(raw)) => serde_json::from_str(raw.get())?,
+		_ => Vec::new(),
+	};
+	let cause = session.head().ok_or(SessionError::NoActiveTurn)?;
+	session.patch(Txn {
+		cause,
+		label: Some(Str::new_static("queue.pop")),
+		ops: vec![Op::Set {
+			h:     handle,
+			prop:  status,
+			value: Value::Str(Str::new_static("sent")),
+		}],
+	})?;
+	Ok(Some((text, attachments)))
 }
 
 fn is_peer(session: &Session, handle: Handle) -> bool {
@@ -458,7 +515,7 @@ mod tests {
 	fn queue_journals_pending_prompt_under_queues_prompts() {
 		let directory = tempfile::tempdir().expect("temporary session directory");
 		let (mut session, _) = session_with_turn(&directory.path().join("queue.oms"));
-		queue_prompt(&mut session, Str::new_static("follow up")).expect("prompt queues");
+		queue_prompt(&mut session, Str::new_static("follow up"), &[]).expect("prompt queues");
 
 		assert!(!steering_pending(&session), "a queued prompt is not steering");
 		let prompts = omp_session::components::prompts::prompts_handle(session.dom())
@@ -481,6 +538,108 @@ mod tests {
 				.prop(&PropKey::from(PropId::Id))
 				.and_then(Value::as_str)
 				.is_some_and(|id| id.starts_with("queued-"))
+		);
+		assert!(node.prop(&PropKey::from(PropId::Data)).is_none(), "no attachments, no data prop");
+	}
+
+	/// pi `followUp(text, images)`: a queued prompt keeps its images in the
+	/// same `data` shape a `msg.user@1` fold writes, so the pop that starts
+	/// the next turn carries them typed instead of dropping them.
+	#[test]
+	fn queue_journals_attachments_beside_the_prompt() {
+		let directory = tempfile::tempdir().expect("temporary session directory");
+		let (mut session, _) = session_with_turn(&directory.path().join("queue-images.oms"));
+		let attachments = vec![Attachment {
+			blob: omp_journal::blob::BlobRef { hash: omp_core::Hash32::new([0xab; 32]), size: 5 },
+			mime: Str::new_static("image/png"),
+		}];
+		queue_prompt(&mut session, Str::new_static("look [Image #1]"), &attachments)
+			.expect("prompt queues");
+
+		let prompts = omp_session::components::prompts::prompts_handle(session.dom())
+			.expect("prompt queue exists");
+		let children = session.dom().children(prompts);
+		let node = session.dom().get(children[0]).expect("queued prompt node");
+		let Some(Value::Json(raw)) = node.prop(&PropKey::from(PropId::Data)) else {
+			panic!("queued prompt carries its attachments as data");
+		};
+		assert_eq!(
+			serde_json::from_str::<Vec<Attachment>>(raw.get()).expect("attachment json"),
+			attachments
+		);
+	}
+
+	/// The follow-up queue is FIFO and pop is a journaled `sent` mark: the
+	/// oldest pending prompt comes out first with its attachments, the node
+	/// stays (status `sent`) so replay agrees, and an exhausted queue yields
+	/// `None`.
+	#[test]
+	fn pop_takes_the_oldest_pending_prompt_and_marks_it_sent() {
+		let directory = tempfile::tempdir().expect("temporary session directory");
+		let (mut session, _) = session_with_turn(&directory.path().join("queue-pop.oms"));
+		let attachments = vec![Attachment {
+			blob: omp_journal::blob::BlobRef { hash: omp_core::Hash32::new([0xcd; 32]), size: 3 },
+			mime: Str::new_static("image/png"),
+		}];
+		queue_prompt(&mut session, Str::new_static("first [Image #1]"), &attachments)
+			.expect("first queues");
+		queue_prompt(&mut session, Str::new_static("second"), &[]).expect("second queues");
+
+		let popped = pop_queued_prompt(&mut session).expect("pop journals");
+		assert_eq!(popped, Some((Str::new_static("first [Image #1]"), attachments)));
+		let popped = pop_queued_prompt(&mut session).expect("pop journals");
+		assert_eq!(popped, Some((Str::new_static("second"), Vec::new())));
+		assert_eq!(pop_queued_prompt(&mut session).expect("pop journals"), None);
+
+		let prompts = omp_session::components::prompts::prompts_handle(session.dom())
+			.expect("prompt queue exists");
+		let statuses: Vec<_> = session
+			.dom()
+			.children(prompts)
+			.iter()
+			.filter_map(|handle| session.dom().get(*handle))
+			.map(|node| node.prop(&PropKey::from(PropId::Status)).cloned())
+			.collect();
+		assert_eq!(statuses, vec![
+			Some(Value::Str(Str::new_static("sent"))),
+			Some(Value::Str(Str::new_static("sent")))
+		]);
+	}
+
+	#[test]
+	fn malformed_queue_data_is_not_silently_dropped() {
+		let directory = tempfile::tempdir().expect("temporary session directory");
+		let (mut session, _) = session_with_turn(&directory.path().join("queue-invalid-data.oms"));
+		queue_prompt(&mut session, Str::new_static("follow up [Image #1]"), &[])
+			.expect("prompt queues");
+		let prompts = omp_session::components::prompts::prompts_handle(session.dom())
+			.expect("prompt queue exists");
+		let prompt = session.dom().children(prompts)[0];
+		let cause = session.head().expect("journal head");
+		session
+			.patch(Txn {
+				cause,
+				label: Some(Str::new_static("test.invalid-queue-data")),
+				ops: vec![Op::Set {
+					h:     prompt,
+					prop:  PropId::Data.into(),
+					value: Value::Json(
+						serde_json::value::to_raw_value(&serde_json::json!({ "not": "attachments" }))
+							.expect("valid raw json"),
+					),
+				}],
+			})
+			.expect("invalid attachment shape is journaled");
+
+		assert!(
+			pop_queued_prompt(&mut session).is_err(),
+			"invalid attachment data must fail instead of turning into an attachment-free prompt"
+		);
+		let node = session.dom().get(prompt).expect("queued prompt remains");
+		assert_eq!(
+			node.prop(&PropKey::from(PropId::Status)).and_then(Value::as_str),
+			Some("pending"),
+			"a failed decode must not mark the prompt sent"
 		);
 	}
 

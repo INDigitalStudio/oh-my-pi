@@ -73,6 +73,19 @@ pub trait Inference: Send {
 		request: ChatRequest,
 	) -> impl Future<Output = Result<ChatStream, omp_inference::Error>> + Send;
 
+	/// Starts one isolated chat operation on the model `selector` names (a
+	/// catalog key or `@role`) without re-targeting the live route: an
+	/// auxiliary second-model call (the advisor watchdog). Stacks that carry
+	/// no catalog run it on the live route.
+	fn chat_on(
+		&mut self,
+		selector: &str,
+		request: ChatRequest,
+	) -> impl Future<Output = Result<ChatStream, omp_inference::Error>> + Send {
+		let _ = selector;
+		self.chat(request)
+	}
+
 	/// Installs the observer that receives same-route retry notices for
 	/// every subsequent chat. Inference stacks without a retry layer keep the
 	/// default no-op.
@@ -1248,6 +1261,51 @@ impl<C: Inference> Kernel<C> {
 					},
 				}
 			}
+			// Cold candidate-yield hooks (the advisor's second-model review)
+			// run under the same turn control as the pre-inference hooks: an
+			// interrupt drops the review mid-flight.
+			let yield_control = CallControl::new(self.mailbox_rx.clone(), turn_cancel.clone(), self.cancel.clone(), Some(control.clone()), self.approvals.clone());
+			let reviewed = {
+				let mut cx = MutDirectorCx {
+					session,
+					inference: &mut self.client,
+					blobs: &self.dispatcher.policy().spill,
+					route: &route,
+					turn,
+					director: None,
+					events: Some(&self.events),
+					con: self.con.as_deref(),
+					hooks: self.lifecycle_hooks.as_ref(),
+				};
+				let reviewing = directors.before_yield(&mut cx, &turn_view);
+				tokio::pin!(reviewing);
+				tokio::select! {
+					biased;
+					result = &mut reviewing => PreflightSignal::Ready(result),
+					() = control.cancelled() => PreflightSignal::Cancelled,
+					message = yield_control.recv() => PreflightSignal::Control(message),
+				}
+			};
+			match reviewed {
+				PreflightSignal::Ready(result) => result?,
+				PreflightSignal::Cancelled => {
+					self.notify_interrupt(session, turn, "idle");
+					return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
+				},
+				PreflightSignal::Control(message) => match yield_control.handle(session, message)? {
+					Received::Cancelled => {
+						self.notify_interrupt(session, turn, "idle");
+						return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
+					},
+					Received::Rewound(work) => {
+						self.dispatcher.jobs().apply_lifecycle(session, &work).await;
+						turn_cancel.cancel_turn();
+						return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
+					},
+					Received::None | Received::Steering | Received::Approved(_) => {},
+				},
+			}
+			self.apply_live_components(session)?;
 			let decision = directors.on_yield(session, &director_cx, &turn_view)?;
 			self.apply_live_components(session)?;
 			// A Director may have committed session-layer convar writes (a
@@ -2815,8 +2873,8 @@ enum ToolGate {
 	Deny(Str),
 }
 
-enum PreflightSignal {
-	Ready(Result<Prepared, DirectorError>),
+enum PreflightSignal<T> {
+	Ready(T),
 	Control(Up),
 	Cancelled,
 }

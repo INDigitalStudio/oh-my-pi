@@ -1,6 +1,10 @@
 use omp_agent::{
 	LoopDecision,
-	directors::{autoresearch::Autoresearch, loop_mode::LoopMode, vibe::Vibe},
+	directors::{
+		autoresearch::Autoresearch,
+		loop_mode::LoopMode,
+		vibe::{VIBE_TOOLS, Vibe},
+	},
 };
 
 use crate::harness::{Call, Harness};
@@ -61,12 +65,15 @@ fn test_loop_replays_at_idle_exactly_count_times_then_exits() {
 }
 
 #[test]
-fn test_vibe_spawn_is_anchored_and_workers_outlive_prototype_director() {
+fn test_vibe_task_is_anchored_and_workers_outlive_director() {
 	let mut world = Harness::new();
 	world.add_pending_wake();
 	let jobs_before = world.session.dom().count("jobs job").unwrap();
 	world.engage(Vibe::new());
-	assert_eq!(world.state_str("vibe", "tool").as_deref(), Some("vibe_spawn"));
+	assert_eq!(world.state_str("vibe", "tool").as_deref(), Some("task"));
+	assert!(VIBE_TOOLS.contains(&"task"));
+	assert!(VIBE_TOOLS.contains(&"hub"));
+	assert!(!VIBE_TOOLS.iter().any(|name| name.starts_with("vibe")));
 	world.remove_director("vibe");
 	assert_eq!(world.session.dom().count("jobs job").unwrap(), jobs_before);
 }

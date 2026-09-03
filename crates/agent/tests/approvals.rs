@@ -1,3 +1,5 @@
+//! Durable approval ticket, route, and replay contracts.
+
 use std::sync::Arc;
 
 use omp_agent::{
