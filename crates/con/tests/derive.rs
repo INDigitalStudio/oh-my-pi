@@ -40,10 +40,10 @@ fn derive_layers_replaces_the_stack_from_the_director_chain() {
 	assert_eq!(ctx.get("test_derived"), Some(Value::Int(7)));
 	assert_eq!(ctx.layer_owners(), vec![Str::new("plan#3")]);
 	// Inner engagement wins; outer stays.
-	ctx.derive_layers(&chain(&[("plan#3", &[("test_derived", 7)]), ("goal#5", &[(
-		"test_derived",
-		9,
-	)])]));
+	ctx.derive_layers(&chain(&[
+		("plan#3", &[("test_derived", 7)]),
+		("goal#5", &[("test_derived", 9)]),
+	]));
 	assert_eq!(ctx.get("test_derived"), Some(Value::Int(9)));
 	// Rewind removed the inner element: derivation pops it without an exit call.
 	ctx.derive_layers(&chain(&[("plan#3", &[("test_derived", 7)])]));
@@ -66,7 +66,8 @@ fn director_binds_name_registered_variables_and_derive_without_being_dropped() {
 	let ctx = Ctx::builder()
 		.sink(move |_, text| sink.lock().push(text.to_string()))
 		.build();
-	let roster = Value::List(vec![Value::Str(Str::new_static("read")), Value::Str(Str::new_static("todo"))]);
+	let roster =
+		Value::List(vec![Value::Str(Str::new_static("read")), Value::Str(Str::new_static("todo"))]);
 	ctx.derive_layers(&[
 		(Str::new_static("plan#1"), vec![
 			(Str::new_static("ai_prompt_mode"), Value::Str(Str::new_static("plan"))),
@@ -81,10 +82,7 @@ fn director_binds_name_registered_variables_and_derive_without_being_dropped() {
 	assert_eq!(omp_con::AI_PROMPT_MODE.get(&ctx).as_str(), "vibe");
 	assert_eq!(omp_con::AI_MODEL.get(&ctx).as_str(), "@plan");
 	assert_eq!(ctx.get("sv_tools"), Some(roster));
-	assert_eq!(
-		omp_con::SV_TOOLS.get(&ctx),
-		vec![Str::new_static("read"), Str::new_static("todo")]
-	);
+	assert_eq!(omp_con::SV_TOOLS.get(&ctx), vec![Str::new_static("read"), Str::new_static("todo")]);
 	// The mode prompt derives from the live stack: popping the inner
 	// engagement restores the outer value, an empty chain the default.
 	ctx.derive_layers(&[(Str::new_static("plan#1"), vec![(
@@ -130,24 +128,23 @@ fn session_writes_stream_carries_committed_values_not_engagement_values() {
 	ctx.run("test_archived_only true").unwrap();
 	assert!(rx.try_recv().is_err());
 	// A reset journals the default so replay clears the earlier write.
-	ctx.set("test_derived", Value::Int(1), Origin::Default).unwrap();
+	ctx.set("test_derived", Value::Int(1), Origin::Default)
+		.unwrap();
 	assert_eq!(rx.try_recv().unwrap(), (Str::new("test_derived"), Value::Int(1)));
 }
 
 #[test]
 fn clear_session_write_drops_only_the_session_layer() {
 	let ctx = Ctx::new();
-	ctx.set("test_derived", Value::Int(2), Origin::Archive).unwrap();
+	ctx.set("test_derived", Value::Int(2), Origin::Archive)
+		.unwrap();
 	ctx.run("test_derived 6").unwrap();
 	assert_eq!(ctx.get("test_derived"), Some(Value::Int(6)));
 	let rx = ctx.subscribe_session_writes();
 	ctx.clear_session_write("test_derived").unwrap();
 	assert_eq!(ctx.get("test_derived"), Some(Value::Int(2)));
 	assert!(rx.try_recv().is_err(), "clearing is derivation, not a write");
-	assert!(matches!(
-		ctx.clear_session_write("test_nonexistent"),
-		Err(ConError::Unknown { .. })
-	));
+	assert!(matches!(ctx.clear_session_write("test_nonexistent"), Err(ConError::Unknown { .. })));
 }
 
 #[test]
@@ -175,6 +172,7 @@ fn seed_child_carries_dynamic_declarations_before_values() {
 			ty:      TypeSpec::BOOL,
 			flags:   VarFlags::SESSION,
 			default: Value::Bool(false),
+			ui:      None,
 		})
 		.unwrap();
 

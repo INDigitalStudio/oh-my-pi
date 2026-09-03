@@ -138,28 +138,18 @@ fn arbitrary_schema_injection_normalizes_protocol_fields() {
 
 #[test]
 fn arbitrary_schema_injection_rejects_invalid_shapes() {
-	assert!(matches!(
-		inject_protocol_schema(br#"{"#),
-		Err(ProtocolSchemaError::Json(_))
-	));
+	assert!(matches!(inject_protocol_schema(br#"{"#), Err(ProtocolSchemaError::Json(_))));
 	for schema in [br#"[]"#.as_slice(), br#"{"type":"string"}"#] {
-		assert!(matches!(
-			inject_protocol_schema(schema),
-			Err(ProtocolSchemaError::Object)
-		));
+		assert!(matches!(inject_protocol_schema(schema), Err(ProtocolSchemaError::Object)));
 	}
 	assert!(matches!(
 		inject_protocol_schema(br#"{"type":"object","properties":[]}"#),
 		Err(ProtocolSchemaError::Properties)
 	));
-	for schema in [
-		br#"{"type":"object","required":{}}"#.as_slice(),
-		br#"{"type":"object","required":[1]}"#,
-	] {
-		assert!(matches!(
-			inject_protocol_schema(schema),
-			Err(ProtocolSchemaError::Required)
-		));
+	for schema in
+		[br#"{"type":"object","required":{}}"#.as_slice(), br#"{"type":"object","required":[1]}"#]
+	{
+		assert!(matches!(inject_protocol_schema(schema), Err(ProtocolSchemaError::Required)));
 	}
 }
 
@@ -172,16 +162,19 @@ struct DomainParams {
 
 #[test]
 fn decode_strips_protocol_fields_but_invocation_metadata_retains_them() {
-	let raw = Str::new_static(
-		r#"{"i":"Reading protocol fields","notrunc":true,"required":"value"}"#,
-	);
+	let raw =
+		Str::new_static(r#"{"i":"Reading protocol fields","notrunc":true,"required":"value"}"#);
 	let (feed, mut incoming) = IncomingParams::channel();
-	feed.args_committed(raw.clone()).expect("invocation remains connected");
+	feed
+		.args_committed(raw.clone())
+		.expect("invocation remains connected");
 
 	let decoded = block_on(incoming.whole::<DomainParams>()).expect("domain parameters decode");
 	assert_eq!(decoded, DomainParams { required: "value".to_owned() });
 
-	let finalized = feed.take_finalized_args().expect("finalized metadata receipt");
+	let finalized = feed
+		.take_finalized_args()
+		.expect("finalized metadata receipt");
 	assert_eq!(finalized.raw(), &raw);
 	assert_eq!(finalized.effective()["i"].as_str(), Some("Reading protocol fields"));
 	assert_eq!(finalized.effective()["notrunc"].as_bool(), Some(true));

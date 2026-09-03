@@ -425,6 +425,7 @@ fn dynamic_registration_uses_explicit_default_for_diff_dump() {
 		desc:    "unchanged".into(),
 		ty:      TypeSpec::INT,
 		flags:   VarFlags::ARCHIVE,
+		ui:      None,
 		default: Value::Int(7),
 	})
 	.unwrap();
@@ -433,6 +434,7 @@ fn dynamic_registration_uses_explicit_default_for_diff_dump() {
 		desc:    "changed".into(),
 		ty:      TypeSpec::INT,
 		flags:   VarFlags::ARCHIVE,
+		ui:      None,
 		default: Value::Int(9),
 	})
 	.unwrap();

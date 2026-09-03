@@ -3872,10 +3872,7 @@ mod tests {
 		assert!(restricted.resolved_identity("alpha").is_none());
 		assert!(matches!(restricted.live_spec("other"), Err(RegistryError::UnknownTool(_))));
 		let (_feed, params) = IncomingParams::channel();
-		assert!(matches!(
-			restricted.invoke("other", params),
-			Err(RegistryError::UnknownTool(_))
-		));
+		assert!(matches!(restricted.invoke("other", params), Err(RegistryError::UnknownTool(_))));
 		assert_eq!(restricted.host_tool_revision("rpc/client"), Some(1));
 		assert!(registry.resolved_identity("other").is_some(), "the source is untouched");
 	}

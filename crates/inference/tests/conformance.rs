@@ -668,6 +668,7 @@ fn cassette_request(body: BodySource, format: NativeResponseFormat) -> Transport
 		response_hooks: Default::default(),
 		attempt:        TransportAttempt {
 			request_id:          RequestId::from("cassette-request"),
+			session:             None,
 			provider:            ProviderId::from("offline-provider"),
 			model:               None,
 			api:                 sf!("native"),
@@ -1204,6 +1205,7 @@ async fn client_plans_without_service_effects_executes_the_exact_route_and_rejec
 		deadline:       None,
 		budget:         ExecutionBudget::default(),
 		session:        None,
+		debug_session:  None,
 		response_hooks: Default::default(),
 	};
 	let request = chat_request(Vec::new());
@@ -1241,6 +1243,7 @@ async fn client_plans_without_service_effects_executes_the_exact_route_and_rejec
 		deadline:       None,
 		budget:         ExecutionBudget::default(),
 		session:        None,
+		debug_session:  None,
 		response_hooks: Default::default(),
 	};
 	let unsupported_error = Client::new(registry.service(), router.clone(), unsupported_meta)
@@ -1255,6 +1258,7 @@ async fn client_plans_without_service_effects_executes_the_exact_route_and_rejec
 		deadline:       None,
 		budget:         ExecutionBudget::default(),
 		session:        None,
+		debug_session:  None,
 		response_hooks: Default::default(),
 	};
 	let unknown_error = Client::new(registry.service(), router.clone(), unknown_meta)

@@ -1,4 +1,5 @@
-//! Focused embedded proof for Python dynamic convar declarations and observation.
+//! Focused embedded proof for Python dynamic convar declarations and
+//! observation.
 
 use omp_py::{Engine, pyo3::ffi::c_str};
 
