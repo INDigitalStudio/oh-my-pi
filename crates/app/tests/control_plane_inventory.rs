@@ -1,3 +1,5 @@
+//! Literal pi-settings disposition inventory for omp's convar control plane.
+
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 #[derive(Clone, Copy)]

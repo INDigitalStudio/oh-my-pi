@@ -30,6 +30,7 @@ use omp_tools::read::{
 use super::{
 	github_url::{GithubCredentialBridge, GithubResolver, GithubScheme},
 	mcp::McpService,
+	security_scan::SecurityScanService,
 	ssh::SshService,
 	vault::VaultService,
 };
@@ -208,6 +209,8 @@ pub(super) enum UrlResolver {
 	Memory(memory::MemoryUrlResolver),
 	/// Configured native SSH hosts.
 	Ssh(ssh::SshResolver),
+	/// Project-owned security scan reports and advisories.
+	Security(SecurityScanService),
 	/// Configured local vaults.
 	Vault(vault::VaultResolver),
 	/// Resources exposed by mounted MCP servers.
@@ -235,6 +238,7 @@ impl Resolve for UrlResolver {
 			Self::Local(resolver) => resolver.read(resource, selector).await,
 			Self::Memory(resolver) => resolver.read(resource, selector).await,
 			Self::Ssh(resolver) => resolver.read(resource, selector).await,
+			Self::Security(resolver) => resolver.read(resource, selector).await,
 			Self::Vault(resolver) => resolver.read(resource, selector).await,
 			Self::Mcp(resolver) => resolver.read(resource, selector).await,
 			Self::Content(resolver) => resolver.read(resource, selector).await,
@@ -258,6 +262,9 @@ impl Resolve for UrlResolver {
 				resolver.read_query(resource, query, selector).await
 			},
 			Self::Ssh(resolver) => resolver.read_query(resource, query, selector).await,
+			Self::Security(resolver) if query.is_some() => {
+				resolver.read_query(resource, query, selector).await
+			},
 			Self::Vault(resolver) if query.is_some() => {
 				resolver.read_query(resource, query, selector).await
 			},
@@ -286,6 +293,7 @@ impl Resolve for UrlResolver {
 			Self::Local(resolver) => resolver.list(resource, max_entries, max_bytes).await,
 			Self::Memory(resolver) => resolver.list(resource, max_entries, max_bytes).await,
 			Self::Ssh(resolver) => resolver.list(resource, max_entries, max_bytes).await,
+			Self::Security(resolver) => resolver.list(resource, max_entries, max_bytes).await,
 			Self::Vault(resolver) => resolver.list(resource, max_entries, max_bytes).await,
 			Self::Mcp(_) => Err(Fault::Invalid {
 				message: Str::new_static(
@@ -339,6 +347,7 @@ impl Resolve for UrlResolver {
 			Self::Local(resolver) => resolver.complete(query, max_results).await,
 			Self::Memory(resolver) => resolver.complete(query, max_results).await,
 			Self::Ssh(resolver) => resolver.complete(query, max_results).await,
+			Self::Security(resolver) => resolver.complete(query, max_results).await,
 			Self::Vault(resolver) => resolver.complete(query, max_results).await,
 			Self::Mcp(resolver) => resolver.complete(query, max_results).await,
 			Self::Content(resolver) => resolver.complete(query, max_results).await,
@@ -369,6 +378,7 @@ pub(super) fn production_url_resolvers(
 	session_authority: Option<Arc<dyn SessionAuthority>>,
 	mcp: Arc<McpService>,
 	ssh: SshService,
+	security: SecurityScanService,
 	vault: VaultService,
 ) -> Arc<ResolverTable<UrlResolver>> {
 	let mut builder = ResolverTable::builder();
@@ -397,6 +407,18 @@ pub(super) fn production_url_resolvers(
 			UrlResolver::Ssh(ssh::SshResolver::new(ssh)),
 		)
 		.expect("ssh URL resolver is unique");
+	builder
+		.register(
+			SchemeEntry::new(
+				Scheme::Security,
+				true,
+				false,
+				"project-owned security scan reports and validated advisories",
+			)
+			.with_capabilities(true, false, true),
+			UrlResolver::Security(security),
+		)
+		.expect("security URL resolver is unique");
 	builder
 		.register(
 			SchemeEntry::new(Scheme::Vault, true, false, "configured symlink-confined vaults")

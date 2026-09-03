@@ -2,15 +2,25 @@
 
 use std::{
 	collections::BTreeMap,
+	fmt::Write as _,
 	fs,
 	path::{Path, PathBuf},
 	sync::Arc,
 };
 
-use omp_core::{Hash32, Str};
-use omp_tools::security_scan::{
-	Action, Fault, Params, Payload, SecurityScanControl, TargetKind, ValidationEvidence,
-	ValidationStatus,
+use omp_core::{CowBytes, Hash32, Str};
+use omp_tools::{
+	read::{
+		Fault as ReadFault,
+		resolver::{
+			LineOffsetCache, Resolve, ResourceCompletion, ResourceEntry, ResourceList, fuzzy_score,
+		},
+		selector::ParsedSelector,
+	},
+	security_scan::{
+		Action, Fault, Params, Payload, SecurityScanControl, TargetKind, ValidationEvidence,
+		ValidationStatus,
+	},
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -75,6 +85,7 @@ pub struct SecurityScanService {
 	root:       Arc<PathBuf>,
 	state_path: Arc<PathBuf>,
 	state:      Arc<Mutex<Result<State, ()>>>,
+	lines:      Arc<LineOffsetCache>,
 }
 
 impl SecurityScanService {
@@ -97,6 +108,7 @@ impl SecurityScanService {
 			root:       Arc::new(root),
 			state_path: Arc::new(state_path),
 			state:      Arc::new(Mutex::new(state)),
+			lines:      Arc::new(LineOffsetCache::default()),
 		}
 	}
 
@@ -303,6 +315,204 @@ impl SecurityScanService {
 		let bytes = serde_json::to_vec_pretty(scan).map_err(|_| Fault::Storage)?;
 		fs::write(output.join("security-scan.json"), bytes).map_err(|_| Fault::Storage)
 	}
+
+	fn render_resource(&self, resource: &str) -> Result<Vec<u8>, ReadFault> {
+		let parts = security_parts(resource)?;
+		let state = self
+			.state
+			.lock();
+		let state = state.as_ref().map_err(|()| security_state_fault())?;
+		let mut body = String::new();
+		match parts.as_slice() {
+			[] => {
+				body.push_str(
+					"# Security\n\nOMP-owned software-security scan reports and validated \
+					 advisories. This namespace is read-only; use `dyn security_scan` for \
+					 mutations.\n\n- `security://scans` — stored scans\n",
+				);
+			},
+			["scans"] => {
+				body.push_str("# Security scans\n\n");
+				if state.scans.is_empty() {
+					body.push_str("No scans are stored for this project.\n");
+				} else {
+					for scan in state.scans.values() {
+						let phase = scan_phase(state, &scan.id);
+						let _ = writeln!(
+							body,
+							"- `{}` — {}; {} finding(s)",
+							scan.id,
+							phase,
+							scan.findings.len()
+						);
+					}
+				}
+			},
+			["scans", scan_id] => {
+				let scan = state.scans.get(*scan_id).ok_or_else(|| unknown_scan(scan_id))?;
+				let plan = state.plans.get(&scan.plan_id);
+				let _ = writeln!(body, "# Security scan {}\n", scan.id);
+				let _ = writeln!(body, "- Status: **{}**", scan_phase(state, &scan.id));
+				let _ = writeln!(body, "- Findings: **{}**", scan.findings.len());
+				if let Some(plan) = plan {
+					let _ = writeln!(body, "- Target: **{:?}**", plan.target);
+					let _ = writeln!(body, "- Plan: `{}`", plan.id);
+				}
+				body.push_str(
+					"\nResources: `manifest`, `findings`, and `report`.\n",
+				);
+			},
+			["scans", scan_id, "manifest"] => {
+				let scan = state.scans.get(*scan_id).ok_or_else(|| unknown_scan(scan_id))?;
+				body = serde_json::to_string_pretty(scan)
+					.map_err(|_| security_state_fault())?;
+				body.push('\n');
+			},
+			["scans", scan_id, "findings"] => {
+				let scan = state.scans.get(*scan_id).ok_or_else(|| unknown_scan(scan_id))?;
+				render_findings_index(&mut body, scan);
+			},
+			["scans", scan_id, "findings", finding_id] => {
+				let scan = state.scans.get(*scan_id).ok_or_else(|| unknown_scan(scan_id))?;
+				let finding = scan
+					.findings
+					.iter()
+					.find(|finding| finding.id == *finding_id)
+					.ok_or_else(|| unknown_finding(finding_id))?;
+				render_finding(&mut body, finding);
+			},
+			["scans", scan_id, "report"] => {
+				let scan = state.scans.get(*scan_id).ok_or_else(|| unknown_scan(scan_id))?;
+				let _ = writeln!(body, "# Security report {}\n", scan.id);
+				let _ = writeln!(body, "- Status: **{}**", scan_phase(state, &scan.id));
+				let _ = writeln!(body, "- Findings: **{}**\n", scan.findings.len());
+				for finding in &scan.findings {
+					render_finding(&mut body, finding);
+				}
+			},
+			_ => return Err(unknown_resource(resource)),
+		}
+		Ok(body.into_bytes())
+	}
+
+	fn list_resource(
+		&self,
+		resource: &str,
+		max_entries: usize,
+		max_bytes: usize,
+	) -> Result<ResourceList, ReadFault> {
+		let parts = security_parts(resource)?;
+		let state = self
+			.state
+			.lock();
+		let state = state.as_ref().map_err(|()| security_state_fault())?;
+		let mut candidates = Vec::new();
+		match parts.as_slice() {
+			[] => candidates.push(security_entry("scans", true, "scans")),
+			["scans"] => {
+				for scan in state.scans.values() {
+					candidates.push(security_entry(
+						&format!("scans/{}", scan.id),
+						true,
+						&scan.id,
+					));
+				}
+			},
+			["scans", scan_id] => {
+				if !state.scans.contains_key(*scan_id) {
+					return Err(unknown_scan(scan_id));
+				}
+				for (name, directory) in
+					[("manifest", false), ("findings", true), ("report", false)]
+				{
+					candidates.push(security_entry(
+						&format!("scans/{scan_id}/{name}"),
+						directory,
+						name,
+					));
+				}
+			},
+			["scans", scan_id, "findings"] => {
+				let scan = state.scans.get(*scan_id).ok_or_else(|| unknown_scan(scan_id))?;
+				for finding in &scan.findings {
+					candidates.push(security_entry(
+						&format!("scans/{scan_id}/findings/{}", finding.id),
+						false,
+						&finding.id,
+					));
+				}
+			},
+			_ => return Err(unknown_resource(resource)),
+		}
+		let mut entries = Vec::new();
+		let mut used = 0usize;
+		let mut truncated = false;
+		for entry in candidates {
+			let bytes = entry.uri.len().saturating_add(entry.name.len());
+			if entries.len() == max_entries || used.saturating_add(bytes) > max_bytes {
+				truncated = true;
+				break;
+			}
+			used += bytes;
+			entries.push(entry);
+		}
+		Ok(ResourceList { entries, truncated })
+	}
+
+	fn complete_resource(
+		&self,
+		query: &str,
+		max_results: usize,
+	) -> Result<Vec<ResourceCompletion>, ReadFault> {
+		let state = self
+			.state
+			.lock();
+		let state = state.as_ref().map_err(|()| security_state_fault())?;
+		let mut paths = vec![("scans".to_owned(), Str::new_static("stored security scans"))];
+		for scan in state.scans.values() {
+			let prefix = format!("scans/{}", scan.id);
+			paths.push((
+				prefix.clone(),
+				Str::new(format!("{}; {} finding(s)", scan_phase(state, &scan.id), scan.findings.len())),
+			));
+			for child in ["manifest", "findings", "report"] {
+				paths.push((
+					format!("{prefix}/{child}"),
+					Str::new_static("security scan resource"),
+				));
+			}
+			for finding in &scan.findings {
+				paths.push((
+					format!("{prefix}/findings/{}", finding.id),
+					finding.summary.clone(),
+				));
+			}
+		}
+		let query = query
+			.trim()
+			.strip_prefix("security://")
+			.unwrap_or(query.trim())
+			.trim_start_matches('/');
+		let mut matches = paths
+			.into_iter()
+			.filter_map(|(path, description)| {
+				let score = fuzzy_score(query, &path)?;
+				Some(ResourceCompletion {
+					value: Str::new(format!("security://{path}")),
+					description,
+					score,
+				})
+			})
+			.collect::<Vec<_>>();
+		matches.sort_unstable_by(|left, right| {
+			right
+				.score
+				.cmp(&left.score)
+				.then_with(|| left.value.cmp(&right.value))
+		});
+		matches.truncate(max_results);
+		Ok(matches)
+	}
 }
 
 impl SecurityScanControl for SecurityScanService {
@@ -313,6 +523,134 @@ impl SecurityScanControl for SecurityScanService {
 				.await
 				.map_err(|_| Fault::Storage)?
 		}
+	}
+}
+
+impl Resolve for SecurityScanService {
+	async fn read<'a>(
+		&'a self,
+		resource: &'a str,
+		selector: &'a ParsedSelector,
+	) -> Result<CowBytes<'static>, ReadFault> {
+		let bytes = self.render_resource(resource)?;
+		crate::tool_url::select_bytes(&self.lines, resource, CowBytes::from(bytes), selector)
+	}
+
+	async fn list(
+		&self,
+		resource: &str,
+		max_entries: usize,
+		max_bytes: usize,
+	) -> Result<ResourceList, ReadFault> {
+		self.list_resource(resource, max_entries, max_bytes)
+	}
+
+	async fn complete(
+		&self,
+		query: &str,
+		max_results: usize,
+	) -> Result<Vec<ResourceCompletion>, ReadFault> {
+		self.complete_resource(query, max_results)
+	}
+}
+
+fn security_parts(resource: &str) -> Result<Vec<&str>, ReadFault> {
+	let resource = resource.trim_matches('/');
+	if resource.is_empty() {
+		return Ok(Vec::new());
+	}
+	let parts = resource.split('/').collect::<Vec<_>>();
+	if parts
+		.iter()
+		.any(|part| part.is_empty() || matches!(*part, "." | "..") || part.contains('\\'))
+	{
+		return Err(ReadFault::Invalid {
+			message: Str::new_static("Invalid or escaping security:// resource."),
+		});
+	}
+	Ok(parts)
+}
+
+fn security_state_fault() -> ReadFault {
+	ReadFault::Source {
+		message: Str::new_static("Stored security scan state is corrupt or unavailable."),
+	}
+}
+
+fn unknown_scan(scan_id: &str) -> ReadFault {
+	ReadFault::Source {
+		message: Str::new(format!(
+			"Unknown security scan: {scan_id}. Read security://scans to list stored scans."
+		)),
+	}
+}
+
+fn unknown_finding(finding_id: &str) -> ReadFault {
+	ReadFault::Source {
+		message: Str::new(format!("Unknown security finding: {finding_id}.")),
+	}
+}
+
+fn unknown_resource(resource: &str) -> ReadFault {
+	ReadFault::Source {
+		message: Str::new(format!(
+			"Unknown security resource: security://{}. Read security:// for the index.",
+			resource.trim_matches('/')
+		)),
+	}
+}
+
+fn scan_phase<'a>(state: &'a State, scan_id: &str) -> &'a str {
+	state
+		.operations
+		.values()
+		.find(|operation| operation.scan_id == scan_id)
+		.map_or("stored", |operation| operation.phase.as_str())
+}
+
+fn render_findings_index(body: &mut String, scan: &Scan) {
+	let _ = writeln!(body, "# Findings for {}\n", scan.id);
+	if scan.findings.is_empty() {
+		body.push_str("No findings.\n");
+		return;
+	}
+	for finding in &scan.findings {
+		let _ = writeln!(
+			body,
+			"- `{}` **{}** — {} (`{}:{}`)",
+			finding.id,
+			finding.rule,
+			finding.summary,
+			finding.path,
+			finding.line
+		);
+	}
+}
+
+fn render_finding(body: &mut String, finding: &Finding) {
+	let _ = writeln!(body, "## {}\n", finding.summary);
+	let _ = writeln!(body, "- ID: `{}`", finding.id);
+	let _ = writeln!(body, "- Rule: `{}`", finding.rule);
+	let _ = writeln!(body, "- Location: `{}:{}`", finding.path, finding.line);
+	if let Some(validation) = &finding.validation {
+		let _ = writeln!(body, "- Validation: **{:?}**", validation.status);
+		let _ = writeln!(body, "\n{}\n", validation.summary);
+		if !validation.evidence.is_empty() {
+			body.push_str("### Evidence\n\n");
+			for evidence in &validation.evidence {
+				let _ = writeln!(body, "- **{}** — {}", evidence.label, evidence.explanation);
+			}
+		}
+	}
+	body.push('\n');
+}
+
+fn security_entry(path: &str, directory: bool, name: &str) -> ResourceEntry {
+	ResourceEntry {
+		uri: Str::new(format!("security://{path}{}", if directory { "/" } else { "" })),
+		name: Str::new(name),
+		directory,
+		size: 0,
 	}
 }
 
@@ -516,6 +854,66 @@ mod tests {
 				.scans
 				.contains_key(scan_id)
 		);
+		fs::remove_dir_all(root).expect("remove fixture");
+		fs::remove_dir_all(state_dir).expect("remove state");
+	}
+
+	#[tokio::test]
+	async fn security_url_lists_reads_and_completes_real_scan_state() {
+		let (root, state_dir) = fixture();
+		fs::write(root.join("leak.txt"), "-----BEGIN PRIVATE KEY-----\n").expect("security fixture");
+		let service = SecurityScanService::new(root.clone(), &state_dir);
+		let preflight = service
+			.preflight(Params {
+				action: Action::Preflight,
+				target_kind: Some(TargetKind::Repository),
+				..empty_params(Action::Preflight)
+			})
+			.expect("preflight");
+		let plan_id = preflight.data["plan"]["id"].as_str().expect("plan id");
+		let started = service
+			.start(Params { plan_id: Some(Str::new(plan_id)), ..empty_params(Action::Start) })
+			.expect("start");
+		let scan_id = started.data["scan"]["id"].as_str().expect("scan id");
+
+		let index = service
+			.read("scans", &ParsedSelector::None)
+			.await
+			.expect("security scan index");
+		let index = std::str::from_utf8(&index).expect("UTF-8 index");
+		assert!(index.contains(scan_id), "{index}");
+		assert!(index.contains("1 finding(s)"), "{index}");
+
+		let listing = service
+			.list(&format!("scans/{scan_id}"), 10, 64 * 1024)
+			.await
+			.expect("scan resource listing");
+		assert_eq!(
+			listing
+				.entries
+				.iter()
+				.map(|entry| entry.name.as_str())
+				.collect::<Vec<_>>(),
+			["manifest", "findings", "report"]
+		);
+		let report = service
+			.read(&format!("scans/{scan_id}/report"), &ParsedSelector::None)
+			.await
+			.expect("security report");
+		let report = std::str::from_utf8(&report).expect("UTF-8 report");
+		assert!(report.contains("private-key"), "{report}");
+		assert!(report.contains("leak.txt:1"), "{report}");
+
+		let completions = service
+			.complete(scan_id, 20)
+			.await
+			.expect("security completions");
+		assert!(
+			completions
+				.iter()
+				.any(|completion| completion.value == format!("security://scans/{scan_id}/report"))
+		);
+
 		fs::remove_dir_all(root).expect("remove fixture");
 		fs::remove_dir_all(state_dir).expect("remove state");
 	}

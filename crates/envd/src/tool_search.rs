@@ -137,15 +137,24 @@ impl WorkspaceSearch for WorkspaceSearchAdapter {
 	) -> impl Future<Output = Option<Result<WalkResult, glob::Fault>>> + Send + '_ {
 		let resolvers = sync::Arc::clone(&self.resolvers);
 		async move {
-			if !request.path.as_str().split(';').any(|target| {
-				target.trim().to_ascii_lowercase().starts_with("ssh://")
-					|| target.trim().to_ascii_lowercase().starts_with("memory://")
-			}) {
+			if !request
+				.path
+				.as_str()
+				.split(';')
+				.any(is_resource_glob_target)
+			{
 				return None;
 			}
 			Some(resource_glob(&resolvers, request).await)
 		}
 	}
+}
+
+fn is_resource_glob_target(target: &str) -> bool {
+	let Some((scheme, _)) = target.trim().split_once("://") else {
+		return false;
+	};
+	matches!(Scheme::parse(scheme), Scheme::Ssh | Scheme::Vault | Scheme::Memory)
 }
 
 async fn resource_glob(
@@ -1287,7 +1296,11 @@ mod tests {
 	};
 
 	use super::*;
-	use crate::document_cache::project_document_cache;
+	use crate::{
+		document_cache::project_document_cache,
+		tool_url::{UrlResolver, vault::VaultResolver},
+		vault::{VaultPaths, VaultService},
+	};
 
 	async fn connected_search_adapter(root: &Path) -> WorkspaceSearchAdapter {
 		let config = ServerConfig::new(root).expect("docserver config");
@@ -1329,6 +1342,64 @@ mod tests {
 			max_columns: 512,
 			timeout_ms,
 		}
+	}
+
+	#[test]
+	fn resource_glob_target_routing_keeps_vault_uris() {
+		assert!(is_resource_glob_target("vault://reports/**/*.json"));
+		assert!(is_resource_glob_target(" VAULT://reports/**/*.json "));
+		assert!(is_resource_glob_target("ssh://host/**/*.rs"));
+		assert!(is_resource_glob_target("memory://notes/*"));
+		assert!(!is_resource_glob_target("artifact://sha256/*"));
+	}
+
+	#[tokio::test]
+	async fn resource_glob_walks_configured_vault_paths() {
+		let fixture = tempfile::tempdir().expect("fixture");
+		let vault_root = fixture.path().join("vault");
+		fs::create_dir_all(vault_root.join("reports")).expect("vault directories");
+		fs::write(vault_root.join("reports/a.json"), "{}").expect("vault file");
+		fs::write(vault_root.join("reports/b.txt"), "skip").expect("nonmatching vault file");
+		let user_config = fixture.path().join("config");
+		fs::create_dir_all(&user_config).expect("config directory");
+		fs::write(
+			user_config.join("vaults.toml"),
+			format!("[vaults]\nreports = {:?}\n", vault_root),
+		)
+		.expect("vault config");
+		let service = VaultService::load_layered(&VaultPaths::new(
+			&user_config,
+			fixture.path(),
+		))
+		.expect("vault service");
+		let mut builder = ResolverTable::builder();
+		builder
+			.register(
+				omp_tools::read::resolver::SchemeEntry::new(
+					Scheme::Vault,
+					true,
+					false,
+					"test vault",
+				)
+				.with_capabilities(true, false, true),
+				UrlResolver::Vault(VaultResolver::new(service)),
+			)
+			.expect("vault resolver");
+		let resolvers = builder.build();
+		let result = resource_glob(
+			&resolvers,
+			glob::WalkRequest {
+				path: Str::new_static("vault://reports/**/*.json"),
+				hidden: true,
+				gitignore: true,
+				limit: 20,
+				timeout_ms: 30_000,
+			},
+		)
+		.await
+		.expect("vault glob");
+		assert_eq!(result.matches.len(), 1);
+		assert_eq!(result.matches[0].path, "vault://reports/reports/a.json");
 	}
 
 	#[test]

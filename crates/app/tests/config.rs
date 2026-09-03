@@ -134,6 +134,35 @@ fn exec_and_writecfg_use_the_installed_cfg_files() {
 }
 
 #[test]
+fn chat_services_address_user_configuration_under_the_config_root() {
+	let config = tempfile::tempdir().expect("config directory");
+	let data = tempfile::tempdir().expect("data directory");
+	// SAFETY: see above.
+	unsafe {
+		std::env::set_var("OMP_CONFIG_DIR", config.path());
+		std::env::set_var("OMP_DATA_DIR", data.path());
+	}
+	let project = tempfile::tempdir().expect("project directory");
+
+	// `/mcp` in chat and `omp config mcp` on the CLI must address one file.
+	let chat = omp_app::chat_services::mcp_config_paths(project.path()).expect("mcp paths");
+	let cli = omp_envd::mcp::McpConfigPaths::new(
+		&omp_core::dirs::user_config_root().expect("config root"),
+		project.path(),
+	);
+	assert_eq!(chat, cli);
+	assert_eq!(chat.user, config.path().join("mcp.json"));
+	assert_eq!(chat.project, project.path().join(".omp/mcp.json"));
+	assert!(!chat.user.starts_with(data.path()), "user mcp.json must not live in the data dir");
+
+	// `/share` redacts with the user `secrets.yml` under the same root.
+	let [user, project_secrets] =
+		omp_app::chat_services::secrets_files(project.path()).expect("secrets files");
+	assert_eq!(user, config.path().join("secrets.yml"));
+	assert_eq!(project_secrets, project.path().join(".omp/secrets.yml"));
+}
+
+#[test]
 fn config_set_persists_and_get_reads_back() {
 	let config = tempfile::tempdir().expect("config directory");
 	// SAFETY: see above.

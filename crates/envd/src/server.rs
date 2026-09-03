@@ -2618,7 +2618,7 @@ impl EnvServer {
 			enabled: lsp_settings.enabled,
 			lazy:    lsp_settings.lazy,
 		};
-		let document_user_config = omp_core::dirs::data_dir(None).ok();
+		let document_user_config = Some(document_user_config_root()?);
 		let server_build = Str::from(omp_env::build_id::current());
 		let (documents, mut document_authority) = connect_or_start_docserver(
 			&root,
@@ -11422,6 +11422,21 @@ pub async fn run(_args: EnvdConfig, _bridges: RegistryBridges) -> Result<(), Env
 		io::Error::new(io::ErrorKind::Unsupported, "envd requires a Unix-domain socket in Phase 1")
 			.into(),
 	)
+}
+
+/// The user configuration root the document authority probes for `lsp.json`
+/// and `dap.json` overrides (`<root>` and `<root>/agent`).
+///
+/// User configuration lives in `~/.o2` ([`omp_core::dirs::user_config_root`],
+/// profile-aware), never under the data directory: a language-server
+/// declaration in `~/.o2/lsp.json` must reach the native LSP supervisor.
+///
+/// # Errors
+///
+/// Returns [`omp_core::dirs::DataDirError::HomeUnset`] when no home directory
+/// is set.
+pub fn document_user_config_root() -> Result<PathBuf, omp_core::dirs::DataDirError> {
+	omp_core::dirs::user_config_root()
 }
 
 #[cfg(any(unix, windows))]

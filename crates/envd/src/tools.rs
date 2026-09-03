@@ -3349,7 +3349,6 @@ fn prepare_registry(registry: &mut Registry) -> Result<(), EnvdError> {
 		"image_gen",
 		"tts",
 		"report_issue",
-		"vibe",
 		"retain",
 		"recall",
 		"reflect",
@@ -4040,13 +4039,11 @@ pub(crate) fn production_registry<
 		long_tail_presentation(policy),
 		builtin_device_claims(),
 	)?;
+	let security = SecurityScanService::new(workspace.root().to_path_buf(), state_dir);
 	if tool_settings.enabled("security_scan") {
 		environment_registry(
 			&mut registry,
-			omp_tools::security_scan::tool(SecurityScanService::new(
-				workspace.root().to_path_buf(),
-				state_dir,
-			)),
+			omp_tools::security_scan::tool(security.clone()),
 			Presentation::Device,
 			builtin_device_claims(),
 		)?;
@@ -4138,6 +4135,7 @@ pub(crate) fn production_registry<
 		session_authority,
 		Arc::clone(mcp),
 		ssh,
+		security,
 		vault,
 	);
 	let environment_edit_dialect = env::var("OMP_EDIT_DIALECT").ok();

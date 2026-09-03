@@ -16,7 +16,7 @@ pub(crate) struct VaultResolver {
 	lines:   LineOffsetCache,
 }
 impl VaultResolver {
-	pub(super) fn new(service: VaultService) -> Self {
+	pub(crate) fn new(service: VaultService) -> Self {
 		Self { service, lines: LineOffsetCache::default() }
 	}
 }

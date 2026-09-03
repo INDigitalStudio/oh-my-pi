@@ -120,7 +120,9 @@ use omp_tools::{
 };
 use parking_lot::{Mutex, RwLock};
 pub use presence::PresenceError;
-pub use server::{AgentControlBinding, EnvServer, EnvdError, ExtensionDataBinding};
+pub use server::{
+	AgentControlBinding, EnvServer, EnvdError, ExtensionDataBinding, document_user_config_root,
+};
 pub use site::validate_trusted_module;
 #[cfg(unix)]
 use tokio::net::UnixStream;

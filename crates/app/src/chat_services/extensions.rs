@@ -3,11 +3,11 @@
 //!
 //! Row ids follow pi (`mcp:<server>`, `ext:<id>`, `plugin:<name@market>`) so
 //! the dashboard's toggle routes back to the switch that owns the row: the
-//! MCP config stores (`~/.omp/mcp.json`, `.omp/mcp.json`, `.mcp.json`), the
+//! MCP config stores (`~/.o2/mcp.json`, `.omp/mcp.json`, `.mcp.json`), the
 //! extension installation record (`omp ext enable|disable`), or the
 //! marketplace plugin registry.
 
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 
 use omp_chat::overlays::services::{
 	ExtensionKind, ExtensionRow, ExtensionStatus, Pending, ServiceError, ServiceResult,
@@ -15,7 +15,7 @@ use omp_chat::overlays::services::{
 use omp_core::{Str, sf};
 use omp_envd::mcp::{
 	config::{ConfigSource, ConfigSourceKind, resolve_sources},
-	config_store::{McpConfigStore, set_server_enabled},
+	config_store::set_server_enabled,
 	manager::{McpInspectorHealth, McpInspectorSnapshot},
 };
 
@@ -28,7 +28,7 @@ const PLUGIN_PREFIX: &str = "plugin:";
 
 /// Every MCP server, installed Python extension, and marketplace plugin.
 pub(super) fn rows(state: &ServiceState) -> ServiceResult<Vec<ExtensionRow>> {
-	let mut rows = mcp_rows(state);
+	let mut rows = mcp_rows(state)?;
 	let paths = StatePaths::new(&state.data_dir, &state.project);
 	rows.extend(python_rows(state, &paths)?);
 	rows.extend(plugin_rows(state)?);
@@ -39,7 +39,7 @@ pub(super) fn rows(state: &ServiceState) -> ServiceResult<Vec<ExtensionRow>> {
 /// the worker generation so the change is live.
 pub(super) fn set_enabled(state: &ServiceState, id: &str, enabled: bool) -> ServiceResult<()> {
 	if let Some(name) = id.strip_prefix(MCP_PREFIX) {
-		let (user, project, root) = mcp_stores(&state.data_dir, &state.project);
+		let (user, project, root) = super::mcp::stores(state)?;
 		return set_server_enabled(&user, &project, Some((&root, true)), name, enabled)
 			.map_err(ServiceError::failed);
 	}
@@ -82,18 +82,10 @@ pub(super) fn reload(state: &ServiceState) -> ServiceResult<Pending<Str>> {
 	Ok(rx)
 }
 
-fn mcp_stores(data_dir: &Path, project: &Path) -> (McpConfigStore, McpConfigStore, McpConfigStore) {
-	(
-		McpConfigStore::new(data_dir.join("mcp.json")),
-		McpConfigStore::new(project.join(".omp/mcp.json")),
-		McpConfigStore::new(project.join(".mcp.json")),
-	)
-}
-
 /// Live MCP catalogs joined with the persisted configuration so disabled
 /// declarations still appear (as `Disabled`) beside the mounted ones.
-fn mcp_rows(state: &ServiceState) -> Vec<ExtensionRow> {
-	let (user, project, root) = mcp_stores(&state.data_dir, &state.project);
+fn mcp_rows(state: &ServiceState) -> ServiceResult<Vec<ExtensionRow>> {
+	let (user, project, root) = super::mcp::stores(state)?;
 	let sources: Vec<ConfigSource> = [
 		(ConfigSourceKind::User, user),
 		(ConfigSourceKind::Project, project),
@@ -144,7 +136,7 @@ fn mcp_rows(state: &ServiceState) -> Vec<ExtensionRow> {
 			error: None,
 		});
 	}
-	rows.into_values().collect()
+	Ok(rows.into_values().collect())
 }
 
 fn mcp_row(snapshot: &McpInspectorSnapshot, enabled: bool) -> ExtensionRow {

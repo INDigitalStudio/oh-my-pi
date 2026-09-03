@@ -180,6 +180,21 @@ pub fn ssh_remove(state: &ServiceState, alias: &str, project: bool) -> ServiceRe
 	}
 }
 
+/// The `secrets.yml` files `/share` redacts with, low to high precedence:
+/// the user file under the configuration root (`~/.o2`, profile-aware —
+/// never the data directory), then `<project>/.omp/secrets.yml`.
+///
+/// # Errors
+///
+/// Returns [`omp_core::dirs::DataDirError::HomeUnset`] when no home directory
+/// is set.
+pub fn secrets_files(project: &Path) -> Result<[PathBuf; 2], omp_core::dirs::DataDirError> {
+	Ok([
+		omp_core::dirs::user_config_root()?.join("secrets.yml"),
+		project.join(".omp").join("secrets.yml"),
+	])
+}
+
 /// `/share`: redact, seal, and upload the snapshot; settles with the viewer
 /// URL (pi `Share URL: …`).
 pub fn share(state: &ServiceState, snapshot: serde_json::Value) -> ServiceResult<Pending<Str>> {
@@ -187,10 +202,11 @@ pub fn share(state: &ServiceState, snapshot: serde_json::Value) -> ServiceResult
 		return Err(ServiceError::Unavailable("share (credentials live on the remote gateway host)"));
 	};
 	let settings = omp_driver::settings::Settings::from_con(&state.con);
+	let [user_secrets, project_secrets] = secrets_files(&state.project).map_err(failed)?;
 	let secrets = omp_driver::secrets::session::SecretSessionSnapshot::build(
 		0,
-		&state.data_dir.join("secrets.yml"),
-		&state.project.join(".omp").join("secrets.yml"),
+		&user_secrets,
+		&project_secrets,
 		[],
 	)
 	.map_err(failed)?;

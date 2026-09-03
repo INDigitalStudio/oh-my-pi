@@ -1,5 +1,5 @@
 //! `/mcp`: pi's `MCPCommandController` over the Environment's MCP
-//! authorities — the persisted config stores (`~/.omp/mcp.json`,
+//! authorities — the persisted config stores (`~/.o2/mcp.json`,
 //! `.omp/mcp.json`, `.mcp.json`) for `add`/`remove`/`enable`/`disable`,
 //! the live manager for `list`/`test`/`reconnect`/`reload`/`resources`/
 //! `prompts`/`notifications`, and the OAuth authority for
@@ -9,8 +9,9 @@
 use std::{fmt::Write as _, path::Path, time::Duration};
 
 use omp_chat::overlays::services::{McpAdd, McpOp, McpRun, McpScope, ServiceError, ServiceResult};
-use omp_core::{Str, sf};
+use omp_core::{Str, dirs::DataDirError, sf};
 use omp_envd::mcp::{
+	McpConfigPaths,
 	config::{McpServerConfig, TransportKind},
 	config_store::{McpConfigStore, set_server_enabled},
 	manager::{McpInspectorHealth, McpInspectorSnapshot},
@@ -29,19 +30,35 @@ fn failed(error: impl std::fmt::Display) -> ServiceError {
 	ServiceError::failed(error)
 }
 
-fn stores(state: &ServiceState) -> (McpConfigStore, McpConfigStore, McpConfigStore) {
-	(
-		McpConfigStore::new(state.data_dir.join("mcp.json")),
-		McpConfigStore::new(state.project.join(".omp/mcp.json")),
-		McpConfigStore::new(state.project.join(".mcp.json")),
-	)
+/// The three MCP config files `/mcp` reads and mutates: the same
+/// [`McpConfigPaths`] the Environment and `omp config mcp` address, rooted at
+/// the user configuration root (`~/.o2`, profile-aware) — never the data
+/// directory.
+///
+/// # Errors
+///
+/// Returns [`DataDirError::HomeUnset`] when no home directory is set.
+pub fn mcp_config_paths(project: &Path) -> Result<McpConfigPaths, DataDirError> {
+	Ok(McpConfigPaths::new(&omp_core::dirs::user_config_root()?, project))
 }
 
-fn store_for(state: &ServiceState, scope: McpScope) -> McpConfigStore {
-	match scope {
-		McpScope::User => McpConfigStore::new(state.data_dir.join("mcp.json")),
-		McpScope::Project => McpConfigStore::new(state.project.join(".omp/mcp.json")),
-	}
+pub(super) fn stores(
+	state: &ServiceState,
+) -> ServiceResult<(McpConfigStore, McpConfigStore, McpConfigStore)> {
+	let paths = mcp_config_paths(&state.project).map_err(failed)?;
+	Ok((
+		McpConfigStore::new(paths.user),
+		McpConfigStore::new(paths.project),
+		McpConfigStore::new(paths.root),
+	))
+}
+
+fn store_for(state: &ServiceState, scope: McpScope) -> ServiceResult<McpConfigStore> {
+	let paths = mcp_config_paths(&state.project).map_err(failed)?;
+	Ok(McpConfigStore::new(match scope {
+		McpScope::User => paths.user,
+		McpScope::Project => paths.project,
+	}))
 }
 
 /// Runs one operation; synchronous config edits settle immediately, live
@@ -50,7 +67,7 @@ pub(super) fn run(state: &ServiceState, op: McpOp) -> ServiceResult<McpRun> {
 	let (tx, rx) = flume::bounded(1);
 	match op {
 		McpOp::List => {
-			let _ = tx.send(Ok(list(state)));
+			let _ = tx.send(list(state));
 		},
 		McpOp::Add(add) => {
 			let _ = tx.send(add_server(state, &add));
@@ -167,7 +184,7 @@ pub(super) fn run(state: &ServiceState, op: McpOp) -> ServiceResult<McpRun> {
 
 /// The declaration for `name` from the first store that has it.
 fn declared_config(state: &ServiceState, name: &str) -> Option<McpServerConfig> {
-	let (user, project, root) = stores(state);
+	let (user, project, root) = stores(state).ok()?;
 	[project, root, user]
 		.iter()
 		.find_map(|store| store.get(name).ok().flatten())
@@ -175,8 +192,8 @@ fn declared_config(state: &ServiceState, name: &str) -> Option<McpServerConfig> 
 
 /// pi `#handleList`: user-level, project-level, then discovered servers,
 /// each with its connection state.
-fn list(state: &ServiceState) -> Str {
-	let (user, project, root) = stores(state);
+fn list(state: &ServiceState) -> ServiceResult<Str> {
+	let (user, project, root) = stores(state)?;
 	let live = state.mcp.snapshots();
 	let health = |name: &str| {
 		live
@@ -221,11 +238,11 @@ fn list(state: &ServiceState) -> Str {
 		out.push('\n');
 	}
 	if out.is_empty() {
-		return Str::new_static(
+		return Ok(Str::new_static(
 			"No MCP servers configured. Add one with /mcp add <name> -- <command>.",
-		);
+		));
 	}
-	Str::new(out.trim_end())
+	Ok(Str::new(out.trim_end()))
 }
 
 const fn status_label(health: Option<McpInspectorHealth>) -> &'static str {
@@ -245,7 +262,7 @@ fn shorten(path: &Path, project: &Path) -> String {
 
 /// pi `#handleAdd` (non-interactive form): validate, write, report.
 fn add_server(state: &ServiceState, add: &McpAdd) -> ServiceResult<Str> {
-	let store = store_for(state, add.scope);
+	let store = store_for(state, add.scope)?;
 	let mut config = McpServerConfig {
 		transport:         None,
 		enabled:           true,
@@ -283,7 +300,7 @@ fn add_server(state: &ServiceState, add: &McpAdd) -> ServiceResult<Str> {
 
 /// pi `#handleRemove`.
 fn remove_server(state: &ServiceState, name: &str, scope: McpScope) -> ServiceResult<Str> {
-	let store = store_for(state, scope);
+	let store = store_for(state, scope)?;
 	if store.get(name).map_err(failed)?.is_none() {
 		return Err(ServiceError::Failed(sf!("Server \"{name}\" not found in {scope} config.")));
 	}
@@ -305,7 +322,7 @@ fn set_enabled(state: &ServiceState, name: &str, enabled: bool) -> ServiceResult
 	if !known {
 		return Err(ServiceError::Failed(sf!("Server \"{name}\" not found.")));
 	}
-	let (user, project, root) = stores(state);
+	let (user, project, root) = stores(state)?;
 	set_server_enabled(&user, &project, Some((&root, true)), name, enabled).map_err(|error| {
 		ServiceError::Failed(sf!(
 			"Failed to {} server: {error}",
