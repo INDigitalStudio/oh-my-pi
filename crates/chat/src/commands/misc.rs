@@ -7,9 +7,10 @@
 //! Every command here either flips a convar (ADR 0012: the convar *is* the
 //! live setting), asks the application through the [`Services`] seam, or
 //! opens an observer-local panel. Commands whose backing service left the
-//! tree in the kernel cutover (`/collab`, `/join`, `/leave`, `/prewalk`,
-//! `/advisor`) are registered so the palette matches pi and answer with the
-//! exact missing seam instead of pretending. `/vision` sets the journaled
+//! tree in the kernel cutover (`/collab`, `/join`, `/leave`, `/prewalk`) are
+//! registered so the palette matches pi and answer with the exact missing
+//! seam instead of pretending. `/advisor` controls the journal-backed advisor
+//! Director; `/vision` sets the journaled
 //! `ai_vision` convar the kernel's request projection consumes.
 //!
 //! [`Services`]: crate::overlays::services::Services
@@ -20,9 +21,10 @@ use omp_con::{ConError, Value};
 use omp_core::{Str, StrMut, sf};
 use omp_tui::Icon;
 
-use super::{PaletteEntry, rest};
+use super::{PaletteEntry, rest, run::director_active};
 use crate::{
 	actions::{HostAction, post},
+	host::HostCommand,
 	overlays::{
 		PanelAnchor, PanelCall, PanelCx, PanelEvent, PanelOpener,
 		report::ReportPanel,
@@ -72,9 +74,6 @@ const DEFERRED_JOIN: &str = "Joining a collaboration room is unavailable: the gu
 const DEFERRED_PREWALK: &str = "Prewalk is unavailable: it needs a prewalk Director in \
                                 crates/agent/src/directors (the mode regime was deleted with the \
                                 kernel cutover); sv_task_agent_prewalk only affects children.";
-const DEFERRED_ADVISOR: &str = "Advisor is unavailable: no advisor Director exists in \
-                                crates/agent/src/directors (only prompts/modes/advisor.md).";
-
 omp_con::var! {
 	/// Uses the premium extended-context pricing tier of the current model
 	/// (pi `/extended-context`).
@@ -514,14 +513,37 @@ omp_con::cmd! {
 		}))
 	};
 
-	/// Second-model watchdog: `/advisor [on|off|status]`.
+	/// Second-model watchdog: `/advisor [on|off|status|toggle|dump|configure]`.
 	advisor(?mode: Str) = |ctx, args| {
-		match args.opt::<Str>(0)?.as_deref().map(str::trim) {
-			None | Some("on" | "off" | "status" | "toggle" | "dump" | "configure") => {
-				call(ctx, PanelCall::new(|_cx| notice(DEFERRED_ADVISOR)))
-			},
-			Some(_) => Err(usage("Usage: /advisor [on|off|status|dump|configure]")),
+		let mode = args
+			.opt::<Str>(0)?
+			.map_or_else(|| Str::new_static("status"), |mode| Str::new(mode.trim().to_ascii_lowercase()));
+		if !matches!(mode.as_str(), "on" | "off" | "status" | "toggle" | "dump" | "configure") {
+			return Err(usage("Usage: /advisor [on|off|status|toggle|dump|configure]"));
 		}
+		call(ctx, PanelCall::new(move |cx| {
+			let active = director_active(cx.dom, "advisor");
+			match mode.as_str() {
+				"status" | "dump" => notice(if active { "Advisor: on" } else { "Advisor: off" }),
+				"configure" => notice("Configure ai_advisor_enabled, ai_advisor_sync_backlog, and ai_advisor_immune_turns in /settings."),
+				"on" | "off" | "toggle" => {
+					let enabled = match mode.as_str() {
+						"on" => true,
+						"off" => false,
+						_ => !active,
+					};
+					if let Err(error) = set_var(cx, "ai_advisor_enabled", Value::Bool(enabled)) {
+						return notice(error);
+					}
+					PanelEvent::Command(HostCommand::Director {
+						id: Str::new_static("advisor"),
+						engage: enabled,
+						args: Vec::new(),
+					})
+				},
+				_ => unreachable!("advisor command vocabulary checked above"),
+			}
+		}))
 	};
 
 	/// Hosts a live collaboration room: `/collab [start|view|status|stop]`.
@@ -633,6 +655,26 @@ mod tests {
 			.attach(omp_con::Ctx::builder())
 			.build();
 		assert!(ctx.run("extended-context sideways").is_err(), "bad words are usage errors");
+	}
+
+	#[test]
+	fn advisor_command_controls_the_real_director_and_convar() {
+		let (ctx, event) = run_call("advisor on");
+		assert!(omp_inference::pi_settings::AI_ADVISOR_ENABLED.get(&ctx));
+		assert_eq!(
+			event,
+			PanelEvent::Command(HostCommand::Director {
+				id: Str::new_static("advisor"),
+				engage: true,
+				args: Vec::new(),
+			})
+		);
+		let (_, event) = run_call("advisor status");
+		assert_eq!(event, PanelEvent::Notice(Str::new_static("Advisor: off")));
+		let ctx = crate::actions::HostMailbox::new()
+			.attach(omp_con::Ctx::builder())
+			.build();
+		assert!(ctx.run("advisor sideways").is_err(), "bad words are usage errors");
 	}
 
 	#[test]

@@ -8,7 +8,7 @@ use omp_agent::{
 };
 use omp_core::{Str, base64};
 use omp_dom::Event;
-use omp_driver::headless::kernel::SessionHome;
+use omp_driver::{headless::kernel::SessionHome, sessions::SessionIndex};
 use omp_session::{AttachmentInput, Session, SessionError};
 use serde_json::{Map, Value, json};
 use tokio::io::{
@@ -19,6 +19,9 @@ use crate::{
 	chat_cmd::{Launch, LaunchEnv},
 	cli::{AcpArgs, ChatArgs},
 };
+
+/// `session/list` page size (pi `acp-agent.ts` `SESSION_PAGE_SIZE`).
+const SESSION_PAGE_SIZE: usize = 50;
 
 /// Runs ACP using stdin for NDJSON requests and stdout for NDJSON responses.
 pub async fn run(args: AcpArgs) -> miette::Result<()> {
@@ -185,7 +188,7 @@ where
 						"authMethods": [],
 						"agentCapabilities": {
 							"loadSession": true,
-							"sessionCapabilities": {"resume": {}, "close": {}},
+							"sessionCapabilities": {"list": {}, "fork": {}, "resume": {}, "close": {}},
 							"promptCapabilities": {"image": true, "embeddedContext": true},
 						},
 					}))
@@ -232,6 +235,51 @@ where
 					},
 				};
 				let next = match home.open(Path::new(selector)) {
+					Ok(next) => next,
+					Err(source) => {
+						if let Some(id) = id {
+							output_tx
+								.send(error(id, -32000, &source.to_string()))
+								.into_diagnostic()?;
+						}
+						continue;
+					},
+				};
+				switch_session(
+					&mut controller,
+					next,
+					&home,
+					&output_tx,
+					&mut forwarder,
+					&mut session_id,
+				)
+				.await?;
+				Ok(session_descriptor(session_id.as_str()))
+			},
+			// pi `listSessions`: stored sessions newest first, paged by an
+			// offset cursor, optionally scoped to one `cwd`. The live session
+			// is flushed to disk by construction (journal-first), so the scan
+			// already sees it.
+			"session/list" => match list_sessions(&home, &params) {
+				Ok(page) => Ok(page),
+				Err(message) => Err((-32602, message)),
+			},
+			// pi `unstable_forkSession`: copy the source journal (the whole
+			// branch tree travels) and switch authority to the copy.
+			"session/fork" if active.is_some() => Err((-32001, "a turn is already running")),
+			"session/fork" => {
+				let selector = match requested_session(&params) {
+					Ok(selector) => selector,
+					Err(message) => {
+						if let Some(id) = id {
+							output_tx
+								.send(error(id, -32602, message))
+								.into_diagnostic()?;
+						}
+						continue;
+					},
+				};
+				let next = match home.fork(Path::new(selector)) {
 					Ok(next) => next,
 					Err(source) => {
 						if let Some(id) = id {
@@ -499,7 +547,65 @@ fn requested_session(params: &Map<String, Value>) -> Result<&str, &'static str> 
 		.get("sessionId")
 		.or_else(|| params.get("session"))
 		.and_then(Value::as_str)
-		.ok_or("session/load requires sessionId")
+		.ok_or("sessionId is required")
+}
+
+/// `session/list {cwd?, cursor?}` → `{sessions, nextCursor?}` (pi
+/// `listSessions` / `#toSessionInfo`): every journal under the session
+/// directory, newest first, `cwd` scoping by the genesis working directory
+/// and `cursor` an offset into that ordering.
+fn list_sessions(home: &SessionHome, params: &Map<String, Value>) -> Result<Value, &'static str> {
+	let cwd = match params.get("cwd").and_then(Value::as_str) {
+		Some(cwd) => {
+			let path = Path::new(cwd);
+			if !path.is_absolute() {
+				return Err("cwd must be an absolute path");
+			}
+			Some(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+		},
+		None => None,
+	};
+	let offset = match params.get("cursor") {
+		None | Some(Value::Null) => 0,
+		Some(cursor) => cursor
+			.as_str()
+			.and_then(|cursor| cursor.parse::<usize>().ok())
+			.or_else(|| cursor.as_u64().and_then(|cursor| usize::try_from(cursor).ok()))
+			.ok_or("invalid session cursor")?,
+	};
+	let index = SessionIndex::open(&home.sessions_dir).map_err(|_| "session directory unreadable")?;
+	let mut rows = index.list();
+	if let Some(cwd) = &cwd {
+		rows.retain(|row| {
+			let recorded = Path::new(row.cwd.as_str());
+			recorded == cwd
+				|| fs::canonicalize(recorded).is_ok_and(|recorded| recorded == *cwd)
+		});
+	}
+	let total = rows.len();
+	let page: Vec<Value> = rows
+		.iter()
+		.skip(offset)
+		.take(SESSION_PAGE_SIZE)
+		.map(|row| {
+			let size = fs::metadata(&row.path).map(|meta| meta.len()).unwrap_or(0);
+			json!({
+				"sessionId": row.id,
+				"cwd": row.cwd,
+				"title": row.title,
+				"updatedAt": jiff::Timestamp::from_millisecond(i64::try_from(row.updated_ms).unwrap_or(i64::MAX))
+					.map(|stamp| stamp.to_string())
+					.unwrap_or_default(),
+				"_meta": {"messageCount": row.messages, "size": size},
+			})
+		})
+		.collect();
+	let next = offset.saturating_add(page.len());
+	let mut result = json!({ "sessions": page });
+	if next < total {
+		result["nextCursor"] = Value::String(next.to_string());
+	}
+	Ok(result)
 }
 
 fn session_descriptor(session_id: &str) -> Value {

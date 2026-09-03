@@ -3,7 +3,7 @@
 use omp_core::Str;
 use omp_dom::{Dom, KnownTag, PropId, PropKey, Tag, Value};
 
-use crate::status_band::{GoalState, ModeChip};
+use crate::status_band::{AdvisorBadge, AdvisorHealth, GoalState, ModeChip};
 
 /// Observer-visible status values.
 #[derive(Clone, Debug, PartialEq)]
@@ -228,6 +228,33 @@ pub fn director_mode(dom: &Dom) -> Option<ModeChip> {
 	})
 }
 
+/// The advisor roster badge (pi `getAdvisorStatusOverview`): the engaged
+/// `advisor` Director's journaled health and whether it finished reviewing
+/// the yielded turn. `None` when no advisor is configured, so the model chip
+/// carries no badge.
+#[must_use]
+pub fn advisor_badge(dom: &Dom) -> Option<AdvisorBadge> {
+	let root = dom.children(dom.meta()).iter().copied().find(|handle| {
+		dom.get(*handle)
+			.is_some_and(|node| node.tag == Tag::Known(KnownTag::Directors))
+	})?;
+	let node = dom.handles().find_map(|handle| {
+		let node = dom.get(handle)?;
+		(node.tag == Tag::Known(KnownTag::Director)
+			&& under(dom, handle, root)
+			&& custom_str(node, "family") == Some("advisor")
+			&& matches!(custom_str(node, "status"), Some("active" | "paused")))
+		.then_some(node)
+	})?;
+	let health = match custom_str(node, "state/status") {
+		Some("quota_exhausted") => AdvisorHealth::QuotaExhausted,
+		Some("error") => AdvisorHealth::Error,
+		Some("paused" | "no_model") => AdvisorHealth::Paused,
+		_ => AdvisorHealth::Running,
+	};
+	Some(AdvisorBadge { health, yielded: custom_bool(node, "state/yielded") })
+}
+
 fn under(dom: &Dom, mut handle: omp_dom::Handle, root: omp_dom::Handle) -> bool {
 	while let Some(parent) = dom.parent(handle) {
 		if parent == root {
@@ -311,6 +338,10 @@ mod tests {
 	}
 
 	fn mode(family: &str, status: &str, state: &[(&str, Value)]) -> Option<ModeChip> {
+		director_mode(with_director(family, status, state).dom())
+	}
+
+	fn with_director(family: &str, status: &str, state: &[(&str, Value)]) -> omp_session::Session {
 		let mut session = session();
 		let meta = session.dom().meta();
 		let directors = session
@@ -343,7 +374,42 @@ mod tests {
 				}],
 			})
 			.expect("director");
-		director_mode(session.dom())
+		session
+	}
+
+	#[test]
+	fn advisor_badge_projects_the_directors_journaled_health_and_eye() {
+		assert_eq!(advisor_badge(session().dom()), None, "no advisor, no badge");
+		let badge = |status: &str, state: &[(&str, Value)]| {
+			advisor_badge(with_director("advisor", status, state).dom())
+		};
+		assert_eq!(
+			badge("active", &[
+				("state/status", Value::Str(Str::new_static("running"))),
+				("state/yielded", Value::Bool(false)),
+			]),
+			Some(AdvisorBadge { health: AdvisorHealth::Running, yielded: false })
+		);
+		assert_eq!(
+			badge("active", &[
+				("state/status", Value::Str(Str::new_static("running"))),
+				("state/yielded", Value::Bool(true)),
+			]),
+			Some(AdvisorBadge { health: AdvisorHealth::Running, yielded: true })
+		);
+		assert_eq!(
+			badge("active", &[("state/status", Value::Str(Str::new_static("quota_exhausted")))]),
+			Some(AdvisorBadge { health: AdvisorHealth::QuotaExhausted, yielded: false })
+		);
+		assert_eq!(
+			badge("active", &[("state/status", Value::Str(Str::new_static("error")))]),
+			Some(AdvisorBadge { health: AdvisorHealth::Error, yielded: false })
+		);
+		assert_eq!(
+			badge("active", &[("state/status", Value::Str(Str::new_static("no_model")))]),
+			Some(AdvisorBadge { health: AdvisorHealth::Paused, yielded: false })
+		);
+		assert_eq!(badge("queued", &[]), None, "a queued frame is not configured yet");
 	}
 
 	#[test]

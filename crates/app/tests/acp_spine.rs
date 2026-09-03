@@ -314,3 +314,98 @@ async fn new_load_and_resume_switch_the_authoritative_durable_session() {
 		"prompt must be journaled in the requested resumed session"
 	);
 }
+
+/// pi `listSessions` / `unstable_forkSession`: `session/list` pages the
+/// stored journals (newest first, offset cursor, `cwd` scoping) and
+/// `session/fork` copies a stored session into a fresh one that becomes the
+/// authority, with both capabilities advertised by `initialize`.
+#[tokio::test]
+async fn list_and_fork_expose_stored_sessions() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let sessions = directory.path().join("sessions");
+	std::fs::create_dir_all(&sessions).expect("sessions directory");
+	let source_path = sessions.join("source.oms");
+	{
+		let mut source =
+			Session::create(&source_path, ComponentRegistry::standard()).expect("stored source");
+		source.begin_turn().expect("turn");
+		source
+			.user("remember the fixture", Vec::new())
+			.expect("stored prompt");
+	}
+	let (kernel, session, home) = harness(&directory, [Script::Text("forked reply")]);
+	let frames = exchange(
+		kernel,
+		session,
+		home,
+		br#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":1}}
+{"jsonrpc":"2.0","id":"list","method":"session/list","params":{}}
+{"jsonrpc":"2.0","id":"page","method":"session/list","params":{"cursor":"1"}}
+{"jsonrpc":"2.0","id":"elsewhere","method":"session/list","params":{"cwd":"/nonexistent/elsewhere"}}
+{"jsonrpc":"2.0","id":"badcursor","method":"session/list","params":{"cursor":"later"}}
+{"jsonrpc":"2.0","id":"fork","method":"session/fork","params":{"sessionId":"source"}}
+{"jsonrpc":"2.0","id":"prompt","method":"session/prompt","params":{"prompt":"in the fork"}}
+{"jsonrpc":"2.0","id":"after","method":"session/list","params":{}}
+{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":{}}
+"#,
+	)
+	.await;
+
+	let capabilities = &response(&frames, "init")["result"]["agentCapabilities"]["sessionCapabilities"];
+	assert!(capabilities.get("list").is_some() && capabilities.get("fork").is_some());
+
+	let listed = response(&frames, "list")["result"].clone();
+	let ids = |page: &Value| {
+		page["sessions"]
+			.as_array()
+			.expect("sessions array")
+			.iter()
+			.map(|row| row["sessionId"].as_str().expect("id").to_owned())
+			.collect::<Vec<_>>()
+	};
+	let mut all = ids(&listed);
+	all.sort();
+	assert_eq!(all, ["source", "startup"]);
+	assert!(listed.get("nextCursor").is_none(), "two rows fit one page");
+	let source_row = listed["sessions"]
+		.as_array()
+		.expect("sessions")
+		.iter()
+		.find(|row| row["sessionId"] == "source")
+		.expect("source row");
+	assert_eq!(source_row["title"], "remember the fixture");
+	assert_eq!(source_row["_meta"]["messageCount"], 1);
+	assert!(source_row["_meta"]["size"].as_u64().is_some_and(|size| size > 0));
+	assert!(
+		source_row["updatedAt"]
+			.as_str()
+			.is_some_and(|stamp| stamp.ends_with('Z') && stamp.contains('T'))
+	);
+
+	assert_eq!(ids(&response(&frames, "page")["result"]).len(), 1, "cursor skips one row");
+	assert!(ids(&response(&frames, "elsewhere")["result"]).is_empty(), "cwd scoping");
+	assert_eq!(response(&frames, "badcursor")["error"]["code"], -32602);
+
+	let fork_id = response(&frames, "fork")["result"]["sessionId"]
+		.as_str()
+		.expect("fork id")
+		.to_owned();
+	assert_ne!(fork_id, "source");
+	let fork_path = sessions.join(format!("{fork_id}.oms"));
+	assert!(fork_path.exists());
+	let mut after = ids(&response(&frames, "after")["result"]);
+	after.sort();
+	let mut expected = vec!["source".to_owned(), "startup".to_owned(), fork_id.clone()];
+	expected.sort();
+	assert_eq!(after, expected);
+
+	let fork = Session::open(&fork_path, ComponentRegistry::standard()).expect("fork reopens");
+	let fork_snapshot = String::from_utf8_lossy(fork.dom().snapshot().as_bytes()).into_owned();
+	assert!(fork_snapshot.contains("remember the fixture"), "the fork carries its source's history");
+	assert!(fork_snapshot.contains("in the fork"), "the fork is the authority for new prompts");
+	let source = Session::open(&source_path, ComponentRegistry::standard()).expect("source reopens");
+	assert!(
+		!String::from_utf8_lossy(source.dom().snapshot().as_bytes()).contains("in the fork"),
+		"the source is untouched by prompts in the fork"
+	);
+}

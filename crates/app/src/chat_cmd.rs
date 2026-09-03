@@ -746,6 +746,7 @@ fn apply_launch_session(
 			.into_diagnostic()?;
 	}
 	apply_launch_plan(session, launch.plan_mode, launch.plan_yolo.as_ref()).into_diagnostic()?;
+	omp_agent::directors::advisor::apply_launch(session, ctx).into_diagnostic()?;
 	Ok(())
 }
 
@@ -1126,6 +1127,20 @@ mod tests {
 		let launch = Launch::prepare(args, Arc::clone(&ctx), test_env(dir.path()))
 			.await
 			.expect("launch lowers");
+		let mut session = omp_session::Session::create(
+			dir.path().join("launch.oms"),
+			omp_session::ComponentRegistry::standard(),
+		)
+		.expect("launch session");
+		apply_launch_session(&ctx, &mut session, &launch).expect("session launch applies");
+		assert_eq!(
+			session
+				.dom()
+				.count("directors director[family=advisor]")
+				.expect("advisor selector"),
+			1,
+			"--advisor engages the journal-backed Director exactly once"
+		);
 
 		assert_eq!(omp_con::AI_COMPACT_THRESHOLD.get(&ctx), 0.5, "--config overlay ran");
 		assert_eq!(omp_catalog::settings::AI_TIER_OPENAI.get(&ctx), TierSetting::Priority);

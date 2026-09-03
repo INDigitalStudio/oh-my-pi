@@ -10,9 +10,9 @@ use omp_chat::{
 	render_surface,
 };
 use omp_core::Str;
-use omp_dom::{Op, Txn, Value};
+use omp_dom::{Handle, KnownTag, NodeSpec, Op, PropKey, Txn, Value};
 use omp_session::{ComponentRegistry, Session};
-use omp_tui::{Charset, Size, Ui, UiContext, frame_text};
+use omp_tui::{Charset, Icon, Size, Ui, UiContext, frame_text};
 use tempfile::tempdir;
 
 /// pi's band row from the capture at the given geometry, for exact-byte
@@ -82,6 +82,49 @@ fn surface(width: u16, height: u16) -> (Vec<String>, Option<(u16, u16)>) {
 	surface_of(&mut boot_session(), width, height)
 }
 
+fn directors_root(session: &Session) -> Handle {
+	session
+		.dom()
+		.children(session.dom().meta())
+		.iter()
+		.copied()
+		.find(|handle| {
+			session
+				.dom()
+				.get(*handle)
+				.is_some_and(|node| node.tag == omp_dom::Tag::Known(KnownTag::Directors))
+		})
+		.expect("directors root")
+}
+
+fn insert_director(
+	session: &mut Session,
+	parent: Handle,
+	family: &'static str,
+	state: &[(&'static str, Value)],
+) -> Handle {
+	let mut node = NodeSpec::new(KnownTag::Director)
+		.with_prop(PropKey::Custom(Str::new_static("family")), Value::Str(Str::new_static(family)))
+		.with_prop(PropKey::Custom(Str::new_static("status")), Value::Str(Str::new_static("active")));
+	for (key, value) in state {
+		node = node.with_prop(PropKey::Custom(Str::new_static(key)), value.clone());
+	}
+	let high = session.dom().high_water();
+	let cause = session.head().expect("head");
+	session
+		.patch(Txn {
+			cause,
+			label: Some(Str::new_static("director.test")),
+			ops: vec![Op::Ins {
+				parent,
+				after: session.dom().children(parent).last().copied(),
+				node,
+			}],
+		})
+		.expect("director patch");
+	Handle::new(high + 1).expect("new handle")
+}
+
 /// The band pi paints for a fresh session at `width`: the group, then the
 /// embedded gauge with `0%` on the one accent cell, the compaction tick at
 /// `threshold` percent of the scale, and the `1M` window label at the end.
@@ -130,6 +173,30 @@ fn boot_surface_keeps_the_composer_reachable_at_80x24() {
 	// pi's resize capture keeps the whole band with the gauge at its
 	// label-preserving minimum; ours keeps every chip at 80 columns too.
 	assert_eq!(rows[prompt - 1], expected_band(" π  > ⬢ Fable 5 > 📁 omp > ⑂ main ▶", 80, 80));
+}
+
+#[test]
+fn headless_surface_projects_director_mode_and_advisor_health_from_the_snapshot() {
+	let mut session = boot_session();
+	let root = directors_root(&session);
+	let advisor = insert_director(&mut session, root, "advisor", &[
+		("state/status", Value::Str(Str::new_static("running"))),
+		("state/yielded", Value::Bool(false)),
+	]);
+	insert_director(&mut session, advisor, "plan", &[]);
+	let (rows, _) = surface_of(&mut session, 120, 40);
+	let band = rows
+		.iter()
+		.find(|row| row.contains("Plan"))
+		.expect("status band carries the mode chip");
+	assert!(
+		band.contains(ui().charset.icon(Icon::Advisor)),
+		"advisor badge comes from the snapshot: {band}"
+	);
+	assert!(
+		rows.iter().any(|row| row.starts_with('▎')),
+		"plan Director reshapes the headless composer into its rail"
+	);
 }
 
 #[test]
