@@ -80,7 +80,11 @@ impl Card for BrowserCard {
 			.flatten()
 			.map(display_value)
 			.map(|text| {
-				if expanded { Str::new(text) } else { preview_lines(&text, PREVIEW_LINES) }
+				if expanded {
+					Str::new(text)
+				} else {
+					preview_lines(&text, PREVIEW_LINES)
+				}
 			})
 			.collect::<Vec<_>>();
 		let returned = result

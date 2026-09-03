@@ -76,7 +76,10 @@ fn display_content(text: &str) -> DisplayContent {
 		lines.next();
 	}
 	let rows = lines.collect::<Vec<_>>();
-	let numbered = rows.iter().map(|row| row.split_once(':')).collect::<Vec<_>>();
+	let numbered = rows
+		.iter()
+		.map(|row| row.split_once(':'))
+		.collect::<Vec<_>>();
 	let start = numbered
 		.first()
 		.copied()

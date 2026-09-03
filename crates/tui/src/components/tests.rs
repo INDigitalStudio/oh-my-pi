@@ -165,15 +165,14 @@ fn select_scrolls_the_preselected_row_into_view_on_the_first_layout() {
 #[test]
 fn select_filter_ranks_word_matches_first_and_resets_the_cursor_to_the_best_match() {
 	let mut ui = Ui::from_markup(
-		"<select id=models filter h=8>\
-		 <option value=0 label=\"Abliteration llama-3 abliteration/llama-3\"/>\
-		 <option value=1 label=\"OpenRouter Qwen Plus openrouter/qwen/qwen-plus\"/>\
-		 <option value=2 label=\"OpenRouter gpt-oss-120b openrouter/openai/gpt-oss-120b\"/>\
-		 <option value=3 label=\"Zai glm-4-plus zai/glm-4-plus\"/>\
-		 <option value=4 label=\"Anthropic Claude Opus 4.6 anthropic/claude-opus-4-6\"/>\
-		 <option value=5 label=\"Anthropic Claude Opus 5 anthropic/claude-opus-5\" recommended/>\
-		 <option value=6 label=\"OpenRouter Claude Opus 5 openrouter/anthropic/claude-opus-5\"/>\
-		 </select>",
+		"<select id=models filter h=8><option value=0 label=\"Abliteration llama-3 \
+		 abliteration/llama-3\"/><option value=1 label=\"OpenRouter Qwen Plus \
+		 openrouter/qwen/qwen-plus\"/><option value=2 label=\"OpenRouter gpt-oss-120b \
+		 openrouter/openai/gpt-oss-120b\"/><option value=3 label=\"Zai glm-4-plus \
+		 zai/glm-4-plus\"/><option value=4 label=\"Anthropic Claude Opus 4.6 \
+		 anthropic/claude-opus-4-6\"/><option value=5 label=\"Anthropic Claude Opus 5 \
+		 anthropic/claude-opus-5\" recommended/><option value=6 label=\"OpenRouter Claude Opus 5 \
+		 openrouter/anthropic/claude-opus-5\"/></select>",
 		80,
 		UiContext::default(),
 	)
@@ -192,7 +191,11 @@ fn select_filter_ranks_word_matches_first_and_resets_the_cursor_to_the_best_matc
 	ui.handle_key(Key::Char('4'));
 	let select = select_of(&mut ui);
 	assert_eq!(select.visible_len(), 1);
-	assert_eq!(select.cursor_option(), Some(4), "the list changed above the cursor: back to the top");
+	assert_eq!(
+		select.cursor_option(),
+		Some(4),
+		"the list changed above the cursor: back to the top"
+	);
 }
 
 #[test]

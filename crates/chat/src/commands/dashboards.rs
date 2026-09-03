@@ -10,7 +10,7 @@
 //! turn's timeline from the replica plus the recorded kernel notifications.
 
 use omp_con::{ConError, ConResult, Ctx};
-use omp_core::{Str, sf};
+use omp_core::Str;
 use omp_tui::Icon;
 
 use super::{PaletteEntry, rest};
@@ -19,7 +19,7 @@ use crate::{
 	host::HostCommand,
 	overlays::{
 		PanelCall, PanelEvent, PanelOpener,
-		info::{DebugSelector, changelog_report, context_report, debug_report, hotkeys_report},
+		info::{DebugSelector, changelog_report, context_report, hotkeys_report, open_debug},
 		report::{PendingReportPanel, ReportPanel},
 		reset_usage::ResetUsageSelector,
 		services::{Mutation, ServiceError},
@@ -150,21 +150,29 @@ omp_con::cmd! {
 		Ok(Box::new(ReportPanel::new("hotkeys", "Hotkeys", hotkeys_report(cx.con), cx.ui)) as Box<_>)
 	}));
 
-	/// Opens the debug tools selector: `/debug [paths|system|values]`.
-	debug(?inspector: Str) = |ctx, args| match rest(args, 0) {
+	/// Opens the complete native debug tools selector or executes one stable
+	/// operation key.
+	debug(?operation: Str) = |ctx, args| match rest(args, 0) {
 		None => open(ctx, PanelOpener::new(|cx| {
 			Ok(Box::new(DebugSelector::open(cx.ui, cx.viewport.width)) as Box<_>)
 		})),
-		Some(key) => open(ctx, PanelOpener::new(move |cx| {
-			let body = debug_report(cx, key.as_str().trim())?;
-			let title = sf!("Debug · {}", key.as_str().trim());
-			Ok(Box::new(ReportPanel::new("debug", title, body, cx.ui)) as Box<_>)
-		})),
+		Some(key) => {
+			let action = key
+				.as_str()
+				.trim()
+				.parse::<crate::overlays::services::DebugAction>()
+				.map_err(|_| usage("Usage: /debug [open-artifacts|performance|work|dump|memory|logs|system|terminal|protocols|raw-sse|transcript|clear-cache]"))?;
+			open(ctx, PanelOpener::new(move |cx| {
+				open_debug(cx, action, super::control::transcript_text(cx.dom))
+			}))
+		},
 	};
 }
 
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	#[test]

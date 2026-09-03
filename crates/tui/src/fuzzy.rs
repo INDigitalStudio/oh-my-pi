@@ -37,9 +37,7 @@ fn normalize(value: &str) -> String {
 			let camel = previous.is_lowercase()
 				|| previous.is_numeric()
 				|| (previous.is_uppercase()
-					&& chars
-						.get(index + 1)
-						.is_some_and(|next| next.is_lowercase()));
+					&& chars.get(index + 1).is_some_and(|next| next.is_lowercase()));
 			pending_space |= camel;
 		}
 		if pending_space && !out.is_empty() {

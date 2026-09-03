@@ -322,7 +322,8 @@ fn fault_frames(tool: &str, fault: &Value) -> Vec<OutputFrame> {
 }
 
 /// The durable `bash@2` payload for a readable fixture transcript
-/// (`{"transcript":[{"data":"…"}],"status":{"exit_code":…,"wall_clock_ms":…}}`).
+/// (`{"transcript":[{"data":"…"}],"status":{"exit_code":…,"wall_clock_ms":…
+/// }}`).
 fn shell_payload(args: &Value, value: &Value) -> shell::Payload {
 	let exit_code = value
 		.pointer("/status/exit_code")
@@ -385,12 +386,10 @@ fn eval_payload(
 			Ok(OutputFrame { update, text })
 		})
 		.collect::<Result<Vec<_>, serde_json::Error>>()?;
-	let status: eval::CellStatus = serde_json::from_value(
-		value
-			.get("status")
-			.cloned()
-			.unwrap_or_else(|| serde_json::json!({"outcome":"complete","exit_code":0,"duration_ms":0,"exception":null})),
-	)?;
+	let status: eval::CellStatus =
+		serde_json::from_value(value.get("status").cloned().unwrap_or_else(
+			|| serde_json::json!({"outcome":"complete","exit_code":0,"duration_ms":0,"exception":null}),
+		))?;
 	let display_outputs: Vec<eval::DisplayOutput> = serde_json::from_value(
 		value
 			.get("display_outputs")
@@ -401,16 +400,8 @@ fn eval_payload(
 		session_id: Bytes::new(),
 		cell_id: Bytes::new(),
 		language: eval::Language::Py,
-		title: args
-			.get("title")
-			.and_then(Value::as_str)
-			.map(Str::new),
-		code: Str::new(
-			args
-				.get("code")
-				.and_then(Value::as_str)
-				.unwrap_or_default(),
-		),
+		title: args.get("title").and_then(Value::as_str).map(Str::new),
+		code: Str::new(args.get("code").and_then(Value::as_str).unwrap_or_default()),
 		reset: false,
 		had_output: !frames.is_empty(),
 		result: None,
@@ -660,11 +651,21 @@ fn fixture_payload(
 				.into_iter()
 				.flatten()
 				.map(|entry| {
-					let line = entry.get("line").cloned().unwrap_or_else(|| serde_json::json!(1));
+					let line = entry
+						.get("line")
+						.cloned()
+						.unwrap_or_else(|| serde_json::json!(1));
 					let bindings = match entry.get("bindings") {
 						Some(Value::Object(fields)) => fields
 							.iter()
-							.map(|(key, value)| format!("${key}={}", value.as_str().map_or_else(|| value.to_string(), str::to_owned)))
+							.map(|(key, value)| {
+								format!(
+									"${key}={}",
+									value
+										.as_str()
+										.map_or_else(|| value.to_string(), str::to_owned)
+								)
+							})
 							.collect::<Vec<_>>()
 							.join(", "),
 						Some(Value::String(text)) => text.clone(),
@@ -747,19 +748,37 @@ fn fixture_payload(
 				.and_then(serde_json::Value::as_array)
 				.into_iter()
 				.flatten()
-				.map(|child| serde_json::json!({
-					"id": child.get("id").or_else(|| child.get("job")).cloned().unwrap_or_else(|| serde_json::json!("agent")),
-					"agent": child.get("agent").cloned().unwrap_or_else(|| serde_json::json!("task")),
-					"text": child.get("text").or_else(|| child.get("output")).cloned().unwrap_or_else(|| serde_json::json!("")),
-					"session_path": child.get("session_path").cloned().unwrap_or_else(|| serde_json::json!("")),
-					"tokens_in": child.get("tokens_in").or_else(|| child.get("context_tokens")).cloned().unwrap_or_else(|| serde_json::json!(0)),
-					"tokens_out": child.get("tokens_out").cloned().unwrap_or_else(|| serde_json::json!(0)),
-					"output": null,
-					"workspace": null,
-					"error": child.get("error").cloned(),
-				}))
+				.map(|child| {
+					let cost_nano_usd = child
+						.get("cost")
+						.and_then(Value::as_f64)
+						.map_or(0, |cost| (cost * 1_000_000_000.0).round() as u64);
+					serde_json::json!({
+						"id": child.get("id").or_else(|| child.get("job")).cloned().unwrap_or_else(|| serde_json::json!("agent")),
+						"agent": child.get("agent").cloned().unwrap_or_else(|| serde_json::json!("task")),
+						"text": child.get("text").or_else(|| child.get("output")).cloned().unwrap_or_else(|| serde_json::json!("")),
+						"description": child.get("description").cloned(),
+						"assignment": child.get("assignment").cloned(),
+						"stats": {
+							"requests": child.get("requests").cloned().unwrap_or_else(|| serde_json::json!(0)),
+							"context_tokens": child.get("context_tokens").cloned().unwrap_or_else(|| serde_json::json!(0)),
+							"context_window": child.get("context_window").cloned().unwrap_or_else(|| serde_json::json!(0)),
+							"cost_nano_usd": cost_nano_usd,
+							"duration_ms": child.get("wall_ms").cloned().unwrap_or_else(|| serde_json::json!(0))
+						},
+						"session_path": child.get("session_path").cloned().unwrap_or_else(|| serde_json::json!("")),
+						"tokens_in": child.get("tokens_in").or_else(|| child.get("context_tokens")).cloned().unwrap_or_else(|| serde_json::json!(0)),
+						"tokens_out": child.get("tokens_out").cloned().unwrap_or_else(|| serde_json::json!(0)),
+						"output": null,
+						"workspace": null,
+						"error": child.get("error").cloned(),
+					})
+				})
 				.collect::<Vec<_>>();
-			serde_json::json!({ "children": children })
+			serde_json::json!({
+				"children": children,
+				"duration_ms": value.get("total_duration_ms").cloned().unwrap_or_else(|| serde_json::json!(0))
+			})
 		},
 		"recall" => {
 			let items = value
@@ -1075,11 +1094,11 @@ mod tests {
 	}
 
 	#[test]
-	fn all_46_fixtures_use_projected_production_settlement() {
+	fn all_41_fixtures_use_projected_production_settlement() {
 		let sections = render_sections(None, &GalleryState::ALL, 100, false)
 			.expect("every fixture should fold through settle_projected/fail_projected");
-		assert_eq!(fixture_names().len(), 46);
-		assert_eq!(sections.len(), 46 * GalleryState::ALL.len());
+		assert_eq!(fixture_names().len(), 41);
+		assert_eq!(sections.len(), 41 * GalleryState::ALL.len());
 		assert!(
 			sections
 				.iter()

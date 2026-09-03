@@ -86,8 +86,13 @@ impl Component for Countdown {
 		if !self.expired(now) {
 			let elapsed = now.saturating_sub(self.started);
 			let left = self.duration.saturating_sub(elapsed);
-			let into_second = Duration::from_nanos(u64::try_from(left.as_nanos() % 1_000_000_000).unwrap_or(0));
-			let step = if into_second.is_zero() { Duration::from_secs(1) } else { into_second };
+			let into_second =
+				Duration::from_nanos(u64::try_from(left.as_nanos() % 1_000_000_000).unwrap_or(0));
+			let step = if into_second.is_zero() {
+				Duration::from_secs(1)
+			} else {
+				into_second
+			};
 			pc.wake(self.slot, now.saturating_add(step));
 		}
 		let color = if remaining <= 5 {

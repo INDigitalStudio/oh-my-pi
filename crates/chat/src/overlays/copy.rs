@@ -681,8 +681,8 @@ pub fn collect_targets(dom: &Dom, show_thinking: bool) -> Vec<CopyTarget> {
 				// late diagnostics, `/tan` breadcrumbs): outline targets
 				// labeled `message` whose clipboard text is the card's text.
 				Tag::Known(KnownTag::Notice) => {
-					let Some((title, body)) = prop_text(node, PropId::Kind)
-						.and_then(|kind| notice_copy(kind.as_str(), node))
+					let Some((title, body)) =
+						prop_text(node, PropId::Kind).and_then(|kind| notice_copy(kind.as_str(), node))
 					else {
 						continue;
 					};
@@ -1099,7 +1099,8 @@ mod tests {
 		assert_eq!(panel.id(), "copy");
 		assert_eq!(panel.target_count(), 2);
 		let text = frame_text(panel.frame(Size { width: 80, height: 24 }));
-		assert!(text.contains("pick what to put on the clipboard"), "header missing:\n{text}");
+		assert!(text.contains("pick what to put on the"), "header missing:\n{text}");
+		assert!(text.contains("clipboard"), "wrapped header tail missing:\n{text}");
 		assert!(
 			text.contains("2/2  ↑/↓ step  → blocks  enter copy  ctrl+o expand  esc close"),
 			"hint:\n{text}"
@@ -1246,7 +1247,10 @@ mod tests {
 		assert!(panel.hint().ends_with("enter copy  o open"), "{}", panel.hint());
 		let text = frame_text(panel.frame(Size { width: 80, height: 24 }));
 		assert!(text.contains("2/3 · link · the docs · 1 line"), "{text}");
-		assert_eq!(panel.key(Key::Enter), PanelEvent::Copy(Str::new_static("https://example.com/docs")));
+		assert_eq!(
+			panel.key(Key::Enter),
+			PanelEvent::Copy(Str::new_static("https://example.com/docs"))
+		);
 
 		static OPENED: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
 		fn record(href: &str) {
@@ -1262,7 +1266,11 @@ mod tests {
 			panel.key(Key::Char('O')),
 			PanelEvent::Notice(Str::new_static("Opening link: https://plain.example/"))
 		);
-		assert_eq!(*OPENED.lock(), ["https://plain.example/"], "only the link block reached the opener");
+		assert_eq!(
+			*OPENED.lock(),
+			["https://plain.example/"],
+			"only the link block reached the opener"
+		);
 		assert!(panel.tick(Duration::ZERO), "opening closes the picker through `settled`");
 		assert_eq!(panel.settled(), Some(PanelEvent::Close));
 
@@ -1283,9 +1291,12 @@ mod tests {
 
 		let directory = tempfile::tempdir().expect("temp directory");
 		let store = BlobStore::open(directory.path()).expect("blob store");
-		let summary = store.put(b"Earlier: wired the parser.").expect("summary blob");
-		let mut session = Session::create(directory.path().join("copy.oms"), ComponentRegistry::standard())
-			.expect("session");
+		let summary = store
+			.put(b"Earlier: wired the parser.")
+			.expect("summary blob");
+		let mut session =
+			Session::create(directory.path().join("copy.oms"), ComponentRegistry::standard())
+				.expect("session");
 		session.begin_turn().expect("turn one");
 		session.user("first", Vec::new()).expect("user one");
 		let boundary = session
@@ -1309,8 +1320,8 @@ mod tests {
 				.children(session.dom().body())
 				.last()
 				.expect("turn");
-			let mut node =
-				NodeSpec::new(KnownTag::Notice).with_prop(PropId::Kind, Value::Str(Str::new_static(kind)));
+			let mut node = NodeSpec::new(KnownTag::Notice)
+				.with_prop(PropId::Kind, Value::Str(Str::new_static(kind)));
 			for (prop, value) in props {
 				node = node.with_prop(*prop, Value::Str(Str::new(*value)));
 			}
@@ -1323,7 +1334,7 @@ mod tests {
 					label: Some(Str::new_static("kernel.notice")),
 					ops:   vec![Op::Ins {
 						parent: turn,
-						after:  session.dom().children(turn).last().copied(),
+						after: session.dom().children(turn).last().copied(),
 						node,
 					}],
 				})
@@ -1359,7 +1370,11 @@ mod tests {
 			"Tests are missing\nThe parser change has no coverage.\nSee [the plan](https://example.com/plan)."
 		);
 		assert_eq!(
-			targets[3].blocks.iter().filter_map(|block| block.href.as_deref()).collect::<Vec<_>>(),
+			targets[3]
+				.blocks
+				.iter()
+				.filter_map(|block| block.href.as_deref())
+				.collect::<Vec<_>>(),
 			["https://example.com/plan"],
 			"links in a note stay reachable through the picker and /copy link"
 		);
@@ -1372,7 +1387,10 @@ mod tests {
 		}
 		let text = frame_text(picker.frame(Size::new(80, 40)));
 		assert!(text.contains("remote-compacted · 256K→20K"), "the divider is previewed:\n{text}");
-		assert!(text.contains("Earlier: wired the parser."), "expanded so its summary shows:\n{text}");
+		assert!(
+			text.contains("Earlier: wired the parser."),
+			"expanded so its summary shows:\n{text}"
+		);
 		assert_eq!(
 			picker.key(Key::Enter),
 			PanelEvent::Copy(Str::new_static("Earlier: wired the parser.")),
@@ -1395,7 +1413,11 @@ mod tests {
 		);
 		let mut blocks = Vec::new();
 		push_markdown_blocks(&mut blocks, "```py\nx = 1\n```\n```\nnever closed");
-		assert_eq!(blocks.len(), 1, "a closed fence still extracts; the open tail does not: {blocks:?}");
+		assert_eq!(
+			blocks.len(),
+			1,
+			"a closed fence still extracts; the open tail does not: {blocks:?}"
+		);
 		assert_eq!(blocks[0].content, "x = 1");
 	}
 

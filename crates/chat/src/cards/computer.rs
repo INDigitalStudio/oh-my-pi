@@ -66,11 +66,7 @@ impl Card for ComputerCard {
 				})
 		});
 		// pi `statusSuffix`: the header names the error state.
-		let title = if view.status == CardStatus::Failed {
-			Str::new_static("Computer: error")
-		} else {
-			Str::new_static("Computer")
-		};
+		let failed = view.status == CardStatus::Failed;
 		// pi shows a bounded script and output preview in both states; only
 		// the bounds change with `@expanded`. A call without a script (old
 		// persisted `{window, actions}` calls) stays a bare header.
@@ -96,13 +92,16 @@ impl Card for ComputerCard {
 		let fault = fault.filter(|_| code.is_some());
 		dom! {
 			<col>
-				<row gap=1>
+				<row gap=1 kind=title>
 					match view.status {
 						CardStatus::StreamingArgs | CardStatus::InProgress => <i:pending/>,
 						CardStatus::Done => <i:success/>,
 						CardStatus::Failed => <i:error/>,
 					}
-					<text bold>{title}</text>
+					<row>
+						<text>{"Computer"}</text>
+						if failed { <text fg=output>{": error"}</text> }
+					</row>
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 				if let Some(code) = code {

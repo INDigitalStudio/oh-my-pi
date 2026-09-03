@@ -159,8 +159,7 @@ fn running_tool_calls_are_distinct_actionable_lifecycle_nodes() {
 			"provider-reused-id",
 			None,
 			Some(
-				serde_json::value::to_raw_value(&serde_json::json!({}))
-					.expect("arguments serialize"),
+				serde_json::value::to_raw_value(&serde_json::json!({})).expect("arguments serialize"),
 			),
 			None,
 		)

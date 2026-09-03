@@ -6,8 +6,7 @@ use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
 use super::{
-	Card, CardStatus, CardView, Component, elapsed_badge, partial_string, typed_input,
-	typed_result,
+	Card, CardStatus, CardView, Component, elapsed_badge, partial_string, typed_input, typed_result,
 };
 
 /// Agent rows a collapsed batch call shows; the rest fold into one
@@ -145,7 +144,10 @@ fn call_rows(args: &CallArgs) -> Vec<Component> {
 	let mut rows = Vec::with_capacity(args.tasks.len().min(COLLAPSED_AGENT_LIMIT) + 2);
 	let brief = args.task.as_deref().and_then(first_line);
 	if args.name.is_some() || brief.is_some() {
-		let label = args.name.as_deref().map_or_else(|| Str::new_static("agent"), task_id);
+		let label = args
+			.name
+			.as_deref()
+			.map_or_else(|| Str::new_static("agent"), task_id);
 		rows.push(call_row(label, brief, args.agent.as_deref(), false));
 	}
 	let shown = args.tasks.len().min(COLLAPSED_AGENT_LIMIT);
@@ -156,20 +158,28 @@ fn call_rows(args: &CallArgs) -> Vec<Component> {
 			.map(str::trim)
 			.filter(|name| !name.is_empty())
 			.map_or_else(|| sf!("#{}", index + 1), task_id);
-		let brief = item.get("task").and_then(Value::as_str).and_then(first_line);
+		let brief = item
+			.get("task")
+			.and_then(Value::as_str)
+			.and_then(first_line);
 		let agent = item.get("agent").and_then(Value::as_str);
 		let isolated = item.get("isolated").and_then(Value::as_bool) == Some(true);
 		rows.push(call_row(label, brief, agent, isolated));
 	}
 	if shown < args.tasks.len() {
 		let more = sf!("… {} more agents", args.tasks.len() - shown);
-		rows.push(dom! { <row gap=1><text fg=muted>{"•"}</text><text fg=muted>{more}</text></row> }.into_component());
+		rows.push(
+			dom! { <row gap=1><text fg=muted>{"•"}</text><text fg=muted>{more}</text></row> }
+				.into_component(),
+		);
 	}
 	rows
 }
 
 fn call_row(label: Str, brief: Option<Str>, agent: Option<&str>, isolated: bool) -> Component {
-	let name = brief.as_ref().map_or_else(|| label.clone(), |_| sf!("{label}:"));
+	let name = brief
+		.as_ref()
+		.map_or_else(|| label.clone(), |_| sf!("{label}:"));
 	let badge = agent
 		.map(str::trim)
 		.filter(|agent| !agent.is_empty() && *agent != "task")
@@ -255,7 +265,11 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 		// pi's row is `id: description`; omp's child request carries no
 		// description, so the brief of its assignment stands in, as pi's own
 		// running rows do without one.
-		let assignment = args.assignment_for(index, &job);
+		let assignment = row
+			.get("assignment")
+			.and_then(Value::as_str)
+			.map(Str::new)
+			.or_else(|| args.assignment_for(index, &job));
 		let desc = row
 			.get("description")
 			.and_then(Value::as_str)
@@ -317,16 +331,21 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 			.into_component(),
 		);
 	}
-	let tokens_in: u64 = rows
+	let requests: u64 = rows
 		.iter()
-		.filter_map(|row| row.get("tokens_in")?.as_u64())
+		.filter_map(|row| row.pointer("/stats/requests")?.as_u64())
 		.sum();
-	let tokens_out: u64 = rows
-		.iter()
-		.filter_map(|row| row.get("tokens_out")?.as_u64())
-		.sum();
+	let duration_ms = result
+		.get("duration_ms")
+		.and_then(Value::as_u64)
+		.unwrap_or_else(|| {
+			rows
+				.iter()
+				.filter_map(|row| row.pointer("/stats/duration_ms")?.as_u64())
+				.sum()
+		});
 	let status = if failed { "failed" } else { "succeeded" };
-	let summary = sf!("⟨{count} {status} · ↓{tokens_in} · ↑{tokens_out}⟩");
+	let summary = sf!("⟨{count} {status} · {requests} req · {:.1}s⟩", duration_ms as f64 / 1_000.0);
 	dom! {
 		<box border=round title={title} title_pad=3 pad="0 1">
 			{sections}
@@ -403,12 +422,39 @@ fn row_failed(row: &Value) -> bool {
 }
 
 fn task_detail(row: &Value) -> Option<Str> {
-	let tokens_in = row.get("tokens_in").and_then(Value::as_u64)?;
-	let tokens_out = row
-		.get("tokens_out")
+	let stats = row.get("stats")?;
+	let requests = stats.get("requests").and_then(Value::as_u64)?;
+	let context = stats
+		.get("context_tokens")
 		.and_then(Value::as_u64)
 		.unwrap_or_default();
-	Some(sf!("↓{tokens_in} · ↑{tokens_out}"))
+	let window = stats
+		.get("context_window")
+		.and_then(Value::as_u64)
+		.unwrap_or_default();
+	let cost = stats
+		.get("cost_nano_usd")
+		.and_then(Value::as_u64)
+		.unwrap_or_default();
+	let duration = stats
+		.get("duration_ms")
+		.and_then(Value::as_u64)
+		.unwrap_or_default();
+	let window_label = if window >= 1_000 && window.is_multiple_of(1_000) {
+		sf!("{}K", window / 1_000)
+	} else {
+		sf!("{window}")
+	};
+	let percent = if window == 0 {
+		0.0
+	} else {
+		context as f64 * 100.0 / window as f64
+	};
+	Some(sf!(
+		"{requests} req · {percent:.1}%/{window_label} · ${:.2} · {:.1}s",
+		cost as f64 / 1_000_000_000.0,
+		duration as f64 / 1_000.0
+	))
 }
 
 /// The first `limit` output lines, each cut at 70 cells, and pi's

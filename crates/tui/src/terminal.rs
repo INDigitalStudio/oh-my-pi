@@ -1591,7 +1591,11 @@ impl Terminal {
 		if self.mouse == mouse {
 			return Ok(());
 		}
-		let payload = if mouse { MOUSE_TRACKING_ON } else { MOUSE_TRACKING_OFF };
+		let payload = if mouse {
+			MOUSE_TRACKING_ON
+		} else {
+			MOUSE_TRACKING_OFF
+		};
 		terminal_write_all(&mut self.tty, payload)?;
 		self.tty.flush()?;
 		self.mouse = mouse;

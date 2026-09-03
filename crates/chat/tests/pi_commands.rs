@@ -9,13 +9,11 @@ use std::{path::PathBuf, sync::Arc};
 
 use omp_chat::{
 	HostCommand, HostOptions, NativeEffect, NativeHost,
-	overlays::{
-		Panel, PanelEvent,
-		services::{AccountRow, McpOp, McpRun, ServiceError, ServiceResult, Services, WorktreeInfo},
-		settings::{Group, SettingRow, SettingsPanel, Widget},
+	overlays::services::{
+		AccountRow, McpOp, McpRun, ServiceError, ServiceResult, Services, WorktreeInfo,
 	},
 };
-use omp_con::{Value, ValueKind};
+use omp_con::Value;
 use omp_core::Str;
 use omp_session::{ComponentRegistry, Session};
 use omp_tui::{Key, Size, UiContext, frame_text, slots::ResizePolicy};
@@ -273,181 +271,29 @@ fn model_row(key: &'static str, name: &'static str) -> omp_chat::ModelRow {
 
 // ------------------------------------------------------------------ /settings
 
-fn settings_fixture() -> Vec<SettingRow> {
-	let row = |name: &'static str, widget, value, default| SettingRow {
-		name: Str::new_static(name),
-		desc: Str::new(format!("Doc for {name}.")),
-		group: Group::of(name),
-		widget,
-		variants: if widget == Widget::Enum {
-			&["off", "low", "medium", "high"]
-		} else {
-			&[]
-		},
-		elem: ValueKind::Str,
-		value,
-		default,
-		min: if widget == Widget::Int {
-			Some(1.0)
-		} else {
-			None
-		},
-		max: if widget == Widget::Int {
-			Some(100.0)
-		} else {
-			None
-		},
-	};
-	vec![
-		row("ai_fastmode", Widget::Bool, Value::Bool(false), Value::Bool(false)),
-		row(
-			"ai_model",
-			Widget::Text,
-			Value::Str("anthropic/claude-fable-5".into()),
-			Value::Str("".into()),
-		),
-		row("ai_thinking", Widget::Enum, Value::Enum("medium".into()), Value::Enum("off".into())),
-		row("ai_compact_threshold", Widget::Int, Value::Int(80), Value::Int(80)),
-		row("cl_showthinking", Widget::Bool, Value::Bool(true), Value::Bool(true)),
-		row("cl_showtools", Widget::Bool, Value::Bool(true), Value::Bool(true)),
-		row("cl_theme", Widget::Text, Value::Str("cyanotype".into()), Value::Str("".into())),
-		row(
-			"cl_resize_policy",
-			Widget::Enum,
-			Value::Enum("rebuild".into()),
-			Value::Enum("rebuild".into()),
-		),
-		row("sv_approval_mode", Widget::Enum, Value::Enum("ask".into()), Value::Enum("ask".into())),
-		row(
-			"sv_tools",
-			Widget::List,
-			Value::List(vec![Value::Str("read".into()), Value::Str("edit".into())]),
-			Value::List(Vec::new()),
-		),
-		row("sv_worktree_base", Widget::Text, Value::Str("".into()), Value::Str("".into())),
-	]
-}
-
 #[test]
-fn settings_panel_golden_at_120x40() {
-	let ui = UiContext { charset: omp_tui::Charset::Unicode, ..UiContext::default() };
-	let mut panel = SettingsPanel::from_rows(settings_fixture(), &ui);
-	let rows = frame_text(panel.frame(Size::new(120, 40)))
-		.lines()
-		.map(|line| line.trim_end().to_owned())
-		.collect::<Vec<_>>();
-	insta::assert_snapshot!("settings_model_tab", rows.join("\n"));
-	panel.key(Key::Right);
-	let rows = frame_text(panel.frame(Size::new(120, 40)))
-		.lines()
-		.map(|line| line.trim_end().to_owned())
-		.collect::<Vec<_>>();
-	insta::assert_snapshot!("settings_interface_tab", rows.join("\n"));
-	for character in "think".chars() {
-		panel.key(Key::Char(character));
-	}
-	let rows = frame_text(panel.frame(Size::new(120, 40)))
-		.lines()
-		.map(|line| line.trim_end().to_owned())
-		.collect::<Vec<_>>();
-	insta::assert_snapshot!("settings_search", rows.join("\n"));
-}
-
-#[test]
-fn settings_key_navigation_follows_pi() {
-	let mut panel = SettingsPanel::from_rows(settings_fixture(), &UiContext::default());
-	assert_eq!(panel.tab(), Group::Model);
-	assert_eq!(panel.selected().map(|row| row.name.as_str()), Some("ai_compact_threshold"));
-	// ↓ walks rows; End/Home jump; PgDn is bounded by the tab.
-	panel.key(Key::Down);
-	assert_eq!(panel.selected().map(|row| row.name.as_str()), Some("ai_fastmode"));
-	panel.key(Key::End);
-	assert_eq!(panel.selected().map(|row| row.name.as_str()), Some("ai_thinking"));
-	panel.key(Key::Home);
-	assert_eq!(panel.selected().map(|row| row.name.as_str()), Some("ai_compact_threshold"));
-	panel.key(Key::PageDown);
-	assert_eq!(panel.selected().map(|row| row.name.as_str()), Some("ai_thinking"));
-	// Tab / Shift+Tab / ←/→ switch tabs and wrap; each lands on the first row.
-	panel.key(Key::Tab);
-	assert_eq!(panel.tab(), Group::Interface);
-	assert_eq!(panel.selected().map(|row| row.name.as_str()), Some("cl_resize_policy"));
-	panel.key(Key::Tab);
-	assert_eq!(panel.tab(), Group::Server);
-	panel.key(Key::Tab);
-	assert_eq!(panel.tab(), Group::Model);
-	panel.key(Key::BackTab);
-	assert_eq!(panel.tab(), Group::Server);
-	// ←/→ always switch tabs (pi routes them to the tab bar).
-	panel.key(Key::Left);
-	assert_eq!(panel.tab(), Group::Interface);
-	panel.key(Key::Left);
-	assert_eq!(panel.tab(), Group::Model);
-	assert_eq!(panel.selected().map(|row| row.name.as_str()), Some("ai_compact_threshold"));
-	// Enter on a number opens the inline editor; the typed value applies
-	// within the declared clamps.
-	assert_eq!(panel.key(Key::Enter), PanelEvent::Consumed);
-	assert!(panel.editing());
-	panel.key(Key::Ctrl('u'));
-	for character in "500".chars() {
-		panel.key(Key::Char(character));
-	}
-	assert!(matches!(panel.key(Key::Enter), PanelEvent::Notice(_)), "500 exceeds max 100");
-	assert!(!panel.editing());
-	panel.key(Key::Enter);
-	panel.key(Key::Ctrl('u'));
-	for character in "79".chars() {
-		panel.key(Key::Char(character));
-	}
-	assert_eq!(panel.key(Key::Enter), PanelEvent::Run("ai_compact_threshold 79; writecfg".into()));
-	assert_eq!(panel.tab(), Group::Model);
-	// Enter on an enum cycles; Enter on a bool flips; Space flips too.
-	panel.key(Key::End);
-	assert_eq!(panel.key(Key::Enter), PanelEvent::Run("ai_thinking high; writecfg".into()));
-	assert_eq!(panel.key(Key::Enter), PanelEvent::Run("ai_thinking off; writecfg".into()));
-	panel.key(Key::Home);
-	panel.key(Key::Down);
-	assert_eq!(panel.key(Key::Space), PanelEvent::Run("ai_fastmode true; writecfg".into()));
-	// Typing searches every tab; Tab hops between tabs with matches; Esc
-	// ends the search on the selected result's tab; Esc again closes.
-	for character in "show".chars() {
-		panel.key(Key::Char(character));
-	}
-	assert_eq!(panel.query(), "show");
-	assert_eq!(panel.tab(), Group::Interface);
-	assert_eq!(panel.selected().map(|row| row.name.as_str()), Some("cl_showthinking"));
-	panel.key(Key::Down);
-	assert_eq!(panel.selected().map(|row| row.name.as_str()), Some("cl_showtools"));
-	assert_eq!(panel.key(Key::Esc), PanelEvent::Consumed);
-	assert_eq!(panel.query(), "");
-	assert_eq!(panel.tab(), Group::Interface);
-	assert_eq!(panel.selected().map(|row| row.name.as_str()), Some("cl_showtools"));
-	// Backspace on a one-character query ends the search too.
-	panel.key(Key::Char('x'));
-	assert_eq!(panel.selected(), None, "no match");
-	panel.key(Key::Backspace);
-	assert_eq!(panel.query(), "");
-	assert_eq!(panel.tab(), Group::Interface);
-	assert_eq!(panel.key(Key::Esc), PanelEvent::Close);
-}
-
-#[test]
-fn settings_command_opens_the_panel_over_the_live_registry_and_applies_a_toggle() {
+fn settings_command_opens_curated_rows_and_applies_a_human_label_toggle() {
 	let mut h = harness(Vec::new());
 	assert_eq!(h.host.console("settings").expect("console"), NativeEffect::Consumed);
 	assert_eq!(h.host.overlay_id(), Some("settings"));
 	let frame = h.host.picker_frame().expect("panel frame");
 	let text = frame_text(&frame);
 	assert!(text.contains("Settings"), "{text}");
-	assert!(text.contains("ai_"), "model tab rows:\n{text}");
+	assert!(text.contains("Appearance"), "{text}");
+	assert!(text.contains("Model"), "{text}");
+	assert!(!text.contains("ai_") && !text.contains("cl_") && !text.contains("sv_"), "{text}");
 	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::Overlay { open: true, .. })));
-	// Search for the fast-mode row, flip it: the console var changes live
-	// and the archive write is attempted (no saver here, so it reports).
-	for character in "ai_fastmode".chars() {
+
+	for character in "hide thinking".chars() {
 		h.host.key(Key::Char(character)).expect("type");
 	}
-	assert_eq!(h.con.get("ai_fastmode"), Some(Value::Bool(false)));
+	let frame = h.host.picker_frame().expect("search frame");
+	let text = frame_text(&frame);
+	assert!(text.contains("Hide Thinking Blocks"), "{text}");
+	assert!(!text.contains("cl_showthinking"), "{text}");
+	assert_eq!(h.con.get("cl_showthinking"), Some(Value::Bool(true)));
 	h.host.key(Key::Enter).expect("toggle");
-	assert_eq!(h.con.get("ai_fastmode"), Some(Value::Bool(true)));
+	assert_eq!(h.con.get("cl_showthinking"), Some(Value::Bool(false)));
 	assert_eq!(h.host.overlay_id(), Some("settings"), "the panel stays open");
 	h.host.key(Key::Esc).expect("end search");
 	h.host.key(Key::Esc).expect("close");

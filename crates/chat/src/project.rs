@@ -146,14 +146,7 @@ pub(crate) fn project(
 						});
 						user_bubble(text, None, &chips)
 					};
-					blocks.push(rendered(
-						*handle,
-						BlockKind::User,
-						raw,
-						Mode::Mutable,
-						true,
-						component,
-					));
+					blocks.push(rendered(*handle, BlockKind::User, raw, Mode::Mutable, true, component));
 				},
 				Tag::Known(KnownTag::Assistant) => {
 					assistant_blocks(dom, *handle, node, options, &mut blocks, &mut reaction_target);
@@ -356,7 +349,11 @@ fn apply_reaction(
 	let split = reaction::split_reaction(text.as_str());
 	match split.emoji {
 		Some(emoji) => {
-			if let Some(block) = blocks.iter_mut().rev().find(|block| block.view.key == target.key) {
+			if let Some(block) = blocks
+				.iter_mut()
+				.rev()
+				.find(|block| block.view.key == target.key)
+			{
 				block.component = user_bubble(target.text, Some(Str::new(emoji)), &target.chips);
 			}
 			Str::new(split.body)
@@ -1157,7 +1154,10 @@ mod tests {
 		let image = Charset::default().icon(Icon::Image);
 		assert!(text.contains(&format!("{image} #1")), "vision marker collapses:\n{text}");
 		assert!(text.contains(&format!("{clip} #2 · 300B")), "unreferenced attachment chip:\n{text}");
-		assert!(!text.contains(&format!("{clip} #1")), "referenced attachment is not repeated:\n{text}");
+		assert!(
+			!text.contains(&format!("{clip} #1")),
+			"referenced attachment is not repeated:\n{text}"
+		);
 
 		let user = last_user(&session);
 		set_prop(&mut session, user, PropId::Author, Value::Str(Str::new_static("ada")));
@@ -1171,9 +1171,15 @@ mod tests {
 		let (synthetic, _) =
 			user_and_assistant_text(projected(&session, &Options { expanded: true, ..options }));
 		assert!(synthetic.contains("Synthetic input"), "{synthetic}");
-		assert!(synthetic.contains(&format!("{image} #1")), "synthetic row collapses markers:\n{synthetic}");
+		assert!(
+			synthetic.contains(&format!("{image} #1")),
+			"synthetic row collapses markers:\n{synthetic}"
+		);
 		assert!(!synthetic.contains("[Image #1"), "{synthetic}");
-		assert!(synthetic.contains(&format!("{clip} #2 · 300B")), "synthetic row keeps chips:\n{synthetic}");
+		assert!(
+			synthetic.contains(&format!("{clip} #2 · 300B")),
+			"synthetic row keeps chips:\n{synthetic}"
+		);
 	}
 
 	/// pi `reaction.ts` + `#reactionRow`: a reply opening with a lone emoji
@@ -1225,7 +1231,9 @@ mod tests {
 
 		let mut session = empty_session();
 		session.begin_turn().expect("turn");
-		session.user("# Session update\nstate", Vec::new()).expect("user");
+		session
+			.user("# Session update\nstate", Vec::new())
+			.expect("user");
 		let user = last_user(&session);
 		set_prop(&mut session, user, PropId::Synthetic, Value::Bool(true));
 		reply(&mut session, "👍\nNoted.");
@@ -1236,7 +1244,9 @@ mod tests {
 		let live = streaming("", "👍");
 		let blocks = projected(&live, &options);
 		assert!(
-			!blocks.iter().any(|block| block.view.kind == BlockKind::Assistant),
+			!blocks
+				.iter()
+				.any(|block| block.view.kind == BlockKind::Assistant),
 			"an emoji-only opening run is withheld while it may still become a reaction"
 		);
 		let live = streaming("", "👍 sure");

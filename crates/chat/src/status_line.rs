@@ -9,28 +9,28 @@ use crate::status_band::{AdvisorBadge, AdvisorHealth, GoalState, ModeChip};
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatusLine {
 	/// Last assistant model or model prompt fact.
-	pub model:             Str,
+	pub model: Str,
 	/// Session location projected from prompt facts.
-	pub session:           Str,
+	pub session: Str,
 	/// Home directory projected from prompt facts, for `~` shortening.
-	pub home:              Str,
+	pub home: Str,
 	/// User-facing session title from the `<meta>` `name` prop, when the
 	/// session has been named.
-	pub name:              Option<Str>,
+	pub name: Option<Str>,
 	/// Prompt size of the most recent receipt — uncached input plus the
 	/// cache read/write tokens — the live context size (pi
 	/// `calculatePromptTokens`).
-	pub context:           u64,
+	pub context: u64,
 	/// Total input tokens across visible turns.
-	pub tokens_in:         u64,
+	pub tokens_in: u64,
 	/// Total output tokens across visible turns.
-	pub tokens_out:        u64,
+	pub tokens_out: u64,
 	/// Total prompt-cache tokens read across visible turns.
-	pub cache_read:        u64,
+	pub cache_read: u64,
 	/// Total prompt-cache tokens written across visible turns.
-	pub cache_write:       u64,
+	pub cache_write: u64,
 	/// Total spend across visible turns in nano-US dollars.
-	pub cost_nano_usd:     u64,
+	pub cost_nano_usd: u64,
 	/// Total premium-request units billed across visible turns at millionth
 	/// precision (GitHub Copilot `premium_interactions`; pi
 	/// `usage.premiumRequests`).
@@ -39,7 +39,7 @@ pub struct StatusLine {
 	/// `duration-ms`), when the receipt journals a duration.
 	pub tokens_per_second: Option<f32>,
 	/// Number of explicit turn elements.
-	pub turns:             usize,
+	pub turns: usize,
 }
 
 impl StatusLine {
@@ -450,13 +450,13 @@ mod tests {
 		session.user("one", Vec::new()).expect("user");
 		session
 			.receipt(TurnReceipt {
-				tokens_in:     1_000,
-				tokens_out:    200,
-				cost_nano_usd: 120_000_000,
-				cache_read:    900,
-				cache_write:   50,
-				ttft_ms:       None,
-				duration_ms:   Some(4_000),
+				tokens_in:                   1_000,
+				tokens_out:                  200,
+				cost_nano_usd:               120_000_000,
+				cache_read:                  900,
+				cache_write:                 50,
+				ttft_ms:                     None,
+				duration_ms:                 Some(4_000),
 				premium_requests_millionths: 330_000,
 			})
 			.expect("receipt");
@@ -465,13 +465,13 @@ mod tests {
 		session.user("two", Vec::new()).expect("user");
 		session
 			.receipt(TurnReceipt {
-				tokens_in:     3_000,
-				tokens_out:    400,
-				cost_nano_usd: 5_000_000,
-				cache_read:    2_500,
-				cache_write:   0,
-				ttft_ms:       None,
-				duration_ms:   Some(2_000),
+				tokens_in:                   3_000,
+				tokens_out:                  400,
+				cost_nano_usd:               5_000_000,
+				cache_read:                  2_500,
+				cache_write:                 0,
+				ttft_ms:                     None,
+				duration_ms:                 Some(2_000),
 				premium_requests_millionths: 1_000_000,
 			})
 			.expect("receipt");
@@ -501,13 +501,13 @@ mod tests {
 		session.user("one", Vec::new()).expect("user");
 		session
 			.receipt(TurnReceipt {
-				tokens_in:     5_000,
-				tokens_out:    100,
-				cost_nano_usd: 0,
-				cache_read:    95_000,
-				cache_write:   0,
-				ttft_ms:       None,
-				duration_ms:   None,
+				tokens_in:                   5_000,
+				tokens_out:                  100,
+				cost_nano_usd:               0,
+				cache_read:                  95_000,
+				cache_write:                 0,
+				ttft_ms:                     None,
+				duration_ms:                 None,
 				premium_requests_millionths: 0,
 			})
 			.expect("receipt");

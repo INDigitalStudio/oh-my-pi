@@ -115,11 +115,7 @@ fn insert_director(
 		.patch(Txn {
 			cause,
 			label: Some(Str::new_static("director.test")),
-			ops: vec![Op::Ins {
-				parent,
-				after: session.dom().children(parent).last().copied(),
-				node,
-			}],
+			ops: vec![Op::Ins { parent, after: session.dom().children(parent).last().copied(), node }],
 		})
 		.expect("director patch");
 	Handle::new(high + 1).expect("new handle")

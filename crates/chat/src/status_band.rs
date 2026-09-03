@@ -104,96 +104,96 @@ pub enum ModeChip {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatusFacts {
 	/// Short model label.
-	pub model:             Str,
+	pub model: Str,
 	/// Active Director workflow, when one owns subsequent turns.
-	pub mode:              Option<ModeChip>,
+	pub mode: Option<ModeChip>,
 	/// Reasoning level (`off`, `minimal` … `max`) when the model can reason;
 	/// `None` for models without thinking.
-	pub thinking:          Option<Str>,
+	pub thinking: Option<Str>,
 	/// Whether the thinking glyph replaces the model icon instead of trailing
 	/// the name as ` · <level>` (pi `statusLine.compactThinkingLevel`).
-	pub compact_thinking:  bool,
+	pub compact_thinking: bool,
 	/// Fast mode is on (`ai_fastmode`); the fast icon trails the model name.
-	pub fast:              bool,
+	pub fast: bool,
 	/// Advisor roster badge after the model name, when advisors are
 	/// configured.
-	pub advisor:           Option<AdvisorBadge>,
+	pub advisor: Option<AdvisorBadge>,
 	/// Project directory label: home-shortened and root-stripped, not yet
 	/// clamped (the band clamps to the width it has).
-	pub cwd:               Str,
+	pub cwd: Str,
 	/// Whether the project lives under a scratch root (pi `scratchFolder`
 	/// icon instead of the folder icon).
-	pub scratch:           bool,
+	pub scratch: bool,
 	/// Checked-out git branch, an observer-local fact the app supplies.
-	pub branch:            Option<Str>,
+	pub branch: Option<Str>,
 	/// Working tree has staged, unstaged, or untracked changes.
-	pub dirty:             bool,
+	pub dirty: bool,
 	/// User-facing session title, the elastic right-group chip.
-	pub session_name:      Option<Str>,
+	pub session_name: Option<Str>,
 	/// Tokens in the last inference request (context usage).
-	pub tokens:            u64,
+	pub tokens: u64,
 	/// Total context window when known.
-	pub context_window:    Option<u64>,
+	pub context_window: Option<u64>,
 	/// Auto-compaction threshold as a whole percent of the window
 	/// (`ai_compact_threshold`), the gauge's tick position.
-	pub compact_percent:   u8,
+	pub compact_percent: u8,
 	/// Background compaction speculation, animating the threshold tick.
-	pub speculation:       Speculation,
+	pub speculation: Speculation,
 	/// Cumulative input tokens across the session.
-	pub tokens_in:         u64,
+	pub tokens_in: u64,
 	/// Cumulative output tokens across the session.
-	pub tokens_out:        u64,
+	pub tokens_out: u64,
 	/// Cumulative prompt-cache tokens read (excluded from the total: it
 	/// re-reads the whole cached context every turn).
-	pub cache_read:        u64,
+	pub cache_read: u64,
 	/// Cumulative prompt-cache tokens written.
-	pub cache_write:       u64,
+	pub cache_write: u64,
 	/// Output throughput of the last receipt.
 	pub tokens_per_second: Option<f32>,
 	/// Cumulative spend in nano-US dollars.
-	pub cost_nano_usd:     u64,
+	pub cost_nano_usd: u64,
 	/// The route bills to a subscription rather than metered usage.
-	pub subscription:      bool,
+	pub subscription: bool,
 	/// Premium-request units consumed at millionth precision (GitHub Copilot
 	/// `premium_interactions`: `330_000` is 0.33 of a request).
 	pub premium_requests_millionths: u64,
 	/// Start of the in-flight turn on the presentation clock; `Some` swaps
 	/// the brand glyph for the spinner and elapsed-time timer.
-	pub working:           Option<Duration>,
+	pub working: Option<Duration>,
 	/// Subagent whose session the view shows (pi `focusedAgentId`): the
 	/// brand slot carries the ghost and the agent id in the warning color
 	/// for as long as input goes to that agent.
-	pub focused_agent:     Option<Str>,
+	pub focused_agent: Option<Str>,
 }
 
 impl Default for StatusFacts {
 	fn default() -> Self {
 		Self {
-			model:             Str::default(),
-			mode:              None,
-			thinking:          None,
-			compact_thinking:  true,
-			fast:              false,
-			advisor:           None,
-			cwd:               Str::default(),
-			scratch:           false,
-			branch:            None,
-			dirty:             false,
-			session_name:      None,
-			tokens:            0,
-			context_window:    None,
-			compact_percent:   80,
-			speculation:       Speculation::None,
-			tokens_in:         0,
-			tokens_out:        0,
-			cache_read:        0,
-			cache_write:       0,
+			model: Str::default(),
+			mode: None,
+			thinking: None,
+			compact_thinking: true,
+			fast: false,
+			advisor: None,
+			cwd: Str::default(),
+			scratch: false,
+			branch: None,
+			dirty: false,
+			session_name: None,
+			tokens: 0,
+			context_window: None,
+			compact_percent: 80,
+			speculation: Speculation::None,
+			tokens_in: 0,
+			tokens_out: 0,
+			cache_read: 0,
+			cache_write: 0,
 			tokens_per_second: None,
-			cost_nano_usd:     0,
-			subscription:      false,
+			cost_nano_usd: 0,
+			subscription: false,
 			premium_requests_millionths: 0,
-			working:           None,
-			focused_agent:     None,
+			working: None,
+			focused_agent: None,
 		}
 	}
 }
@@ -1214,10 +1214,8 @@ pub(crate) mod tests {
 		assert_eq!(label(2_004_999), "2", "rounds to the nearest hundredth");
 		assert_eq!(label(2_005_000), "2.01");
 		assert_eq!(label(12_340_000_000), "12K", "whole thousands compact like counts");
-		let fractional = self::row(
-			StatusFacts { premium_requests_millionths: 330_000, ..spending() },
-			170,
-		);
+		let fractional =
+			self::row(StatusFacts { premium_requests_millionths: 330_000, ..spending() }, 170);
 		assert!(fractional.ends_with("< $0.12 ★ 0.33"), "{fractional}");
 	}
 

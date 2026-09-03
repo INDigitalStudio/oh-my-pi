@@ -303,11 +303,7 @@ impl Session {
 			if let Some(prompt_parts) = prompt_parts {
 				node = node.with_prop(PropId::Data, Value::Json(prompt_parts));
 			}
-			ops.push(Op::Ins {
-				parent: call,
-				after: self.dom.children(call).last().copied(),
-				node,
-			});
+			ops.push(Op::Ins { parent: call, after: self.dom.children(call).last().copied(), node });
 		} else {
 			let child = child_with_tag(&self.dom, call, KnownTag::Result)
 				.ok_or(SessionError::UnknownCall { id: entry.by.expect("journal enforces causes") })?;
@@ -345,7 +341,8 @@ impl Session {
 			.with_prop(PropId::CacheRead, unsigned(payload.cache_read))
 			.with_prop(PropId::CacheWrite, unsigned(payload.cache_write));
 		if payload.premium_requests_millionths != 0 {
-			node = node.with_prop(PropId::PremiumRequests, unsigned(payload.premium_requests_millionths));
+			node =
+				node.with_prop(PropId::PremiumRequests, unsigned(payload.premium_requests_millionths));
 		}
 		if let Some(ttft) = payload.ttft_ms {
 			node = node.with_prop(PropId::TtftMs, unsigned(ttft));
@@ -544,7 +541,9 @@ fn project_update(
 	// Its journaled typed update retains only metadata plus an emptied `data`
 	// field and must not overwrite or prefix that authoritative stream.
 	if object.is_some_and(|map| {
-		map.get("sequence").and_then(serde_json::Value::as_u64).is_some()
+		map.get("sequence")
+			.and_then(serde_json::Value::as_u64)
+			.is_some()
 			&& map.get("data").is_some_and(|data| match data {
 				serde_json::Value::String(text) => text.is_empty(),
 				serde_json::Value::Array(bytes) => bytes.is_empty(),
@@ -579,8 +578,7 @@ fn project_update(
 		});
 		return Ok(());
 	}
-	let (target, severity, projected) = if let Some(usage) =
-		object.and_then(|map| map.get("usage"))
+	let (target, severity, projected) = if let Some(usage) = object.and_then(|map| map.get("usage"))
 	{
 		(KnownTag::Usage, None, usage)
 	} else {

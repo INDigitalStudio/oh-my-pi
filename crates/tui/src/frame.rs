@@ -1211,7 +1211,8 @@ impl Frame {
 		let other_start = usize::from(other_row) * width;
 		self.cells[start..start + width] == other.cells[other_start..other_start + width]
 			&& self.soft_wrap(row) == other.soft_wrap(other_row)
-			&& self.row_mark(row, RowMark::PromptStart) == other.row_mark(other_row, RowMark::PromptStart)
+			&& self.row_mark(row, RowMark::PromptStart)
+				== other.row_mark(other_row, RowMark::PromptStart)
 			&& self.row_mark(row, RowMark::PromptEnd) == other.row_mark(other_row, RowMark::PromptEnd)
 	}
 

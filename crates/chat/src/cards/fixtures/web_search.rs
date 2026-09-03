@@ -1,7 +1,6 @@
 use super::{CardFixture, FixtureState};
 
-const ARGS: &str =
-	r#"{"query":"Bun vs Node.js performance benchmarks 2026","recency":"month","limit":4,"provider":"perplexity"}"#;
+const ARGS: &str = r#"{"query":"Bun vs Node.js performance benchmarks 2026","recency":"month","limit":4,"provider":"perplexity"}"#;
 const RESULT: &str = r#"{
 	"provider":"perplexity","model":"sonar-pro","auth_mode":"api_key","request_id":"req_a1b2c3d4e5f6",
 	"answer":"Bun continues to outperform Node.js on raw HTTP throughput and cold-start<br>\ntime thanks to its JavaScriptCore engine and native-Zig runtime, while<br>\nNode.js retains an edge in ecosystem maturity and long-term stability.<br>\nFor script-heavy workflows Bun's faster startup is the decisive factor.",

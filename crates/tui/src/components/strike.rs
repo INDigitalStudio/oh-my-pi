@@ -46,7 +46,13 @@ pub struct Strike {
 impl Strike {
 	/// Creates an empty struck line.
 	pub fn new() -> Self {
-		Self { props: Props::new(), slot: next_slot(), text: Str::default(), total: 0, anchor: None }
+		Self {
+			props:  Props::new(),
+			slot:   next_slot(),
+			text:   Str::default(),
+			total:  0,
+			anchor: None,
+		}
 	}
 
 	/// Sets one property.
@@ -151,9 +157,9 @@ impl Component for Strike {
 		let style = self.props.style(&pc.ctx.theme);
 		let (struck, rest) = self.text.as_str().split_at(end);
 		let limit = rect.x.saturating_add(rect.width);
-		let column =
-			pc.frame
-				.put_clipped(rect.x, rect.y, rect.width, struck, style.strikethrough());
+		let column = pc
+			.frame
+			.put_clipped(rect.x, rect.y, rect.width, struck, style.strikethrough());
 		if !rest.is_empty() && column < limit {
 			pc.frame
 				.put_clipped(column, rect.y, limit - column, rest, style);
@@ -177,11 +183,7 @@ impl Component for Strike {
 mod tests {
 	use super::*;
 	use crate::{
-		Frame, Size,
-		component::Wake,
-		frame::CellContent,
-		test_support::frame_row_text,
-		ui::Ui,
+		Frame, Size, component::Wake, frame::CellContent, test_support::frame_row_text, ui::Ui,
 	};
 
 	/// Per painted cell of row zero, whether it paints struck-through.
@@ -223,7 +225,9 @@ mod tests {
 	fn todo_strike_reveals_progressively_then_settles() {
 		// pi: 14 frames of 65 ms — two held plain, twelve sweeping.
 		let mut ui = Ui::from_root(
-			Strike::new().with(Prop::Reveal, "910ms").text("Scaffold crate"),
+			Strike::new()
+				.with(Prop::Reveal, "910ms")
+				.text("Scaffold crate"),
 			20,
 			UiContext::default(),
 		);

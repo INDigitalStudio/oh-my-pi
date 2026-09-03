@@ -152,9 +152,8 @@ impl Pulse {
 		let max = Self::DWELL_MAX.as_secs_f32() * 1000.0;
 		let mut out = [0.0_f32; Self::FACETS + 1];
 		for facet in 0..Self::FACETS {
-			let phase = (1.0
-				- (std::f32::consts::TAU * facet as f32 / Self::FACETS as f32).cos())
-				/ 2.0;
+			let phase =
+				(1.0 - (std::f32::consts::TAU * facet as f32 / Self::FACETS as f32).cos()) / 2.0;
 			out[facet + 1] = out[facet] + (max - min).mul_add(phase, min);
 		}
 		out

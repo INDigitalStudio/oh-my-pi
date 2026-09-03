@@ -218,7 +218,10 @@ impl<'a> JsonTree<'a> {
 	fn render_root(&mut self, value: &Value) {
 		match value {
 			Value::Object(map) => {
-				let keys = map.keys().filter(|key| key.as_str() != "i").collect::<Vec<_>>();
+				let keys = map
+					.keys()
+					.filter(|key| key.as_str() != "i")
+					.collect::<Vec<_>>();
 				for key in keys {
 					self.render_node(&map[key], Some(key.as_str()), &mut Vec::new(), true, 1);
 					if self.lines.len() >= self.max_lines {
@@ -250,7 +253,13 @@ impl<'a> JsonTree<'a> {
 		let vertical = icon(self.ui, "tree-vertical");
 		ancestors
 			.iter()
-			.map(|has_next| if *has_next { format!("{vertical}  ") } else { "   ".to_owned() })
+			.map(|has_next| {
+				if *has_next {
+					format!("{vertical}  ")
+				} else {
+					"   ".to_owned()
+				}
+			})
 			.collect()
 	}
 
@@ -303,7 +312,13 @@ impl<'a> JsonTree<'a> {
 				} else {
 					let count = map.len();
 					for (index, (child_key, child)) in map.iter().enumerate() {
-						self.render_node(child, Some(child_key), ancestors, index + 1 == count, depth + 1);
+						self.render_node(
+							child,
+							Some(child_key),
+							ancestors,
+							index + 1 == count,
+							depth + 1,
+						);
 						if self.lines.len() >= self.max_lines {
 							self.truncated = true;
 							break;

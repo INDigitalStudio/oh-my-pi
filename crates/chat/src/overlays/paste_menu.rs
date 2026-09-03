@@ -186,15 +186,15 @@ mod tests {
 	#[test]
 	fn enter_picks_the_highlighted_choice_and_esc_falls_back_to_inline() {
 		let mut panel = menu();
-		assert_eq!(
-			panel.key(Key::Enter),
-			PanelEvent::Paste { text: panel.text.clone(), choice: PasteChoice::Wrapped }
-		);
+		assert_eq!(panel.key(Key::Enter), PanelEvent::Paste {
+			text:   panel.text.clone(),
+			choice: PasteChoice::Wrapped,
+		});
 		panel.key(Key::Down);
-		assert_eq!(
-			panel.key(Key::Enter),
-			PanelEvent::Paste { text: panel.text.clone(), choice: PasteChoice::LocalFile }
-		);
+		assert_eq!(panel.key(Key::Enter), PanelEvent::Paste {
+			text:   panel.text.clone(),
+			choice: PasteChoice::LocalFile,
+		});
 		panel.key(Key::Up);
 		panel.key(Key::Up);
 		assert_eq!(
@@ -202,14 +202,14 @@ mod tests {
 			PanelEvent::Paste { text: panel.text.clone(), choice: PasteChoice::Inline },
 			"selection wraps around"
 		);
-		assert_eq!(
-			panel.key(Key::Esc),
-			PanelEvent::Paste { text: panel.text.clone(), choice: PasteChoice::Inline }
-		);
-		assert_eq!(
-			panel.key(Key::Char('2')),
-			PanelEvent::Paste { text: panel.text.clone(), choice: PasteChoice::LocalFile }
-		);
+		assert_eq!(panel.key(Key::Esc), PanelEvent::Paste {
+			text:   panel.text.clone(),
+			choice: PasteChoice::Inline,
+		});
+		assert_eq!(panel.key(Key::Char('2')), PanelEvent::Paste {
+			text:   panel.text.clone(),
+			choice: PasteChoice::LocalFile,
+		});
 	}
 
 	#[test]
@@ -244,10 +244,7 @@ mod tests {
 		}
 
 		fn write_local(&self, name: &str, content: &str) -> ServiceResult<Str> {
-			self
-				.files
-				.lock()
-				.push((Str::new(name), Str::new(content)));
+			self.files.lock().push((Str::new(name), Str::new(content)));
 			Ok(sf!("local://{name}"))
 		}
 	}

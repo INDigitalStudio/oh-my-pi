@@ -653,6 +653,7 @@ mod tests {
 			desc:    Str::new_static("test"),
 			ty:      TypeSpec::STR,
 			flags:   VarFlags::NONE,
+			ui:      None,
 			default: Value::Str(Str::new_static("all")),
 		})
 		.expect("registers");
@@ -662,6 +663,7 @@ mod tests {
 			desc:    Str::new_static("test"),
 			ty:      TypeSpec::BOOL,
 			flags:   VarFlags::NONE,
+			ui:      None,
 			default: Value::Bool(false),
 		})
 		.expect("registers");

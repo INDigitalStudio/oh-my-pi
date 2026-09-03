@@ -20,7 +20,7 @@ impl Card for ThinkCard {
 			|| thought(node_text(view.input).unwrap_or_default().as_str()),
 			|params| params.thoughts,
 		);
-		dom! { <text fg=muted italic wrap=word pad-x=1>{text}</text> }.into_component()
+		dom! { <text fg=output wrap=word pad-x=1>{text}</text> }.into_component()
 	}
 }
 

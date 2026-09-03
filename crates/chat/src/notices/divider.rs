@@ -463,8 +463,11 @@ mod tests {
 		assert!("bogus".parse::<Method>().is_err(), "unknown methods are not spelled by the journal");
 		assert!("other".parse::<Method>().is_err(), "`Other` is never parsed by name");
 		assert_eq!(
-			SummaryDivider::compaction(&compaction_node(Some("extension-provided"), 0, 0, None), false)
-				.label,
+			SummaryDivider::compaction(
+				&compaction_node(Some("extension-provided"), 0, 0, None),
+				false
+			)
+			.label,
 			"compacted",
 			"an unknown method reads `compacted` like pi"
 		);

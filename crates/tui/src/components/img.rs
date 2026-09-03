@@ -104,35 +104,35 @@ impl ImgState {
 /// compositors always show the full source), so padded logo sources stay
 /// visible even as tiny thumbnails.
 pub struct Img {
-	props:  Props,
-	slot:   Slot,
-	state:  ImgState,
-	bytes:  Option<Bytes>,
-	dims:   Option<ImageDimensions>,
-	kitty:  Option<(u32, u16, u16)>,
+	props:       Props,
+	slot:        Slot,
+	state:       ImgState,
+	bytes:       Option<Bytes>,
+	dims:        Option<ImageDimensions>,
+	kitty:       Option<(u32, u16, u16)>,
 	/// Cached `src`-interned placeholder box, resolved once per column budget.
-	auto:   AutoBox,
+	auto:        AutoBox,
 	/// Column budget the current `state` was decoded for; a `max-rows` cap
 	/// can leave the sampled width narrower than the budget.
 	decoded_for: u16,
-	top:    String,
-	bottom: String,
+	top:         String,
+	bottom:      String,
 }
 
 impl Img {
 	/// Creates an image with no source.
 	pub fn new() -> Self {
 		Self {
-			props:  Props::new(),
-			slot:   next_slot(),
-			state:  ImgState::default(),
-			bytes:  None,
-			dims:   None,
-			kitty:  None,
-			auto:   AutoBox::Unresolved,
+			props:       Props::new(),
+			slot:        next_slot(),
+			state:       ImgState::default(),
+			bytes:       None,
+			dims:        None,
+			kitty:       None,
+			auto:        AutoBox::Unresolved,
 			decoded_for: 0,
-			top:    String::new(),
-			bottom: String::new(),
+			top:         String::new(),
+			bottom:      String::new(),
 		}
 	}
 
@@ -864,7 +864,8 @@ mod tests {
 		let padded = sample_cells(&pixels, 1, RowBound::Aspect, PAINT_GATE);
 		assert_eq!(&*padded.cells, &[(None, None)], "padding averages the glyph away");
 
-		let trimmed = sample_cells(&trim_transparent(pixels), 1, RowBound::Aspect, TRIMMED_PAINT_GATE);
+		let trimmed =
+			sample_cells(&trim_transparent(pixels), 1, RowBound::Aspect, TRIMMED_PAINT_GATE);
 		assert_eq!(
 			&*trimmed.cells,
 			&[(Some([0, 0, 255]), Some([0, 0, 255]))],

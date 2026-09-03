@@ -159,7 +159,10 @@ fn issue_id(value: &str) -> Option<String> {
 	}
 	for marker in ["/issues/", "/pull/"] {
 		if let Some((_, tail)) = trimmed.split_once(marker) {
-			let digits = tail.split(|c: char| !c.is_ascii_digit()).next().unwrap_or_default();
+			let digits = tail
+				.split(|c: char| !c.is_ascii_digit())
+				.next()
+				.unwrap_or_default();
 			if !digits.is_empty() {
 				return Some(format!("#{digits}"));
 			}

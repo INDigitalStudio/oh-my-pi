@@ -123,15 +123,30 @@ impl Time {
 			Mode::Relative => {
 				let age = self.age_at(now);
 				let (unit, value, period) = relative_parts(age);
-				let delta = period - age % period;
+				let unit_delta = period - age % period;
+				// A display-family boundary may precede the next tick of the
+				// current unit: `4w` becomes `1mo` at 30 days, not 5 weeks.
+				let transition = match unit {
+					RelativeUnit::Now => Some(SECOND_MS),
+					RelativeUnit::Second => Some(MINUTE_MS),
+					RelativeUnit::Minute => Some(HOUR_MS),
+					RelativeUnit::Hour => Some(DAY_MS),
+					RelativeUnit::Day => Some(WEEK_MS),
+					RelativeUnit::Week => Some(MONTH_MS),
+					RelativeUnit::Month => Some(YEAR_MS),
+					RelativeUnit::Year => None,
+				};
+				let delta = transition
+					.and_then(|at| at.checked_sub(age))
+					.filter(|delta| *delta != 0)
+					.map_or(unit_delta, |delta| unit_delta.min(delta));
 				let next = age.checked_add(delta).map(|_| delta);
 				(FormatKey::Relative(unit, value), next)
 			},
 			Mode::Elapsed => {
 				self.anchor = None;
 				let since = Duration::from_millis(self.source_ms());
-				let elapsed =
-					u64::try_from(now.saturating_sub(since).as_millis()).unwrap_or(u64::MAX);
+				let elapsed = u64::try_from(now.saturating_sub(since).as_millis()).unwrap_or(u64::MAX);
 				// A clock still behind the start instant reads zero until
 				// one full second after it.
 				let lead = u64::try_from(since.saturating_sub(now).as_millis()).unwrap_or(u64::MAX);
@@ -272,7 +287,9 @@ mod tests {
 	}
 
 	fn elapsed(since_ms: u64) -> Time {
-		Time::new().with(Prop::Ms, since_ms).with(Prop::Kind, "elapsed")
+		Time::new()
+			.with(Prop::Ms, since_ms)
+			.with(Prop::Kind, "elapsed")
 	}
 
 	fn paint_at(time: &mut Time, now_ms: u64) -> (String, Vec<Wake>) {
@@ -314,7 +331,7 @@ mod tests {
 			(3_600_000, "1h ago", 3_600_000),
 			(86_399_999, "23h ago", 1),
 			(86_400_000, "1d ago", 86_400_000),
-			(2_591_999_999, "29d ago", 1),
+			(2_591_999_999, "4w ago", 1),
 			(2_592_000_000, "1mo ago", 2_592_000_000),
 			(5_183_999_999, "1mo ago", 1),
 			(31_536_000_000, "1y ago", 31_536_000_000),

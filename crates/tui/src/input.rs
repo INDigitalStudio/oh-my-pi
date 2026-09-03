@@ -687,7 +687,10 @@ enum Decoded {
 	Release(Chord),
 	BareChord(Chord),
 	KittyChord(Chord),
-	KittyText { chords: SmallVec<Chord, 4>, dedup: Option<u32> },
+	KittyText {
+		chords: SmallVec<Chord, 4>,
+		dedup:  Option<u32>,
+	},
 	PasteStart,
 	None,
 }
@@ -1723,6 +1726,7 @@ impl Keymap {
 	pub const fn chord_events(&self) -> bool {
 		self.chords
 	}
+
 	/// Adds or replaces the binding for `chord`.
 	pub fn bind(&mut self, chord: Chord, key: Key) {
 		self.set(chord, Some(key));
@@ -2194,6 +2198,17 @@ mod tests {
 
 		keymap.unbind(smart);
 		assert_eq!(keymap.resolve(smart), Some(Key::Ctrl('v')));
+	}
+
+	#[test]
+	fn decoder_routes_kitty_and_modify_other_keys_debug_chords() {
+		let start = Instant::now();
+		for bytes in [b"\x1b[100;6u".as_slice(), b"\x1b[27;6;68~".as_slice()] {
+			let mut decoder = InputDecoder::new();
+			let mut events = Vec::new();
+			decoder.feed(bytes, start, &mut events);
+			assert_eq!(events, [InputEvent::Key(Key::DebugMenu)], "{bytes:?}");
+		}
 	}
 
 	#[test]

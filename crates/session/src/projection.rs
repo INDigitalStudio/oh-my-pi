@@ -433,10 +433,9 @@ fn project_local_tool(dom: &Dom, handle: Handle, name: &str, node: &Node, items:
 	let output = output.trim_end();
 	let mut text = match name {
 		"bash" => format!("Ran `{}`\n", args["command"].as_str().unwrap_or_default()),
-		"eval" => format!(
-			"Ran Python:\n```python\n{}\n```\n",
-			args["code"].as_str().unwrap_or_default()
-		),
+		"eval" => {
+			format!("Ran Python:\n```python\n{}\n```\n", args["code"].as_str().unwrap_or_default())
+		},
 		other => format!("Ran `{other}` with `{args}`\n"),
 	};
 	if output.is_empty() {

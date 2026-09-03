@@ -819,10 +819,7 @@ mod tests {
 			PanelEvent::Consumed
 		);
 		assert_eq!(picker.current(), Some(1), "the wheel highlights without resuming");
-		assert_eq!(
-			picker.mouse(report(Mouse::WheelUp, MouseButton::WheelUp)),
-			PanelEvent::Consumed
-		);
+		assert_eq!(picker.mouse(report(Mouse::WheelUp, MouseButton::WheelUp)), PanelEvent::Consumed);
 		assert_eq!(picker.current(), Some(0));
 		assert_eq!(
 			picker.mouse(report(Mouse::Click, MouseButton::Left)),

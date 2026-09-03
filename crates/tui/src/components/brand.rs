@@ -112,9 +112,7 @@ impl Brand {
 	/// Hosts embedding the mark inside their own paint call this and forward
 	/// [`next_wake`](Self::next_wake) to their own slot.
 	pub fn paint_at(&self, pc: &mut PaintCtx<'_>, x: u16, y: u16) {
-		let (phase, shine) = self
-			.elapsed(pc.now)
-			.map_or((0.0, None), Intro::frame);
+		let (phase, shine) = self.elapsed(pc.now).map_or((0.0, None), Intro::frame);
 		let gradient = Gradient::shifted(phase);
 		// Terminals without truecolor run a quantized theme (every token
 		// indexed); the accent is the tell.
@@ -196,7 +194,10 @@ mod tests {
 		assert_eq!(frame_row_text(ui.frame(), 3), "   ▒▒  ██");
 		assert_eq!(fg(&ui, 0, 0), Color::Rgb(248, 79, 204));
 		assert_eq!(fg(&ui, 11, 0), Color::Rgb(147, 98, 244));
-		assert_eq!(fg(&ui, 8, 4), Gradient::default().color(Gradient::diagonal(8, 4, 12, 5), None, true));
+		assert_eq!(
+			fg(&ui, 8, 4),
+			Gradient::default().color(Gradient::diagonal(8, 4, 12, 5), None, true)
+		);
 		assert_eq!(fg(&ui, 3, 3), UiContext::default().theme.muted, "▒ cells stay muted");
 		assert_eq!(ui.next_wake(), None);
 	}

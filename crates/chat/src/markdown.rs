@@ -87,7 +87,8 @@ pub fn extract_links(text: &str) -> Vec<Link> {
 
 fn is_http(href: &str) -> bool {
 	let scheme_end = href.find("://").unwrap_or(0);
-	href[..scheme_end].eq_ignore_ascii_case("http") || href[..scheme_end].eq_ignore_ascii_case("https")
+	href[..scheme_end].eq_ignore_ascii_case("http")
+		|| href[..scheme_end].eq_ignore_ascii_case("https")
 }
 
 /// The most recent link of any assistant message on the live chain (pi

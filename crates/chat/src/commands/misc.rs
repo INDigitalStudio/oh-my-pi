@@ -664,9 +664,9 @@ mod tests {
 		assert_eq!(
 			event,
 			PanelEvent::Command(HostCommand::Director {
-				id: Str::new_static("advisor"),
+				id:     Str::new_static("advisor"),
 				engage: true,
-				args: Vec::new(),
+				args:   Vec::new(),
 			})
 		);
 		let (_, event) = run_call("advisor status");

@@ -169,10 +169,12 @@ fn touched_phases(
 			}
 		}
 		if let Some(content) = args.get("task").and_then(Value::as_str) {
-			if let Some(phase) = phases
-				.iter()
-				.find(|phase| phase.tasks.iter().any(|task| task.content.as_str() == content))
-			{
+			if let Some(phase) = phases.iter().find(|phase| {
+				phase
+					.tasks
+					.iter()
+					.any(|task| task.content.as_str() == content)
+			}) {
 				touch(&phase.name);
 			}
 		}

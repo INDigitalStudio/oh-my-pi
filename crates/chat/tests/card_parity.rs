@@ -640,8 +640,10 @@ fn ast_grep_card_previews_directory_groups_that_fit_when_collapsed() {
 fn grep_file(path: &str, lines: &[u32]) -> Value {
 	let matches = lines
 		.iter()
-		.map(|line| json!({"line_number": line, "line": format!("useState({line})"),
-			"truncated": false, "context_before": [], "context_after": []}))
+		.map(|line| {
+			json!({"line_number": line, "line": format!("useState({line})"),
+			"truncated": false, "context_before": [], "context_after": []})
+		})
 		.collect::<Vec<_>>();
 	json!({"path": path, "source_key": path, "snapshot_tag": null, "matches": matches})
 }
@@ -789,24 +791,33 @@ fn browser_card_caps_script_and_output_when_collapsed() {
 #[test]
 fn recall_card_is_header_only_when_collapsed_and_warns_on_no_matches() {
 	let items = (1..=12)
-		.map(|index| json!({
-			"memory": {
-				"id": format!("mem-{index}"), "bank": "global", "tier": "working",
-				"content": format!("memory {index}"), "source": null, "session_id": "s",
-				"timestamp": "2026-01-01T00:00:00Z", "importance": 0.5, "veracity": "observed",
-				"memory_type": "fact", "metadata": {}, "superseded_by": null
-			},
-			"score": 0.5,
-			"voice_scores": {"vector": 0.0, "graph": 0.0, "episodic": 0.0, "working": 0.0},
-			"broadened": false
-		}))
+		.map(|index| {
+			json!({
+				"memory": {
+					"id": format!("mem-{index}"), "bank": "global", "tier": "working",
+					"content": format!("memory {index}"), "source": null, "session_id": "s",
+					"timestamp": "2026-01-01T00:00:00Z", "importance": 0.5, "veracity": "observed",
+					"memory_type": "fact", "metadata": {}, "superseded_by": null
+				},
+				"score": 0.5,
+				"voice_scores": {"vector": 0.0, "graph": 0.0, "episodic": 0.0, "working": 0.0},
+				"broadened": false
+			})
+		})
 		.collect::<Vec<_>>();
 	let payload = json!({"query": "q", "items": items});
-	let collapsed =
-		render_done::<omp_tools::memory::RecallPayload>("recall", r#"{"query":"q"}"#, payload.clone(), false);
+	let collapsed = render_done::<omp_tools::memory::RecallPayload>(
+		"recall",
+		r#"{"query":"q"}"#,
+		payload.clone(),
+		false,
+	);
 	assert!(collapsed.contains("12 found"), "{collapsed}");
 	assert!(collapsed.contains("⟨Ctrl+O: Expand⟩"), "{collapsed}");
-	assert!(!collapsed.contains("memory 1"), "pi keeps the collapsed recall to its header: {collapsed}");
+	assert!(
+		!collapsed.contains("memory 1"),
+		"pi keeps the collapsed recall to its header: {collapsed}"
+	);
 	let expanded =
 		render_done::<omp_tools::memory::RecallPayload>("recall", r#"{"query":"q"}"#, payload, true);
 	assert!(expanded.contains("memory 10"), "{expanded}");
@@ -824,7 +835,10 @@ fn recall_card_is_header_only_when_collapsed_and_warns_on_no_matches() {
 }
 
 fn lang_glyph(name: &str) -> &'static str {
-	UiContext::default().charset.icon_named(name).expect("catalog language icon")
+	UiContext::default()
+		.charset
+		.icon_named(name)
+		.expect("catalog language icon")
 }
 
 #[test]
@@ -883,10 +897,8 @@ fn edit_card_paints_the_language_icon_of_the_edited_path() {
 	assert!(!makefile.contains(lang_glyph("text")), "{makefile}");
 
 	// The streaming preview reads the path from the arguments.
-	let streaming = node(
-		KnownTag::Input,
-		r#"{"path":"scripts/run.py","previewDiff":"@@ -1,1 +1,1 @@\n-a\n+b"}"#,
-	);
+	let streaming =
+		node(KnownTag::Input, r#"{"path":"scripts/run.py","previewDiff":"@@ -1,1 +1,1 @@\n-a\n+b"}"#);
 	let text = render("edit", &streaming, None, None, CardStatus::StreamingArgs, false);
 	assert!(text.contains(lang_glyph("python")), "{text}");
 }
@@ -926,7 +938,8 @@ fn glob_card_paints_each_file_with_its_own_language_icon() {
 		"projected_text": "", "output_blob": null, "output_artifact_uri": null,
 		"output_shown_lines": 3, "output_total_lines": 3});
 	let text = render_done::<omp_tools::glob::Payload>("glob", r#"{"path":"**/*"}"#, payload, false);
-	for (path, icon) in [("src/main.rs", "rust"), ("web/index.html", "html"), (".gitignore", "conf")] {
+	for (path, icon) in [("src/main.rs", "rust"), ("web/index.html", "html"), (".gitignore", "conf")]
+	{
 		let row = text
 			.lines()
 			.find(|line| line.contains(path))
@@ -968,7 +981,9 @@ fn task_card_names_the_dispatched_agent_and_brief_while_the_call_is_live() {
 	let text = render("task", &torn, None, None, CardStatus::StreamingArgs, false);
 	assert!(text.contains("Task: task"), "{text}");
 	assert!(
-		text.contains("• AuthLoader: Read packages/server/src/auth/*.ts and summarize the session-co…"),
+		text.contains(
+			"• AuthLoader: Read packages/server/src/auth/*.ts and summarize the session-co…"
+		),
 		"{text}"
 	);
 	assert!(text.contains("├"), "divider before the agent rows: {text}");
@@ -986,7 +1001,10 @@ fn task_card_names_the_dispatched_agent_and_brief_while_the_call_is_live() {
 	assert!(text.contains("• Anna>Bob: Map the auth flow."), "{text}");
 	assert!(text.contains("⟨scout⟩"), "{text}");
 	assert!(text.contains("Then report file:line evidence."), "the assignment section: {text}");
-	assert!(!text.contains("Anna>Bob: Map the auth flow. Then"), "brief stops at the first line: {text}");
+	assert!(
+		!text.contains("Anna>Bob: Map the auth flow. Then"),
+		"brief stops at the first line: {text}"
+	);
 
 	// Batch form: the shared context, then one row per item (`#N` when
 	// unnamed), folded past four.

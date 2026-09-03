@@ -289,7 +289,11 @@ impl KeywordGradient {
 			let t = index as f32 / Self::STOPS as f32;
 			let hue = self.hue_span.mul_add(t, self.hue_start).round();
 			let color = anim::hsl(hue, Self::SATURATION, Self::LIGHTNESS);
-			*slot = if truecolor { color } else { color.quantized_256() };
+			*slot = if truecolor {
+				color
+			} else {
+				color.quantized_256()
+			};
 		}
 		palette
 	}
@@ -1154,10 +1158,7 @@ impl Component for EditInput {
 		// by itself when focus leaves or the keyword is deleted.
 		let shimmer = focused && keyword_accent;
 		let phase = if shimmer {
-			pc.wake(
-				self.slot,
-				pc.now.saturating_add(KeywordGradient::SHIMMER_FRAME),
-			);
+			pc.wake(self.slot, pc.now.saturating_add(KeywordGradient::SHIMMER_FRAME));
 			anim::phase(pc.now, KeywordGradient::SHIMMER_PERIOD)
 		} else {
 			0.0
@@ -1218,9 +1219,9 @@ impl Component for EditInput {
 		// caret keeps no right chrome (box border, field cap, surface fill).
 		let ime_tail_row = (self.ime_safe_cursor && focused)
 			.then(|| {
-				rows.iter().position(|content| {
-					content.cursor_column == Some(cell_width(content.text))
-				})
+				rows
+					.iter()
+					.position(|content| content.cursor_column == Some(cell_width(content.text)))
 			})
 			.flatten()
 			.and_then(|row| u16::try_from(row).ok());
@@ -1264,16 +1265,12 @@ impl Component for EditInput {
 							.get(usize::from(row))
 							.and_then(|content| content.cursor_column)
 							.map_or(rect.width, |column| {
-								layout
-									.side_chrome
-									.saturating_add(column)
-									.min(rect.width)
+								layout.side_chrome.saturating_add(column).min(rect.width)
 							})
 					} else {
 						rect.width
 					};
-					pc.frame
-						.fill(Rect::new(rect.x, y, fill_width, 1), surface);
+					pc.frame.fill(Rect::new(rect.x, y, fill_width, 1), surface);
 					if self.style == ComposerStyle::Field {
 						let (left, right_cap) = field_caps(pc.ctx.charset);
 						pc.frame
@@ -2875,11 +2872,11 @@ mod tests {
 	use std::{env, fs, path::PathBuf};
 
 	use super::*;
-	use crate::editcore::Command;
 	use crate::{
 		Color, Icon, Renderer, SlashCommands, Ui,
 		components::{ContextGaugeMode, Input, Segment, Status, StatusPlacement},
 		context::{Charset, UiContext},
+		editcore::Command,
 		frame::{Frame, Size},
 		test_support::frame_row_text,
 	};
@@ -3309,7 +3306,14 @@ mod tests {
 		let (column, row) = rail.frame().cursor().expect("caret");
 		let panel = rail.context().theme.panel;
 		assert_ne!(rail.frame().cell(column, row).style().background_color(), panel);
-		assert_eq!(rail.frame().cell(column - 1, row).style().background_color(), panel);
+		assert_eq!(
+			rail
+				.frame()
+				.cell(column - 1, row)
+				.style()
+				.background_color(),
+			panel
+		);
 	}
 
 	/// pi `CustomEditor.decorateText`: magic keywords shimmer on the paint
@@ -3366,7 +3370,12 @@ mod tests {
 
 		// 256-color terminals take the nearest indexed stop.
 		let indexed = magic.palette(0, false);
-		assert!(indexed.iter().all(|color| matches!(color, Color::Indexed(_))), "{indexed:?}");
+		assert!(
+			indexed
+				.iter()
+				.all(|color| matches!(color, Color::Indexed(_))),
+			"{indexed:?}"
+		);
 		assert_eq!(indexed[0], anim::hsl(0.0, 0.90, 0.62).quantized_256());
 	}
 

@@ -262,7 +262,8 @@ pub enum HostCommand {
 		/// Media bytes plus MIME in marker order.
 		attachments: Vec<omp_session::AttachmentInput>,
 	},
-	/// Engage or exit a Director by id (`/advisor`, `/vibe`, `/goal`, `/loop`, `/force`).
+	/// Engage or exit a Director by id (`/advisor`, `/vibe`, `/goal`, `/loop`,
+	/// `/force`).
 	Director {
 		/// Director family.
 		id:     Str,
@@ -405,10 +406,8 @@ fn read_attachments(images: &[Str]) -> Result<Vec<omp_session::AttachmentInput>,
 			.map_err(|error| format!("Could not read image {source}: {error}"))?;
 		let format = omp_tui::imagefmt::format(&bytes)
 			.ok_or_else(|| format!("Unsupported image format: {source}"))?;
-		attachments.push(omp_session::AttachmentInput {
-			mime: Str::new_static(format.media_type()),
-			bytes,
-		});
+		attachments
+			.push(omp_session::AttachmentInput { mime: Str::new_static(format.media_type()), bytes });
 	}
 	Ok(attachments)
 }
@@ -1750,7 +1749,9 @@ impl Presenter {
 	fn composer_action(&mut self, action: ComposerAction) -> Result<Routed, HostError> {
 		Ok(match action {
 			ComposerAction::Submit(text) => self.submit(text),
-			ComposerAction::SubmitWithImages { text, images } => self.submit_with_images(text, &images),
+			ComposerAction::SubmitWithImages { text, images } => {
+				self.submit_with_images(text, &images)
+			},
 			// A submitted `/name args` line is the console statement
 			// `name args`, exactly like a bound key.
 			ComposerAction::Command(statement) => self.run_console(statement.as_str())?,
@@ -2171,7 +2172,9 @@ impl Presenter {
 			Err(reason) => return self.refuse_local(&text, reason),
 		};
 		self.last_prompt = Some(text.clone());
-		let _ = self.commands.send(HostCommand::Queue { prompt: text, attachments });
+		let _ = self
+			.commands
+			.send(HostCommand::Queue { prompt: text, attachments });
 		self.notice("Queued message for when the agent yields")
 	}
 

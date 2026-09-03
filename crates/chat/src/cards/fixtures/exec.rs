@@ -174,7 +174,12 @@ pub(super) const FIXTURES: &[CardFixture] = &[
 			},
 			// `browser::Update` is uninhabited and `Fault` carries no tab
 			// context, so a failed run titles the tab name only.
-			FixtureState { args: BROWSER_ARGS, update: None, result: None, fault: Some(BROWSER_FAULT) },
+			FixtureState {
+				args:   BROWSER_ARGS,
+				update: None,
+				result: None,
+				fault:  Some(BROWSER_FAULT),
+			},
 		],
 	},
 	CardFixture {

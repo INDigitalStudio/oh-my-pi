@@ -963,7 +963,11 @@ impl<'p, S: RichSink> Wrap<'p, S> {
 			self.line_width = self.line_width.saturating_add(self.gap_width);
 			self.content = true;
 		}
-		let join_gap = self.gap_width.max(1);
+		let join_gap = if leading_gap {
+			0
+		} else {
+			self.gap_width.max(1)
+		};
 		if self.content
 			&& self
 				.line_width

@@ -1985,7 +1985,8 @@ mod tests {
 	#[test]
 	fn orphan_closing_fence_before_heading_is_repaired() {
 		let source = Str::new(
-			"Latency: 1,240 ms\n```\n\n### Status\n\n| Workload | Pods |\n| --- | --- |\n| api | 1/1 |",
+			"Latency: 1,240 ms\n```\n\n### Status\n\n| Workload | Pods |\n| --- | --- |\n| api | 1/1 \
+			 |",
 		);
 		assert_eq!(
 			repair_orphan_closing_fence(&source),
@@ -1998,8 +1999,9 @@ mod tests {
 
 	#[test]
 	fn orphan_fence_before_table_is_repaired() {
-		let source =
-			Str::new("Results below\n```\n| Name | Value |\n|:---|---:|\n| a | 1 |\n\n## Summary\nDone");
+		let source = Str::new(
+			"Results below\n```\n| Name | Value |\n|:---|---:|\n| a | 1 |\n\n## Summary\nDone",
+		);
 		assert_eq!(
 			repair_orphan_closing_fence(&source),
 			"Results below\n| Name | Value |\n|:---|---:|\n| a | 1 |\n\n## Summary\nDone",
@@ -2031,7 +2033,8 @@ mod tests {
 
 	#[test]
 	fn partial_render_does_not_repair() {
-		let source = "Latency: 1,240 ms\n```\n\n### Status\n\n| Workload | Pods |\n| --- | --- |\n| api | 1/1 |";
+		let source = "Latency: 1,240 ms\n```\n\n### Status\n\n| Workload | Pods |\n| --- | --- |\n| \
+		              api | 1/1 |";
 		let streaming = plain_partial(source, 80);
 		assert!(
 			streaming.iter().any(|row| row.contains("| --- | --- |")),

@@ -850,10 +850,7 @@ impl Component for Select {
 		let columns = self.solve_cells(ctx, content.width);
 		let gap = self.cell_gap();
 		let count = self.state.visible.len();
-		self.state.cursor = self
-			.state
-			.cursor
-			.min(count.saturating_sub(1) as u16);
+		self.state.cursor = self.state.cursor.min(count.saturating_sub(1) as u16);
 		let cursor_at = usize::from(self.state.cursor);
 		let cap = content.height.saturating_sub(header).max(1);
 		let mut scroll = usize::from(self.state.scroll).min(count.saturating_sub(1));

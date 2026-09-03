@@ -64,11 +64,7 @@ fn render_done(
 		.and_then(Value::as_u64)
 		.unwrap_or_else(|| groups.iter().map(|group| group.files.len() as u64).sum());
 	let plan = plan_rows(&groups, expanded);
-	let shown_matches: u64 = plan
-		.iter()
-		.flatten()
-		.map(|shown| *shown as u64)
-		.sum();
+	let shown_matches: u64 = plan.iter().flatten().map(|shown| *shown as u64).sum();
 	let hidden = match_count.saturating_sub(shown_matches);
 	dom! {
 		<col pad-x=1 w="100%">

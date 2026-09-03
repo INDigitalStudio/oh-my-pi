@@ -129,7 +129,10 @@ const COLLAPSED_MATCH_LINES: usize = 6;
 fn directory_groups(matches: &[Value]) -> Vec<(String, Vec<&Value>)> {
 	let mut groups: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
 	for entry in matches {
-		let path = entry.get("path").and_then(Value::as_str).unwrap_or_default();
+		let path = entry
+			.get("path")
+			.and_then(Value::as_str)
+			.unwrap_or_default();
 		let dir = path.rsplit_once('/').map_or(".", |(dir, _)| dir);
 		groups.entry(format!("{dir}/")).or_default().push(entry);
 	}

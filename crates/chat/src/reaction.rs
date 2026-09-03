@@ -100,7 +100,8 @@ mod tests {
 			body:    "\nParty",
 			pending: false,
 		});
-		for emoji in ["🇺🇸", "👍🏽", "1️⃣", "👨‍👩‍👧", "👩🏽‍❤️‍👨🏻", "❤️", "🏴󠁧󠁢󠁳󠁣󠁴󠁿"] {
+		for emoji in ["🇺🇸", "👍🏽", "1️⃣", "👨‍👩‍👧", "👩🏽‍❤️‍👨🏻", "❤️", "🏴󠁧󠁢󠁳󠁣󠁴󠁿"]
+		{
 			let text = format!("{emoji}\nbody");
 			assert_eq!(split_reaction(&text).emoji, Some(emoji), "{emoji}");
 		}
@@ -110,7 +111,8 @@ mod tests {
 	/// punctuation, or an over-long run.
 	#[test]
 	fn prose_first_lines_are_not_reactions() {
-		for text in ["Sure 👍\nDone.", "👍👍\nDone.", "👍!\nDone.", "hello\nworld", "\nDone."] {
+		for text in ["Sure 👍\nDone.", "👍👍\nDone.", "👍!\nDone.", "hello\nworld", "\nDone."]
+		{
 			let split = split_reaction(text);
 			assert_eq!(split.emoji, None, "{text:?}");
 			assert_eq!(split.body, text);

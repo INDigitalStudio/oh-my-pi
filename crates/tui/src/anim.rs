@@ -523,7 +523,11 @@ impl Gradient {
 	/// brightest slot where the shine band peaks.
 	#[must_use]
 	pub fn color(self, t: f32, shine: Option<Shine>, truecolor: bool) -> Color {
-		let t = if self.phase == 0.0 { t } else { wrap_unit(t + self.phase) };
+		let t = if self.phase == 0.0 {
+			t
+		} else {
+			wrap_unit(t + self.phase)
+		};
 		let intensity = shine.map_or(0.0, |shine| shine.intensity(t));
 		if truecolor {
 			let stops = &Self::STOPS;
@@ -534,7 +538,11 @@ impl Gradient {
 			let b = stops[index + 1];
 			let channel = |lane: usize| {
 				let base = (f32::from(b[lane]) - f32::from(a[lane])).mul_add(f, f32::from(a[lane]));
-				let lifted = if intensity > 0.0 { (255.0 - base).mul_add(intensity, base) } else { base };
+				let lifted = if intensity > 0.0 {
+					(255.0 - base).mul_add(intensity, base)
+				} else {
+					base
+				};
 				lifted.round().clamp(0.0, 255.0) as u8
 			};
 			return Color::Rgb(channel(0), channel(1), channel(2));

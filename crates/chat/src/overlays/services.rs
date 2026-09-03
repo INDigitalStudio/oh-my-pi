@@ -665,6 +665,98 @@ pub struct AgentView {
 	pub events:   Option<Receiver<omp_dom::Event>>,
 }
 
+/// Stable native debug operation selected by `/debug`.
+#[derive(
+	Clone, Copy, Debug, Eq, PartialEq, strum::Display, strum::EnumString, strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "kebab-case")]
+pub enum DebugAction {
+	/// Open the session artifact directory.
+	OpenArtifacts,
+	/// Capture current native scheduling evidence and create a report bundle.
+	Performance,
+	/// Write and open a flamegraph from recent work scheduling events.
+	Work,
+	/// Create an immediate session report bundle.
+	Dump,
+	/// Capture process memory facts and create a report bundle.
+	Memory,
+	/// Show bounded recent process logs.
+	Logs,
+	/// Show host system facts.
+	System,
+	/// Show negotiated terminal facts.
+	Terminal,
+	/// Exercise typed terminal presentation protocols.
+	Protocols,
+	/// Show the bounded, redacted, session-scoped provider SSE stream.
+	RawSse,
+	/// Export the visible TUI transcript.
+	Transcript,
+	/// Remove expired unreferenced artifact cache entries.
+	ClearCache,
+}
+
+/// Negotiated presentation facts supplied to terminal debug operations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DebugTerminal {
+	/// Current cell viewport.
+	pub viewport:   omp_tui::Size,
+	/// Character-set tier.
+	pub charset:    Str,
+	/// Graphics protocol tier.
+	pub graphics:   Str,
+	/// Appearance selected by terminal detection.
+	pub appearance: Str,
+}
+
+/// Facts supplied to one debug operation by the projection host.
+#[derive(Clone, Debug)]
+pub struct DebugRequest {
+	/// Operation to execute.
+	pub action:     DebugAction,
+	/// Visible transcript, used only by [`DebugAction::Transcript`].
+	pub transcript: Str,
+	/// Already-negotiated presentation facts.
+	pub terminal:   DebugTerminal,
+}
+
+/// One sanitized provider SSE frame crossing the application/services seam.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DebugSseFrame {
+	/// Monotonic process-local sequence.
+	pub sequence: u64,
+	/// Provider event name.
+	pub event:    Str,
+	/// Irreversibly redacted bounded frame payload.
+	pub payload:  Str,
+}
+
+/// Result of a real application debug operation.
+pub enum DebugOutput {
+	/// A completed operation rendered as a report.
+	Report {
+		/// Panel title.
+		title: &'static str,
+		/// Markdown body.
+		body:  Str,
+	},
+	/// Live session-scoped provider stream.
+	RawSse {
+		/// Frames retained when the viewer opened.
+		initial: Vec<DebugSseFrame>,
+		/// Subsequent frames; bounded so a slow viewer never blocks inference.
+		events:  Receiver<DebugSseFrame>,
+	},
+	/// The typed terminal protocol probe component.
+	ProtocolProbe {
+		/// Capability summary shown beneath the live samples.
+		summary: Str,
+		/// Temporary PNG used to exercise the negotiated graphics path.
+		image:   PathBuf,
+	},
+}
+
 /// One application-state mutation a dashboard asks the controller for
 /// (`HostCommand::Service`). Panels never call the mutating owner directly
 /// (ADR 0005; ADR 0014: one control stream).
@@ -1010,6 +1102,16 @@ pub trait Services: Send + Sync {
 	/// first (bounded by the application).
 	fn trace_events(&self) -> ServiceResult<Vec<TraceEvent>> {
 		Err(ServiceError::Unavailable("kernel trace"))
+	}
+
+	/// Executes one native debug operation through the application owner.
+	fn debug(&self, _request: DebugRequest) -> ServiceResult<DebugOutput> {
+		Err(ServiceError::Unavailable("debug services"))
+	}
+
+	/// Writes the current session's bounded redacted raw-SSE ring to a file.
+	fn dump_raw_sse(&self) -> ServiceResult<PathBuf> {
+		Err(ServiceError::Unavailable("raw SSE dump"))
 	}
 }
 

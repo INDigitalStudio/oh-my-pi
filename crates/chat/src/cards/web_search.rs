@@ -29,7 +29,12 @@ impl Card for WebSearchCard {
 			let provider = fault
 				.as_ref()
 				.and_then(|fault| serde_json::to_value(fault).ok())
-				.and_then(|value| value.get("provider").and_then(Value::as_str).map(provider_name))
+				.and_then(|value| {
+					value
+						.get("provider")
+						.and_then(Value::as_str)
+						.map(provider_name)
+				})
 				.filter(|provider| !provider.is_empty());
 			let error = typed_fault::<omp_tools::web_search::Fault>(view)
 				.unwrap_or_else(|| omp_core::Str::new_static("search failed"));

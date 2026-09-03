@@ -37,7 +37,7 @@ pub use generic::GenericCard;
 use omp_core::{Str, sf};
 use omp_dom::{Node, PropId};
 use omp_tool::{ArgPath, CallOutcome};
-use omp_tui::{Graphics, IntoComponent as _, UiContext, dom};
+use omp_tui::{Graphics, IntoComponent as _, Prop, UiContext, dom};
 use serde::de::DeserializeOwned;
 
 /// A boxed retained TUI component.
@@ -263,7 +263,11 @@ pub(crate) fn elapsed_badge(view: &CardView<'_>) -> Option<Component> {
 /// paths pi does not recognise at all paint `lang.text`, pi's `?? "text"`
 /// fallback.
 pub(crate) fn path_language_icon(path: &str) -> &'static str {
-	let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_ascii_lowercase();
+	let name = path
+		.rsplit(['/', '\\'])
+		.next()
+		.unwrap_or(path)
+		.to_ascii_lowercase();
 	let key = if name.starts_with(".env.") {
 		"env"
 	} else if name.starts_with("dockerfile.") {
@@ -309,12 +313,11 @@ pub(crate) fn path_language_icon(path: &str) -> &'static str {
 		"env" => "env",
 		"zig" | "pl" | "pm" | "perl" | "scala" | "sc" | "sbt" | "groovy" | "clj" | "cljc"
 		| "cljs" | "edn" | "el" | "fs" | "vb" | "jsonc" | "rst" | "adoc" | "tex" | "graphql"
-		| "gql" | "proto" | "tf" | "hcl" | "tfvars" | "nix" | "ex" | "exs" | "erl" | "hrl"
-		| "hs" | "ml" | "mli" | "r" | "dart" | "elm" | "v" | "nim" | "cr" | "d" | "pas"
-		| "pp" | "lisp" | "lsp" | "rkt" | "scm" | "bat" | "cmd" | "tla" | "tlaplus" | "m"
-		| "mm" | "sol" | "odin" | "star" | "bzl" | "sv" | "svh" | "vh" | "vim" | "ipynb"
-		| "hbs" | "hsb" | "handlebars" | "diff" | "patch" | "makefile" | "mk" | "mak"
-		| "cmake" => "default",
+		| "gql" | "proto" | "tf" | "hcl" | "tfvars" | "nix" | "ex" | "exs" | "erl" | "hrl" | "hs"
+		| "ml" | "mli" | "r" | "dart" | "elm" | "v" | "nim" | "cr" | "d" | "pas" | "pp" | "lisp"
+		| "lsp" | "rkt" | "scm" | "bat" | "cmd" | "tla" | "tlaplus" | "m" | "mm" | "sol" | "odin"
+		| "star" | "bzl" | "sv" | "svh" | "vh" | "vim" | "ipynb" | "hbs" | "hsb" | "handlebars"
+		| "diff" | "patch" | "makefile" | "mk" | "mak" | "cmake" => "default",
 		_ => "text",
 	}
 }
@@ -340,7 +343,9 @@ pub(crate) fn partial_string(json: &str, key: &str) -> Option<Str> {
 				Some('b') => out.push('\u{8}'),
 				Some('f') => out.push('\u{c}'),
 				Some('u') => {
-					let Some(hex) = chars.as_str().get(..4) else { break };
+					let Some(hex) = chars.as_str().get(..4) else {
+						break;
+					};
 					let code = u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
 					out.push(code.unwrap_or('\u{fffd}'));
 					chars = chars.as_str()[4..].chars();
@@ -579,10 +584,53 @@ impl CardRegistry {
 		expanded: bool,
 		ui: &UiContext,
 	) -> Component {
-		self.cards.get(tool).map_or_else(
+		let mut component = self.cards.get(tool).map_or_else(
 			|| self.fallback.render_named(tool, view, expanded, ui),
 			|card| card.render(view, expanded, ui),
-		)
+		);
+		style_tool_surfaces(component.as_mut(), view.status, "output");
+		component
+	}
+}
+
+fn style_tool_surfaces(
+	component: &mut dyn omp_tui::Component,
+	status: CardStatus,
+	inherited: &'static str,
+) {
+	let role = if component
+		.props()
+		.str_of(Prop::Kind)
+		.is_some_and(|kind| kind == "title")
+	{
+		"accent"
+	} else {
+		inherited
+	};
+	component.props_mut().set(Prop::Bold, false);
+	component.props_mut().set(Prop::Italic, false);
+	if !component.props().contains(Prop::Fg) && !component.kind().ends_with("::Icon") {
+		component.props_mut().set(Prop::Fg, role);
+	}
+	if component.props().border().is_some() {
+		let props = component.props_mut();
+		props.set(Prop::Fg, "output");
+		props.set(
+			Prop::Bg,
+			if status == CardStatus::Failed {
+				"error_surface"
+			} else {
+				"panel"
+			},
+		);
+		props.set(Prop::Bc, match status {
+			CardStatus::StreamingArgs | CardStatus::InProgress => "accent",
+			CardStatus::Done => "border",
+			CardStatus::Failed => "err",
+		});
+	}
+	for child in component.children_mut() {
+		style_tool_surfaces(child.comp_mut(), status, role);
 	}
 }
 

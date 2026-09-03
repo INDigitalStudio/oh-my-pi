@@ -33,6 +33,7 @@ bind alt+shift+l cl_copy_line
 bind alt+shift+c cl_copy_prompt
 bind ctrl+v cl_paste_image
 bind ctrl+shift+v cl_paste_raw
+bind ctrl+shift+d debug
 bind ctrl+p panel_toggle_path
 bind ctrl+s panel_toggle_sort
 bind ctrl+r panel_rename
@@ -524,6 +525,22 @@ fn decoded_follow_up_key_runs_the_ctrl_enter_bind() {
 	assert_eq!(h.host.notice(), Some("Queued message for when the agent yields"));
 }
 
+/// Both the semantic key emitted by legacy input routing and the exact Kitty /
+/// modifyOtherKeys chord run the literal debug bind.
+#[test]
+fn ctrl_shift_d_opens_the_debug_selector() {
+	let mut h = harness(idle_session());
+	h.host.key(Key::DebugMenu).expect("semantic debug key");
+	assert_eq!(h.host.overlay_id(), Some("debug"));
+	h.host.key(Key::Esc).expect("close debug");
+
+	let chord = Chord::parse("ctrl+shift+d").expect("debug chord");
+	h.host
+		.chord(KeyEvent { chord, key: Some(Key::DebugMenu), pressed: true })
+		.expect("physical debug chord");
+	assert_eq!(h.host.overlay_id(), Some("debug"));
+}
+
 /// pi `parseQueueShorthand` + `#queueForYield`: `-> body` starts at once
 /// when the agent is idle with an empty queue, otherwise queues behind the
 /// stream / earlier follow-ups.
@@ -844,7 +861,10 @@ fn interrupt_bind_offers_escape_to_a_modal_panel_before_dismissing_it() {
 /// threshold of 0 disables the menu.
 #[test]
 fn large_paste_menu_gates_on_the_threshold_and_lands_the_choice() {
-	let big = (0..120).map(|n| format!("row {n}")).collect::<Vec<_>>().join("\n");
+	let big = (0..120)
+		.map(|n| format!("row {n}"))
+		.collect::<Vec<_>>()
+		.join("\n");
 	let mut h = harness(idle_session());
 	h.host.paste(&big);
 	assert_eq!(h.host.overlay_id(), Some("paste-menu"), "120 lines >= default 100");
@@ -923,13 +943,8 @@ fn side_panels_keep_terminal_mouse_tracking_on() {
 	assert!(h.host.mouse_tracking(), "a side panel still takes pointer reports");
 	let band = h.host.picker_band().expect("side panel band");
 	assert_eq!(band.rows, 1);
-	assert!(
-		band.y < 30 && band.y > 20,
-		"a side panel sits directly above the composer: {band:?}"
-	);
-	h.host
-		.mouse(click(band.x + 1, band.y))
-		.expect("mouse");
+	assert!(band.y < 30 && band.y > 20, "a side panel sits directly above the composer: {band:?}");
+	h.host.mouse(click(band.x + 1, band.y)).expect("mouse");
 	assert_eq!(h.host.take_clipboard().as_deref(), Some("clicked:1,0"));
 	h.host.key(Key::Esc).expect("close");
 	assert!(!h.host.mouse_tracking());

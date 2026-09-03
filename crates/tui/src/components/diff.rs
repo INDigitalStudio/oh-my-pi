@@ -166,7 +166,9 @@ impl DiffView {
 
 	/// Appends a new unnumbered line to the diff view.
 	pub fn push(&mut self, kind: DiffKind, text: impl IntoStr) {
-		self.lines.push(DiffLine { kind, text: text.into_str(), number: None });
+		self
+			.lines
+			.push(DiffLine { kind, text: text.into_str(), number: None });
 		self.dirty = true;
 	}
 
@@ -432,7 +434,11 @@ impl Painter {
 	}
 
 	fn row<'s>(&'s self, numbered: bool, out: &'s mut RichText) -> CharWrap<'s, &'s mut RichText> {
-		let cont = if numbered { &self.cont_numbered } else { &self.cont_bare };
+		let cont = if numbered {
+			&self.cont_numbered
+		} else {
+			&self.cont_bare
+		};
 		out.wrap_chars_prefixed(self.width, Prefix::empty_ref(), cont)
 	}
 
@@ -549,7 +555,9 @@ fn spaces(scratch: &mut String, count: usize) -> Prefix {
 }
 
 fn decimal_width(number: u32) -> usize {
-	number.checked_ilog10().map_or(1, |magnitude| magnitude as usize + 1)
+	number
+		.checked_ilog10()
+		.map_or(1, |magnitude| magnitude as usize + 1)
 }
 
 /// Bytes of leading spaces and tabs.
@@ -571,7 +579,8 @@ fn language_for_path(path: &str) -> Option<&str> {
 /// constructs tokenize with their neighbours. Collapse markers (`...`) are
 /// not code and split runs instead of joining them.
 fn highlight_context(lines: &[DiffLine], language: &str, styles: &HighlightStyles) -> Highlights {
-	let mut highlights = Highlights { rows: RichText::default(), row_of: vec![u16::MAX; lines.len()] };
+	let mut highlights =
+		Highlights { rows: RichText::default(), row_of: vec![u16::MAX; lines.len()] };
 	let mut source = String::new();
 	let mut run: SmallVec<usize, 16> = SmallVec::new();
 	for (index, line) in lines.iter().enumerate() {
@@ -603,8 +612,7 @@ fn flush_highlight_run(
 	let first = RichText::rows(&highlights.rows);
 	highlight::render(source, language, run.len(), styles, &mut highlights.rows);
 	for (offset, &index) in run.iter().enumerate() {
-		highlights.row_of[index] =
-			first.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+		highlights.row_of[index] = first.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
 	}
 	source.clear();
 	run.clear();
@@ -769,7 +777,9 @@ fn marks(tokens: &[Token<'_>], changed: &[bool]) -> Marks {
 		let is_changed = changed[word];
 		word += 1;
 		if is_changed {
-			let start = pending_space.take().map_or(token.start, |space| space.start);
+			let start = pending_space
+				.take()
+				.map_or(token.start, |space| space.start);
 			push_mark(&mut marks, start..end);
 		} else {
 			pending_space = None;
@@ -868,7 +878,9 @@ mod tests {
 	/// Cell column of the first occurrence of `needle` in row `y`.
 	fn column(frame: &Frame, y: u16, needle: &str) -> u16 {
 		let row = frame_row_text(frame, y);
-		let at = row.find(needle).unwrap_or_else(|| panic!("{needle:?} in {row:?}"));
+		let at = row
+			.find(needle)
+			.unwrap_or_else(|| panic!("{needle:?} in {row:?}"));
 		u16::try_from(row[..at].chars().count()).unwrap()
 	}
 
@@ -876,8 +888,14 @@ mod tests {
 	fn canonical_and_legacy_diff_lines_parse_line_numbers() {
 		assert_eq!(DiffLine::parse("+123|content"), line(DiffKind::Add, "content", Some(123)));
 		assert_eq!(DiffLine::parse("-  7|x"), line(DiffKind::Remove, "x", Some(7)));
-		assert_eq!(DiffLine::parse(" 12|\tindented"), line(DiffKind::Context, "\tindented", Some(12)));
-		assert_eq!(DiffLine::parse("- 4│old_name();"), line(DiffKind::Remove, "old_name();", Some(4)));
+		assert_eq!(
+			DiffLine::parse(" 12|\tindented"),
+			line(DiffKind::Context, "\tindented", Some(12))
+		);
+		assert_eq!(
+			DiffLine::parse("- 4│old_name();"),
+			line(DiffKind::Remove, "old_name();", Some(4))
+		);
 		assert_eq!(DiffLine::parse("+123 content"), line(DiffKind::Add, "content", Some(123)));
 		assert_eq!(DiffLine::parse("+content"), line(DiffKind::Add, "content", None));
 		assert_eq!(
@@ -886,7 +904,10 @@ mod tests {
 		);
 		assert_eq!(DiffLine::parse(" "), line(DiffKind::Context, "", None));
 		assert_eq!(DiffLine::parse("+"), line(DiffKind::Add, "", None));
-		assert_eq!(DiffLine::parse("@@ -1,2 +1,3 @@"), line(DiffKind::Header, "@@ -1,2 +1,3 @@", None));
+		assert_eq!(
+			DiffLine::parse("@@ -1,2 +1,3 @@"),
+			line(DiffKind::Header, "@@ -1,2 +1,3 @@", None)
+		);
 		assert_eq!(DiffLine::parse("+++ b/file"), line(DiffKind::Header, "+++ b/file", None));
 		assert_eq!(DiffLine::parse(""), line(DiffKind::Header, "", None));
 		assert_eq!(DiffLine::parse("..."), line(DiffKind::Header, "", None));
@@ -1039,7 +1060,11 @@ mod tests {
 		assert_eq!(keyword.foreground, ctx.theme.accent, "`fn` takes the keyword color");
 		assert!(keyword.bold);
 		assert_eq!(frame_row_text(&frame, 1), "-···fn old() {}");
-		assert_eq!(frame_cell_style(&frame, 4, 1).foreground, ctx.theme.err, "changes keep +/- color");
+		assert_eq!(
+			frame_cell_style(&frame, 4, 1).foreground,
+			ctx.theme.err,
+			"changes keep +/- color"
+		);
 		assert_eq!(frame_cell_style(&frame, 4, 2).foreground, ctx.theme.ok);
 
 		let mut unknown = DiffView::new()
@@ -1054,7 +1079,11 @@ mod tests {
 	/// pi's `renderDiff` does in `.gallery-ref/tools/{edit,apply_patch}.txt`.
 	#[test]
 	fn gallery_edit_fixtures_match_pi_rows() {
-		let edit = "@@ -88,5 +88,6 @@\n \tconst offset = args.offset ?? 1;\n-\tconst limit = args.limit ?? 2000;\n+\tconst limit = args.limit ?? 4000;\n \tconst raw = await Bun.file(path).text();\n-\treturn raw.slice(offset , offset + limit);\n+\treturn raw.split(\"\\n\").slice(offset - 1, offset - 1 + limit).join(\"\\n\");";
+		let edit = "@@ -88,5 +88,6 @@\n \tconst offset = args.offset ?? 1;\n-\tconst limit = \
+		            args.limit ?? 2000;\n+\tconst limit = args.limit ?? 4000;\n \tconst raw = await \
+		            Bun.file(path).text();\n-\treturn raw.slice(offset , offset + \
+		            limit);\n+\treturn raw.split(\"\\n\").slice(offset - 1, offset - 1 + \
+		            limit).join(\"\\n\");";
 		let mut diff = DiffView::new()
 			.with(Prop::Path, "packages/coding-agent/src/tools/read.ts")
 			.text(edit);
@@ -1070,7 +1099,13 @@ mod tests {
 			"+···return raw.split(\"\\n\").slice(offset - 1, offset - 1 + limit).join(\"\\n\");",
 		]);
 
-		let patch = "@@ -177,4 +177,4 @@\n /** Count distinct file paths in an edits array. */\n-function countEditFiles(edits: EditRenderEntry[]): number {\n+function countDistinctFiles(edits: EditRenderEntry[]): number {\n \treturn new Set(edits.map(edit => filePathFromEditEntry(edit.path)).filter(Boolean)).size;\n }\n@@ -467,2 +467,2 @@\n-\t\tfileCount = countEditFiles(editArgs.edits);\n+\t\tfileCount = countDistinctFiles(editArgs.edits);";
+		let patch = "@@ -177,4 +177,4 @@\n /** Count distinct file paths in an edits array. \
+		             */\n-function countEditFiles(edits: EditRenderEntry[]): number {\n+function \
+		             countDistinctFiles(edits: EditRenderEntry[]): number {\n \treturn new \
+		             Set(edits.map(edit => \
+		             filePathFromEditEntry(edit.path)).filter(Boolean)).size;\n }\n@@ -467,2 +467,2 \
+		             @@\n-\t\tfileCount = countEditFiles(editArgs.edits);\n+\t\tfileCount = \
+		             countDistinctFiles(editArgs.edits);";
 		let mut diff = DiffView::new()
 			.with(Prop::Path, "packages/coding-agent/src/edit/renderer.ts")
 			.text(patch);
@@ -1081,7 +1116,8 @@ mod tests {
 			" /** Count distinct file paths in an edits array. */",
 			"-function countEditFiles(edits: EditRenderEntry[]): number {",
 			"+function countDistinctFiles(edits: EditRenderEntry[]): number {",
-			"    return new Set(edits.map(edit => filePathFromEditEntry(edit.path)).filter(Boolean)).size;",
+			"    return new Set(edits.map(edit => \
+			 filePathFromEditEntry(edit.path)).filter(Boolean)).size;",
 			" }",
 			"@@ -467,2 +467,2 @@",
 			"-······fileCount = countEditFiles(editArgs.edits);",

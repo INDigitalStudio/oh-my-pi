@@ -7,8 +7,7 @@ use omp_core::Str;
 use omp_tui::{
 	Command, EditorOptions, Frame, Key, SpellingFeatures, Ui, UiContext, UiEvent,
 	components::{
-		AttachmentContent, ComposerStyle, EditorPane, InlineAccent, PrefixAccent,
-		marker_sized_paste,
+		AttachmentContent, ComposerStyle, EditorPane, InlineAccent, PrefixAccent, marker_sized_paste,
 	},
 };
 
@@ -1506,7 +1505,10 @@ mod tests {
 
 		// A marker-sized paste at or above the line threshold is held for the
 		// menu; below it, or with the menu disabled, it collapses to a chip.
-		let twelve = (0..12).map(|n| format!("l{n}")).collect::<Vec<_>>().join("\n");
+		let twelve = (0..12)
+			.map(|n| format!("l{n}"))
+			.collect::<Vec<_>>()
+			.join("\n");
 		composer.set_settings(ComposerSettings {
 			paste_large_menu_lines: 12,
 			..ComposerSettings::default()
@@ -1557,7 +1559,10 @@ mod tests {
 			"[Image #1, 4x3] then [Image #2] x"
 		);
 		assert_eq!(compact_image_markers("[Image #1] [Image #2]", &[1, 2]), "[Image #1] [Image #2]");
-		assert_eq!(compact_image_markers("[Image #9] [Image #] [x]", &[3]), "[Image #9] [Image #] [x]");
+		assert_eq!(
+			compact_image_markers("[Image #9] [Image #] [x]", &[3]),
+			"[Image #9] [Image #] [x]"
+		);
 		assert_eq!(compact_image_markers("no markers", &[]), "no markers");
 	}
 

@@ -79,9 +79,9 @@ use strum::{EnumString, IntoStaticStr};
 use crate::{
 	component::{Cached, Component},
 	components::{
-		Boxed, Button, Callout, Checkbox, Choice, Col, CustomElement, DiffStat, DiffView,
-		EditorPane, Fact, Field, Files, Form, Hr, Icon, Img, Input, JsonPreview, Latex, Markdown,
-		NumberLeaf, Pre, Progress, Pulse, Qr, Quote, Radio, Row, Scroll, Segment, Segmented, Select,
+		Boxed, Button, Callout, Checkbox, Choice, Col, CustomElement, DiffStat, DiffView, EditorPane,
+		Fact, Field, Files, Form, Hr, Icon, Img, Input, JsonPreview, Latex, Markdown, NumberLeaf,
+		Pre, Progress, Pulse, Qr, Quote, Radio, Row, Scroll, Segment, Segmented, Select,
 		SelectOption, Spacer, Spinner, State, Status, Strike, Table, TableCell, TableRow, Tabs,
 		TaskStatus, TextLeaf, Time, Todo, TodoTask, Tree, TreeNode, Wizard,
 	},

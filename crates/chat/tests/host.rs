@@ -1334,5 +1334,8 @@ fn pasted_image_chip_submits_attachments_and_the_bubble_shows_the_chip() {
 	assert!(!frame.contains("[Image #1"), "the marker collapses:\n{frame}");
 	assert!(frame.contains("what is this?"), "{frame}");
 	let paperclip = omp_tui::Charset::default().icon(omp_tui::Icon::Paperclip);
-	assert!(!frame.contains(&format!("{paperclip} #1")), "a referenced image is not repeated:\n{frame}");
+	assert!(
+		!frame.contains(&format!("{paperclip} #1")),
+		"a referenced image is not repeated:\n{frame}"
+	);
 }

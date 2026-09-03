@@ -2451,8 +2451,7 @@ impl Editor {
 			})
 			.filter(|picker| clear_of_atoms(&picker.range));
 		if picker.is_none() && self.options.emoji {
-			picker =
-				emoji_picker(text, cursor, rows).filter(|picker| clear_of_atoms(&picker.range));
+			picker = emoji_picker(text, cursor, rows).filter(|picker| clear_of_atoms(&picker.range));
 		}
 		self.hint = self
 			.completion

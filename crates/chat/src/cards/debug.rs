@@ -7,9 +7,11 @@ use serde_json::Value;
 
 use super::{Card, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result};
 
-/// Command-output rows shown while collapsed (pi `PREVIEW_LIMITS.COLLAPSED_LINES`).
+/// Command-output rows shown while collapsed (pi
+/// `PREVIEW_LIMITS.COLLAPSED_LINES`).
 const OUTPUT_COLLAPSED_LINES: usize = 3;
-/// Command-output rows shown when expanded (pi `PREVIEW_LIMITS.EXPANDED_LINES`).
+/// Command-output rows shown when expanded (pi
+/// `PREVIEW_LIMITS.EXPANDED_LINES`).
 const OUTPUT_EXPANDED_LINES: usize = 12;
 
 /// Renders debugger session state and stack frames.

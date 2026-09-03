@@ -810,8 +810,8 @@ mod tests {
 
 	#[test]
 	fn append_only_block_with_markdown_root_streams_stable_rows_and_commits_settled_rows() {
-		const SOURCE: &str = "# Title\n\nalpha beta gamma delta epsilon zeta eta theta\n\n- one \
-		                      two three\n- four five six\n\n**bold** tail line\n";
+		const SOURCE: &str = "# Title\n\nalpha beta gamma delta epsilon zeta eta theta\n\n- one two \
+		                      three\n- four five six\n\n**bold** tail line\n";
 		let width = 24;
 		let mut slots = Slots::new(width, 2, ResizePolicy::Rebuild);
 		let id = slots.open_with(

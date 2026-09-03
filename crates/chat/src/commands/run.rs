@@ -126,7 +126,9 @@ impl Presenter {
 			CommandAction::Loop { limit, prompt } => self.loop_mode(limit, prompt),
 			CommandAction::Queue { prompt } => {
 				let active = self.turn_active;
-				let _ = self.commands.send(HostCommand::Queue { prompt, attachments: Vec::new() });
+				let _ = self
+					.commands
+					.send(HostCommand::Queue { prompt, attachments: Vec::new() });
 				self.notice(if active {
 					"Queued message for when the agent yields"
 				} else {

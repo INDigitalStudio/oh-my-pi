@@ -122,25 +122,25 @@ pub enum SessionError {
 
 /// The mutable controller for one journal-derived session tree.
 pub struct Session {
-	pub(crate) journal:               Journal,
-	pub(crate) entries:               Vec<Entry>,
-	pub(crate) entry_index:           FastHashMap<EntryId, usize>,
-	pub(crate) handle_floors:         Vec<u64>,
-	pub(crate) stream_floors:         Vec<Sid>,
-	pub(crate) dom:                   Dom,
-	pub(crate) components:            ComponentRegistry,
-	pub(crate) head:                  Option<EntryId>,
-	pub(crate) current_turn:          Option<EntryId>,
-	pub(crate) current_assistant:     Option<EntryId>,
-	pub(crate) call_handles:          FastHashMap<EntryId, Handle>,
-	pub(crate) stream_targets:        FastHashMap<Sid, Handle>,
-	pub(crate) summaries:             FastHashMap<BlobRef, Str>,
+	pub(crate) journal: Journal,
+	pub(crate) entries: Vec<Entry>,
+	pub(crate) entry_index: FastHashMap<EntryId, usize>,
+	pub(crate) handle_floors: Vec<u64>,
+	pub(crate) stream_floors: Vec<Sid>,
+	pub(crate) dom: Dom,
+	pub(crate) components: ComponentRegistry,
+	pub(crate) head: Option<EntryId>,
+	pub(crate) current_turn: Option<EntryId>,
+	pub(crate) current_assistant: Option<EntryId>,
+	pub(crate) call_handles: FastHashMap<EntryId, Handle>,
+	pub(crate) stream_targets: FastHashMap<Sid, Handle>,
+	pub(crate) summaries: FastHashMap<BlobRef, Str>,
 	pub(crate) entry_patch_published: bool,
-	pub(crate) next_sid:              Sid,
-	pending_prior:                    Option<EntryId>,
+	pub(crate) next_sid: Sid,
+	pending_prior: Option<EntryId>,
 	/// Content-addressed store every blob this session references resolves
 	/// against: compaction summaries, spilled tool output, attachments.
-	blobs:                            BlobStore,
+	blobs: BlobStore,
 }
 
 /// User media on its way into the session: what a composer image chip or an
@@ -158,18 +158,18 @@ pub struct AttachmentInput {
 #[derive(Clone, Debug)]
 pub struct UnsettledCall {
 	/// Journal identity of the `tool.call@1`.
-	pub entry:   EntryId,
+	pub entry:     EntryId,
 	/// Provider call identity recorded on the element.
-	pub call_id: Str,
+	pub call_id:   Str,
 	/// Tool name (the element tag).
-	pub name:    Str,
+	pub name:      Str,
 	/// Journaled tool revision.
-	pub rev:     u32,
+	pub rev:       u32,
 	/// Whether canonical arguments were committed (`running`) or the argument
 	/// stream never closed (`arguments`).
 	pub committed: bool,
 	/// Canonical committed arguments, when `committed`.
-	pub args:    Option<Box<RawValue>>,
+	pub args:      Option<Box<RawValue>>,
 }
 
 impl Session {
@@ -363,8 +363,12 @@ impl Session {
 		let mut out = Vec::new();
 		for turn in dom.children(dom.body()) {
 			for child in dom.children(*turn) {
-				let Some(node) = dom.get(*child) else { continue };
-				let Tag::Custom(name) = &node.tag else { continue };
+				let Some(node) = dom.get(*child) else {
+					continue;
+				};
+				let Tag::Custom(name) = &node.tag else {
+					continue;
+				};
 				let status = node
 					.prop(&PropKey::from(omp_dom::PropId::Status))
 					.and_then(Value::as_str)
@@ -428,7 +432,11 @@ impl Session {
 	pub fn recover_unsettled_calls(&mut self) -> Result<usize, SessionError> {
 		let calls = self.unsettled_calls();
 		for call in &calls {
-			let abort = if call.committed { Abort::MissingOutcome } else { Abort::InputDropped };
+			let abort = if call.committed {
+				Abort::MissingOutcome
+			} else {
+				Abort::InputDropped
+			};
 			if !call.committed {
 				self.call_ready(call.entry, RawValue::from_string("{}".to_owned())?)?;
 			}
@@ -437,8 +445,7 @@ impl Session {
 				serde_json::Value,
 				serde_json::Value,
 			>::aborted(abort))?;
-			let prompt_parts =
-				serde_json::value::to_raw_value(&vec![ToolPart::Text { text }])?;
+			let prompt_parts = serde_json::value::to_raw_value(&vec![ToolPart::Text { text }])?;
 			self.fail_projected(call.entry, fault, prompt_parts)?;
 		}
 		Ok(calls.len())
@@ -908,20 +915,17 @@ impl Session {
 			.get(&call)
 			.copied()
 			.ok_or(SessionError::UnknownCall { id: call })?;
-		let complete = [
-			omp_dom::KnownTag::Input,
-			omp_dom::KnownTag::Result,
-			omp_dom::KnownTag::Usage,
-		]
-		.into_iter()
-		.all(|tag| {
-			self.dom.children(handle).iter().any(|child| {
-				self
-					.dom
-					.get(*child)
-					.is_some_and(|node| node.tag == omp_dom::Tag::Known(tag))
-			})
-		});
+		let complete =
+			[omp_dom::KnownTag::Input, omp_dom::KnownTag::Result, omp_dom::KnownTag::Usage]
+				.into_iter()
+				.all(|tag| {
+					self.dom.children(handle).iter().any(|child| {
+						self
+							.dom
+							.get(*child)
+							.is_some_and(|node| node.tag == omp_dom::Tag::Known(tag))
+					})
+				});
 		complete
 			.then_some(())
 			.ok_or(SessionError::UnknownCall { id: call })

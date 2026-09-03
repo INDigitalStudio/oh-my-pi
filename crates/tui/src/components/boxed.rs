@@ -78,16 +78,13 @@ impl Boxed {
 		let start = self.children.len();
 		children.extend_children(&mut self.children);
 		if !self.titled
-			&& let Some(index) = self.children[start..]
-				.iter()
-				.position(|child| {
-					child
-						.comp()
-						.props()
-						.str_of(Prop::Kind)
-						.is_some_and(|kind| kind == "title")
-				})
-		{
+			&& let Some(index) = self.children[start..].iter().position(|child| {
+				child
+					.comp()
+					.props()
+					.str_of(Prop::Kind)
+					.is_some_and(|kind| kind == "title")
+			}) {
 			let title = self.children.remove(start + index);
 			self.children.insert(0, title);
 			self.titled = true;
@@ -283,7 +280,10 @@ mod tests {
 
 	#[test]
 	fn kind_title_child_paints_on_the_top_border_and_animates() {
-		use crate::{components::{Row, Spinner}, ui::Ui};
+		use crate::{
+			components::{Row, Spinner},
+			ui::Ui,
+		};
 		let mut ui = Ui::from_root(
 			Boxed::new()
 				.with(Prop::Border, Border::Round)

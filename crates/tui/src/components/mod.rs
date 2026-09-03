@@ -168,13 +168,13 @@ pub use fact::Fact;
 pub use files::Files;
 pub use form::{Field, Form};
 pub use hr::{Hr, Spacer};
-pub use loader::Loader;
 pub use icon::Icon;
 pub use img::{Img, RowBound, draw_image_inline, image_cell_box};
 pub(crate) use img::{ImgState, decode_source};
 pub use input::Input;
 pub use json::JsonPreview;
 pub use latex::Latex;
+pub use loader::Loader;
 pub use logo::Logo;
 pub use markdown::Markdown;
 pub use number::{NumberLeaf, write_compact_count};
@@ -191,12 +191,12 @@ pub use select::{Select, SelectOption};
 pub use shader::Shader;
 pub use spinner::Spinner;
 pub use state::State;
-pub use strike::{STRIKE_HOLD_FRAMES, STRIKE_REVEAL_FRAMES, STRIKE_TOTAL_FRAMES, Strike};
 pub use status::{
 	BoundaryLayout, CompactionBoundaries, ContextGauge, ContextGaugeMode, GaugeCell, Segment,
 	Status, StatusPlacement, advisor_spend_label, boundary_layout, compaction_boundary_color,
 	compaction_threshold_color, spend_label,
 };
+pub use strike::{STRIKE_HOLD_FRAMES, STRIKE_REVEAL_FRAMES, STRIKE_TOTAL_FRAMES, Strike};
 pub use table::{Table, TableCell, TableRow};
 pub use tabs::Tabs;
 pub use text::{Pre, TextLeaf};

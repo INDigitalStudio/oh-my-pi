@@ -255,7 +255,9 @@ fn projection_through_keeps_only_entries_up_to_the_cut_and_no_summary() {
 		.compaction(omp_journal::data::Compaction::new(summary, boundary))
 		.expect("compaction appends");
 	session.begin_turn().expect("middle turn starts");
-	let cut = session.user("middle", Vec::new()).expect("middle user appends");
+	let cut = session
+		.user("middle", Vec::new())
+		.expect("middle user appends");
 	session.begin_turn().expect("new turn starts");
 	session.user("new", Vec::new()).expect("new user appends");
 
@@ -281,11 +283,12 @@ fn compaction_uses_the_composed_session_blob_store_across_reopen() {
 	std::fs::create_dir_all(&session_dir).expect("session directory");
 	let path = session_dir.join("compact.oms");
 	let blobs = BlobStore::open(&blob_dir).expect("blob store opens");
-	let mut session =
-		Session::create_with_blob_store(&path, ComponentRegistry::default(), blobs)
-			.expect("session creates");
+	let mut session = Session::create_with_blob_store(&path, ComponentRegistry::default(), blobs)
+		.expect("session creates");
 	session.begin_turn().expect("turn starts");
-	let boundary = session.user("old context", Vec::new()).expect("user appends");
+	let boundary = session
+		.user("old context", Vec::new())
+		.expect("user appends");
 	let summary = session
 		.blobs()
 		.put(b"summary from the composed store")
@@ -296,9 +299,8 @@ fn compaction_uses_the_composed_session_blob_store_across_reopen() {
 	drop(session);
 
 	let blobs = BlobStore::open(&blob_dir).expect("blob store reopens");
-	let restored =
-		Session::open_with_blob_store(&path, ComponentRegistry::default(), blobs)
-			.expect("session restores");
+	let restored = Session::open_with_blob_store(&path, ComponentRegistry::default(), blobs)
+		.expect("session restores");
 	let items = project_thread(restored.dom());
 	let text = items
 		.first()
@@ -377,19 +379,11 @@ fn reopen_journals_abort_results_for_ready_and_partial_calls() {
 	let results: Vec<_> = items
 		.iter()
 		.filter_map(|item| match &item.kind {
-			Some(item::Kind::ToolResult(result)) => {
-				Some((result.call_id.as_str(), result.is_error))
-			},
+			Some(item::Kind::ToolResult(result)) => Some((result.call_id.as_str(), result.is_error)),
 			_ => None,
 		})
 		.collect();
-	assert_eq!(
-		calls,
-		[
-			("ready-call", r#"{"path":"README.md"}"#),
-			("abandoned-call", "{}"),
-		]
-	);
+	assert_eq!(calls, [("ready-call", r#"{"path":"README.md"}"#), ("abandoned-call", "{}"),]);
 	assert_eq!(results, [("ready-call", true), ("abandoned-call", true)]);
 	drop(restored);
 	let recovered_journal = std::fs::read(&path).expect("recovered journal bytes");
@@ -527,16 +521,28 @@ fn settled_calls_carry_the_journaled_outcome_beside_the_prompt_parts() {
 	let ok = session
 		.call("bash", 1, "call-ok", None, Some(raw(serde_json::json!({"command":"true"}))), None)
 		.expect("call");
-	let outcome = serde_json::json!({"kind":"ok","value":{"transcript":[],"status":{"exit_code":0}}});
+	let outcome =
+		serde_json::json!({"kind":"ok","value":{"transcript":[],"status":{"exit_code":0}}});
 	session
 		.settle_projected(ok, raw(outcome.clone()), raw(serde_json::json!([])))
 		.expect("settles");
 	let failed = session
-		.call("bash", 1, "call-aborted", None, Some(raw(serde_json::json!({"command":"sleep 9"}))), None)
+		.call(
+			"bash",
+			1,
+			"call-aborted",
+			None,
+			Some(raw(serde_json::json!({"command":"sleep 9"}))),
+			None,
+		)
 		.expect("call");
 	let fault = serde_json::json!({"kind":"aborted","value":{"abort":{"kind":"interrupted","reason":"cancelled"},"kind":"cancelled"}});
 	session
-		.fail_projected(failed, raw(fault.clone()), raw(serde_json::json!([{"kind":"text","text":"interrupted: cancelled"}])))
+		.fail_projected(
+			failed,
+			raw(fault.clone()),
+			raw(serde_json::json!([{"kind":"text","text":"interrupted: cancelled"}])),
+		)
 		.expect("fails");
 
 	let check = |session: &Session| {
@@ -546,7 +552,10 @@ fn settled_calls_carry_the_journaled_outcome_beside_the_prompt_parts() {
 				.find(|handle| {
 					dom.get(*handle).is_some_and(|node| {
 						matches!(node.tag, Tag::Custom(_))
-							&& node.prop(&PropKey::from(PropId::Id)).and_then(Value::as_str) == Some(id)
+							&& node
+								.prop(&PropKey::from(PropId::Id))
+								.and_then(Value::as_str)
+								== Some(id)
 					})
 				})
 				.expect("tool element exists")
@@ -556,9 +565,15 @@ fn settled_calls_carry_the_journaled_outcome_beside_the_prompt_parts() {
 				.children(tool(id))
 				.iter()
 				.copied()
-				.find(|handle| dom.get(*handle).is_some_and(|node| node.tag == Tag::Known(tag)))
+				.find(|handle| {
+					dom.get(*handle)
+						.is_some_and(|node| node.tag == Tag::Known(tag))
+				})
 				.expect("child element");
-			match dom.get(child).and_then(|node| node.prop(&PropKey::from(prop)).cloned()) {
+			match dom
+				.get(child)
+				.and_then(|node| node.prop(&PropKey::from(prop)).cloned())
+			{
 				Some(Value::Json(json)) => serde_json::from_str(json.get()).expect("json prop"),
 				other => panic!("{prop:?} missing: {other:?}"),
 			}
@@ -570,10 +585,15 @@ fn settled_calls_carry_the_journaled_outcome_beside_the_prompt_parts() {
 			.children(tool("call-aborted"))
 			.iter()
 			.copied()
-			.find(|handle| dom.get(*handle).is_some_and(|node| node.tag == Tag::Known(KnownTag::Diag)))
+			.find(|handle| {
+				dom.get(*handle)
+					.is_some_and(|node| node.tag == Tag::Known(KnownTag::Diag))
+			})
 			.expect("diag element");
 		assert_eq!(
-			dom.get(diag).and_then(|node| node.prop(&PropKey::from(PropId::Text)).and_then(Value::as_str)),
+			dom.get(diag).and_then(|node| node
+				.prop(&PropKey::from(PropId::Text))
+				.and_then(Value::as_str)),
 			Some("interrupted: cancelled"),
 		);
 	};
@@ -596,7 +616,9 @@ fn assistant_receipts_pair_in_turn_order() {
 	session
 		.assistant_start("model", "provider", "route")
 		.expect("first assistant starts");
-	session.assistant_end("tool_use").expect("first assistant ends");
+	session
+		.assistant_end("tool_use")
+		.expect("first assistant ends");
 	session
 		.receipt(omp_journal::data::TurnReceipt::tokens(1, 2, 3))
 		.expect("first receipt");
@@ -614,13 +636,19 @@ fn assistant_receipts_pair_in_turn_order() {
 		.children(session.dom().body())
 		.last()
 		.expect("turn");
-	let second = *session.dom().children(turn).last().expect("second assistant");
+	let second = *session
+		.dom()
+		.children(turn)
+		.last()
+		.expect("second assistant");
 	let sid = session
 		.stream_open(second, omp_dom::PropId::Text.into())
 		.expect("stream opens");
 	session.stream_append(sid, "done").expect("stream appends");
 	session.stream_close(sid).expect("stream closes");
-	session.assistant_end("stop").expect("second assistant ends");
+	session
+		.assistant_end("stop")
+		.expect("second assistant ends");
 	session
 		.receipt(omp_journal::data::TurnReceipt::tokens(10, 20, 30))
 		.expect("second receipt");
@@ -631,7 +659,9 @@ fn assistant_receipts_pair_in_turn_order() {
 			Some(item::Kind::Message(message))
 				if message.role == omp_proto::thread::v1::Role::Assistant as i32 =>
 			{
-				message.usage.map(|usage| (usage.input_tokens, usage.output_tokens))
+				message
+					.usage
+					.map(|usage| (usage.input_tokens, usage.output_tokens))
 			},
 			_ => None,
 		})
@@ -651,16 +681,10 @@ fn diagnostics_are_separate_ordered_children_and_fault_is_last() {
 		.call("read", 1, "call-1", None, Some(raw(serde_json::json!({}))), None)
 		.expect("call");
 	session
-		.call_update(
-			call,
-			raw(serde_json::json!({"diag":{"severity":"warn","text":"first"}})),
-		)
+		.call_update(call, raw(serde_json::json!({"diag":{"severity":"warn","text":"first"}})))
 		.expect("first diagnostic");
 	session
-		.call_update(
-			call,
-			raw(serde_json::json!({"diag":{"severity":"info","text":"second"}})),
-		)
+		.call_update(call, raw(serde_json::json!({"diag":{"severity":"info","text":"second"}})))
 		.expect("second diagnostic");
 	session
 		.fail_projected(
@@ -677,7 +701,9 @@ fn diagnostics_are_separate_ordered_children_and_fault_is_last() {
 			.find(|handle| {
 				dom.get(*handle).is_some_and(|node| {
 					matches!(node.tag, Tag::Custom(_))
-						&& node.prop(&PropKey::from(PropId::Id)).and_then(Value::as_str)
+						&& node
+							.prop(&PropKey::from(PropId::Id))
+							.and_then(Value::as_str)
 							== Some("call-1")
 				})
 			})
@@ -688,7 +714,8 @@ fn diagnostics_are_separate_ordered_children_and_fault_is_last() {
 				let node = dom.get(*handle)?;
 				(node.tag == Tag::Known(KnownTag::Diag)).then(|| {
 					(
-						node.prop(&PropKey::from(PropId::Severity))
+						node
+							.prop(&PropKey::from(PropId::Severity))
 							.and_then(Value::as_str)
 							.unwrap_or_default()
 							.to_owned(),
@@ -698,26 +725,20 @@ fn diagnostics_are_separate_ordered_children_and_fault_is_last() {
 			})
 			.collect::<Vec<_>>()
 	};
-	assert_eq!(
-		inspect(&session),
-		[
-			("warn".to_owned(), false),
-			("info".to_owned(), false),
-			("error".to_owned(), true),
-		]
-	);
+	assert_eq!(inspect(&session), [
+		("warn".to_owned(), false),
+		("info".to_owned(), false),
+		("error".to_owned(), true),
+	]);
 	let live = session.dom().snapshot();
 	drop(session);
 	let reopened = Session::open(&path, ComponentRegistry::default()).expect("session reopens");
 	assert_eq!(reopened.dom().snapshot(), live);
-	assert_eq!(
-		inspect(&reopened),
-		[
-			("warn".to_owned(), false),
-			("info".to_owned(), false),
-			("error".to_owned(), true),
-		]
-	);
+	assert_eq!(inspect(&reopened), [
+		("warn".to_owned(), false),
+		("info".to_owned(), false),
+		("error".to_owned(), true),
+	]);
 }
 
 /// Even before the controller can journal crash recovery, projection remains
@@ -726,8 +747,7 @@ fn diagnostics_are_separate_ordered_children_and_fault_is_last() {
 fn live_projection_never_emits_an_unmatched_tool_call() {
 	let directory = tempfile::tempdir().expect("temporary session directory");
 	let path = directory.path().join("unfinished.oms");
-	let mut session =
-		Session::create(&path, ComponentRegistry::default()).expect("session creates");
+	let mut session = Session::create(&path, ComponentRegistry::default()).expect("session creates");
 	session.begin_turn().expect("turn starts");
 	session.user("question", Vec::new()).expect("user appends");
 	session
@@ -752,7 +772,9 @@ fn live_projection_never_emits_an_unmatched_tool_call() {
 	for item in &items {
 		match &item.kind {
 			Some(item::Kind::ToolCall(call)) => calls.push(call.id.clone()),
-			Some(item::Kind::ToolResult(result)) => results.push((result.call_id.clone(), result.is_error)),
+			Some(item::Kind::ToolResult(result)) => {
+				results.push((result.call_id.clone(), result.is_error))
+			},
 			_ => {},
 		}
 	}
@@ -766,10 +788,13 @@ fn message_texts(items: &[omp_proto::thread::v1::Item]) -> Vec<(i32, Option<Stri
 		.filter_map(|item| match item.kind.as_ref()? {
 			item::Kind::Message(message) => Some((
 				message.role,
-				message.parts.first().and_then(|part| match part.kind.as_ref()? {
-					part::Kind::Text(text) => Some(text.clone()),
-					_ => None,
-				}),
+				message
+					.parts
+					.first()
+					.and_then(|part| match part.kind.as_ref()? {
+						part::Kind::Text(text) => Some(text.clone()),
+						_ => None,
+					}),
 			)),
 			_ => None,
 		})
@@ -829,7 +854,9 @@ fn steering_user_message_projects_with_interjection_envelope() {
 		.filter_map(|handle| session.dom().get(*handle)?.content.clone())
 		.collect::<Vec<_>>();
 	assert!(
-		journaled.iter().all(|text| !text.contains("<system-notice>")),
+		journaled
+			.iter()
+			.all(|text| !text.contains("<system-notice>")),
 		"the envelope is a projection, never journaled"
 	);
 }
@@ -852,7 +879,9 @@ fn empty_assistant_messages_are_omitted_from_projection() {
 	session
 		.assistant_start("model", "provider", "route")
 		.expect("tool-only assistant starts");
-	session.assistant_end("tool_use").expect("tool-only assistant ends");
+	session
+		.assistant_end("tool_use")
+		.expect("tool-only assistant ends");
 	session
 		.receipt(omp_journal::data::TurnReceipt::tokens(5, 6, 0))
 		.expect("tool-only receipt");
@@ -874,7 +903,9 @@ fn empty_assistant_messages_are_omitted_from_projection() {
 	let sid = session
 		.stream_open(assistant, omp_dom::PropId::Text.into())
 		.expect("stream opens");
-	session.stream_append(sid, "answer").expect("stream appends");
+	session
+		.stream_append(sid, "answer")
+		.expect("stream appends");
 	session.stream_close(sid).expect("stream closes");
 	session.assistant_end("stop").expect("final assistant ends");
 	session
@@ -927,7 +958,14 @@ fn user_attachment_projects_a_media_part_with_its_mime() {
 		.store_attachment("image/png", png)
 		.expect("attachment stores");
 	assert_eq!(attachment.blob, BlobRef { hash: Hash32::sum(png), size: png.len() as u64 });
-	assert_eq!(session.blobs().get(&attachment.blob).expect("bytes stored").as_ref(), png);
+	assert_eq!(
+		session
+			.blobs()
+			.get(&attachment.blob)
+			.expect("bytes stored")
+			.as_ref(),
+		png
+	);
 	session.begin_turn().expect("turn starts");
 	session
 		.user("what is this? [Image #1, 4x3]", vec![attachment.clone()])
