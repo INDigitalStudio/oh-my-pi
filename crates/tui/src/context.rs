@@ -438,6 +438,10 @@ pub struct Theme {
 	/// Secondary accent (cost figures, alternate roles); distinct from
 	/// `accent` without carrying ok/warn/err semantics.
 	pub secondary:     Color,
+	/// Python language identity used by eval-cell chrome.
+	pub python:        Color,
+	/// Inactive rule color inside the compact status-line context gauge.
+	pub status_rule:   Color,
 	/// Text painted on top of accent/warn fills.
 	pub contrast:      Color,
 }
@@ -463,6 +467,8 @@ impl Default for Theme {
 			panel:         Color::Rgb(0x0f, 0x12, 0x16),
 			error_surface: Color::Rgb(0x1a, 0x0f, 0x10),
 			secondary:     Color::Rgb(0xab, 0x77, 0xe6),
+			python:        Color::Rgb(0x37, 0x76, 0xab),
+			status_rule:   Color::Rgb(0x2a, 0x30, 0x38),
 			contrast:      Color::Rgb(0x10, 0x12, 0x16),
 		}
 	}
@@ -503,6 +509,8 @@ impl Theme {
 			panel:         self.panel.quantized_256(),
 			error_surface: self.error_surface.quantized_256(),
 			secondary:     self.secondary.quantized_256(),
+			python:        self.python.quantized_256(),
+			status_rule:   self.status_rule.quantized_256(),
 			contrast:      self.contrast.quantized_256(),
 		}
 	}
@@ -529,6 +537,8 @@ impl Theme {
 				panel:         Color::Rgb(0x0f, 0x12, 0x16),
 				error_surface: Color::Rgb(0x1a, 0x0f, 0x10),
 				secondary:     Color::Rgb(0xab, 0x77, 0xe6),
+				python:        Color::Rgb(0x37, 0x76, 0xab),
+				status_rule:   Color::Rgb(0x2a, 0x30, 0x38),
 				contrast:      Color::Rgb(0x10, 0x12, 0x16),
 			},
 			Appearance::Light => Self {
@@ -550,6 +560,8 @@ impl Theme {
 				panel:         Color::Rgb(0xee, 0xf0, 0xf3),
 				error_surface: Color::Rgb(0xff, 0xed, 0xee),
 				secondary:     Color::Rgb(0x6f, 0x42, 0xc1),
+				python:        Color::Rgb(0x37, 0x76, 0xab),
+				status_rule:   Color::Rgb(0xc8, 0xd0, 0xd8),
 				contrast:      Color::Rgb(0xff, 0xff, 0xff),
 			},
 		}
@@ -562,10 +574,13 @@ impl Theme {
 	/// `err`, and `ok`; producers routinely emit the long spellings.
 	pub(crate) fn token(&self, name: &str) -> Option<Color> {
 		Some(match name {
+			"default" => Color::Default,
 			"fg" => self.fg,
 			"accent" => self.accent,
 			"info" => self.info,
 			"secondary" => self.secondary,
+			"python" => self.python,
+			"status_rule" => self.status_rule,
 			"ok" | "success" => self.ok,
 			"warn" | "warning" => self.warn,
 			"err" | "error" => self.err,
@@ -589,7 +604,8 @@ impl Theme {
 	pub(crate) fn is_token(name: &str) -> bool {
 		matches!(
 			name,
-			"fg"
+			"default"
+				| "fg"
 				| "accent"
 				| "info" | "ok"
 				| "warn" | "err"
@@ -602,6 +618,8 @@ impl Theme {
 				| "error_surface"
 				| "panel"
 				| "secondary"
+				| "python"
+				| "status_rule"
 				| "border"
 				| "code_border"
 				| "surface"

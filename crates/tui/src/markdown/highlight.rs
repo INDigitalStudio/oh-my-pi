@@ -98,17 +98,17 @@ impl HighlightStyles {
 	/// Derives syntax categories from the shared semantic palette.
 	pub(crate) const fn from_theme(theme: &Theme) -> Self {
 		Self {
-			base:        Style::new().fg(theme.fg),
-			comment:     Style::new().fg(theme.muted).italic(),
-			keyword:     Style::new().fg(theme.accent).bold(),
-			function:    Style::new().fg(theme.info),
+			base:        Style::new(),
+			comment:     Style::new().fg(theme.muted),
+			keyword:     Style::new().fg(theme.accent),
+			function:    Style::new().fg(theme.ok),
 			variable:    Style::new().fg(theme.fg),
-			string:      Style::new().fg(theme.ok),
+			string:      Style::new().fg(theme.code_border),
 			number:      Style::new().fg(theme.warn),
 			type_name:   Style::new().fg(theme.warn),
 			operator:    Style::new().fg(theme.accent),
-			punctuation: Style::new().fg(theme.muted),
-			inserted:    Style::new().fg(theme.ok),
+			punctuation: Style::new().fg(theme.output),
+			inserted:    Style::new().fg(theme.info),
 			deleted:     Style::new().fg(theme.err),
 		}
 	}

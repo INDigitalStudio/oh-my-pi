@@ -10,6 +10,7 @@ use crate::{
 	anim::{self},
 	component::{Component, MemoKey, PaintCtx, Slot, next_slot},
 	frame::{Decor, DecorKind, Rect, Style},
+	markdown::highlight::{self, HighlightStyles},
 	markup::{Align, TextWrap, Truncate},
 	props::{Prop, PropValue, Props},
 	rich::{Pipeline, RichSink, RichText, cell_width},
@@ -440,22 +441,26 @@ fn line_number_prefix<'a>(
 
 /// Preformatted text backing the `<pre>` markup tag.
 pub struct Pre {
-	props:      Props,
-	slot:       Slot,
-	text:       Str,
-	line_count: u16,
-	max_width:  u16,
+	props:           Props,
+	slot:            Slot,
+	text:            Str,
+	line_count:      u16,
+	max_width:       u16,
+	highlighted:     RichText,
+	highlighted_for: Option<(crate::Theme, Str)>,
 }
 
 impl Pre {
 	/// Creates an empty preformatted block.
 	pub fn new() -> Self {
 		Self {
-			props:      Props::new(),
-			slot:       next_slot(),
-			text:       Str::default(),
-			line_count: 0,
-			max_width:  0,
+			props:           Props::new(),
+			slot:            next_slot(),
+			text:            Str::default(),
+			line_count:      0,
+			max_width:       0,
+			highlighted:     RichText::default(),
+			highlighted_for: None,
 		}
 	}
 
@@ -491,6 +496,43 @@ impl Pre {
 		}
 		self.line_count = line_count;
 		self.max_width = max_width;
+		self.highlighted_for = None;
+	}
+
+	fn syntax_token(&self) -> Option<&str> {
+		let path = self.props.str_of(Prop::Path)?.as_str();
+		let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+		let token = name
+			.rsplit_once('.')
+			.map_or(name, |(_, extension)| extension)
+			.split(':')
+			.next()
+			.unwrap_or_default();
+		highlight::supports_language(token).then_some(token)
+	}
+
+	fn refresh_highlight(&mut self, ctx: &UiContext) {
+		let Some(token) = self.syntax_token().map(str::to_owned) else {
+			self.highlighted_for = None;
+			self.highlighted.clear();
+			return;
+		};
+		if self
+			.highlighted_for
+			.as_ref()
+			.is_some_and(|(theme, cached)| *theme == ctx.theme && cached.as_str() == token)
+		{
+			return;
+		}
+		self.highlighted.clear();
+		highlight::render(
+			&self.text,
+			&token,
+			usize::from(self.line_count),
+			&HighlightStyles::from_theme(&ctx.theme),
+			&mut self.highlighted,
+		);
+		self.highlighted_for = Some((ctx.theme, Str::new(token)));
 	}
 }
 
@@ -561,6 +603,7 @@ impl Component for Pre {
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
+		self.refresh_highlight(pc.ctx);
 		let plan = overflow_plan(&self.props, self.line_count(), rect.height);
 		let content_rows = plan.map_or(rect.height, |plan| plan.content_rows);
 		let clip = pc.clip.min(rect.y.saturating_add(content_rows));
@@ -593,7 +636,14 @@ impl Component for Pre {
 					line_number_prefix(number, digits, pc.ctx.charset.quote_rail(), &mut prefix_buffer);
 				put_clipped(pc.frame, x, y, content_x, &prefix, gutter_style);
 			}
-			put_clipped(pc.frame, content_x, y, right, line, style);
+			if self.highlighted_for.is_some() {
+				let mut run_x = content_x;
+				for (run_style, text) in self.highlighted.row_runs(row as u16) {
+					run_x = put_clipped(pc.frame, run_x, y, right, text, style.inherit(run_style));
+				}
+			} else {
+				put_clipped(pc.frame, content_x, y, right, line, style);
+			}
 		}
 		if let Some(plan) = plan {
 			paint_overflow_footer(pc, rect, plan);

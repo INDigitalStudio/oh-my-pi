@@ -592,6 +592,7 @@ impl Props {
 			},
 			Prop::Match => self.match_pattern.as_ref(),
 			Prop::Src => self.src.as_ref(),
+			Prop::Href => self.href.as_ref(),
 			Prop::Path => self.path.as_ref(),
 			Prop::Icon => self.icon.as_ref(),
 			Prop::Badge => self.badge.as_ref(),
@@ -642,6 +643,9 @@ impl Props {
 		}
 		if self.strike == Some(true) {
 			style = style.strikethrough();
+		}
+		if let Some(href) = self.href.as_deref() {
+			style = style.link(href);
 		}
 		style
 	}

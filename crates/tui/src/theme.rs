@@ -316,6 +316,8 @@ struct ThemePatch {
 	panel:         Option<String>,
 	error_surface: Option<String>,
 	secondary:     Option<String>,
+	python:        Option<String>,
+	status_rule:   Option<String>,
 	contrast:      Option<String>,
 }
 
@@ -349,6 +351,8 @@ impl ThemePatch {
 		apply!(panel);
 		apply!(error_surface);
 		apply!(secondary);
+		apply!(python);
+		apply!(status_rule);
 		apply!(contrast);
 		Ok(theme)
 	}
@@ -372,7 +376,8 @@ fn apply_rich(
 			"warning" | "statusLineGitDirty" | "statusLineDirty" => theme.warn = color,
 			"error" | "toolDiffRemoved" => theme.err = color,
 			"toolErrorBg" => theme.error_surface = color,
-			"muted" | "statusLineSep" => theme.muted = color,
+			"statusLineSep" => theme.status_rule = color,
+			"muted" => theme.muted = color,
 			"dim" => theme.dim = color,
 			"thinkingText" | "toolOutput" | "toolDiffContext" => theme.output = color,
 			"mdCodeBlockBorder" => theme.code_border = color,
@@ -382,7 +387,8 @@ fn apply_rich(
 			"userMessageBg" | "customMessageBg" | "toolSuccessBg" | "statusLineBg" => {
 				theme.panel = color;
 			},
-			"customMessageLabel" | "pythonMode" | "statusLineSpend" | "statusLineCost" => {
+			"pythonMode" => theme.python = color,
+			"customMessageLabel" | "statusLineSpend" | "statusLineCost" => {
 				theme.secondary = color;
 			},
 			"userMessageText" | "customMessageText" => theme.contrast = color,

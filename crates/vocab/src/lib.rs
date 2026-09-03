@@ -173,6 +173,8 @@ macro_rules! for_each_prop {
 			Match("match") => match_pattern: Str;
 			/// Image or external content source.
 			Src("src") => src: Str;
+			/// OSC 8 hyperlink target applied to text descendants.
+			Href("href") => href: Str [ref Str; "Returns the hyperlink target attached to text."];
 			/// Source file path whose extension selects diff syntax highlighting.
 			Path("path") => path: Str [ref Str; "Returns the source file path used to infer a language."];
 			/// Leading icon name.

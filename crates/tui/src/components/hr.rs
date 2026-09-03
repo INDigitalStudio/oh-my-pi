@@ -7,7 +7,7 @@ use xutf::Text as _;
 use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},
 	context::UiContext,
-	frame::{CellContent, Rect},
+	frame::{CellContent, Rect, Style},
 	markup::{Align, Border},
 	props::{Prop, PropValue, Props},
 };
@@ -231,11 +231,8 @@ impl Component for Hr {
 					.x
 					.saturating_add(rect.width.saturating_sub(1).saturating_sub(total)),
 			);
-			let label_style = if self.props.has_foreground() {
-				style.bold()
-			} else {
-				style.fg(pc.ctx.theme.fg).bold()
-			};
+			let label_style =
+				if self.props.has_foreground() { style } else { Style::new().bg(style.background_color()) };
 			let mut end = x;
 			if left_pad {
 				end = pc.frame.put(end, rect.y, " ", style);

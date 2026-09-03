@@ -318,9 +318,9 @@ impl Painter {
 			(theme.ok, theme.err)
 		};
 		let palette = Palette {
-			header:     Style::new().fg(theme.muted),
-			context:    Style::new().fg(theme.fg),
-			add:        Style::new().fg(ok),
+			header:     Style::new().fg(theme.output),
+			context:    Style::new().fg(theme.output),
+			add:        Style::new().fg(if colorblind { ok } else { theme.info }),
 			remove:     Style::new().fg(err),
 			diagnostic: Style::new().fg(theme.warn),
 			summary:    Style::new().fg(theme.muted).italic(),
@@ -631,30 +631,18 @@ fn paint_plain(sink: &mut dyn RichSink, style: Style, text: &str) {
 	}
 }
 
-/// Emits `text[start..]`, painting the byte ranges in `marks` in reverse
-/// video on top of `style`.
+/// Emits `text[start..]` in the semantic line style.
+///
+/// Pi computes word marks for change accounting but its terminal renderer does
+/// not invert changed words; the whole removed/added row carries one role.
 fn paint_marked(
 	sink: &mut dyn RichSink,
 	style: Style,
 	text: &str,
 	start: usize,
-	marks: &[Range<usize>],
+	_marks: &[Range<usize>],
 ) {
-	let inverse = style.reverse();
-	let mut marks = marks.iter().skip_while(|mark| mark.end <= start).peekable();
-	let mut pos = start;
-	while pos < text.len() {
-		let (run_style, end, marked) = match marks.peek() {
-			Some(mark) if pos >= mark.start => (inverse, mark.end.min(text.len()), true),
-			Some(mark) => (style, mark.start, false),
-			None => (style, text.len(), false),
-		};
-		paint_plain(sink, run_style, &text[pos..end]);
-		if marked {
-			marks.next();
-		}
-		pos = end;
-	}
+	paint_plain(sink, style, &text[start..]);
 }
 
 type Marks = SmallVec<Range<usize>, 4>;
