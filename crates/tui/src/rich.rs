@@ -957,6 +957,12 @@ impl<'p, S: RichSink> Wrap<'p, S> {
 		let runs = mem::take(&mut self.word_runs);
 		let word_width = mem::take(&mut self.word_width);
 		self.start_row();
+		let leading_gap = !self.content && !self.gap_text.is_empty();
+		if leading_gap {
+			self.emit_gap();
+			self.line_width = self.line_width.saturating_add(self.gap_width);
+			self.content = true;
+		}
 		let join_gap = self.gap_width.max(1);
 		if self.content
 			&& self
@@ -967,7 +973,7 @@ impl<'p, S: RichSink> Wrap<'p, S> {
 		{
 			self.break_row(false);
 			self.start_row();
-		} else if self.content {
+		} else if self.content && !leading_gap {
 			self.emit_gap();
 			self.line_width = self.line_width.saturating_add(join_gap);
 		}
