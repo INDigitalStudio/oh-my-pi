@@ -21,6 +21,7 @@ use strum::IntoStaticStr;
 
 use crate::{
 	answer::{AnswerBody, Embedding, EmbeddingBatch, TokenCount, TokenizerProvenance},
+	auth::AuthScheme,
 	body::BodySource,
 	call::{
 		ChatRequest, ContentPart, CountTokensRequest, EmbedRequest, EmbeddingInput, HostedTool,
@@ -36,7 +37,7 @@ use crate::{
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{BlockKind, ChatEvent, FinishReason, UsageUpdate},
 	id::ToolCallId,
-	receipt::{ExecutionReceipt, ReasonId, Usage, UsageSource},
+	receipt::{Adjustment, ExecutionReceipt, FeatureId, ReasonId, Usage, UsageSource},
 	recovery::thinking::ThinkingFenceStripper,
 	transport::{Frame, FramingProtocol},
 };
@@ -47,6 +48,11 @@ pub const GENERATIVE_LANGUAGE_BASE: &str = "https://generativelanguage.googleapi
 /// Public Generative Language streaming path suffix.
 pub const GENERATIVE_LANGUAGE_STREAM_PATH: &str = ":streamGenerateContent?alt=sse";
 const SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+/// Adjustment feature recorded when a resumed conversation carries a
+/// continuation proof issued by a different provider or codec.
+const FOREIGN_SIGNATURE_FEATURE: &str = "reasoning.signature";
+/// Stable reason attached to [`FOREIGN_SIGNATURE_FEATURE`].
+const FOREIGN_SIGNATURE_REASON: &str = "signature.foreign-scope";
 const NON_VISION_IMAGE_PLACEHOLDER: &str = "[image omitted: model does not support vision]";
 const TOOL_RESULT_IMAGE_LABEL: &str = "Tool result image:";
 const TOOL_RESULT_IMAGE_REFERENCE: &str = "(see attached image)";
@@ -124,9 +130,12 @@ pub struct GoogleRequestOptions {
 	pub drop_unsigned_reasoning:         bool,
 	/// Whether function calls and results carry their canonical call ID.
 	pub supports_function_part_id:       Option<bool>,
-	/// Whether unsigned historical function calls carry Google's validation
-	/// bypass sentinel.
+	/// Whether every unsigned historical function call carries Google's
+	/// validation bypass sentinel.
 	pub requires_skip_thought_signature: bool,
+	/// Whether only the first function call of an assistant message carries the
+	/// bypass sentinel when it is unsigned; later unsigned calls stay bare.
+	pub requires_skip_thought_signature_on_first_function_call: bool,
 	/// Whether tool-result media is nested in `functionResponse.parts`.
 	pub multimodal_function_response:    Option<bool>,
 	/// Whether image inputs are replaced by the non-vision placeholder.
@@ -688,6 +697,31 @@ pub struct GoogleProjection {
 	pub adjustments: Vec<GoogleAdjustment>,
 }
 
+impl GoogleProjection {
+	/// Returns the first adjustment that planning should have prevented.
+	///
+	/// A foreign continuation proof is a request-shape fact the codec resolves
+	/// by omission, exactly as pi does, so it never signals a planning gap. A
+	/// merely preferred grammar is exempt when `allow_preferred_grammar` is set.
+	pub fn unplanned_adjustment(&self, allow_preferred_grammar: bool) -> Option<&GoogleAdjustment> {
+		self.adjustments.iter().find(|adjustment| {
+			adjustment.what != FOREIGN_SIGNATURE_FEATURE
+				&& (adjustment.what != "response_format.grammar" || !allow_preferred_grammar)
+		})
+	}
+}
+
+fn canonical_google_adjustments(adjustments: &[GoogleAdjustment]) -> Vec<Adjustment> {
+	adjustments
+		.iter()
+		.filter(|adjustment| adjustment.what == FOREIGN_SIGNATURE_FEATURE)
+		.map(|_| Adjustment::Dropped {
+			feature: FeatureId::new_static(FOREIGN_SIGNATURE_FEATURE),
+			reason:  ReasonId::new_static(FOREIGN_SIGNATURE_REASON),
+		})
+		.collect()
+}
+
 /// Pure `GenerateContent` request projector.
 #[derive(Clone, Copy, Debug)]
 pub struct GeminiCodec {
@@ -901,6 +935,7 @@ impl GeminiCodec {
 		}
 		let is_system = matches!(message.role, Role::System | Role::Developer);
 		let mut parts = Vec::new();
+		let mut first_tool_call = true;
 		for (part_index, part) in message.content.iter().enumerate() {
 			if is_system {
 				match part {
@@ -958,7 +993,14 @@ impl GeminiCodec {
 				));
 				continue;
 			}
-			parts.push(self.project_part(part, message_index, part_index, options)?);
+			parts.push(self.project_part(
+				part,
+				message_index,
+				part_index,
+				options,
+				&mut first_tool_call,
+				adjustments,
+			)?);
 		}
 		if parts.is_empty() {
 			return Ok(());
@@ -994,38 +1036,34 @@ impl GeminiCodec {
 		message_index: usize,
 		part_index: usize,
 		options: &GoogleRequestOptions,
+		first_tool_call: &mut bool,
+		adjustments: &mut Vec<GoogleAdjustment>,
 	) -> Result<GooglePart, GoogleCodecError> {
 		match part {
 			ContentPart::Text { text, proof } => Ok(GooglePart {
 				text: Some(text.clone()),
-				thought_signature: proof
-					.as_ref()
-					.map(|proof| proof_string(proof, options))
-					.transpose()?,
+				thought_signature: proof_string(proof.as_ref(), options, adjustments)?,
 				..GooglePart::default()
 			}),
 			ContentPart::Reasoning { text, proof } => Ok(GooglePart {
 				text: Some(text.clone()),
 				thought: Some(true),
-				thought_signature: proof
-					.as_ref()
-					.map(|proof| proof_string(proof, options))
-					.transpose()?,
+				thought_signature: proof_string(proof.as_ref(), options, adjustments)?,
 				..GooglePart::default()
 			}),
 			ContentPart::Image(media) | ContentPart::Audio(media) | ContentPart::Document(media) => {
 				project_media(media, options.remote_files.get(&(message_index, part_index)))
 			},
 			ContentPart::ToolCall { call, name, arguments, proof } => {
-				let thought_signature = proof
-					.as_ref()
-					.map(|proof| proof_string(proof, options))
-					.transpose()?
-					.or_else(|| {
-						options
-							.requires_skip_thought_signature
-							.then(|| sf!(SKIP_THOUGHT_SIGNATURE))
-					});
+				// pi google-shared: the public API needs the bypass sentinel on
+				// every unsigned call; Cloud Code Assist needs it only when the
+				// first call of the message is itself unsigned.
+				let requires_fallback = options.requires_skip_thought_signature
+					|| (*first_tool_call
+						&& options.requires_skip_thought_signature_on_first_function_call);
+				*first_tool_call = false;
+				let thought_signature = proof_string(proof.as_ref(), options, adjustments)?
+					.or_else(|| requires_fallback.then(|| sf!(SKIP_THOUGHT_SIGNATURE)));
 				Ok(GooglePart {
 					function_call: Some(GoogleFunctionCall {
 						id:   (options.supports_function_part_id == Some(true))
@@ -1428,10 +1466,19 @@ fn opaque_raw(value: &OpaqueJson, label: &str) -> Result<Box<RawValue>, GoogleCo
 		.map_err(|error| GoogleCodecError::encoding(format!("invalid {label}: {error}")))
 }
 
+/// Resolves a historical continuation proof to its wire `thoughtSignature`.
+///
+/// A proof issued by a different provider or codec (a resumed conversation
+/// after a model switch) is omitted rather than fatal, mirroring pi's
+/// `resolveThoughtSignature`; the omission is recorded once per request.
 fn proof_string(
-	proof: &ProviderProof,
+	proof: Option<&ProviderProof>,
 	options: &GoogleRequestOptions,
-) -> Result<Str, GoogleCodecError> {
+	adjustments: &mut Vec<GoogleAdjustment>,
+) -> Result<Option<Str>, GoogleCodecError> {
+	let Some(proof) = proof else {
+		return Ok(None);
+	};
 	let scope = options.proof_scope.as_ref().ok_or_else(|| {
 		GoogleCodecError::encoding(
 			"Google continuation proof cannot be returned without selected provider and codec \
@@ -1439,13 +1486,22 @@ fn proof_string(
 		)
 	})?;
 	if proof.provider != scope.provider || proof.codec != scope.codec {
-		return Err(GoogleCodecError::encoding(
-			"Google continuation proof belongs to a different provider or codec",
-		));
+		if !adjustments
+			.iter()
+			.any(|adjustment| adjustment.what == FOREIGN_SIGNATURE_FEATURE)
+		{
+			adjustments.push(GoogleAdjustment::new_static(
+				FOREIGN_SIGNATURE_FEATURE,
+				FOREIGN_SIGNATURE_REASON,
+			));
+		}
+		return Ok(None);
 	}
-	str::from_utf8(&proof.value).map(Str::new).map_err(|error| {
-		GoogleCodecError::encoding(format!("Google thought signature is not UTF-8: {error}"))
-	})
+	str::from_utf8(&proof.value)
+		.map(|signature| Some(Str::new(signature)))
+		.map_err(|error| {
+			GoogleCodecError::encoding(format!("Google thought signature is not UTF-8: {error}"))
+		})
 }
 
 fn wire_function_arguments(args: &RawValue) -> Result<(Bytes, bool), GoogleCodecError> {
@@ -1874,6 +1930,14 @@ pub enum GoogleDecodedEvent {
 		/// Optional provider continuation proof.
 		signature: Option<Str>,
 	},
+	/// Continuation proof delivered on an empty-text part for the block that is
+	/// currently open; it carries no visible delta.
+	Signature {
+		/// Canonical block index of the open text or thinking block.
+		index:     u32,
+		/// Provider continuation proof.
+		signature: Str,
+	},
 	/// Complete provider function call.
 	FunctionCall {
 		/// Canonical block index.
@@ -2062,7 +2126,7 @@ impl GeminiDecoder {
 
 	fn decode_part(
 		&mut self,
-		part: GooglePart,
+		mut part: GooglePart,
 		events: &mut Vec<GoogleDecodedEvent>,
 	) -> Result<(), GoogleCodecError> {
 		if let Some(call) = part.function_call {
@@ -2092,7 +2156,23 @@ impl GeminiDecoder {
 			});
 			return Ok(());
 		}
-		if let Some(text) = part.text
+		if let Some(active) = self.active_part
+			&& part.text.as_deref() == Some("")
+			&& let Some(signature) = part
+				.thought_signature
+				.take()
+				.filter(|signature| !signature.is_empty())
+		{
+			// Google can deliver the proof on a trailing empty-text part; it
+			// belongs to the block that is still open, exactly like pi's
+			// `part.text === ""` branch.
+			let slot = match active {
+				ContiguousPartKind::Text => &mut self.text_index,
+				ContiguousPartKind::Thinking => &mut self.thinking_index,
+			};
+			let index = *slot.get_or_insert_with(|| take_index(&mut self.next_index));
+			events.push(GoogleDecodedEvent::Signature { index, signature });
+		} else if let Some(text) = part.text
 			&& !text.is_empty()
 		{
 			if part.thought.unwrap_or(false) {
@@ -2239,6 +2319,11 @@ impl Codec for GeminiCodec {
 			supports_function_part_id: context.policy.tool.supports_function_part_id,
 			requires_skip_thought_signature: context.policy.tool.requires_skip_thought_signature
 				== Some(true),
+			requires_skip_thought_signature_on_first_function_call: context
+				.policy
+				.tool
+				.requires_skip_thought_signature_on_first_function_call
+				== Some(true),
 			multimodal_function_response: context.policy.image.multimodal_function_response,
 			strip_image_input: context.policy.image.strip_input == Some(true),
 			cca_legacy_parameters_schema: context.policy.tool.cca_legacy_parameters_schema,
@@ -2253,10 +2338,9 @@ impl Codec for GeminiCodec {
 		let projection = self
 			.project_for_encode(request, &options, context.thinking_policy, context.thinking_selection)
 			.map_err(|error| error.into_inference(false))?;
-		if let Some(adjustment) = projection.adjustments.iter().find(|adjustment| {
-			adjustment.what != "response_format.grammar"
-				|| !matches!(&request.output, Setting::Prefer(_))
-		}) {
+		if let Some(adjustment) =
+			projection.unplanned_adjustment(matches!(&request.output, Setting::Prefer(_)))
+		{
 			return Err(
 				GoogleCodecError::capability(format!(
 					"planning did not account for unsupported Google feature `{}`: {}",
@@ -2265,6 +2349,7 @@ impl Codec for GeminiCodec {
 				.into_inference(false),
 			);
 		}
+		let adjustments = canonical_google_adjustments(&projection.adjustments);
 		let body =
 			Self::encode_json(&projection.request).map_err(|error| error.into_inference(false))?;
 		let project = context
@@ -2283,6 +2368,7 @@ impl Codec for GeminiCodec {
 			target.wire_model.as_str(),
 			project,
 			location,
+			context.auth_scheme == Some(AuthScheme::ApiKey),
 		)
 		.map_err(|error| error.into_inference(false))?;
 		Ok(EncodedRequest {
@@ -2302,6 +2388,7 @@ impl Codec for GeminiCodec {
 				response:     512 * 1024 * 1024,
 			},
 			sealed_body: None,
+			adjustments,
 		})
 	}
 
@@ -2387,7 +2474,8 @@ fn encode_google_count_tokens(
 		top_logprobs:      None,
 		safety:            Arc::from([]),
 		negotiation:       Default::default(),
-	};
+	forced_call: None,
+};
 	let projection = codec
 		.project(&chat, &GoogleRequestOptions {
 			proof_scope: Some(GoogleProofScope {
@@ -2397,6 +2485,11 @@ fn encode_google_count_tokens(
 			drop_unsigned_reasoning: context.policy.reasoning.drop_unsigned == Some(true),
 			supports_function_part_id: context.policy.tool.supports_function_part_id,
 			requires_skip_thought_signature: context.policy.tool.requires_skip_thought_signature
+				== Some(true),
+			requires_skip_thought_signature_on_first_function_call: context
+				.policy
+				.tool
+				.requires_skip_thought_signature_on_first_function_call
 				== Some(true),
 			multimodal_function_response: context.policy.image.multimodal_function_response,
 			strip_image_input: context.policy.image.strip_input == Some(true),
@@ -2410,7 +2503,7 @@ fn encode_google_count_tokens(
 			..GoogleRequestOptions::default()
 		})
 		.map_err(|error| error.into_inference(false))?;
-	if let Some(adjustment) = projection.adjustments.first() {
+	if let Some(adjustment) = projection.unplanned_adjustment(false) {
 		return Err(
 			GoogleCodecError::capability(format!(
 				"planning did not account for unsupported Google CountTokens feature `{}`: {}",
@@ -2419,6 +2512,7 @@ fn encode_google_count_tokens(
 			.into_inference(false),
 		);
 	}
+	let adjustments = canonical_google_adjustments(&projection.adjustments);
 	let full_request = projection.request.system_instruction.is_some()
 		|| !projection.request.tools.is_empty()
 		|| projection.request.tool_config.is_some();
@@ -2433,7 +2527,7 @@ fn encode_google_count_tokens(
 			generate_content_request: None,
 		}
 	};
-	encode_google_unary(
+	let mut encoded = encode_google_unary(
 		codec.endpoint,
 		context,
 		OperationKind::CountTokens,
@@ -2442,7 +2536,9 @@ fn encode_google_count_tokens(
 			GoogleCodecError::encoding(format!("invalid Google CountTokens request: {error}"))
 				.into_inference(false)
 		})?,
-	)
+	)?;
+	encoded.adjustments = adjustments;
+	Ok(encoded)
 }
 
 fn encode_google_embeddings(
@@ -2541,6 +2637,7 @@ fn encode_google_unary(
 		project,
 		location,
 		action,
+		context.auth_scheme == Some(AuthScheme::ApiKey),
 	)
 	.map_err(|error| error.into_inference(false))?;
 	Ok(EncodedRequest {
@@ -2560,6 +2657,7 @@ fn encode_google_unary(
 			response:     64 * 1024 * 1024,
 		},
 		sealed_body: None,
+		adjustments: Vec::new(),
 	})
 }
 
@@ -2570,12 +2668,17 @@ fn google_unary_uri(
 	project: Option<&str>,
 	location: Option<&str>,
 	action: &str,
+	api_key: bool,
 ) -> Result<Str, GoogleCodecError> {
 	validate_path("model", model, false)?;
 	let base = base.trim_end_matches('/');
 	match endpoint {
 		GoogleEndpointKind::GenerativeLanguage => {
 			Ok(format!("{base}/models/{model}:{action}").into())
+		},
+		GoogleEndpointKind::Vertex if api_key => {
+			let version = vertex_version_prefix(base);
+			Ok(format!("{base}{version}/publishers/google/models/{model}:{action}").into())
 		},
 		GoogleEndpointKind::Vertex => {
 			let project = project.ok_or_else(|| {
@@ -2737,18 +2840,28 @@ impl Decoder for GoogleUnaryDecoder {
 	}
 }
 
+/// Builds the streaming `GenerateContent` URI.
+///
+/// Vertex API keys authenticate against the Express publisher path, which
+/// carries neither project nor location (pi `google-vertex.ts`); bearer
+/// credentials keep the project-scoped path and therefore still require both.
 fn google_stream_uri(
 	endpoint: GoogleEndpointKind,
 	base: &str,
 	model: &str,
 	project: Option<&str>,
 	location: Option<&str>,
+	api_key: bool,
 ) -> Result<Str, GoogleCodecError> {
 	validate_path("model", model, false)?;
 	let base = base.trim_end_matches('/');
 	let uri = match endpoint {
 		GoogleEndpointKind::GenerativeLanguage => {
 			format!("{base}/models/{model}{GENERATIVE_LANGUAGE_STREAM_PATH}")
+		},
+		GoogleEndpointKind::Vertex if api_key => {
+			let version = vertex_version_prefix(base);
+			format!("{base}{version}/publishers/google/models/{model}{GENERATIVE_LANGUAGE_STREAM_PATH}")
 		},
 		GoogleEndpointKind::Vertex => {
 			let project = project.ok_or_else(|| {
@@ -2833,6 +2946,12 @@ impl CanonicalGeminiDecoder {
 							signature: Bytes::copy_from_slice(signature.as_bytes()),
 						}));
 					}
+				},
+				GoogleDecodedEvent::Signature { index, signature } => {
+					emit(RawEvent::ProviderState(ProviderStateEvent::ReasoningSignature {
+						index,
+						signature: Bytes::copy_from_slice(signature.as_bytes()),
+					}));
 				},
 				GoogleDecodedEvent::FunctionCall { index, id, name, args, thought_signature } => {
 					self.tool_calls = true;
@@ -3193,8 +3312,8 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		call::{Sampling as CallSampling, ToolInputConstraint},
-		id::RequestId,
+		call::{AccountRoutingContext, Sampling as CallSampling, ToolInputConstraint},
+		id::{ProjectId, RegionId, RequestId},
 	};
 
 	fn opaque(source: &str) -> OpaqueJson {
@@ -3249,7 +3368,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       Default::default(),
-		}
+	forced_call: None,
+}
 	}
 
 	fn tool_call_message() -> Message {
@@ -3323,6 +3443,138 @@ mod tests {
 				.thought_signature
 				.as_deref(),
 			Some(SKIP_THOUGHT_SIGNATURE),
+		);
+	}
+
+	#[test]
+	fn first_function_call_sentinel_applies_only_to_first_unsigned_call() {
+		let mut request = empty_chat_request();
+		request.messages = vec![Message {
+			role:    Role::Assistant,
+			content: vec![
+				ContentPart::ToolCall {
+					call:      ToolCallId::new("call-1"),
+					name:      sf!("read"),
+					arguments: opaque(r#"{"path":"a.txt"}"#),
+					proof:     None,
+				},
+				ContentPart::ToolCall {
+					call:      ToolCallId::new("call-2"),
+					name:      sf!("read"),
+					arguments: opaque(r#"{"path":"b.txt"}"#),
+					proof:     None,
+				},
+			]
+			.into(),
+			name:    None,
+		}]
+		.into();
+		let signatures = |options: GoogleRequestOptions| {
+			GeminiCodec::cloud_code_assist(None)
+				.project(&request, &options)
+				.expect("unsigned parallel calls project")
+				.request
+				.contents[0]
+				.parts
+				.iter()
+				.map(|part| part.thought_signature.as_deref().map(str::to_owned))
+				.collect::<Vec<_>>()
+		};
+		assert_eq!(
+			signatures(GoogleRequestOptions {
+				requires_skip_thought_signature_on_first_function_call: true,
+				..Default::default()
+			}),
+			[Some(SKIP_THOUGHT_SIGNATURE.to_owned()), None],
+			"only the first unsigned call of the message carries the sentinel",
+		);
+		assert_eq!(
+			signatures(GoogleRequestOptions {
+				requires_skip_thought_signature: true,
+				..Default::default()
+			}),
+			[Some(SKIP_THOUGHT_SIGNATURE.to_owned()), Some(SKIP_THOUGHT_SIGNATURE.to_owned())],
+			"the all-calls variant signs every unsigned call",
+		);
+		assert_eq!(signatures(GoogleRequestOptions::default()), [None, None]);
+	}
+
+	#[test]
+	fn foreign_proof_is_omitted_not_fatal() {
+		let provider = ProviderId::new("google");
+		let codec_id = CodecId::new("gemini");
+		let foreign = ProviderProof {
+			provider: ProviderId::new("anthropic"),
+			codec:    CodecId::new("anthropic"),
+			value:    Bytes::from_static(b"claude-sig"),
+		};
+		let mut request = empty_chat_request();
+		request.messages = vec![Message {
+			role:    Role::Assistant,
+			content: vec![
+				ContentPart::Reasoning { text: sf!("plan"), proof: Some(foreign.clone()) },
+				ContentPart::Text { text: sf!("answer"), proof: Some(foreign.clone()) },
+				ContentPart::ToolCall {
+					call:      ToolCallId::new("call-1"),
+					name:      sf!("read"),
+					arguments: opaque(r#"{"path":"note.txt"}"#),
+					proof:     Some(foreign),
+				},
+			]
+			.into(),
+			name:    None,
+		}]
+		.into();
+		let projection = GeminiCodec::generative_language(None)
+			.project(&request, &GoogleRequestOptions {
+				proof_scope: Some(GoogleProofScope { provider, codec: codec_id }),
+				..Default::default()
+			})
+			.expect("a model switch omits foreign signatures instead of failing");
+		let parts = &projection.request.contents[0].parts;
+		assert_eq!(parts.len(), 3);
+		assert!(parts.iter().all(|part| part.thought_signature.is_none()));
+		assert_eq!(parts[0].text.as_deref(), Some("plan"));
+		assert_eq!(parts[2].function_call.as_ref().map(|call| call.name.as_str()), Some("read"));
+		assert_eq!(projection.adjustments, [GoogleAdjustment::new_static(
+			FOREIGN_SIGNATURE_FEATURE,
+			FOREIGN_SIGNATURE_REASON
+		)]);
+		assert!(
+			projection.unplanned_adjustment(false).is_none(),
+			"a foreign signature is not a planning gap"
+		);
+
+		let catalog = Catalog::embedded();
+		let route = catalog
+			.routes()
+			.iter()
+			.find(|route| route.codec.as_str() == "google-genai")
+			.expect("Google GenerateContent route");
+		let target = WireTarget {
+			route: route.id.clone(),
+			codec: route.codec.clone(),
+			endpoint: route.endpoint.clone(),
+			wire_model: omp_catalog::WireModelId::new("gemini-2.5-flash"),
+		};
+		let request_id = RequestId::new("gemini-foreign-proof");
+		let policy = policy::WirePolicy::baseline();
+		let context = EncodeContext {
+			request_id: &request_id,
+			route,
+			target: Some(&target),
+			policy: &policy,
+			..EncodeContext::default()
+		};
+		let encoded = GeminiCodec::generative_language(None)
+			.encode(&context, &OperationCall::Chat(Arc::new(request)))
+			.expect("foreign signatures omit on the live codec path");
+		assert_eq!(
+			encoded.adjustments,
+			[Adjustment::Dropped {
+				feature: FeatureId::new_static(FOREIGN_SIGNATURE_FEATURE),
+				reason: ReasonId::new_static(FOREIGN_SIGNATURE_REASON),
+			}],
 		);
 	}
 
@@ -4036,7 +4288,8 @@ mod tests {
 					top_logprobs:      None,
 					safety:            Arc::from([]),
 					negotiation:       Default::default(),
-				},
+	forced_call: None,
+},
 				&GoogleRequestOptions::default(),
 				Some(&policy),
 				Some(&selection),
@@ -4218,6 +4471,7 @@ mod tests {
 			]
 			.into(),
 			negotiation:       Default::default(),
+			forced_call:       None,
 		};
 		let options = GoogleRequestOptions {
 			response_modalities: vec!["TEXT".into()],
@@ -4269,6 +4523,37 @@ mod tests {
 			))
 		);
 	}
+	#[test]
+	fn signature_only_parts_attach_to_active_text_and_thinking_blocks() {
+		let mut text_decoder = GeminiDecoder::default();
+		let text = text_decoder
+			.push_json(
+				br#"{"candidates":[{"content":{"parts":[{"text":"answer"},{"text":"","thoughtSignature":"text-sig"}]}}]}"#,
+			)
+			.expect("text signature frame decodes");
+		assert!(matches!(
+			text.as_slice(),
+			[
+				GoogleDecodedEvent::Text { index: 0, text, signature: None },
+				GoogleDecodedEvent::Signature { index: 0, signature },
+			] if text.as_str() == "answer" && signature.as_str() == "text-sig"
+		));
+
+		let mut thinking_decoder = GeminiDecoder::default();
+		let thinking = thinking_decoder
+			.push_json(
+				br#"{"candidates":[{"content":{"parts":[{"text":"plan","thought":true},{"text":"","thoughtSignature":"thinking-sig"}]}}]}"#,
+			)
+			.expect("thinking signature frame decodes");
+		assert!(matches!(
+			thinking.as_slice(),
+			[
+				GoogleDecodedEvent::Thinking { index: 0, text, signature: None },
+				GoogleDecodedEvent::Signature { index: 0, signature },
+			] if text.as_str() == "plan" && signature.as_str() == "thinking-sig"
+		));
+	}
+
 	#[test]
 	fn non_contiguous_text_parts_receive_new_block_indexes() {
 		let mut decoder = GeminiDecoder::default();
@@ -4748,6 +5033,139 @@ mod tests {
 	}
 
 	#[test]
+	fn vertex_api_keys_use_express_paths_without_project_coordinates() {
+		for base in ["https://aiplatform.googleapis.com", "https://aiplatform.googleapis.com/v1"] {
+			assert_eq!(
+				google_stream_uri(
+					GoogleEndpointKind::Vertex,
+					base,
+					"gemini-2.5-pro",
+					None,
+					None,
+					true,
+				)
+				.expect("Vertex Express stream path")
+				.as_str(),
+				"https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+			);
+			assert_eq!(
+				google_unary_uri(
+					GoogleEndpointKind::Vertex,
+					base,
+					"gemini-embedding",
+					None,
+					None,
+					"embedContent",
+					true,
+				)
+				.expect("Vertex Express unary path")
+				.as_str(),
+				"https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-embedding:embedContent",
+			);
+		}
+
+		let catalog = Catalog::embedded();
+		let route = catalog
+			.routes()
+			.iter()
+			.find(|route| route.codec.as_str() == "google-vertex")
+			.expect("Vertex route");
+		let mut endpoint = route.endpoint.clone();
+		endpoint.base_url = sf!("https://aiplatform.googleapis.com/v1");
+		let target = WireTarget {
+			route: route.id.clone(),
+			codec: route.codec.clone(),
+			endpoint,
+			wire_model: omp_catalog::WireModelId::new("gemini-2.5-pro"),
+		};
+		let request_id = RequestId::new("vertex-express-api-key");
+		let policy = policy::WirePolicy::baseline();
+		let api_key_context = EncodeContext {
+			request_id: &request_id,
+			auth_scheme: Some(AuthScheme::ApiKey),
+			route,
+			target: Some(&target),
+			policy: &policy,
+			..EncodeContext::default()
+		};
+		let chat = GeminiCodec::vertex(None)
+			.encode(
+				&api_key_context,
+				&OperationCall::Chat(Arc::new(empty_chat_request())),
+			)
+			.expect("API-key Vertex chat uses Express mode");
+		assert_eq!(
+			chat.uri.as_str(),
+			"https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+		);
+		let count = GeminiCodec::vertex(None)
+			.encode(
+				&api_key_context,
+				&OperationCall::CountTokens(Arc::new(CountTokensRequest {
+					messages: Arc::from([]),
+					tools: Arc::from([]),
+					accuracy: crate::call::CountAccuracy::Exact,
+				})),
+			)
+			.expect("API-key Vertex unary request uses Express mode");
+		assert_eq!(
+			count.uri.as_str(),
+			"https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-pro:countTokens",
+		);
+
+		let account = AccountRoutingContext {
+			project: Some(ProjectId::new("project")),
+			region: Some(RegionId::new("global")),
+			..AccountRoutingContext::default()
+		};
+		let bearer_context = EncodeContext {
+			request_id: &request_id,
+			auth_scheme: Some(AuthScheme::ApplicationDefault),
+			route,
+			target: Some(&target),
+			policy: &policy,
+			account: Some(&account),
+			..EncodeContext::default()
+		};
+		let bearer = GeminiCodec::vertex(None)
+			.encode(
+				&bearer_context,
+				&OperationCall::Chat(Arc::new(empty_chat_request())),
+			)
+			.expect("ADC Vertex chat remains project scoped");
+		assert_eq!(
+			bearer.uri.as_str(),
+			"https://aiplatform.googleapis.com/v1/projects/project/locations/global/publishers/google/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+		);
+
+		assert!(
+			google_stream_uri(
+				GoogleEndpointKind::Vertex,
+				"https://aiplatform.googleapis.com/v1",
+				"gemini-2.5-pro",
+				None,
+				None,
+				false,
+			)
+			.is_err(),
+			"bearer-authenticated Vertex remains project scoped",
+		);
+		assert!(
+			google_unary_uri(
+				GoogleEndpointKind::Vertex,
+				"https://aiplatform.googleapis.com/v1",
+				"gemini-embedding",
+				None,
+				None,
+				"embedContent",
+				false,
+			)
+			.is_err(),
+			"bearer-authenticated Vertex unary operations remain project scoped",
+		);
+	}
+
+	#[test]
 	fn unary_google_paths_and_count_shape_are_exact() {
 		assert_eq!(
 			google_unary_uri(
@@ -4757,6 +5175,7 @@ mod tests {
 				None,
 				None,
 				"countTokens",
+				false,
 			)
 			.expect("direct path")
 			.as_str(),
@@ -4771,6 +5190,7 @@ mod tests {
 					Some("project"),
 					Some("global"),
 					"batchEmbedContents",
+					false,
 				)
 				.expect("Vertex path")
 				.as_str(),

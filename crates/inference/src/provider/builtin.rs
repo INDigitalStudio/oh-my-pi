@@ -14,7 +14,7 @@ use std::{
 use futures::StreamExt as _;
 use http::{HeaderName, HeaderValue};
 use omp_catalog::{
-	OperationBits, OperationKind,
+	NativeToolChoicePenalty, OperationBits, OperationKind, ToolFeatureBits, WireModelId,
 	provider::{AuthSpecKind, CodecProfile, DiscoveryKind, RouteDef, TransportKind},
 	snapshot::Catalog,
 };
@@ -67,7 +67,7 @@ use crate::{
 		openai_chat,
 		openai_codex::OpenAiCodexCodec,
 		openai_embedding::OpenAiEmbeddingCodec,
-		openai_responses::OpenAiResponsesCodec,
+		openai_responses::{OpenAiResponsesCodec, OpenAiResponsesOptions},
 		search_brave::BraveSearchCodec,
 		search_duckduckgo::DuckduckgoSearchCodec,
 		search_ecosia::EcosiaSearchCodec,
@@ -109,7 +109,8 @@ use crate::{
 		parallel_extract::ParallelExtractCodec,
 		usage::{ConsoleUsageManager, UsageServiceConfig},
 	},
-	receipt::{Adjustment, ExecutionReceipt, FeatureId, ReasonId},
+	plan::{ForcedCallCaps, apply_forced_call_decision, forced_call_ladder},
+	receipt::{Adjustment, ExecutionReceipt, FeatureId, Penalty, ReasonId},
 	registry::RouteUnavailable,
 	session::ConversationSessionPlanner,
 	settings::InferenceSettings,
@@ -499,6 +500,7 @@ impl RouteComposer for ProductionRouteComposer {
 					route,
 					&self.dependencies.google_cca,
 					self.dependencies.settings.retry.server_side_fallback,
+					stateful_responses(catalog, route),
 					bedrock_guardrail,
 					bedrock_ambient_region,
 				)?,
@@ -513,6 +515,7 @@ impl RouteComposer for ProductionRouteComposer {
 					route,
 					&self.dependencies.google_cca,
 					self.dependencies.settings.retry.server_side_fallback,
+					stateful_responses(catalog, route),
 					bedrock_guardrail,
 					bedrock_ambient_region,
 				)?,
@@ -768,10 +771,25 @@ fn local_codec_binding(
 	}
 }
 
+/// Whether a Responses route may chain turns by `previous_response_id`.
+///
+/// The provider's compiled default lowering policy carries the affirmative
+/// `stateful_response_chaining` evidence (set for the official OpenAI
+/// platform, absent for `/v1/responses` proxies that ignore or reject the
+/// parameter); a route-level `disable_server_state` restriction wins over it.
+fn stateful_responses(catalog: &Catalog, route: &RouteDef) -> bool {
+	!route.capability_limits.disable_server_state
+		&& catalog
+			.provider(&route.provider)
+			.and_then(|provider| catalog.wire_policy(&provider.wire_policy))
+			.is_some_and(|policy| policy.context.stateful_response_chaining == Some(true))
+}
+
 fn codec_binding(
 	route: &RouteDef,
 	cca: &GoogleCcaConfig,
 	server_side_fallback: bool,
+	stateful_responses: bool,
 	bedrock_guardrail: Option<&BedrockGuardrail>,
 	bedrock_ambient_region: Option<&Str>,
 ) -> Result<CodecBinding, RouteUnavailable> {
@@ -901,7 +919,10 @@ fn codec_binding(
 			false,
 		),
 		("openai-responses", CodecProfile::Standard) => (
-			Arc::new(OpenAiResponsesCodec::default()),
+			Arc::new(OpenAiResponsesCodec::new(OpenAiResponsesOptions {
+				stateful: stateful_responses,
+				..OpenAiResponsesOptions::default()
+			})),
 			operation_bits(&[OperationKind::Chat, OperationKind::GenerateImage]),
 			None,
 			false,
@@ -1169,6 +1190,60 @@ struct RouteEncoder {
 	transport_timeout: Duration,
 }
 
+const fn forced_choice_penalty(penalty: NativeToolChoicePenalty) -> Penalty {
+	match penalty {
+		NativeToolChoicePenalty::CacheInvalidated => Penalty::CacheInvalidated,
+		NativeToolChoicePenalty::Billable => Penalty::Billable,
+		NativeToolChoicePenalty::Latency => Penalty::Latency,
+		NativeToolChoicePenalty::Unknown => Penalty::Unknown,
+	}
+}
+
+fn forced_call_operation(
+	operation: &OperationCall,
+	plan: &crate::plan::ExecutionPlan,
+	execution: &ExecutionContext,
+) -> Option<OperationCall> {
+	let OperationCall::Chat(request) = operation else {
+		return None;
+	};
+	let forced = request.forced_call?;
+	let features = plan
+		.policy_model
+		.as_ref()
+		.and_then(|model| model.capabilities.chat.as_ref())
+		.and_then(|chat| chat.tools.constraints())
+		.map_or_else(ToolFeatureBits::empty, |tools| tools.features);
+	let decision = forced_call_ladder(
+		&request.tool_choice,
+		ForcedCallCaps::from_wire_policy(
+			features,
+			plan
+				.wire_policy
+				.tool
+				.forced_choice_penalty
+				.map(forced_choice_penalty),
+			&plan.wire_policy,
+		),
+		forced.non_compliant_turns != 0,
+		forced.escalations_left,
+	);
+	if !decision.soft_prompt {
+		return None;
+	}
+	if let Some(escalation) = decision.escalation.as_ref() {
+		execution.with_receipt(|receipt| {
+			if !receipt.adjustments.contains(escalation) {
+				receipt.adjustments.push(escalation.clone());
+			}
+		});
+	}
+	Some(OperationCall::Chat(Arc::new(apply_forced_call_decision(
+		request,
+		&decision,
+	))))
+}
+
 fn encode_wire_request(
 	codec: &dyn Codec,
 	context: &EncodeContext<'_>,
@@ -1249,12 +1324,15 @@ fn azure_effective_route(
 		.as_str()
 		.trim_end_matches('/')
 		.trim_end_matches("/openai");
-	let base_url = if route.codec.as_str() == "openai-responses" {
+	let deployment = config
+		.deployment_for(target.wire_model.as_str())
+		.ok_or_else(|| azure_configuration_error(context, "azure-deployment-not-configured"))?;
+	// Responses is resource-scoped: the deployment travels in `body.model`
+	// instead of the `/deployments/{name}` path segment.
+	let responses = route.codec.as_str() == "openai-responses";
+	let base_url = if responses {
 		sf!("{resource}/openai")
 	} else {
-		let deployment = config
-			.deployment_for(target.wire_model.as_str())
-			.ok_or_else(|| azure_configuration_error(context, "azure-deployment-not-configured"))?;
 		sf!("{resource}/openai/deployments/{deployment}")
 	};
 	let parsed = Url::parse(&base_url)
@@ -1267,6 +1345,9 @@ fn azure_effective_route(
 	effective_route.trust_domain.origin = Str::new(parsed.origin().ascii_serialization());
 	let mut effective_target = target.clone();
 	effective_target.endpoint = effective_route.endpoint.clone();
+	if responses {
+		effective_target.wire_model = WireModelId::new(deployment.clone());
+	}
 	Ok(Some((effective_route, effective_target)))
 }
 
@@ -1376,8 +1457,11 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 						&& execution.provider_error_code_seen(openai_chat::TEMPLATE_EFFORT_REJECTED_CODE),
 				),
 		};
+		let adjusted_operation =
+			forced_call_operation(&call.operation, plan, execution);
+		let operation = adjusted_operation.as_ref().unwrap_or(&call.operation);
 		if matches!(self.route.codec.as_str(), "google-genai" | "google-vertex")
-			&& let OperationCall::Chat(request) = &call.operation
+			&& let OperationCall::Chat(request) = operation
 			&& matches!(
 				&request.output,
 				Setting::Prefer(
@@ -1400,7 +1484,16 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			});
 		}
 		let mut encoded =
-			encode_wire_request(self.codec.as_ref(), &encode_context, &call.operation, execution)?;
+			encode_wire_request(self.codec.as_ref(), &encode_context, operation, execution)?;
+		if !encoded.adjustments.is_empty() {
+			execution.with_receipt(|receipt| {
+				for adjustment in &encoded.adjustments {
+					if !receipt.adjustments.contains(adjustment) {
+						receipt.adjustments.push(adjustment.clone());
+					}
+				}
+			});
+		}
 		append_endpoint_api_version(
 			&mut encoded.uri,
 			route.endpoint.api_version.as_deref(),
@@ -1454,10 +1547,10 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			policy: &plan.wire_policy,
 			thinking_policy: plan.thinking_policy.as_deref(),
 			thinking_selection: plan.thinking_selection.as_ref(),
-			operation: call.operation.kind(),
-			operation_call: &call.operation,
+			operation: operation.kind(),
+			operation_call: operation,
 			framing: encoded.framing,
-			native_response: native_response(&call.operation),
+			native_response: native_response(operation),
 			attempt,
 		};
 		decode_context.debug_assert_valid();
@@ -2236,14 +2329,17 @@ mod tests {
 			ShapedCredential,
 		},
 		call::{
-			ChatRequest, DiscoveryRequest, HostedTool, InferenceAttribution, NegotiationPolicy,
-			RealtimeRequest, Sampling, Target,
+			ChatRequest, ContentPart, DiscoveryRequest, ForcedCall, HostedTool, InferenceAttribution,
+			Message, NegotiationPolicy, OpaqueJson, RealtimeRequest, Role, Sampling, Target,
+			ToolDefinition, ToolInputConstraint,
 		},
 		codec::{
 			ProviderResponseObservation, ProviderResponseObserver, RequestMethod, SizeBounds,
 			google_cca::AntigravityFingerprint,
 		},
-		id::{AccountId, ConversationId, PrincipalId, RequestId, Revision},
+		id::{
+			AccountId, ConversationId, PrincipalId, ProjectId, RequestId, Revision, ToolCallId,
+		},
 		operation::discovery::CatalogDiscoveryProjectorError,
 		plan::{
 			CapabilityAvailability, ExecutionPlan, FallbackScope, ReplayPlan, RouteHealth,
@@ -2338,7 +2434,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
-		}
+	forced_call: None,
+}
 	}
 
 	fn lease(provider: &ProviderId<str>, secret: &str) -> CredentialLease {
@@ -2393,7 +2490,295 @@ mod tests {
 			assert_eq!(target.endpoint.base_url.as_str(), expected);
 			assert_eq!(effective.endpoint.api_version.as_deref(), Some("2025-04-01-preview"));
 			assert_eq!(effective.trust_domain.origin.as_str(), "https://resource.openai.azure.com");
+			if route.codec.as_str() == "openai-responses" {
+				assert_eq!(
+					target.wire_model.as_str(),
+					"production-gpt",
+					"Azure Responses body.model must use the deployment mapping",
+				);
+				let provider = catalog.provider(&route.provider).expect("Azure provider");
+				let policy = catalog
+					.wire_policy(&provider.wire_policy)
+					.expect("Azure provider wire policy");
+				let mut chat = request_hook_chat();
+				chat.hosted_tools = Arc::from([]);
+				chat.tool_choice = Setting::Unset;
+				let operation = OperationCall::Chat(Arc::new(chat));
+				let request_id = RequestId::new("azure-responses-deployment");
+				let encode_context = EncodeContext {
+					request_id: &request_id,
+					route: &effective,
+					target: Some(&target),
+					policy,
+					..EncodeContext::default()
+				};
+				let encoded = OpenAiResponsesCodec::new(OpenAiResponsesOptions::default())
+					.encode(&encode_context, &operation)
+					.expect("Azure Responses request encodes");
+				let BodySource::Bytes(body) = encoded.body else {
+					panic!("Azure Responses request body is buffered JSON");
+				};
+				let body: JsonValue = serde_json::from_slice(&body).expect("request JSON");
+				assert_eq!(body["model"], "production-gpt");
+			}
 		}
+	}
+
+	#[test]
+	fn official_responses_statefulness_uses_compiled_provider_capability() {
+		let catalog = Catalog::embedded();
+		let official = catalog
+			.routes()
+			.iter()
+			.find(|route| {
+				route.provider.as_str() == "openai" && route.codec.as_str() == "openai-responses"
+			})
+			.expect("official OpenAI Responses route");
+		let proxy = catalog
+			.routes()
+			.iter()
+			.find(|route| {
+				route.provider.as_str() == "github-copilot"
+					&& route.codec.as_str() == "openai-responses"
+			})
+			.expect("Responses-compatible proxy route");
+		assert!(stateful_responses(catalog, official));
+		assert!(
+			!stateful_responses(catalog, proxy),
+			"a Responses path alone is not evidence of server-state support",
+		);
+		let mut restricted = official.clone();
+		restricted.capability_limits.disable_server_state = true;
+		assert!(
+			!stateful_responses(catalog, &restricted),
+			"route restrictions override the affirmative provider capability",
+		);
+	}
+
+	#[test]
+	fn first_function_call_axis_reaches_cca_gemini_projection() {
+		let catalog = Catalog::embedded();
+		let (model, route, wire_model) = catalog
+			.models()
+			.iter()
+			.find_map(|model| {
+				let policy = catalog.wire_policy(&model.wire_policy)?;
+				if policy
+					.tool
+					.requires_skip_thought_signature_on_first_function_call
+					!= Some(true)
+				{
+					return None;
+				}
+				model.routes.iter().find_map(|route_id| {
+					let route = catalog.route(route_id)?;
+					(route.codec.as_str() == "google-cca"
+						&& route.codec_profile == CodecProfile::GoogleCcaGeminiCli)
+						.then(|| {
+							let wire_model = model
+								.wire_ids
+								.iter()
+								.find(|(candidate, _)| candidate == route_id)
+								.map(|(_, wire_model)| wire_model.clone())
+								.expect("CCA wire model");
+							(model, route, wire_model)
+						})
+				})
+			})
+			.expect("CCA Gemini model carrying the first-call signature axis");
+		let policy = catalog
+			.wire_policy(&model.wire_policy)
+			.expect("CCA model wire policy");
+		let binding = codec_binding(route, &test_cca(), false, false, None, None)
+			.expect("CCA codec binding");
+		let request = ChatRequest {
+			messages: Arc::from([Message {
+				role:    Role::Assistant,
+				content: Arc::from([
+					ContentPart::ToolCall {
+						call:      ToolCallId::new("call-1"),
+						name:      sf!("lookup"),
+						arguments: OpaqueJson::new(json!({"key": "a"})),
+						proof:     None,
+					},
+					ContentPart::ToolCall {
+						call:      ToolCallId::new("call-2"),
+						name:      sf!("lookup"),
+						arguments: OpaqueJson::new(json!({"key": "b"})),
+						proof:     None,
+					},
+				]),
+				name:    None,
+			}]),
+			tools: Arc::from([]),
+			hosted_tools: Arc::from([]),
+			tool_choice: Setting::Unset,
+			output: Setting::Unset,
+			reasoning: Setting::Unset,
+			verbosity: Setting::Unset,
+			cache_retention: Setting::Unset,
+			service_tier: Setting::Unset,
+			sampling: Sampling::default(),
+			max_output_tokens: None,
+			top_logprobs: None,
+			safety: Arc::from([]),
+			negotiation: NegotiationPolicy::default(),
+			forced_call: None,
+		};
+		let target = WireTarget {
+			route: route.id.clone(),
+			codec: route.codec.clone(),
+			endpoint: route.endpoint.clone(),
+			wire_model,
+		};
+		let request_id = RequestId::new("cca-first-function-call-signature");
+		let policy_model = PolicyModel::from(model);
+		let account = AccountRoutingContext {
+			project: Some(ProjectId::new("test-project")),
+			..AccountRoutingContext::default()
+		};
+		let context = EncodeContext {
+			request_id: &request_id,
+			route,
+			target: Some(&target),
+			policy_model: Some(&policy_model),
+			policy,
+			account: Some(&account),
+			..EncodeContext::default()
+		};
+		let encoded = binding
+			.primary
+			.encode(&context, &OperationCall::Chat(Arc::new(request)))
+			.expect("CCA request encodes through Gemini projection");
+		let BodySource::Bytes(body) = encoded.body else {
+			panic!("CCA request body is buffered JSON");
+		};
+		let body: JsonValue = serde_json::from_slice(&body).expect("CCA request JSON");
+		let parts = body["request"]["contents"][0]["parts"]
+			.as_array()
+			.expect("CCA projected parts");
+		assert_eq!(
+			parts[0]["thoughtSignature"],
+			"skip_thought_signature_validator",
+		);
+		assert!(
+			parts[1].get("thoughtSignature").is_none(),
+			"the first-call-only catalog axis must not sign later unsigned calls",
+		);
+	}
+
+	#[test]
+	fn route_encoder_applies_forced_call_ladder_and_receipts_paid_escalation_once() {
+		let catalog = Catalog::embedded();
+		let (model, route, wire_model) = catalog
+			.models()
+			.iter()
+			.find_map(|model| {
+				let tools = model.capabilities.chat.as_ref()?.tools.constraints()?;
+				if !tools.features.contains(ToolFeatureBits::REQUIRED_CHOICE) {
+					return None;
+				}
+				model.routes.iter().find_map(|route_id| {
+					let route = catalog.route(route_id)?;
+					(route.provider.as_str() == "anthropic").then(|| {
+						let wire_model = model
+							.wire_ids
+							.iter()
+							.find(|(candidate, _)| candidate == route_id)
+							.map(|(_, wire_model)| wire_model.clone())
+							.expect("Anthropic wire model");
+						(model, route.clone(), wire_model)
+					})
+				})
+			})
+			.expect("Anthropic model with required tool choice");
+		let wire_policy = catalog
+			.wire_policy(&model.wire_policy)
+			.expect("Anthropic model wire policy");
+		assert_eq!(wire_policy.tool.forced_choice, Some(true));
+		assert_eq!(
+			wire_policy.tool.forced_choice_penalty,
+			Some(NativeToolChoicePenalty::CacheInvalidated),
+		);
+
+		let (mut encoder, mut call, ..) = discovery_fixture();
+		let binding = codec_binding(&route, &test_cca(), false, false, None, None)
+			.expect("Anthropic codec binding");
+		encoder.route = route.clone();
+		encoder.codec = binding.primary;
+		let plan = Arc::make_mut(call.execution.as_mut().expect("execution plan"));
+		plan.operation = OperationKind::Chat;
+		plan.model = Some(model.key.clone());
+		plan.provider = route.provider.clone();
+		plan.route = route.id.clone();
+		plan.codec = route.codec.clone();
+		plan.policy_model = Some(Arc::new(PolicyModel::from(model)));
+		plan.wire_policy = Arc::new(wire_policy.clone());
+		plan.wire_target = Some(WireTarget {
+			route: route.id.clone(),
+			codec: route.codec.clone(),
+			endpoint: route.endpoint.clone(),
+			wire_model,
+		});
+		let mut chat = request_hook_chat();
+		chat.hosted_tools = Arc::from([]);
+		chat.tools = Arc::from([ToolDefinition {
+			name:        sf!("lookup"),
+			description: Some(sf!("Look up a value")),
+			input:       ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(json!({"type": "object"})),
+				strict:     false,
+			},
+		}]);
+		chat.forced_call = Some(ForcedCall { non_compliant_turns: 0, escalations_left: 1 });
+		call.operation = OperationCall::Chat(Arc::new(chat.clone()));
+
+		let soft_context = ExecutionContext::new(ExecutionBudget::default());
+		let soft = encoder
+			.encode(
+				&call,
+				&None,
+				&BeforeRequestMutation::default(),
+				&soft_context,
+				0,
+				false,
+				Cancellation::default(),
+			)
+			.expect("soft forced-call attempt encodes");
+		let BodySource::Bytes(soft_body) = soft.encoded.body else {
+			panic!("Anthropic request body is buffered JSON");
+		};
+		let soft_body = String::from_utf8(soft_body.to_vec()).expect("request body is UTF-8 JSON");
+		assert!(soft_body.contains(crate::plan::FORCED_CALL_DIRECTIVE));
+		assert!(
+			soft_context.receipt().adjustments.is_empty(),
+			"the free prompt rung has no paid escalation receipt",
+		);
+
+		chat.forced_call = Some(ForcedCall { non_compliant_turns: 1, escalations_left: 1 });
+		call.operation = OperationCall::Chat(Arc::new(chat));
+		let paid_context = ExecutionContext::new(ExecutionBudget::default());
+		for _ in 0..2 {
+			encoder
+				.encode(
+					&call,
+					&None,
+					&BeforeRequestMutation::default(),
+					&paid_context,
+					1,
+					false,
+					Cancellation::default(),
+				)
+				.expect("paid forced-call attempt encodes");
+		}
+		assert_eq!(
+			paid_context.receipt().adjustments,
+			[Adjustment::Escalated {
+				feature: FeatureId(sf!("tool_choice")),
+				penalty: Penalty::CacheInvalidated,
+			}],
+			"re-encoding an attempt must not duplicate the escalation receipt",
+		);
 	}
 
 	#[test]
@@ -2440,6 +2825,19 @@ mod tests {
 		assert_eq!(configured_bedrock_guardrail(&settings, &runtime_route), Some(&runtime_guardrail),);
 	}
 
+	fn test_cca() -> GoogleCcaConfig {
+		GoogleCcaConfig {
+			gemini_cli_platform: sf!("test"),
+			gemini_cli_arch:     sf!("test"),
+			antigravity_headers: CcaHeaders::antigravity(
+				&AntigravityFingerprint::default(),
+				false,
+				None,
+			),
+			antigravity_policy:  AntigravityPolicy::default(),
+		}
+	}
+
 	fn discovery_fixture() -> (RouteEncoder, Call, RouteAccount, AuthSpec, ProviderId, Str) {
 		let catalog = Catalog::try_embedded().expect("embedded catalog");
 		let route = catalog
@@ -2449,17 +2847,9 @@ mod tests {
 			.expect("GitHub Copilot route")
 			.clone();
 		let provider = catalog.provider(&route.provider).expect("provider");
-		let cca = GoogleCcaConfig {
-			gemini_cli_platform: sf!("test"),
-			gemini_cli_arch:     sf!("test"),
-			antigravity_headers: CcaHeaders::antigravity(
-				&AntigravityFingerprint::default(),
-				false,
-				None,
-			),
-			antigravity_policy:  AntigravityPolicy::default(),
-		};
-		let binding = codec_binding(&route, &cca, false, None, None).expect("route codec binding");
+		let cca = test_cca();
+		let binding = codec_binding(&route, &cca, false, false, None, None)
+			.expect("route codec binding");
 		let codec = discovery_codec(catalog, &route, &binding)
 			.expect("discovery codec")
 			.expect("route supports discovery");
@@ -2871,17 +3261,9 @@ mod tests {
 			.expect("catalog OpenAI route");
 		let mut route = route;
 		route.transport = TransportKind::Websocket;
-		let cca = GoogleCcaConfig {
-			gemini_cli_platform: sf!("test"),
-			gemini_cli_arch:     sf!("test"),
-			antigravity_headers: CcaHeaders::antigravity(
-				&AntigravityFingerprint::default(),
-				false,
-				None,
-			),
-			antigravity_policy:  AntigravityPolicy::default(),
-		};
-		let binding = codec_binding(&route, &cca, false, None, None).expect("route codec binding");
+		let cca = test_cca();
+		let binding = codec_binding(&route, &cca, false, false, None, None)
+			.expect("route codec binding");
 		let codec = RouteCodecSet::for_route(
 			&route,
 			OperationBits::for_kind(OperationKind::Realtime),

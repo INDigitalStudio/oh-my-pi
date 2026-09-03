@@ -18,7 +18,7 @@ use crate::{
 	call::{Call, DiscoveryRequest, OperationCall, Setting, StructuredOutput, ToolDefinition},
 	codec::{HandshakeMeta, HandshakenResponse, RawCompletion, RawEvent, UnvalidatedToolCall},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
-	event::{ChatEvent, Completion, FinishReason},
+	event::{BlockKind, ChatEvent, Completion, FinishReason},
 	layer::{ExecutionContext, LayerCall},
 	plan::{ExecutionPlan, NegotiationDecision},
 	receipt::{
@@ -30,6 +30,9 @@ use crate::{
 		empty::{EmptyCompletionKind, EmptyCompletionStage, EmptyEvent, EmptyInput},
 		json::{JsonEnforcement, JsonRepairLimits, JsonRepairStage},
 		reasoning::{ReasoningLimits, ReasoningObservation, ReasoningStallGuard},
+		projection::{
+			DialectRecoveryConfig, DialectRecoveryPipeline, ProjectionBatch, ProjectionFailure,
+		},
 		repetition::{
 			AttemptRepetitionGuard, LoopSignal, OutputVisibility, RepetitionLimits, recovery_record,
 		},
@@ -112,6 +115,13 @@ where
 			OperationCall::Realtime(realtime) => realtime.tools.clone(),
 			_ => Default::default(),
 		};
+		let service_tier = match &request.payload.operation {
+			OperationCall::Chat(chat) => match &chat.service_tier {
+				Setting::Require(tier) | Setting::Prefer(tier) => Some(tier.name.clone()),
+				Setting::Unset => None,
+			},
+			_ => None,
+		};
 		let structured = match &request.payload.operation {
 			OperationCall::Chat(chat) => match &chat.output {
 				Setting::Require(output) => Some((output.clone(), false)),
@@ -145,6 +155,15 @@ where
 				return Err(recovery_error("response.missing-events-and-realtime", &context));
 			};
 			let output_context = context.clone();
+			let projection_config = plan.as_ref().and_then(|plan| {
+				plan.policy_model.as_ref().map(|model| {
+					DialectRecoveryConfig::from_wire_policy(
+						model.wire_policy.clone(),
+						&plan.wire_policy,
+						output_context.attempts().saturating_sub(1),
+					)
+				})
+			});
 			let empty_policy = plan
 				.as_ref()
 				.and_then(|plan| plan.policy_model.as_ref())
@@ -171,6 +190,7 @@ where
 				let mut completion: Option<RawCompletion> = None;
 				let mut empty = empty_policy.map(|policy| EmptyCompletionStage::new(policy, output_context.attempts().saturating_sub(1)));
 				let mut reasoning_guard = guard_reasoning.then(|| ReasoningStallGuard::new(ReasoningLimits::default()));
+				let mut projection = projection_config.map(|config| DialectRecoveryPipeline::new(&tools, config));
 				let mut thinking_repetition = AttemptRepetitionGuard::new(RepetitionLimits::default());
 				let mut text_repetition = AttemptRepetitionGuard::new(RepetitionLimits::default());
 				while let Some(item) = input.next().await {
@@ -187,6 +207,39 @@ where
 							return;
 						}
 						Ok(RawEvent::Completion(terminal)) => {
+							if completion.is_some() {
+								yield Err(recovery_error("response.duplicate-completion", &output_context));
+								return;
+							}
+							if let Some(mut pipeline) = projection.take() {
+								let batch = match pipeline.finish() {
+									Ok(batch) => batch,
+									Err(_) => {
+										yield Err(recovery_error("projection.finish", &output_context));
+										return;
+									},
+								};
+								let events = match projection_events(batch, &output_context) {
+									Ok(events) => events,
+									Err(error) => { yield Err(error); return; },
+								};
+								for event in events {
+									match process_chat_event(
+										event,
+										&mut reasoning_guard,
+										&mut thinking_repetition,
+										&mut text_repetition,
+										&mut empty,
+										&mut json,
+										&mut structured_index,
+										&output_context,
+									) {
+										Ok(Some(event)) => yield Ok(RawEvent::Chat(event)),
+										Ok(None) => {},
+										Err(error) => { yield Err(error); return; },
+									}
+								}
+							}
 							if let Some(signal) = thinking_repetition
 								.finish_exact_cycle(OutputVisibility::Gated)
 								.or_else(|| text_repetition.finish_exact_cycle(OutputVisibility::Gated))
@@ -194,29 +247,36 @@ where
 								yield Err(repetition_error(&signal, &output_context));
 								return;
 							}
-							if completion.replace(terminal).is_some() {
-								yield Err(recovery_error("response.duplicate-completion", &output_context));
-								return;
-							}
+							completion = Some(terminal);
 						}
 						Ok(RawEvent::ToolCallComplete { index, call }) => {
-							let event = match recover_tool(index, call, &tools, &output_context) {
-								Ok(event) => event,
-								Err(error) => { yield Err(error); return; },
+							let events = if let Some(pipeline) = projection.as_mut() {
+								match project_native_call(pipeline, index, call, &output_context) {
+									Ok(events) => events,
+									Err(error) => { yield Err(error); return; },
+								}
+							} else {
+								let event = match recover_tool(index, call, &tools, &output_context) {
+									Ok(event) => event,
+									Err(error) => { yield Err(error); return; },
+								};
+								vec![event]
 							};
-							if let Err(error) = observe_reasoning(
-								&mut reasoning_guard,
-								&mut thinking_repetition,
-								&mut text_repetition,
-								&event,
-								&output_context,
-							) {
-								yield Err(error);
-								return;
-							}
-							match observe_empty(&mut empty, event, &output_context) {
-								Ok(event) => yield Ok(RawEvent::Chat(event)),
-								Err(error) => { yield Err(error); return; },
+							for event in events {
+								match process_chat_event(
+									event,
+									&mut reasoning_guard,
+									&mut thinking_repetition,
+									&mut text_repetition,
+									&mut empty,
+									&mut json,
+									&mut structured_index,
+									&output_context,
+								) {
+									Ok(Some(event)) => yield Ok(RawEvent::Chat(event)),
+									Ok(None) => {},
+									Err(error) => { yield Err(error); return; },
+								}
 							}
 						}
 						Ok(RawEvent::ProviderState(state)) => output_context.stage_provider_state(state),
@@ -232,46 +292,27 @@ where
 							yield Err(recovery_error("response.public-completion-before-finalization", &output_context));
 							return;
 						}
-						Ok(RawEvent::Chat(ChatEvent::TextDelta { index, text })) => {
-							let event = ChatEvent::TextDelta { index, text: text.clone() };
-							if let Err(error) = observe_reasoning(
-								&mut reasoning_guard,
-								&mut thinking_repetition,
-								&mut text_repetition,
-								&event,
-								&output_context,
-							) {
-								yield Err(error);
-								return;
-							}
-							let event = match observe_empty(&mut empty, event, &output_context) {
-								Ok(event) => event,
-								Err(error) => { yield Err(error); return; },
-							};
-							if let Some(stage) = json.as_mut() {
-								structured_index.get_or_insert(index);
-								if stage.push(bytes::Bytes::copy_from_slice(text.as_bytes()), &mut |_| {}).is_err() {
-									yield Err(structured_error("structured-output.repair-input", &output_context));
-									return;
-								}
-							} else {
-								yield Ok(RawEvent::Chat(event));
-							}
-						}
 						Ok(RawEvent::Chat(event)) => {
-							if let Err(error) = observe_reasoning(
-								&mut reasoning_guard,
-								&mut thinking_repetition,
-								&mut text_repetition,
-								&event,
-								&output_context,
-							) {
-								yield Err(error);
-								return;
-							}
-							match observe_empty(&mut empty, event, &output_context) {
-								Ok(event) => yield Ok(RawEvent::Chat(event)),
-								Err(error) => { yield Err(error); return; },
+							let events =
+								match project_source_chat_event(&mut projection, event, &output_context) {
+									Ok(events) => events,
+									Err(error) => { yield Err(error); return; },
+								};
+							for event in events {
+								match process_chat_event(
+									event,
+									&mut reasoning_guard,
+									&mut thinking_repetition,
+									&mut text_repetition,
+									&mut empty,
+									&mut json,
+									&mut structured_index,
+									&output_context,
+								) {
+									Ok(Some(event)) => yield Ok(RawEvent::Chat(event)),
+									Ok(None) => {},
+									Err(error) => { yield Err(error); return; },
+								}
 							}
 						}
 						Ok(RawEvent::ImageGeneration(event)) => yield Ok(RawEvent::ImageGeneration(event)),
@@ -296,7 +337,7 @@ where
 					}
 				}
 				if let Some(terminal) = completion {
-					let finalized = match finalize_completion(terminal, plan.as_deref(), &handshake, evidence.evidence(), &output_context) {
+					let finalized = match finalize_completion(terminal, plan.as_deref(), service_tier.as_deref(), &handshake, evidence.evidence(), &output_context) {
 						Ok(event) => event,
 						Err(error) => { yield Err(error); return; },
 					};
@@ -373,6 +414,105 @@ fn project_discovery(
 }
 fn semantic_loop_guard_enabled(policy: &omp_catalog::WirePolicy) -> bool {
 	policy.reasoning.loop_guard_profile.is_some()
+}
+
+fn projection_events(
+	batch: ProjectionBatch,
+	context: &ExecutionContext,
+) -> Result<Vec<ChatEvent>, Error> {
+	record_recoveries(context, batch.evidence);
+	if let Some(failure) = batch.failure {
+		let reason = match failure {
+			ProjectionFailure::ToolAssemblyRejected => "tool.assembly-rejected",
+			ProjectionFailure::FabricatedToolResult => "projection.fabricated-tool-result",
+			ProjectionFailure::UnpairedToolResult => "projection.unpaired-tool-result",
+			ProjectionFailure::InvalidUtf8 => "projection.invalid-utf8",
+			ProjectionFailure::ToolRegistrationRejected => "projection.tool-registration-rejected",
+		};
+		return Err(recovery_error(reason, context));
+	}
+	Ok(batch.events)
+}
+
+fn project_source_chat_event(
+	projection: &mut Option<DialectRecoveryPipeline<'_>>,
+	event: ChatEvent,
+	context: &ExecutionContext,
+) -> Result<Vec<ChatEvent>, Error> {
+	let Some(pipeline) = projection.as_mut() else {
+		return Ok(vec![event]);
+	};
+	let batch = match event {
+		ChatEvent::TextDelta { text, .. } => pipeline
+			.push_text(bytes::Bytes::copy_from_slice(text.as_bytes()))
+			.map_err(|_| recovery_error("projection.text", context))?,
+		ChatEvent::BlockStarted { kind: BlockKind::Text | BlockKind::ToolCall, .. }
+		| ChatEvent::ToolCallStarted { .. }
+		| ChatEvent::ToolArgumentsDelta { .. }
+		| ChatEvent::ToolCallReady { .. } => ProjectionBatch::default(),
+		event => pipeline.push_passthrough(event),
+	};
+	projection_events(batch, context)
+}
+
+fn project_native_call(
+	projection: &mut DialectRecoveryPipeline<'_>,
+	index: u32,
+	call: UnvalidatedToolCall,
+	context: &ExecutionContext,
+) -> Result<Vec<ChatEvent>, Error> {
+	let name = bytes::Bytes::copy_from_slice(call.name.as_bytes());
+	let batches = [
+		projection.push_native(ToolFragment::Start {
+			source_index: index,
+			id: Some(call.id),
+			name,
+			input_kind: call.input_kind,
+		}),
+		projection.push_native(ToolFragment::ArgumentsDelta {
+			source_index: index,
+			bytes: call.arguments,
+		}),
+		projection.push_native(ToolFragment::End { source_index: index }),
+	];
+	let mut events = Vec::new();
+	for batch in batches {
+		events.extend(projection_events(batch, context)?);
+	}
+	if !events.iter().any(|event| matches!(event, ChatEvent::ToolCallReady { .. })) {
+		return Err(recovery_error("tool.assembly-rejected", context));
+	}
+	Ok(events)
+}
+
+fn process_chat_event(
+	event: ChatEvent,
+	reasoning_guard: &mut Option<ReasoningStallGuard>,
+	thinking_repetition: &mut AttemptRepetitionGuard,
+	text_repetition: &mut AttemptRepetitionGuard,
+	empty: &mut Option<EmptyCompletionStage>,
+	json: &mut Option<JsonRepairStage>,
+	structured_index: &mut Option<u32>,
+	context: &ExecutionContext,
+) -> Result<Option<ChatEvent>, Error> {
+	observe_reasoning(
+		reasoning_guard,
+		thinking_repetition,
+		text_repetition,
+		&event,
+		context,
+	)?;
+	let event = observe_empty(empty, event, context)?;
+	if let ChatEvent::TextDelta { index, text } = &event
+		&& let Some(stage) = json.as_mut()
+	{
+		structured_index.get_or_insert(*index);
+		stage
+			.push(bytes::Bytes::copy_from_slice(text.as_bytes()), &mut |_| {})
+			.map_err(|_| structured_error("structured-output.repair-input", context))?;
+		return Ok(None);
+	}
+	Ok(Some(event))
 }
 
 fn observe_reasoning(
@@ -556,6 +696,7 @@ fn structured_error(reason: &'static str, context: &ExecutionContext) -> Error {
 fn finalize_completion(
 	terminal: RawCompletion,
 	plan: Option<&ExecutionPlan>,
+	service_tier: Option<&str>,
 	handshake: &HandshakeMeta,
 	body: AttemptBodyEvidence,
 	context: &ExecutionContext,
@@ -583,31 +724,13 @@ fn finalize_completion(
 		return Err(recovery_error("completion.character-usage-unavailable", context));
 	}
 	let usage = terminal.usage;
-	let dimensions = UsageDimensions {
-		input_tokens:       usage.input_tokens,
-		output_tokens:      usage.output_tokens.saturating_add(usage.reasoning_tokens),
-		cache_read_tokens:  usage.cache_read_tokens,
-		cache_write_tokens: usage.cache_write_tokens,
-		images:             u64::from(usage.images),
-		video_seconds:      usage.video_ms.div_ceil(1_000),
-		audio_seconds:      usage
-			.audio_input_ms
-			.saturating_add(usage.audio_output_ms)
-			.div_ceil(1_000),
-		input_characters:   0,
-		requests:           1,
-	};
-	let nanos = model
-		.pricing
-		.cost(dimensions)
+	let dimensions = billable_dimensions(&usage);
+	let nanos = price_usage(&model.pricing, dimensions, service_tier)
 		.map_err(|_| recovery_error("completion.pricing-overflow", context))?
 		.as_nanos();
 	let micro_usd = i128::from(nanos.div_ceil(1_000));
 	let cost = Cost::from_micro_usd(micro_usd);
-	context.charge_tokens(
-		usage.input_tokens,
-		usage.output_tokens.saturating_add(usage.reasoning_tokens),
-	)?;
+	context.charge_tokens(usage.input_tokens, usage.output_tokens)?;
 	context.charge_cost(cost)?;
 	let index = context.attempts().saturating_sub(1);
 	let routing = context.account_routing().unwrap_or_default();
@@ -655,6 +778,32 @@ fn finalize_completion(
 		usage,
 		receipt: receipt.into(),
 	}))
+}
+
+fn price_usage(
+	pricing: &omp_catalog::Pricing,
+	dimensions: UsageDimensions,
+	service_tier: Option<&str>,
+) -> Result<omp_catalog::NanoUsd, omp_catalog::CostError> {
+	let multiplier = service_tier.and_then(|tier| pricing.service_tier_multiplier(tier));
+	pricing.cost_with_multiplier(dimensions, multiplier)
+}
+
+fn billable_dimensions(usage: &crate::receipt::Usage) -> UsageDimensions {
+	UsageDimensions {
+		input_tokens:       usage.input_tokens,
+		output_tokens:      usage.output_tokens,
+		cache_read_tokens:  usage.cache_read_tokens,
+		cache_write_tokens: usage.cache_write_tokens,
+		images:             u64::from(usage.images),
+		video_seconds:      usage.video_ms.div_ceil(1_000),
+		audio_seconds:      usage
+			.audio_input_ms
+			.saturating_add(usage.audio_output_ms)
+			.div_ceil(1_000),
+		input_characters:   0,
+		requests:           1,
+	}
 }
 
 fn recover_tool(
@@ -767,6 +916,139 @@ mod tests {
 				})),
 			},
 		}
+	}
+
+	#[test]
+	fn billable_dimensions_do_not_double_charge_cached_or_reasoning_subsets() {
+		let usage = crate::receipt::Usage {
+			input_tokens:      70,
+			output_tokens:     30,
+			reasoning_tokens:  20,
+			cache_read_tokens: 40,
+			..Default::default()
+		};
+		let dimensions = billable_dimensions(&usage);
+		assert_eq!(dimensions.input_tokens, 70);
+		assert_eq!(dimensions.cache_read_tokens, 40);
+		assert_eq!(dimensions.output_tokens, 30);
+	}
+
+	#[test]
+	fn selected_service_tier_multiplier_applies_without_provider_branching() {
+		let pricing = omp_catalog::Pricing::new(
+			vec![omp_catalog::Price {
+				unit:      omp_catalog::PriceUnit::Request,
+				nanos_usd: 1_000,
+			}],
+			Vec::new(),
+		)
+		.expect("valid pricing")
+		.with_service_tiers(vec![omp_catalog::ServiceTierPrice {
+			tier:       sf!("priority"),
+			multiplier: omp_catalog::PremiumMultiplier::from_millionths(2_000_000),
+		}]);
+		let dimensions = UsageDimensions { requests: 1, ..UsageDimensions::default() };
+		assert_eq!(
+			price_usage(&pricing, dimensions, Some("priority"))
+				.expect("tier cost")
+				.as_nanos(),
+			2_000
+		);
+		assert_eq!(
+			price_usage(&pricing, dimensions, Some("unpriced-tier"))
+				.expect("base cost")
+				.as_nanos(),
+			1_000
+		);
+	}
+
+	#[test]
+	fn live_dialect_projection_suppresses_source_text_blocks_and_avoids_index_collisions() {
+		let mut policy = omp_catalog::WirePolicy::baseline();
+		policy.streaming.markup_healing_pattern =
+			Some(omp_catalog::StreamMarkupHealingPattern::Qwen);
+		let definitions = [edit_grammar_definition()];
+		let config = DialectRecoveryConfig::from_wire_policy(
+			WirePolicyId::new("qwen-wire"),
+			&policy,
+			0,
+		);
+		let mut projection = Some(DialectRecoveryPipeline::new(&definitions, config));
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		let thinking = project_source_chat_event(
+			&mut projection,
+			ChatEvent::BlockStarted { index: 0, kind: BlockKind::Thinking },
+			&context,
+		)
+		.expect("thinking projects");
+		assert!(matches!(
+			thinking.as_slice(),
+			[ChatEvent::BlockStarted { index: 0, kind: BlockKind::Thinking }]
+		));
+		let source_text_start = project_source_chat_event(
+			&mut projection,
+			ChatEvent::BlockStarted { index: 1, kind: BlockKind::Text },
+			&context,
+		)
+		.expect("source text start is handled");
+		assert!(source_text_start.is_empty());
+		let mut recovered = project_source_chat_event(
+			&mut projection,
+			ChatEvent::TextDelta {
+				index: 1,
+				text:  sf!(r#"<tool_calls><edit input="x" /></tool_calls>"#),
+			},
+			&context,
+		)
+		.expect("configured dialect projects");
+		let terminal = projection
+			.as_mut()
+			.expect("pipeline")
+			.finish()
+			.expect("projection finishes");
+		recovered.extend(projection_events(terminal, &context).expect("terminal batch"));
+		assert!(recovered.iter().any(
+			|event| matches!(event, ChatEvent::ToolCallReady { index: 1, call } if call.name == "edit")
+		));
+		assert!(context.receipt().recoveries.iter().any(
+			|record| record.rule.0.as_str() == "dialect/qwen-wire/qwen-xml"
+		));
+	}
+
+	#[test]
+	fn native_complete_call_runs_through_the_shared_projector() {
+		let definitions = [edit_grammar_definition()];
+		let config = DialectRecoveryConfig::from_wire_policy(
+			WirePolicyId::new("plain-wire"),
+			&omp_catalog::WirePolicy::baseline(),
+			0,
+		);
+		let mut projection = DialectRecoveryPipeline::new(&definitions, config);
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		let events = project_native_call(
+			&mut projection,
+			4,
+			UnvalidatedToolCall {
+				id:         crate::id::ToolCallId::new("call-edit"),
+				name:       sf!("edit"),
+				input_kind: crate::codec::ToolInputKind::Json,
+				arguments:  bytes::Bytes::from_static(br#"{"input":"x"}"#),
+			},
+			&context,
+		)
+		.expect("native call projects");
+		assert!(matches!(
+			events.as_slice(),
+			[
+				ChatEvent::BlockStarted { index: 0, kind: BlockKind::ToolCall },
+				ChatEvent::ToolCallStarted { index: 0, .. },
+				ChatEvent::ToolArgumentsDelta { index: 0, .. },
+				ChatEvent::ToolCallReady { index: 0, call }
+			] if call.arguments.as_value() == &serde_json::json!({"input": "x"})
+		));
+		assert!(context.receipt().recoveries.iter().any(
+			|record| record.rule.0.as_str() == "tool.complete-schema-valid"
+		));
 	}
 
 	#[test]

@@ -907,7 +907,8 @@ mod tests {
 				top_logprobs:      None,
 				safety:            Arc::from([]),
 				negotiation:       NegotiationPolicy::default(),
-			})),
+	forced_call: None,
+})),
 			OperationCall::CountTokens(Arc::new(CountTokensRequest {
 				messages: Arc::from([]),
 				tools:    Arc::from([]),

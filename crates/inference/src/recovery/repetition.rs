@@ -449,14 +449,17 @@ fn write_canonical_value(value: &Value, output: &mut Vec<u8>, limit: usize) -> O
 			Some(())
 		},
 		Value::Object(values) => {
+			let mut keys: Vec<_> = values
+				.keys()
+				.filter(|key| !is_intent_metadata(key))
+				.collect();
+			keys.sort_unstable();
 			push_bounded(b"o", output, limit)?;
-			push_bounded(&(values.len() as u64).to_le_bytes(), output, limit)?;
-			let minimum_key_bytes = values.len().checked_mul(8)?;
+			push_bounded(&(keys.len() as u64).to_le_bytes(), output, limit)?;
+			let minimum_key_bytes = keys.len().checked_mul(8)?;
 			if output.len().saturating_add(minimum_key_bytes) > limit {
 				return None;
 			}
-			let mut keys: Vec<_> = values.keys().collect();
-			keys.sort_unstable();
 			for key in keys {
 				push_field(key.as_bytes(), output, limit)?;
 				write_canonical_value(&values[key], output, limit)?;
@@ -464,6 +467,10 @@ fn write_canonical_value(value: &Value, output: &mut Vec<u8>, limit: usize) -> O
 			Some(())
 		},
 	}
+}
+
+fn is_intent_metadata(key: &str) -> bool {
+	matches!(key, "i" | "__intent")
 }
 
 fn push_field(bytes: &[u8], output: &mut Vec<u8>, limit: usize) -> Option<()> {
@@ -674,6 +681,46 @@ mod tests {
 				.disposition,
 			LoopDisposition::SurfaceCommitted
 		);
+	}
+
+	#[test]
+	fn intent_metadata_is_recursively_excluded_from_cross_turn_fingerprints() {
+		let limits = CrossTurnLimits { consecutive_limit: 2, ..CrossTurnLimits::default() };
+		let make = |arguments, result| TurnRecoveryObservation {
+			tool_exchanges:        vec![ToolExchangeObservation {
+				call_id: ToolCallId::new("ignored"),
+				name: sf!("search"),
+				arguments: OpaqueJson::new(arguments),
+				result: OpaqueJson::new(result),
+				is_error: false,
+			}],
+			made_textual_progress: false,
+		};
+		let first = make(
+			json!({
+				"query": "rust",
+				"i": "Finding the first answer",
+				"nested": {"value": 1, "__intent": "Inspecting one source"},
+				"items": [{"value": 2, "i": "Reading the first item"}]
+			}),
+			json!({"ok": true, "details": {"i": "First receipt"}}),
+		);
+		let second = make(
+			json!({
+				"query": "rust",
+				"i": "Trying a different stated purpose",
+				"nested": {"value": 1, "__intent": "Inspecting another source"},
+				"items": [{"value": 2, "i": "Reading another item"}]
+			}),
+			json!({"ok": true, "details": {"i": "Second receipt"}}),
+		);
+		let mut guard = CrossTurnLoopGuard::new(limits);
+		assert!(guard.observe(&first).is_none());
+		let signal = guard
+			.observe(&second)
+			.expect("intent-only differences must remain the same semantic exchange");
+		assert_eq!(signal.evidence.kind, LoopKind::CrossTurnTool);
+		assert_eq!(signal.evidence.repetitions, 2);
 	}
 
 	#[test]

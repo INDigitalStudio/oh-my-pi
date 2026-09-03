@@ -1248,6 +1248,10 @@ pub enum OAuthError {
 	/// The single onboarding deadline elapsed.
 	#[error("OAuth project provisioning timed out")]
 	ProvisioningTimeout,
+	/// The account needs an explicit Google Cloud project that neither the
+	/// control plane nor the environment supplied.
+	#[error("OAuth account requires a Google Cloud project; set OMP_GOOGLE_CLOUD_PROJECT")]
+	ProjectRequired,
 	/// HTTP transport failed without retaining source text.
 	#[error(transparent)]
 	Transport(#[from] OAuthTransportError),

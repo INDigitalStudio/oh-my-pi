@@ -505,6 +505,8 @@ pub struct InferenceSettings {
 	pub providers: ProviderRuntimeSettings,
 	/// Catalog/model policy.
 	pub model:     omp_catalog::settings::ModelSettings,
+	/// Whether context-overflow plans may promote to a larger compatible model.
+	pub context_promotion_enabled: bool,
 }
 
 impl InferenceSettings {
@@ -516,6 +518,8 @@ impl InferenceSettings {
 			sampling:  SamplingSettings::from_con(ctx),
 			providers: ProviderRuntimeSettings::from_con(ctx),
 			model:     omp_catalog::settings::ModelSettings::from_con(ctx),
+			context_promotion_enabled:
+				crate::pi_settings::AI_CONTEXT_PROMOTION_ENABLED.get(ctx),
 		}
 	}
 
@@ -709,14 +713,14 @@ omp_con::var! {
 	/// Enables transport and model fallback recovery.
 	pub static AI_RETRY_ENABLED = ai_retry_enabled: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Maximum retries after the first attempt.
 	pub static AI_RETRY_MAX_RETRIES = ai_retry_max_retries: u32 {
 		default: 10,
 		min: 0,
 		max: 100,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// First exponential retry ceiling in milliseconds.
 	pub static AI_RETRY_BASE_DELAY_MS = ai_retry_base_delay_ms: u32 {
@@ -724,7 +728,7 @@ omp_con::var! {
 		min: 0,
 		max: 3_600_000,
 		validate: validate_retry_base,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Largest accepted retry delay in milliseconds; zero disables the cap.
 	pub static AI_RETRY_MAX_DELAY_MS = ai_retry_max_delay_ms: u32 {
@@ -732,52 +736,52 @@ omp_con::var! {
 		min: 0,
 		max: 3_600_000,
 		validate: validate_retry_max,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Enables model fallback candidates.
 	pub static AI_RETRY_MODEL_FALLBACK = ai_retry_model_fallback: bool {
 		default: true,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Enables quota-aware preflight fallback.
 	pub static AI_RETRY_USAGE_AWARE_FALLBACK = ai_retry_usage_aware_fallback: bool {
 		default: false,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Remaining quota percentage held in reserve.
 	pub static AI_RETRY_USAGE_RESERVE_PCT = ai_retry_usage_reserve_pct: u8 {
 		default: 10,
 		min: 0,
 		max: 100,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Action when every account is inside the reserve.
 	pub static AI_RETRY_USAGE_RESERVE_POLICY = ai_retry_usage_reserve_policy: UsageReservePolicy {
 		default: UsageReservePolicy::Confirm,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Exact model/provider fallback chains.
 	pub static AI_RETRY_FALLBACK_CHAINS = ai_retry_fallback_chains: Kv {
 		default: serialize_table(&FallbackChains::new()),
 		validate: validate_retry_chains,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Primary reversion behavior after fallback.
 	pub static AI_RETRY_FALLBACK_REVERT = ai_retry_fallback_revert: FallbackRevertPolicy {
 		default: FallbackRevertPolicy::CooldownExpiry,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Enables the explicit Anthropic server-side safety fallback header.
 	pub static AI_RETRY_SERVER_SIDE_FALLBACK = ai_retry_server_side_fallback: bool {
 		default: false,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Default sampling temperature; negative preserves provider default.
 	pub static AI_SAMPLING_TEMPERATURE = ai_sampling_temperature: f32 {
 		default: -1.0,
 		min: -1.0,
 		validate: validate_finite,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Default nucleus cutoff; negative preserves provider default.
 	pub static AI_SAMPLING_TOP_P = ai_sampling_top_p: f32 {
@@ -785,13 +789,13 @@ omp_con::var! {
 		min: -1.0,
 		max: 1.0,
 		validate: validate_finite,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Default top-k bound; negative preserves provider default.
 	pub static AI_SAMPLING_TOP_K = ai_sampling_top_k: i32 {
 		default: -1,
 		min: -1,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Default minimum probability cutoff; negative preserves provider default.
 	pub static AI_SAMPLING_MIN_P = ai_sampling_min_p: f32 {
@@ -799,63 +803,63 @@ omp_con::var! {
 		min: -1.0,
 		max: 1.0,
 		validate: validate_finite,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Default presence penalty; negative preserves provider default.
 	pub static AI_SAMPLING_PRESENCE_PENALTY = ai_sampling_presence_penalty: f32 {
 		default: -1.0,
 		validate: validate_finite,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Default frequency penalty; negative preserves provider default.
 	pub static AI_SAMPLING_FREQUENCY_PENALTY = ai_sampling_frequency_penalty: f32 {
 		default: -1.0,
 		validate: validate_finite,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Default repetition penalty; negative preserves provider default.
 	pub static AI_SAMPLING_REPETITION_PENALTY = ai_sampling_repetition_penalty: f32 {
 		default: -1.0,
 		validate: validate_finite,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Default response verbosity.
 	pub static AI_SAMPLING_VERBOSITY = ai_sampling_verbosity: TextVerbositySetting {
 		default: TextVerbositySetting::Medium,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Maximum concurrent requests keyed by provider id.
 	pub static AI_PROVIDER_MAX_IN_FLIGHT = ai_provider_max_in_flight: Kv {
 		default: serialize_table(&BTreeMap::<Str, usize>::new()),
 		validate: validate_max_in_flight,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Maximum queued callers per provider before backpressure fails fast.
 	pub static AI_PROVIDER_MAX_QUEUED = ai_provider_max_queued: u32 {
 		default: 64,
 		min: 0,
 		max: 100_000,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Per-transport-attempt timeout in seconds.
 	pub static AI_PROVIDER_TIMEOUT_SECONDS = ai_provider_timeout_seconds: u32 {
 		default: 300,
 		min: 1,
 		max: 3_600,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Overall logical-call timeout in seconds; zero preserves caller deadlines.
 	pub static AI_PROVIDER_CALL_TIMEOUT_SECONDS = ai_provider_call_timeout_seconds: u32 {
 		default: 0,
 		min: 0,
 		max: 86_400,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Bedrock guardrail policy keyed by provider id.
 	pub static AI_PROVIDER_BEDROCK_GUARDRAILS = ai_provider_bedrock_guardrails: Kv {
 		default: serialize_table(&BTreeMap::<Str, crate::codec::bedrock::BedrockGuardrail>::new()),
 		validate: validate_bedrock_guardrails,
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 
@@ -935,8 +939,12 @@ mod tests {
 		AI_SAMPLING_VERBOSITY
 			.set(&ctx, TextVerbositySetting::High)
 			.expect("set verbosity");
+		crate::pi_settings::AI_CONTEXT_PROMOTION_ENABLED
+			.set(&ctx, true)
+			.expect("enable context promotion");
 		let settings = InferenceSettings::from_con(&ctx);
 		assert_eq!(settings.retry.max_retries, 3);
+		assert!(settings.context_promotion_enabled);
 		assert_eq!(settings.sampling.verbosity, TextVerbositySetting::High);
 		assert!(settings.retry.validate());
 		assert!(settings.sampling.validate());

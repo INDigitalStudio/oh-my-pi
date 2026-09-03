@@ -532,6 +532,7 @@ impl GoogleCcaCodec {
 				response:     256 * 1024 * 1024,
 			},
 			sealed_body: None,
+			adjustments: Vec::new(),
 		})
 	}
 }
@@ -597,6 +598,11 @@ impl Codec for GoogleCcaCodec {
 			supports_function_part_id: context.policy.tool.supports_function_part_id,
 			requires_skip_thought_signature: context.policy.tool.requires_skip_thought_signature
 				== Some(true),
+			requires_skip_thought_signature_on_first_function_call: context
+				.policy
+				.tool
+				.requires_skip_thought_signature_on_first_function_call
+				== Some(true),
 			multimodal_function_response: context.policy.image.multimodal_function_response,
 			strip_image_input: context.policy.image.strip_input == Some(true),
 			cca_legacy_parameters_schema: context.policy.tool.cca_legacy_parameters_schema,
@@ -612,7 +618,7 @@ impl Codec for GoogleCcaCodec {
 			.gemini
 			.project_for_encode(request, &options, context.thinking_policy, context.thinking_selection)
 			.map_err(|error| error.into_inference(false))?;
-		if let Some(adjustment) = projection.adjustments.first() {
+		if let Some(adjustment) = projection.unplanned_adjustment(false) {
 			return Err(
 				cca_provider_error(format!(
 					"planning did not account for unsupported CCA feature `{}`: {}",
@@ -688,6 +694,7 @@ impl Codec for GoogleCcaCodec {
 				response:     512 * 1024 * 1024,
 			},
 			sealed_body: None,
+			adjustments: Vec::new(),
 		})
 	}
 
@@ -1436,7 +1443,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            sync::Arc::from([]),
 			negotiation:       Default::default(),
-		};
+	forced_call: None,
+};
 		let projected = GeminiCodec::cloud_code_assist(None)
 			.project(&request, &GoogleRequestOptions {
 				supports_function_part_id: Some(true),
@@ -2104,7 +2112,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            sync::Arc::from([]),
 			negotiation:       Default::default(),
-		};
+	forced_call: None,
+};
 		let scope = GoogleProofScope { provider, codec: codec_id };
 		let dropping = GeminiCodec::cloud_code_assist(None)
 			.project(&request, &GoogleRequestOptions {

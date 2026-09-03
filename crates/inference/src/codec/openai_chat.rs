@@ -34,6 +34,7 @@ use crate::{
 		Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest,
 		ProviderStateEvent, RawCompletion, RawEvent, RequestHeader, RequestMethod, SizeBounds,
 		ToolInputKind, UnvalidatedToolCall,
+		schema::{SchemaDialect, normalize_schema},
 	},
 	error::{
 		Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction, classify_provider_rejection,
@@ -41,9 +42,14 @@ use crate::{
 	},
 	event::{BlockKind, ChatEvent, FinishReason, UsageUpdate},
 	id::ToolCallId,
-	receipt::{ExecutionReceipt, Usage, UsageSource},
+	receipt::{Adjustment, ExecutionReceipt, FeatureId, ReasonId, Usage, UsageSource},
 	transport::{Frame, FramingProtocol},
 };
+
+/// Output-token ceiling assumed when a route clamps to the model maximum but
+/// the catalog does not know the model's output limit (pi's
+/// `OPENAI_MAX_OUTPUT_TOKENS`).
+const OPENAI_MAX_OUTPUT_TOKENS: u64 = 64_000;
 
 /// Name of the output-token field accepted by a Chat Completions endpoint.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -194,6 +200,12 @@ pub struct OpenAiChatProfile {
 	/// top-level field only. Set by [`Codec::encode`] from prior-attempt
 	/// evidence, never by catalog policy.
 	pub template_effort_top_level_only: bool,
+	/// Request-scoped output-token ceiling: the caller's limit is lowered to
+	/// `min(limit, ceiling)`. Set by [`Codec::encode`] from the catalog model
+	/// maximum when the route policy clamps output to the model maximum
+	/// (`context.clamp_output_to_model_max`); `None` forwards the caller's
+	/// limit unchanged.
+	pub output_token_ceiling: Option<u64>,
 	/// Historical reasoning text field.
 	pub reasoning_history: ReasoningHistoryField,
 	/// Whether provider-scoped continuation proofs may be replayed.
@@ -248,6 +260,7 @@ impl Default for OpenAiChatProfile {
 			supports_images: true,
 			template_reasoning_effort: false,
 			template_effort_top_level_only: false,
+			output_token_ceiling: None,
 			reasoning_history: ReasoningHistoryField::ReasoningContent,
 			reasoning_proofs: false,
 			reasoning_deltas_cumulative: false,
@@ -329,7 +342,9 @@ impl OpenAiChatProfile {
 				ToolStrictMode::None => ToolStrictWire::Unsupported,
 			};
 		}
-		if matches!(policy.tool.supports_strict_mode, Some(false)) {
+		// ADR 0017: unknown is not support. Only an affirmative compiled
+		// capability may put the strict field on the wire.
+		if !matches!(policy.tool.supports_strict_mode, Some(true)) {
 			self.tool_strict = ToolStrictWire::Unsupported;
 		}
 		if let Some(value) = policy.tool.flatten_root_unions {
@@ -463,10 +478,19 @@ impl OpenAiChatCodec {
 	/// Encodes a chat request to exact JSON bytes for fixture and cassette
 	/// assertions.
 	pub fn encode_chat(&self, model: &str, request: &ChatRequest) -> Result<Bytes, Error> {
-		let wire = self.lower_request(model, request)?;
-		serde_json::to_vec(&wire)
+		self.encode_chat_adjusted(model, request).map(|(body, _)| body)
+	}
+
+	fn encode_chat_adjusted(
+		&self,
+		model: &str,
+		request: &ChatRequest,
+	) -> Result<(Bytes, Vec<Adjustment>), Error> {
+		let (wire, adjustments) = self.lower_request(model, request)?;
+		let body = serde_json::to_vec(&wire)
 			.map(Bytes::from)
-			.map_err(|_| encoding_error(ErrorKind::InternalInvariant))
+			.map_err(|_| encoding_error(ErrorKind::InternalInvariant))?;
+		Ok((body, adjustments))
 	}
 
 	/// Creates a fresh sans-I/O decoder for one Chat Completions response.
@@ -481,13 +505,19 @@ impl OpenAiChatCodec {
 		profile.max_frame_bytes
 	}
 
-	fn lower_request(&self, model: &str, request: &ChatRequest) -> Result<WireRequest, Error> {
+	fn lower_request(
+		&self,
+		model: &str,
+		request: &ChatRequest,
+	) -> Result<(WireRequest, Vec<Adjustment>), Error> {
+		let mut adjustments = Vec::new();
 		let messages = lower_messages(&self.profile, &request.messages)?;
-		let (mut tools, withheld) = lower_tools(&self.profile, &request.tools)?;
+		let (mut tools, withheld) =
+			lower_tools(&self.profile, &request.tools, &mut adjustments)?;
 		tools.extend(lower_hosted_tools(&self.profile, &request.hosted_tools)?);
 		let mut tool_choice =
 			lower_tool_choice(&self.profile, &mut tools, &request.tool_choice, &withheld)?;
-		let response_format = lower_output(&request.output)?;
+		let response_format = lower_output(&self.profile, &request.output, &mut adjustments)?;
 		if !self.profile.supports_reasoning_params && !matches!(request.reasoning, Setting::Unset) {
 			return Err(capability_error());
 		}
@@ -532,12 +562,19 @@ impl OpenAiChatCodec {
 		if !self.profile.stop_sequences && !sampling.stop.is_empty() {
 			return Err(capability_error());
 		}
+		// Mirrors pi's `resolveOpenAIOutputTokenParam`: a caller limit is
+		// lowered to the route's output clamp; an absent limit stays absent.
+		let output_limit = request.max_output_tokens.map(|requested| {
+			self.profile
+				.output_token_ceiling
+				.map_or(requested, |ceiling| requested.min(ceiling))
+		});
 		let (max_tokens, max_completion_tokens, max_output_tokens) =
 			match self.profile.max_tokens_field {
-				MaxTokensField::MaxTokens => (request.max_output_tokens, None, None),
-				MaxTokensField::MaxCompletionTokens => (None, request.max_output_tokens, None),
-				MaxTokensField::MaxOutputTokens => (None, None, request.max_output_tokens),
-				MaxTokensField::Omit if request.max_output_tokens.is_some() => {
+				MaxTokensField::MaxTokens => (output_limit, None, None),
+				MaxTokensField::MaxCompletionTokens => (None, output_limit, None),
+				MaxTokensField::MaxOutputTokens => (None, None, output_limit),
+				MaxTokensField::Omit if output_limit.is_some() => {
 					return Err(capability_error());
 				},
 				MaxTokensField::Omit => (None, None, None),
@@ -549,7 +586,7 @@ impl OpenAiChatCodec {
 		if cache_requested && prompt_cache_key.is_none() && prompt_cache_options.is_none() {
 			return Err(capability_error());
 		}
-		Ok(WireRequest {
+		Ok((WireRequest {
 			model: Str::new(model),
 			messages,
 			stream: true,
@@ -606,7 +643,7 @@ impl OpenAiChatCodec {
 			provider,
 			provider_options,
 			tool_stream,
-		})
+		}, adjustments))
 	}
 }
 
@@ -636,10 +673,17 @@ impl Codec for OpenAiChatCodec {
 		}
 		selected.profile.template_effort_top_level_only =
 			context.attempt.is_template_effort_rejected();
+		selected.profile.output_token_ceiling =
+			(context.policy.context.clamp_output_to_model_max == Some(true)).then(|| {
+				context
+					.policy_model
+					.and_then(|model| model.limits.maximum_output_tokens)
+					.unwrap_or(OPENAI_MAX_OUTPUT_TOKENS)
+			});
 		let wire_model = context
 			.thinking_selection
 			.map_or(&target.wire_model, |selection| &selection.wire_model);
-		let body = selected.encode_chat(wire_model.as_str(), request)?;
+		let (body, adjustments) = selected.encode_chat_adjusted(wire_model.as_str(), request)?;
 		if body.len() as u64 > selected.profile.max_request_bytes {
 			return Err(encoding_error(ErrorKind::InvalidRequest));
 		}
@@ -661,6 +705,7 @@ impl Codec for OpenAiChatCodec {
 				response:     selected.profile.max_response_bytes,
 			},
 			sealed_body: None,
+			adjustments,
 		})
 	}
 
@@ -1379,27 +1424,39 @@ fn coalesce_system_messages(messages: &mut Vec<WireMessage>, role: WireRole) -> 
 fn lower_tools(
 	profile: &OpenAiChatProfile,
 	tools: &[ToolDefinition],
+	adjustments: &mut Vec<Adjustment>,
 ) -> Result<(Vec<WireTool>, Vec<Str>), Error> {
 	let mut lowered = Vec::with_capacity(tools.len());
 	let mut withheld = Vec::new();
 	for tool in tools {
 		let (parameters, declared_strict) = tool.input.wire_schema();
-		let (strict, normalize) = match profile.tool_strict {
-			ToolStrictWire::Mixed => (Some(declared_strict), declared_strict),
-			ToolStrictWire::All => (Some(true), true),
-			ToolStrictWire::Unsupported => (None, false),
+		let requested_strict = match profile.tool_strict {
+			ToolStrictWire::Mixed => declared_strict,
+			ToolStrictWire::All => true,
+			ToolStrictWire::Unsupported => declared_strict,
 		};
+		let strict_capability =
+			(profile.tool_strict != ToolStrictWire::Unsupported).then_some(true);
 		let flattened = if profile.flatten_root_unions {
 			flatten_exclusive_required_root_union(parameters.as_value())
 		} else {
 			None
 		};
-		let parameters = match (normalize, flattened) {
-			(true, Some(flattened)) => strict_schema(&flattened)?,
-			(true, None) => strict_schema(parameters.as_value())?,
-			(false, Some(flattened)) => flattened,
-			(false, None) => parameters.as_value().clone(),
-		};
+		let schema = flattened.as_ref().unwrap_or_else(|| parameters.as_value());
+		let projection = normalize_schema(
+			schema,
+			requested_strict,
+			strict_capability,
+			SchemaDialect::OpenAiChat,
+		);
+		if let Some(reason) = projection.fallback {
+			adjustments.push(Adjustment::Dropped {
+				feature: FeatureId::new_static("chat.tool.strict"),
+				reason:  ReasonId::new_static(reason.reason_id()),
+			});
+		}
+		let parameters = projection.schema;
+		let strict = projection.strict;
 		if profile.flatten_root_unions && leftover_root_object_union(&parameters) {
 			// xAI rejects the entire request over one leftover object-root
 			// union ("tool parameter root must be an object type"); withhold
@@ -1503,40 +1560,6 @@ fn exclusive_required_branch(branch: &Value) -> bool {
 		.all(|key| matches!(key.as_str(), "required" | "description" | "title"))
 }
 
-fn strict_schema(schema: &Value) -> Result<Value, Error> {
-	match schema {
-		Value::Object(object) => {
-			let mut output = object.clone();
-			if let Some(Value::Object(properties)) = object.get("properties") {
-				let mut normalized = serde_json::Map::with_capacity(properties.len());
-				let mut required = Vec::with_capacity(properties.len());
-				for (name, property) in properties {
-					normalized.insert(name.clone(), strict_schema(property)?);
-					required.push(Value::String(name.clone()));
-				}
-				output.insert("properties".into(), Value::Object(normalized));
-				output.insert("required".into(), Value::Array(required));
-				output.insert("additionalProperties".into(), Value::Bool(false));
-			}
-			for keyword in ["items", "additionalProperties", "not", "if", "then", "else"] {
-				if let Some(value) = object.get(keyword).filter(|value| value.is_object()) {
-					output.insert(keyword.into(), strict_schema(value)?);
-				}
-			}
-			for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
-				if let Some(Value::Array(values)) = object.get(keyword) {
-					output.insert(
-						keyword.into(),
-						Value::Array(values.iter().map(strict_schema).collect::<Result<_, _>>()?),
-					);
-				}
-			}
-			Ok(Value::Object(output))
-		},
-		_ => Ok(schema.clone()),
-	}
-}
-
 fn lower_hosted_tools(
 	profile: &OpenAiChatProfile,
 	tools: &[HostedTool],
@@ -1621,23 +1644,37 @@ fn lower_tool_choice(
 	}))
 }
 
-fn lower_output(output: &Setting<StructuredOutput>) -> Result<Option<ResponseFormat>, Error> {
+fn lower_output(
+	profile: &OpenAiChatProfile,
+	output: &Setting<StructuredOutput>,
+	adjustments: &mut Vec<Adjustment>,
+) -> Result<Option<ResponseFormat>, Error> {
 	let output = match output {
 		Setting::Unset => return Ok(None),
 		Setting::Require(value) | Setting::Prefer(value) => value,
 	};
 	Ok(Some(match output {
 		StructuredOutput::JsonObject => ResponseFormat::JsonObject,
-		StructuredOutput::JsonSchema { name, schema, strict } => ResponseFormat::JsonSchema {
-			json_schema: JsonSchemaFormat {
-				name:   name.clone(),
-				schema: if *strict {
-					strict_schema(schema.as_value())?
-				} else {
-					schema.as_value().clone()
+		StructuredOutput::JsonSchema { name, schema, strict } => {
+			let projection = normalize_schema(
+				schema.as_value(),
+				*strict,
+				(profile.tool_strict != ToolStrictWire::Unsupported).then_some(true),
+				SchemaDialect::OpenAiChat,
+			);
+			if let Some(reason) = projection.fallback {
+				adjustments.push(Adjustment::Dropped {
+					feature: FeatureId::new_static("chat.structured_output.strict"),
+					reason:  ReasonId::new_static(reason.reason_id()),
+				});
+			}
+			ResponseFormat::JsonSchema {
+				json_schema: JsonSchemaFormat {
+					name: name.clone(),
+					schema: projection.schema,
+					strict: projection.strict.unwrap_or(false),
 				},
-				strict: *strict,
-			},
+			}
 		},
 		StructuredOutput::Regex(_) | StructuredOutput::Lark(_) | StructuredOutput::Ebnf(_) => {
 			return Err(capability_error());
@@ -2862,7 +2899,7 @@ mod tests {
 	use std::{sync::Arc, time::Duration};
 
 	use bytes::Bytes;
-	use omp_catalog::policy;
+	use omp_catalog::{Catalog, PolicyModel, WireTarget, policy};
 	use serde::Deserialize;
 
 	use super::{
@@ -2871,15 +2908,18 @@ mod tests {
 		flatten_exclusive_required_root_union,
 	};
 	use crate::{
+		body::BodySource,
 		call::{
 			ChatRequest, ContentPart, MediaInput, Message, NegotiationPolicy, OpaqueJson,
-			ReasoningRequest, ReasoningVisibility, Role, Sampling, Setting, ToolChoice,
-			ToolDefinition, ToolInputConstraint, ToolResultContent,
+			OperationCall, ReasoningRequest, ReasoningVisibility, Role, Sampling, Setting,
+			ToolChoice, ToolDefinition, ToolInputConstraint, ToolResultContent,
 		},
 		catalog::ReasoningEffort,
-		codec::{Decoder, RawEvent},
+		codec::{Codec, Decoder, EncodeContext, RawEvent},
 		error::{Error, ErrorDetail, ErrorKind, RetryAction},
 		event::{ChatEvent, FinishReason},
+		id::RequestId,
+		receipt::Adjustment,
 		transport::{Frame, SseDecoder, SseEvent},
 	};
 
@@ -2899,7 +2939,8 @@ mod tests {
 			top_logprobs: None,
 			safety: Arc::from([]),
 			negotiation: NegotiationPolicy::default(),
-		}
+	forced_call: None,
+}
 	}
 
 	fn text_message(text: &str) -> Message {
@@ -3945,7 +3986,7 @@ mod tests {
 			preserve_signatures: false,
 		});
 		request
-	}
+}
 
 	#[test]
 	fn text_only_history_replaces_images_while_ocr_preserves_them() {
@@ -4275,7 +4316,7 @@ mod tests {
 			]),
 			name:    None,
 		}]))
-	}
+}
 
 	#[test]
 	fn replay_reasoning_content_matches_pi_request_shape() {
@@ -4401,7 +4442,7 @@ mod tests {
 			}]),
 			name:    None,
 		}]))
-	}
+}
 
 	#[test]
 	fn uses_openai_tool_call_id_limit_matches_pi_request_shape() {
@@ -4458,7 +4499,7 @@ mod tests {
 		}]);
 		request.tool_choice = Setting::Require(ToolChoice::Named("lookup".into()));
 		request
-	}
+}
 
 	#[test]
 	fn supports_strict_mode_matches_pi_request_shape() {
@@ -4477,6 +4518,7 @@ mod tests {
 	fn tool_strict_mode_matches_pi_request_shape() {
 		let mut policy = policy::WirePolicy::overrides();
 		policy.tool.strict_mode = Some(policy::ToolStrictMode::AllStrict);
+		policy.tool.supports_strict_mode = Some(true);
 		let mut profile = OpenAiChatProfile::default();
 		profile.apply_policy(&policy);
 		let body = OpenAiChatCodec::new(profile, None)
@@ -4485,6 +4527,91 @@ mod tests {
 		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
 		assert_eq!(wire["tools"][0]["function"]["strict"], true);
 		assert_eq!(wire["tools"][0]["function"]["parameters"]["additionalProperties"], false);
+	}
+
+	#[test]
+	fn strict_schema_preserves_optional_fields_as_nullable_and_strips_validation_keywords() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.tool.supports_strict_mode = Some(true);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let mut request = forced_tool_request();
+		request.tools = Arc::from([ToolDefinition {
+			name:        "lookup".into(),
+			description: None,
+			input:       ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(serde_json::json!({
+					"type": "object",
+					"properties": {
+						"query": {"type": "string", "pattern": "^x+$"},
+						"limit": {"type": "integer", "minimum": 1}
+					},
+					"required": ["query"]
+				})),
+				strict:     true,
+			},
+		}]);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &request)
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		let schema = &wire["tools"][0]["function"]["parameters"];
+		assert_eq!(schema["required"], serde_json::json!(["query", "limit"]));
+		assert_eq!(schema["additionalProperties"], false);
+		assert!(schema["properties"]["query"].get("pattern").is_none());
+		assert!(schema["properties"]["limit"].get("minimum").is_none());
+		assert_eq!(schema["properties"]["limit"]["anyOf"][1]["type"], "null");
+	}
+
+	#[test]
+	fn unknown_strict_capability_fails_open_with_typed_adjustment() {
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy::WirePolicy::baseline());
+		let (body, adjustments) = OpenAiChatCodec::new(profile, None)
+			.encode_chat_adjusted("model", &forced_tool_request())
+			.expect("non-strict fallback encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert!(wire["tools"][0]["function"].get("strict").is_none());
+		assert!(matches!(
+			adjustments.as_slice(),
+			[Adjustment::Dropped { feature, reason }]
+				if feature.0 == "chat.tool.strict"
+					&& reason.0 == "catalog.strict-schema-unsupported"
+		));
+	}
+
+	#[test]
+	fn unrepresentable_strict_schema_retains_open_map_semantics_and_receipts_fallback() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.tool.supports_strict_mode = Some(true);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let mut request = forced_tool_request();
+		request.tools = Arc::from([ToolDefinition {
+			name:        "lookup".into(),
+			description: None,
+			input:       ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(serde_json::json!({
+					"type": "object",
+					"additionalProperties": true
+				})),
+				strict:     true,
+			},
+		}]);
+		let (body, adjustments) = OpenAiChatCodec::new(profile, None)
+			.encode_chat_adjusted("model", &request)
+			.expect("fallback encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert_eq!(wire["tools"][0]["function"]["strict"], false);
+		assert_eq!(
+			wire["tools"][0]["function"]["parameters"]["additionalProperties"],
+			true
+		);
+		assert!(matches!(
+			adjustments.as_slice(),
+			[Adjustment::Dropped { reason, .. }]
+				if reason.0 == "schema.strict-schema-unrepresentable"
+		));
 	}
 
 	#[test]
@@ -4529,7 +4656,7 @@ mod tests {
 			},
 			text_message("continue"),
 		]))
-	}
+}
 
 	#[test]
 	fn requires_tool_result_name_matches_pi_request_shape() {
@@ -4655,5 +4782,100 @@ mod tests {
 				.is_none(),
 			"the rejected kwargs spelling must not reappear"
 		);
+	}
+
+	/// Encodes through [`Codec::encode`] against an embedded Chat Completions
+	/// route so the catalog model limits reach the codec the way planning
+	/// delivers them.
+	fn encode_with_model_limit(
+		policy: &policy::WirePolicy,
+		maximum_output_tokens: Option<u64>,
+		request: ChatRequest,
+	) -> serde_json::Value {
+		let catalog = Catalog::embedded();
+		let model = catalog
+			.models()
+			.iter()
+			.find(|model| {
+				model.routes.iter().any(|route| {
+					catalog
+						.route(route)
+						.is_some_and(|route| route.codec.as_str() == "openai-chat")
+				})
+			})
+			.expect("embedded Chat Completions model");
+		let route = model
+			.routes
+			.iter()
+			.filter_map(|route| catalog.route(route))
+			.find(|route| route.codec.as_str() == "openai-chat")
+			.expect("embedded Chat Completions route");
+		let wire_model = model
+			.wire_ids
+			.iter()
+			.find(|(candidate, _)| candidate == &route.id)
+			.expect("embedded Chat Completions wire model")
+			.1
+			.clone();
+		let target = WireTarget {
+			route: route.id.clone(),
+			codec: route.codec.clone(),
+			endpoint: route.endpoint.clone(),
+			wire_model,
+		};
+		let mut policy_model = PolicyModel::from(model);
+		policy_model.limits.maximum_output_tokens = maximum_output_tokens;
+		let request_id = RequestId::new("chat-output-clamp");
+		let context = EncodeContext {
+			request_id: &request_id,
+			route,
+			target: Some(&target),
+			policy_model: Some(&policy_model),
+			policy,
+			..EncodeContext::default()
+		};
+		let encoded = OpenAiChatCodec::new(OpenAiChatProfile::default(), None)
+			.encode(&context, &OperationCall::Chat(Arc::new(request)))
+			.expect("request encodes");
+		let BodySource::Bytes(body) = encoded.body else {
+			panic!("Chat Completions body is buffered JSON");
+		};
+		serde_json::from_slice(&body).expect("wire body is JSON")
+	}
+
+	fn limited_request(max_output_tokens: u64) -> ChatRequest {
+		let mut request = request(Arc::from([text_message("hello")]));
+		request.max_output_tokens = Some(max_output_tokens);
+		request
+}
+
+	#[test]
+	fn clamp_output_to_model_max_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.context.clamp_output_to_model_max = Some(true);
+		// pi: `min(requested, model.maxTokens)` when `clampOutputToModelMax`.
+		let wire = encode_with_model_limit(&policy, Some(131_072), limited_request(200_000));
+		assert_eq!(wire["max_completion_tokens"], 131_072_u64);
+		assert!(wire.get("max_tokens").is_none());
+		// A limit under the model maximum is forwarded as requested.
+		let wire = encode_with_model_limit(&policy, Some(131_072), limited_request(4_096));
+		assert_eq!(wire["max_completion_tokens"], 4_096_u64);
+		// Unknown model maximum falls back to pi's `OPENAI_MAX_OUTPUT_TOKENS`.
+		let wire = encode_with_model_limit(&policy, None, limited_request(200_000));
+		assert_eq!(wire["max_completion_tokens"], super::OPENAI_MAX_OUTPUT_TOKENS);
+		// No caller limit: nothing is synthesized, so nothing is clamped.
+		let wire = encode_with_model_limit(
+			&policy,
+			Some(131_072),
+			request(Arc::from([text_message("hello")])),
+		);
+		assert!(wire.get("max_completion_tokens").is_none());
+	}
+
+	#[test]
+	fn clamp_output_is_inert_without_the_axis() {
+		let policy = policy::WirePolicy::baseline();
+		let wire = encode_with_model_limit(&policy, Some(131_072), limited_request(200_000));
+		assert_eq!(wire["max_completion_tokens"], 200_000_u64);
 	}
 }

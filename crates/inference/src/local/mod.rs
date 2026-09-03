@@ -23,8 +23,6 @@ pub mod speech_catalog;
 /// Candle Whisper speech recognition.
 #[cfg(feature = "local-stt")]
 pub mod stt;
-#[cfg(feature = "local-text")]
-pub mod text;
 /// Curated GGUF title, memory, and classifier artifacts.
 pub mod tiny_catalog;
 /// Tiny generated-title validation and casing reconciliation.

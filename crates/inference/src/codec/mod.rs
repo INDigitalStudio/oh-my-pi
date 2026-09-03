@@ -35,7 +35,7 @@ use crate::{
 	error::Error,
 	event::{ChatEvent, FinishReason, WorkflowResponse},
 	id::{AccountId, PrincipalId, RequestId, ToolCallId},
-	receipt::Usage,
+	receipt::{Adjustment, Usage},
 	session::ServerStateBinding,
 	transport::{Frame, FramingProtocol},
 };
@@ -55,6 +55,7 @@ pub mod openai_embedding;
 pub mod openai_media;
 pub mod openai_realtime;
 pub mod openai_responses;
+pub(crate) mod schema;
 pub mod provider_hooks;
 pub use provider_hooks::{
 	ModelsDiscoverHookPage, ModelsDiscoverHookRequest, ProviderHookCredential, ProviderHookError,
@@ -187,6 +188,9 @@ pub struct EncodedRequest {
 	/// Enforced byte limits.
 	pub bounds:             SizeBounds,
 	pub(crate) sealed_body: Option<SealedBodyTemplate>,
+	/// Encode-time degradations (ADR 0021 §3) the route encoder receipts
+	/// before transport; never a silent change.
+	pub adjustments:        Vec<Adjustment>,
 }
 impl EncodedRequest {
 	/// Constructs an ordinary credential-free encoded request.
@@ -199,7 +203,23 @@ impl EncodedRequest {
 		framing: FramingProtocol,
 		bounds: SizeBounds,
 	) -> Self {
-		Self { operation, method, uri, headers, body, framing, bounds, sealed_body: None }
+		Self {
+			operation,
+			method,
+			uri,
+			headers,
+			body,
+			framing,
+			bounds,
+			sealed_body: None,
+			adjustments: Vec::new(),
+		}
+	}
+
+	/// Attaches encode-time receipted degradations.
+	pub fn with_adjustments(mut self, adjustments: Vec<Adjustment>) -> Self {
+		self.adjustments = adjustments;
+		self
 	}
 
 	pub(crate) fn with_sealed_body(mut self, template: SealedBodyTemplate) -> Self {

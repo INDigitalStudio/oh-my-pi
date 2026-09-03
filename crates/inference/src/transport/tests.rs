@@ -198,6 +198,7 @@ fn request(
 			framing: FramingProtocol::Raw,
 			bounds: SizeBounds { request_body: 1024, frame: 1024, response: 1024 },
 			sealed_body: None,
+			adjustments: Vec::new(),
 		},
 		credentials: None,
 		signature: None,

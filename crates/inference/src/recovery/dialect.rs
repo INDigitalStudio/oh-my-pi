@@ -3,7 +3,10 @@
 use std::{fmt, str};
 
 use bytes::{Bytes, BytesMut};
-use omp_catalog::{id::WirePolicyId, policy::LeakedThinkingHealer};
+use omp_catalog::{
+	id::WirePolicyId,
+	policy::{LeakedThinkingHealer, StreamMarkupHealingPattern},
+};
 use omp_core::{Str, sf};
 use serde::Deserialize;
 use serde_json::{Map, Number, Value};
@@ -94,6 +97,17 @@ pub enum Dialect {
 }
 
 impl Dialect {
+	/// Resolves a tool-envelope dialect from catalog-selected stream recovery policy.
+	pub const fn from_markup_pattern(pattern: StreamMarkupHealingPattern) -> Option<Self> {
+		match pattern {
+			StreamMarkupHealingPattern::Kimi => Some(Self::Kimi),
+			StreamMarkupHealingPattern::Dsml => Some(Self::DeepSeek),
+			StreamMarkupHealingPattern::Qwen => Some(Self::QwenXml),
+			StreamMarkupHealingPattern::Harmony => Some(Self::Harmony),
+			StreamMarkupHealingPattern::Thinking => None,
+		}
+	}
+
 	/// Resolves a tool-envelope dialect from catalog-selected recovery policy.
 	pub const fn from_healer(healer: LeakedThinkingHealer) -> Option<Self> {
 		match healer {

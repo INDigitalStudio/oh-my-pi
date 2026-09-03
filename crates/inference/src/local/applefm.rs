@@ -1581,7 +1581,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            [].into(),
 			negotiation:       NegotiationPolicy::default(),
-		}
+	forced_call: None,
+}
 	}
 
 	fn prompt_of(messages: &[(Role, &str)]) -> Result<(Str, Option<Str>, bool), ErrorKind> {

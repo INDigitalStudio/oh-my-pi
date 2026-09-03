@@ -27,6 +27,7 @@ use crate::{
 
 const REDIRECT_URI_PARAMETER: &str = "redirect_uri";
 const ENDPOINT: &str = "https://daily-cloudcode-pa.googleapis.com";
+const GEMINI_CLI_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
 const LOAD_CODE_ASSIST_URL: &str =
 	"https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 const ONBOARD_USER_URL: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser";
@@ -34,14 +35,44 @@ const FREE_TIER_ID: &str = "free-tier";
 const ONBOARD_TIMEOUT: Duration = Duration::from_secs(30);
 const ONBOARD_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+#[derive(Clone, Copy)]
+enum CloudCodeProfile {
+	Antigravity,
+	GeminiCli,
+}
+
+impl CloudCodeProfile {
+	const fn exchange_kind(self) -> OAuthExchangeKind {
+		match self {
+			Self::Antigravity => OAuthExchangeKind::GoogleAntigravity,
+			Self::GeminiCli => OAuthExchangeKind::GoogleGeminiCli,
+		}
+	}
+
+	const fn endpoint(self) -> &'static str {
+		match self {
+			Self::Antigravity => ENDPOINT,
+			Self::GeminiCli => GEMINI_CLI_ENDPOINT,
+		}
+	}
+
+	const fn metadata(self) -> &'static Metadata {
+		match self {
+			Self::Antigravity => &ANTIGRAVITY_METADATA,
+			Self::GeminiCli => &GEMINI_CLI_METADATA,
+		}
+	}
+}
+
 struct GoogleAntigravityHandler {
-	http:  Arc<dyn OAuthHttpClient>,
-	clock: Arc<dyn OAuthClock>,
+	http:    Arc<dyn OAuthHttpClient>,
+	clock:   Arc<dyn OAuthClock>,
+	profile: CloudCodeProfile,
 }
 
 impl OAuthCustomHandler for GoogleAntigravityHandler {
 	fn exchange_kind(&self) -> OAuthExchangeKind {
-		OAuthExchangeKind::GoogleAntigravity
+		self.profile.exchange_kind()
 	}
 
 	fn exchange<'a>(
@@ -55,8 +86,13 @@ impl OAuthCustomHandler for GoogleAntigravityHandler {
 			let mut pending = engine.begin_pkce(&pkce, driver).await?;
 			let input = engine.receive_pkce_input(&mut pending, driver).await?;
 			let mut tokens = engine.complete_pkce(&pkce, pending, input).await?;
-			let project =
-				discover_project(self.http.as_ref(), self.clock.as_ref(), &tokens.access_token).await?;
+			let project = discover_project(
+				self.http.as_ref(),
+				self.clock.as_ref(),
+				&tokens.access_token,
+				self.profile,
+			)
+			.await?;
 			tokens.set_project(project);
 			Ok(tokens)
 		}
@@ -82,7 +118,16 @@ pub(super) fn register(
 	http: Arc<dyn OAuthHttpClient>,
 	clock: Arc<dyn OAuthClock>,
 ) -> Result<(), OAuthCustomDispatchError> {
-	dispatcher.register(Arc::new(GoogleAntigravityHandler { http, clock }))
+	dispatcher.register(Arc::new(GoogleAntigravityHandler {
+		http: Arc::clone(&http),
+		clock: Arc::clone(&clock),
+		profile: CloudCodeProfile::Antigravity,
+	}))?;
+	dispatcher.register(Arc::new(GoogleAntigravityHandler {
+		http,
+		clock,
+		profile: CloudCodeProfile::GeminiCli,
+	}))
 }
 
 fn pkce_spec(spec: &OAuthCustomSpec) -> Result<OAuthPkceSpec, OAuthError> {
@@ -112,9 +157,19 @@ fn pkce_spec(spec: &OAuthCustomSpec) -> Result<OAuthPkceSpec, OAuthError> {
 #[serde(rename_all = "camelCase")]
 struct Metadata {
 	ide_type: &'static str,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	platform: Option<&'static str>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	plugin_type: Option<&'static str>,
 }
 
-const METADATA: Metadata = Metadata { ide_type: "ANTIGRAVITY" };
+const ANTIGRAVITY_METADATA: Metadata =
+	Metadata { ide_type: "ANTIGRAVITY", platform: None, plugin_type: None };
+const GEMINI_CLI_METADATA: Metadata = Metadata {
+	ide_type: "IDE_UNSPECIFIED",
+	platform: Some("PLATFORM_UNSPECIFIED"),
+	plugin_type: Some("GEMINI"),
+};
 
 #[derive(Serialize)]
 struct LoadRequest<'a> {
@@ -175,8 +230,9 @@ async fn discover_project(
 	http: &dyn OAuthHttpClient,
 	clock: &dyn OAuthClock,
 	access_token: &SecretString,
+	profile: CloudCodeProfile,
 ) -> Result<ProjectId, OAuthError> {
-	let initial = load_code_assist(http, access_token, None).await?;
+	let initial = load_code_assist(http, access_token, None, profile).await?;
 	if !free_tier_allowed(&initial)
 		&& initial.ineligible_tiers.iter().any(|tier| {
 			tier.tier_id.as_deref() == Some(FREE_TIER_ID)
@@ -188,9 +244,9 @@ async fn discover_project(
 		return Err(OAuthError::ProvisioningIneligible);
 	}
 	if initial.current_tier.is_none() {
-		onboard_user(http, clock, access_token).await?;
+		onboard_user(http, clock, access_token, profile).await?;
 	}
-	let refreshed = load_code_assist(http, access_token, None).await?;
+	let refreshed = load_code_assist(http, access_token, None, profile).await?;
 	project_id(&refreshed).ok_or(OAuthError::MalformedResponse)
 }
 
@@ -198,14 +254,17 @@ async fn load_code_assist(
 	http: &dyn OAuthHttpClient,
 	access_token: &SecretString,
 	project: Option<&str>,
+	profile: CloudCodeProfile,
 ) -> Result<LoadResponse, OAuthError> {
+	let endpoint = profile.endpoint();
+	let url = format!("{endpoint}/v1internal:loadCodeAssist");
 	let mut response: LoadResponse = request_json(
 		http,
 		cloud_code_request(
 			Method::POST,
-			LOAD_CODE_ASSIST_URL,
+			&url,
 			access_token,
-			Some(json_body(&LoadRequest { metadata: &METADATA, project })?),
+			Some(json_body(&LoadRequest { metadata: profile.metadata(), project })?),
 		)?,
 	)
 	.await?;
@@ -216,10 +275,10 @@ async fn load_code_assist(
 			http,
 			cloud_code_request(
 				Method::POST,
-				LOAD_CODE_ASSIST_URL,
+				&url,
 				access_token,
 				Some(json_body(&LoadRequest {
-					metadata: &METADATA,
+					metadata: profile.metadata(),
 					project:  Some(project.as_str()),
 				})?),
 			)?,
@@ -248,6 +307,7 @@ async fn onboard_user(
 	http: &dyn OAuthHttpClient,
 	clock: &dyn OAuthClock,
 	access_token: &SecretString,
+	profile: CloudCodeProfile,
 ) -> Result<(), OAuthError> {
 	let deadline = clock
 		.now()
@@ -258,9 +318,12 @@ async fn onboard_user(
 		clock,
 		cloud_code_request(
 			Method::POST,
-			ONBOARD_USER_URL,
+			&format!("{}/v1internal:onboardUser", profile.endpoint()),
 			access_token,
-			Some(json_body(&OnboardRequest { tier_id: FREE_TIER_ID, metadata: &METADATA })?),
+			Some(json_body(&OnboardRequest {
+				tier_id: FREE_TIER_ID,
+				metadata: profile.metadata(),
+			})?),
 		)?,
 		deadline,
 	)
@@ -282,7 +345,7 @@ async fn onboard_user(
 			.ok_or(OAuthError::MalformedResponse)?;
 		let remaining = remaining(deadline, clock.now())?;
 		clock.sleep(ONBOARD_POLL_INTERVAL.min(remaining)).await;
-		let operation_url = format!("{ENDPOINT}/v1internal/{operation_name}");
+		let operation_url = format!("{}/v1internal/{operation_name}", profile.endpoint());
 		operation = request_json_until(
 			http,
 			clock,
@@ -596,8 +659,13 @@ mod tests {
 		}"#;
 		let http = ScriptedHttp::new(&[payload, payload]);
 		let clock = AdvancingClock(Mutex::new(SystemTime::UNIX_EPOCH));
-		let project = discover_project(&http, &clock, &SecretString::from("access-token".to_owned()))
-			.await
+		let project = discover_project(
+			&http,
+			&clock,
+			&SecretString::from("access-token".to_owned()),
+			CloudCodeProfile::Antigravity,
+		)
+		.await
 			.expect("project discovery");
 		assert_eq!(project.as_str(), "project-123");
 		let requests = http.requests.lock();
@@ -621,6 +689,41 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn gemini_cli_discovers_and_persists_project_on_its_endpoint() {
+		let payload = r#"{
+			"currentTier": {"id": "free-tier"},
+			"paidTier": {"id": "standard-tier"},
+			"allowedTiers": [{"id": "free-tier"}],
+			"cloudaicompanionProject": "gemini-project"
+		}"#;
+		let http = ScriptedHttp::new(&[payload, payload]);
+		let clock = AdvancingClock(Mutex::new(SystemTime::UNIX_EPOCH));
+		let project = discover_project(
+			&http,
+			&clock,
+			&SecretString::from("access-token".to_owned()),
+			CloudCodeProfile::GeminiCli,
+		)
+		.await
+		.expect("Gemini CLI project discovery");
+		assert_eq!(project.as_str(), "gemini-project");
+		let requests = http.requests.lock();
+		assert!(requests.iter().all(|request| {
+			request.url == "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+		}));
+		assert_eq!(
+			body(&requests[0]),
+			serde_json::json!({
+				"metadata": {
+					"ideType": "IDE_UNSPECIFIED",
+					"platform": "PLATFORM_UNSPECIFIED",
+					"pluginType": "GEMINI"
+				}
+			})
+		);
+	}
+
+	#[tokio::test]
 	async fn missing_paid_tier_reloads_with_returned_project() {
 		let initial = r#"{
 			"currentTier": {"id": "free-tier"},
@@ -635,8 +738,13 @@ mod tests {
 		}"#;
 		let http = ScriptedHttp::new(&[initial, hydrated, hydrated]);
 		let clock = AdvancingClock(Mutex::new(SystemTime::UNIX_EPOCH));
-		let project = discover_project(&http, &clock, &SecretString::from("access-token".to_owned()))
-			.await
+		let project = discover_project(
+			&http,
+			&clock,
+			&SecretString::from("access-token".to_owned()),
+			CloudCodeProfile::Antigravity,
+		)
+		.await
 			.expect("hydrated project");
 		assert_eq!(project.as_str(), "project-123");
 		let requests = http.requests.lock();
@@ -659,8 +767,13 @@ mod tests {
 			}]
 		}"#]);
 		let clock = AdvancingClock(Mutex::new(SystemTime::UNIX_EPOCH));
-		let error = discover_project(&http, &clock, &SecretString::from("access-token".to_owned()))
-			.await
+		let error = discover_project(
+			&http,
+			&clock,
+			&SecretString::from("access-token".to_owned()),
+			CloudCodeProfile::Antigravity,
+		)
+		.await
 			.expect_err("ineligible account");
 		assert_eq!(error, OAuthError::ProvisioningIneligible);
 		assert_eq!(http.requests.lock().len(), 1);
@@ -686,8 +799,13 @@ mod tests {
 			}"#,
 		]);
 		let clock = AdvancingClock(Mutex::new(SystemTime::UNIX_EPOCH));
-		let project = discover_project(&http, &clock, &SecretString::from("access-token".to_owned()))
-			.await
+		let project = discover_project(
+			&http,
+			&clock,
+			&SecretString::from("access-token".to_owned()),
+			CloudCodeProfile::Antigravity,
+		)
+		.await
 			.expect("provisioned project");
 		assert_eq!(project.as_str(), "project-123");
 		assert_eq!(clock.now(), SystemTime::UNIX_EPOCH + ONBOARD_POLL_INTERVAL);

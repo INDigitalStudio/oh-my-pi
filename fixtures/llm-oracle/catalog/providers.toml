@@ -1,6 +1,13 @@
 # Pi provider registry reconciliation. Model identities, pricing, and limits live in generated JSON.
 # Every table below corresponds to one entry in packages/ai/src/registry/registry.ts.
 
+[providers."abliteration"]
+transport = "open-ai-responses"
+base_url = "https://api.abliteration.ai/v1"
+auth = { type = "bearer", env = ["OMP_ABLITERATION_API_KEY", "ABLITERATION_API_KEY", "ABLIT_KEY"] }
+discovery = { kind = "open-ai-models", label = "Abliteration", authoritative = true }
+facets = ["chat"]
+
 [providers."azure"]
 transport = "open-ai-chat"
 base_url = "https://{region}.openai.azure.com/openai/deployments/{deployment}"
@@ -25,13 +32,13 @@ usage = true
 [providers."anthropic"]
 transport = "anthropic-messages"
 base_url = "https://api.anthropic.com"
-auth = { type = "header", name = "x-api-key", env = ["OMP_ANTHROPIC_API_KEY", "OMP_ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_API_KEY"] }
+auth = { type = "header", name = "x-api-key", env = ["OMP_ANTHROPIC_API_KEY", "OMP_ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_FOUNDRY_API_KEY"] }
 oauth_flow = "anthropic"
-oauth_auth = { type = "bearer", env = ["OMP_ANTHROPIC_OAUTH_TOKEN"] }
+oauth_auth = { type = "bearer", env = ["OMP_ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN"] }
 discovery = { kind = "open-ai-models", label = "Anthropic", authoritative = false }
 facets = ["chat"]
 headers = { "anthropic-version" = "2023-06-01" }
-compat = { "multiple_system_messages" = false, "max_tokens_field" = "max_tokens", "tool_strict_mode" = "none", "reasoning_wire_format" = "anthropic", "cache_control_format" = "anthropic", "image_encoding_format" = "anthropic_source", "tool_schema_flavor" = "anthropic", "stream_protocol" = "sse_events" }
+compat = { "multiple_system_messages" = false, "max_tokens_field" = "max_tokens", "tool_strict_mode" = "none", "forced_tool_choice_penalty" = "cache_invalidated", "reasoning_wire_format" = "anthropic", "cache_control_format" = "anthropic", "image_encoding_format" = "anthropic_source", "tool_schema_flavor" = "anthropic", "stream_protocol" = "sse_events" }
 usage = true
 
 [providers."zai"]
@@ -684,6 +691,13 @@ auth = { type = "bearer", env = ["OMP_AI_GATEWAY_API_KEY", "AI_GATEWAY_API_KEY"]
 discovery = { kind = "open-ai-models", label = "Vercel AI Gateway", authoritative = false }
 facets = ["chat"]
 
+[providers."cline-pass"]
+transport = "open-ai-chat"
+base_url = "https://api.cline.bot/api/v1"
+auth = { type = "optional-bearer", env = ["OMP_CLINE_API_KEY", "CLINE_API_KEY"] }
+discovery = { kind = "open-ai-models", label = "ClinePass", authoritative = true }
+facets = ["chat"]
+
 [providers."cloudflare-ai-gateway"]
 transport = "anthropic-messages"
 base_url = "https://gateway.ai.cloudflare.com/v1/{account}/{gateway}/anthropic"
@@ -852,7 +866,7 @@ compat = { "multiple_system_messages" = false, "tool_strict_mode" = "none", "rea
 [providers."google-vertex"]
 transport = "google-vertex"
 base_url = "https://{location}-aiplatform.googleapis.com/v1"
-auth = { type = "google-adc", api_key_env = ["OMP_GOOGLE_CLOUD_API_KEY"], project_env = ["OMP_GOOGLE_CLOUD_PROJECT", "OMP_GCP_PROJECT", "OMP_GCLOUD_PROJECT"], location_env = ["OMP_GOOGLE_VERTEX_LOCATION", "OMP_GOOGLE_CLOUD_LOCATION", "OMP_VERTEX_LOCATION"] }
+auth = { type = "google-adc", api_key_env = ["OMP_GOOGLE_CLOUD_API_KEY", "GOOGLE_CLOUD_API_KEY"], project_env = ["OMP_GOOGLE_CLOUD_PROJECT", "OMP_GCP_PROJECT", "OMP_GCLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT", "GCP_PROJECT", "GCLOUD_PROJECT"], location_env = ["OMP_GOOGLE_VERTEX_LOCATION", "OMP_GOOGLE_CLOUD_LOCATION", "OMP_VERTEX_LOCATION", "GOOGLE_VERTEX_LOCATION", "GOOGLE_CLOUD_LOCATION", "VERTEX_LOCATION"], credentials_env = ["OMP_GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_APPLICATION_CREDENTIALS"] }
 discovery = { kind = "open-ai-models", label = "Google Vertex AI", authoritative = false }
 facets = ["chat", "embeddings"]
 pending_facets = ["image_generation"]
@@ -890,7 +904,7 @@ facets = ["chat"]
 transport = "bedrock-converse"
 base_url = "https://bedrock-runtime.{region}.amazonaws.com"
 auth = { type = "aws-sig-v4" }
-oauth_auth = { type = "bearer", env = ["OMP_AWS_BEARER_TOKEN_BEDROCK"] }
+oauth_auth = { type = "bearer", env = ["OMP_AWS_BEARER_TOKEN_BEDROCK", "AWS_BEARER_TOKEN_BEDROCK"] }
 discovery = { kind = "specialized", label = "Amazon Bedrock", authoritative = false }
 facets = ["chat"]
 compat = { "multiple_system_messages" = false, "max_tokens_field" = "max_tokens", "tool_strict_mode" = "none", "reasoning_wire_format" = "anthropic", "cache_control_format" = "anthropic", "image_encoding_format" = "anthropic_source", "tool_schema_flavor" = "anthropic", "stream_protocol" = "sse_events" }

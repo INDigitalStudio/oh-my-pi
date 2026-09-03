@@ -788,6 +788,7 @@ async fn execute(
 		"provider response headers"
 	);
 	emit_provider_response(&transport, status, &parts.headers, provider_request_id.clone());
+	let retry_hint = retry_after_hint(&parts.headers);
 	let headers = sanitize_headers(&parts.headers);
 	let concurrency_admission = concurrency_admission_rejection(&parts.headers);
 	let content = ContentDecoder::from_headers(&parts.headers).map_err(|unsupported| {
@@ -837,7 +838,7 @@ async fn execute(
 		})?;
 		let mut capture_remaining = transport.attempt.capture_limit;
 		capture_http_frame(&capture, 0, &Frame::Raw(body.clone()), &mut capture_remaining);
-		let mut error = classify_http_error(status, &body);
+		let mut error = classify_http_error_with_hint(status, &body, retry_hint);
 		surface_concurrency_admission(&mut error, concurrency_admission);
 		return Err(record_failure(
 			error,
@@ -1210,15 +1211,77 @@ fn header_str<'h>(headers: &'h HeaderMap, name: &HeaderName) -> Option<&'h str> 
 	headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+fn retry_after_hint(headers: &HeaderMap) -> Option<time::Duration> {
+	let now = time::SystemTime::now()
+		.duration_since(time::SystemTime::UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_secs_f64();
+	let mut maximum = None;
+	for name in [
+		"retry-after-ms",
+		"retry-after",
+		"ratelimit-reset",
+		"x-ratelimit-reset",
+		"x-ratelimit-reset-requests",
+		"x-ratelimit-reset-tokens",
+	] {
+		let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
+			continue;
+		};
+		let seconds = if name == "retry-after-ms" {
+			value.trim().parse::<f64>().ok().map(|milliseconds| milliseconds / 1_000.0)
+		} else if let Some(milliseconds) = value.trim().strip_suffix("ms") {
+			milliseconds.trim().parse::<f64>().ok().map(|milliseconds| milliseconds / 1_000.0)
+		} else if let Some(seconds) = value.trim().strip_suffix('s') {
+			seconds.trim().parse::<f64>().ok()
+		} else {
+			value
+				.trim()
+				.parse::<f64>()
+				.ok()
+				.map(|value| if value >= 1_000_000_000.0 { (value - now).max(0.0) } else { value })
+		};
+		let Some(seconds) = seconds.filter(|seconds| seconds.is_finite() && *seconds >= 0.0) else {
+			continue;
+		};
+		let duration = time::Duration::from_secs_f64(seconds);
+		maximum = Some(maximum.map_or(duration, |current: time::Duration| current.max(duration)));
+	}
+	maximum
+}
+
 fn classify_http_error(status: u16, body: &[u8]) -> Error {
+	classify_http_error_with_hint(status, body, None)
+}
+
+fn classify_http_error_with_hint(
+	status: u16,
+	body: &[u8],
+	retry_hint: Option<time::Duration>,
+) -> Error {
 	let (code, message) = provider_error_facts(body);
+	let account_exhausted = code
+		.as_deref()
+		.into_iter()
+		.chain(message.as_deref())
+		.any(|evidence| {
+			let evidence = evidence.to_ascii_lowercase();
+			evidence.contains("insufficient_quota")
+				|| evidence.contains("quota exhausted")
+				|| evidence.contains("insufficient balance")
+				|| evidence.contains("insufficient_balance")
+		});
 	let classified_rejection =
 		classify_provider_rejection(Some(status), message.as_deref(), None, None);
 	let transient_generation_fault = status == 400
 		&& message
 			.as_deref()
 			.is_some_and(is_transient_generation_fault);
-	let (kind, action) = if let Some(kind) = classified_rejection {
+	let (kind, action) = if account_exhausted && matches!(status, 402 | 429) {
+		let kind =
+			if status == 402 { ErrorKind::PaymentRequired } else { ErrorKind::RateLimited };
+		(kind, RetryAction::RotateAccount)
+	} else if let Some(kind) = classified_rejection {
 		(kind, RetryAction::Never)
 	} else if transient_generation_fault {
 		(ErrorKind::ResourceExhausted, RetryAction::SameRoute { after: time::Duration::ZERO })
@@ -1230,13 +1293,13 @@ fn classify_http_error(status: u16, body: &[u8]) -> Error {
 				(ErrorKind::DeadlineExceeded, RetryAction::SameRoute { after: time::Duration::ZERO })
 			},
 			429 => (ErrorKind::RateLimited, RetryAction::SameRoute {
-				after: time::Duration::from_secs(30),
+				after: retry_hint.unwrap_or_else(|| time::Duration::from_secs(30)),
 			}),
 			400 | 404 | 405 | 422 => (ErrorKind::InvalidRequest, RetryAction::Never),
 			402 => (ErrorKind::PaymentRequired, RetryAction::Never),
 			409 => (ErrorKind::SessionConflict, RetryAction::Never),
 			500..=599 => (ErrorKind::ResourceExhausted, RetryAction::SameRoute {
-				after: time::Duration::from_millis(500),
+				after: retry_hint.unwrap_or_else(|| time::Duration::from_millis(500)),
 			}),
 			_ => (ErrorKind::ProviderContractMismatch, RetryAction::Never),
 		}
@@ -1992,6 +2055,33 @@ mod tests {
 		}
 		assert_eq!(classify_http_error(401, b"{}").action, RetryAction::RefreshCredential,);
 		assert_eq!(classify_http_error(403, b"{}").action, RetryAction::RotateAccount,);
+	}
+
+	#[test]
+	fn quota_exhaustion_rotates_accounts_before_status_retry() {
+		for (status, body) in [
+			(429, br#"{"error":{"code":"insufficient_quota","message":"quota exhausted"}}"#.as_slice()),
+			(402, br#"{"error":{"code":"billing","message":"insufficient balance"}}"#.as_slice()),
+		] {
+			assert_eq!(
+				classify_http_error(status, body).action,
+				RetryAction::RotateAccount,
+				"status {status}",
+			);
+		}
+	}
+
+	#[test]
+	fn provider_retry_headers_choose_the_largest_valid_hint() {
+		let mut headers = HeaderMap::new();
+		headers.insert("retry-after-ms", HeaderValue::from_static("1250"));
+		headers.insert("retry-after", HeaderValue::from_static("2"));
+		headers.insert("x-ratelimit-reset", HeaderValue::from_static("1500ms"));
+		assert_eq!(retry_after_hint(&headers), Some(time::Duration::from_secs(2)));
+		assert_eq!(
+			classify_http_error_with_hint(429, b"{}", retry_after_hint(&headers)).action,
+			RetryAction::SameRoute { after: time::Duration::from_secs(2) },
+		);
 	}
 
 	#[test]

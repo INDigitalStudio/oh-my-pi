@@ -2407,7 +2407,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
-		}
+	forced_call: None,
+}
 	}
 
 	fn text_message(role: Role, text: &'static str) -> Message {

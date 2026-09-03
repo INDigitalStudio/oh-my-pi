@@ -192,6 +192,7 @@ fn encode_native(
 			response:     request.max_response_bytes,
 		},
 		sealed_body: None,
+		adjustments: Vec::new(),
 	})
 }
 

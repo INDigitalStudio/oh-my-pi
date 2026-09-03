@@ -964,6 +964,18 @@ pub enum SafetyThreshold {
 	BlockMost,
 }
 
+/// Caller-owned forced-call ladder state carried across turns (ADR 0019).
+///
+/// The Director states the invariant (`tool_choice` names the tool); inference
+/// chooses the rung from these counters plus the route's catalog facts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ForcedCall {
+	/// Turns on which the model answered without calling the forced tool.
+	pub non_compliant_turns: u8,
+	/// Remaining paid escalations the caller authorizes.
+	pub escalations_left:    u8,
+}
+
 /// Complete canonical chat request.
 #[derive(Clone, Debug)]
 pub struct ChatRequest {
@@ -995,6 +1007,8 @@ pub struct ChatRequest {
 	pub safety:            Arc<[SafetySetting]>,
 	/// Capability negotiation policy.
 	pub negotiation:       NegotiationPolicy,
+	/// Forced-call ladder state; `None` for ordinary tool choice.
+	pub forced_call:       Option<ForcedCall>,
 }
 
 impl ChatRequest {

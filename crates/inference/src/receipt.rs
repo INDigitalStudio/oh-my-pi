@@ -138,9 +138,10 @@ pub enum UsageSource {
 pub struct Usage {
 	/// Input tokens consumed.
 	pub input_tokens:       u64,
-	/// Output tokens consumed.
+	/// Output tokens consumed, including any reasoning tokens.
 	pub output_tokens:      u64,
-	/// Reasoning tokens consumed.
+	/// Reasoning subset of `output_tokens`; diagnostic only, never priced or
+	/// budgeted separately.
 	pub reasoning_tokens:   u64,
 	/// Prompt-cache tokens read.
 	pub cache_read_tokens:  u64,
@@ -184,12 +185,14 @@ impl Usage {
 		};
 	}
 
-	/// Returns the total of all token dimensions.
+	/// Returns the total of all billable token dimensions.
+	///
+	/// Reasoning tokens are a subset of `output_tokens` and are not added
+	/// again.
 	pub const fn total_tokens(&self) -> u64 {
 		self
 			.input_tokens
 			.saturating_add(self.output_tokens)
-			.saturating_add(self.reasoning_tokens)
 			.saturating_add(self.cache_read_tokens)
 			.saturating_add(self.cache_write_tokens)
 	}

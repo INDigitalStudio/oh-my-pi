@@ -165,41 +165,41 @@ omp_con::var! {
 	pub static AI_SEARCH_ORDER = ai_search_order: Vec<Str> {
 		default: default_order(),
 		validate: validate_unique,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Providers excluded from automatic web search.
 	pub static AI_SEARCH_EXCLUSIONS = ai_search_exclusions: Vec<Str> {
 		default: Vec::new(),
 		validate: validate_unique,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Per-provider search timeout in seconds.
 	pub static AI_SEARCH_TIMEOUT_SECONDS = ai_search_timeout_seconds: u32 {
 		default: 60,
 		min: 1,
 		max: 300,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Optional HTTPS SearXNG endpoint; empty disables it.
 	pub static AI_SEARCH_SEARXNG_ENDPOINT = ai_search_searxng_endpoint: Str {
 		default: Str::new_static(""),
 		validate: validate_searxng_endpoint,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Optional Gemini grounding model; empty preserves provider default.
 	pub static AI_SEARCH_GEMINI_MODEL = ai_search_gemini_model: Str {
 		default: Str::new_static(""),
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Antigravity endpoint mode.
 	pub static AI_SEARCH_ANTIGRAVITY_MODE = ai_search_antigravity_mode: AntigravityMode {
 		default: AntigravityMode::Auto,
-		flags: archive | inherit,
+		flags: archive,
 	};
 	/// Use the Perplexity Responses endpoint.
 	pub static AI_SEARCH_PERPLEXITY_RESPONSES = ai_search_perplexity_responses: bool {
 		default: false,
-		flags: archive | inherit,
+		flags: archive,
 	};
 }
 

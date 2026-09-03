@@ -518,10 +518,16 @@ impl Router {
 			authorized.push(primary.to_owned());
 		}
 		let context_promotion = self
-			.registry
-			.catalog()
-			.model(primary)
-			.and_then(|model| model.context_promotion_target.clone());
+			.settings
+			.context_promotion_enabled
+			.then(|| {
+				self
+					.registry
+					.catalog()
+					.model(primary)
+					.and_then(|model| model.context_promotion_target.clone())
+			})
+			.flatten();
 		if let Some(promotion) = context_promotion.as_ref()
 			&& !authorized.contains(promotion)
 		{
@@ -1557,7 +1563,8 @@ mod tests {
 				top_logprobs:      None,
 				safety:            Arc::from([]),
 				negotiation:       NegotiationPolicy::default(),
-			}))
+	forced_call: None,
+}))
 		};
 		let signed = vec![ContentPart::Reasoning { text: sf!("signed plan"), proof: Some(proof) }];
 		let unsigned = vec![ContentPart::Text { text: sf!("plain answer"), proof: None }];

@@ -1939,6 +1939,7 @@ fn encoded_count_tokens(
 			response:     1024 * 1024,
 		},
 		sealed_body: None,
+		adjustments: Vec::new(),
 	})
 }
 
@@ -2030,6 +2031,7 @@ impl Codec for AnthropicCodec {
 				response:     256 * 1024 * 1024,
 			},
 			sealed_body: None,
+			adjustments: Vec::new(),
 		})
 	}
 
@@ -3218,7 +3220,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
-		}
+	forced_call: None,
+}
 	}
 
 	fn resolved_thinking(mode: ThinkingMode) -> ThinkingSelection {

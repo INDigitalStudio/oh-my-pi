@@ -15,6 +15,7 @@ use super::{
 	Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest, ProviderStateEvent,
 	RawCompletion, RawEvent, RequestMethod, SizeBounds, ToolInputKind, UnvalidatedToolCall,
 	openai_chat,
+	schema::{SchemaDialect, normalize_schema},
 };
 use crate::{
 	answer::{Artifact, ArtifactBody, GenerationEvent, GenerationSummary, ImageArtifact},
@@ -33,7 +34,7 @@ use crate::{
 	error::{Error, ErrorKind, RetryAction},
 	event::{BlockKind, ChatEvent, FinishReason, ToolCall, UsageUpdate},
 	id::{RequestId, ToolCallId},
-	receipt::{Cost, Usage, UsageSource},
+	receipt::{Adjustment, Cost, FeatureId, ReasonId, Usage, UsageSource},
 	session::StoredProviderStateEvent,
 	transport::{Frame, FramingProtocol},
 };
@@ -809,6 +810,13 @@ pub enum ResponsesAdjustment {
 		/// Wire mechanism used for the emulation.
 		method: Str,
 	},
+	/// Requested strict enforcement safely degraded to the original semantics.
+	StrictFallback {
+		/// Strict field omitted or set false.
+		field:  Str,
+		/// Typed capability or representation reason.
+		reason: Str,
+	},
 }
 
 /// An encoded Responses body and its exact adjustment evidence.
@@ -963,7 +971,9 @@ pub struct ResponsesOutputTokenDetails {
 impl From<&ResponsesUsage> for Usage {
 	fn from(value: &ResponsesUsage) -> Self {
 		Self {
-			input_tokens: value.input_tokens,
+			input_tokens: value
+				.input_tokens
+				.saturating_sub(value.input_tokens_details.cached_tokens),
 			output_tokens: value.output_tokens,
 			reasoning_tokens: value.output_tokens_details.reasoning_tokens,
 			cache_read_tokens: value.input_tokens_details.cached_tokens,
@@ -2826,9 +2836,24 @@ impl OpenAiResponsesCodec {
 							quarantined_tools.push(tool.name.clone());
 							return None;
 						}
-						let strict =
-							(context.policy.tool.supports_strict_mode != Some(false)).then_some(*strict);
-						(ResponsesToolKind::Function, Some(schema), strict, None)
+						let projection = normalize_schema(
+							&schema,
+							*strict,
+							context.policy.tool.supports_strict_mode,
+							SchemaDialect::OpenAiResponses,
+						);
+						if let Some(reason) = projection.fallback {
+							adjustments.push(ResponsesAdjustment::StrictFallback {
+								field:  sf!("tools.strict"),
+								reason: sf!(reason.reason_id()),
+							});
+						}
+						(
+							ResponsesToolKind::Function,
+							Some(projection.schema),
+							projection.strict,
+							None,
+						)
 					},
 					ToolInputConstraint::JsonSchema { .. } => {
 						(ResponsesToolKind::Custom, None, None, None)
@@ -3117,11 +3142,25 @@ impl OpenAiResponsesCodec {
 						schema: None,
 						strict: None,
 					},
-					StructuredOutput::JsonSchema { name, schema, strict } => ResponsesTextFormat {
-						kind:   ResponsesTextFormatKind::JsonSchema,
-						name:   Some(name.clone()),
-						schema: Some(schema.as_value().clone()),
-						strict: Some(*strict),
+					StructuredOutput::JsonSchema { name, schema, strict } => {
+						let projection = normalize_schema(
+							schema.as_value(),
+							*strict,
+							context.policy.tool.supports_strict_mode,
+							SchemaDialect::OpenAiResponses,
+						);
+						if let Some(reason) = projection.fallback {
+							adjustments.push(ResponsesAdjustment::StrictFallback {
+								field:  sf!("response_format.strict"),
+								reason: sf!(reason.reason_id()),
+							});
+						}
+						ResponsesTextFormat {
+							kind:   ResponsesTextFormatKind::JsonSchema,
+							name:   Some(name.clone()),
+							schema: Some(projection.schema),
+							strict: projection.strict,
+						}
 					},
 					StructuredOutput::Regex(_)
 					| StructuredOutput::Lark(_)
@@ -4038,6 +4077,29 @@ pub(super) fn hosted_image_decoder(
 	})
 }
 
+fn canonical_responses_adjustments(
+	adjustments: &[ResponsesAdjustment],
+) -> Result<Vec<Adjustment>, Error> {
+	let mut canonical = Vec::new();
+	for adjustment in adjustments {
+		let ResponsesAdjustment::StrictFallback { field, reason } = adjustment else {
+			return Err(encoding_error("responses_adjustment_requires_planning"));
+		};
+		let feature = match field.as_str() {
+			"tools.strict" => FeatureId::new_static("chat.tool.strict"),
+			"response_format.strict" => {
+				FeatureId::new_static("chat.structured_output.strict")
+			},
+			_ => return Err(encoding_error("responses_strict_adjustment_field")),
+		};
+		canonical.push(Adjustment::Dropped {
+			feature,
+			reason: ReasonId(reason.clone()),
+		});
+	}
+	Ok(canonical)
+}
+
 impl Codec for OpenAiResponsesCodec {
 	fn encode(
 		&self,
@@ -4065,6 +4127,7 @@ impl Codec for OpenAiResponsesCodec {
 					response:     256 * 1024 * 1024,
 				},
 				sealed_body: None,
+				adjustments: Vec::new(),
 			});
 		}
 		let OperationCall::Chat(request) = operation else {
@@ -4107,9 +4170,7 @@ impl Codec for OpenAiResponsesCodec {
 					encoding_error("mismatched_responses_server_state")
 				},
 			})?;
-		if !encoded.adjustments.is_empty() {
-			return Err(encoding_error("responses_adjustment_requires_planning"));
-		}
+		let adjustments = canonical_responses_adjustments(&encoded.adjustments)?;
 		let body = serde_json::to_vec(&encoded.request)
 			.map(Bytes::from)
 			.map_err(|_| encoding_error("responses_request_serialization"))?;
@@ -4145,6 +4206,7 @@ impl Codec for OpenAiResponsesCodec {
 				response:     256 * 1024 * 1024,
 			},
 			sealed_body: None,
+			adjustments,
 		})
 	}
 
@@ -4183,13 +4245,14 @@ mod tests {
 			Background, ChatRequest, ContentPart, ContextStrategy, Dimensions, ImageFormat,
 			ImageQuality, ImageRequest, MediaInput, Message, NegotiationPolicy, OpaqueJson,
 			OperationCall, ProviderProof, ReasoningRequest, ReasoningVisibility, Role, Sampling,
-			SessionRequest, Setting, ToolChoice, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
-			ToolInputConstraint, ToolResultContent,
+			SessionRequest, Setting, StructuredOutput, ToolChoice, ToolDefinition, ToolGrammar,
+			ToolGrammarSyntax, ToolInputConstraint, ToolResultContent,
 		},
 		catalog::{ProviderId, RouteId},
 		codec::{Codec as _, Decoder as _, EncodeContext, RawEvent},
 		event::{ChatEvent, FinishReason},
 		id::{ConversationId, RequestId, Revision, ToolCallId},
+		receipt::Usage,
 		transport::{Frame, SseEvent},
 	};
 
@@ -4227,7 +4290,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
-		}
+	forced_call: None,
+}
 	}
 
 	fn empty_chat_request() -> ChatRequest {
@@ -4240,7 +4304,7 @@ mod tests {
 		});
 		request.tools = Arc::from([]);
 		request
-	}
+}
 
 	fn request_with_tool_result(content: Vec<ToolResultContent>) -> ChatRequest {
 		let mut request = empty_chat_request();
@@ -4255,7 +4319,7 @@ mod tests {
 			name:    None,
 		}]);
 		request
-	}
+}
 
 	fn native_tool_output(
 		kind: ResponsesInputItemKind,
@@ -4269,25 +4333,28 @@ mod tests {
 		item
 	}
 
-	fn encode_tool(input: ToolInputConstraint) -> Vec<u8> {
-		let catalog = Catalog::embedded();
-		let model = catalog
+	/// First-party OpenAI Responses fixture: the model, its `openai` Responses
+	/// route, and the wire target. Selected by provider rather than catalog
+	/// order so roster refreshes (new Responses-speaking hosts sorting first)
+	/// cannot swap the fixture for one with a different strict/cache policy.
+	fn embedded_openai_responses_fixture(
+		catalog: &Catalog,
+	) -> (&omp_catalog::ModelSpec, RouteDef, WireTarget) {
+		let (model, route) = catalog
 			.models()
 			.iter()
-			.find(|model| {
-				model.routes.iter().any(|route| {
-					catalog
-						.route(route)
-						.is_some_and(|route| route.codec.as_str() == "openai-responses")
-				})
+			.find_map(|model| {
+				model
+					.routes
+					.iter()
+					.filter_map(|route| catalog.route(route))
+					.find(|route| {
+						route.provider.as_str() == "openai"
+							&& route.codec.as_str() == "openai-responses"
+					})
+					.map(|route| (model, route.clone()))
 			})
-			.expect("embedded Responses model");
-		let route = model
-			.routes
-			.iter()
-			.filter_map(|route| catalog.route(route))
-			.find(|route| route.codec.as_str() == "openai-responses")
-			.expect("embedded Responses route");
+			.expect("embedded first-party OpenAI Responses model");
 		let wire_model = model
 			.wire_ids
 			.iter()
@@ -4301,13 +4368,19 @@ mod tests {
 			endpoint: route.endpoint.clone(),
 			wire_model,
 		};
+		(model, route, target)
+	}
+
+	fn encode_tool(input: ToolInputConstraint) -> Vec<u8> {
+		let catalog = Catalog::embedded();
+		let (model, route, target) = embedded_openai_responses_fixture(catalog);
 		let policy = catalog
 			.wire_policy(&model.wire_policy)
 			.expect("embedded Responses wire policy");
 		let request_id = RequestId::new("responses-tool-encoding");
 		let context = EncodeContext {
 			request_id: &request_id,
-			route,
+			route: &route,
 			target: Some(&target),
 			policy,
 			..EncodeContext::default()
@@ -4319,38 +4392,8 @@ mod tests {
 	}
 	fn encode_cache_affinity(disable_prompt_caching: bool) -> Option<Str> {
 		let catalog = Catalog::embedded();
-		let model = catalog
-			.models()
-			.iter()
-			.find(|model| {
-				model.routes.iter().any(|route| {
-					catalog
-						.route(route)
-						.is_some_and(|route| route.codec.as_str() == "openai-responses")
-				})
-			})
-			.expect("embedded Responses model");
-		let mut route = model
-			.routes
-			.iter()
-			.filter_map(|route| catalog.route(route))
-			.find(|route| route.codec.as_str() == "openai-responses")
-			.expect("embedded Responses route")
-			.clone();
+		let (model, mut route, target) = embedded_openai_responses_fixture(catalog);
 		route.capability_limits.disable_prompt_caching = disable_prompt_caching;
-		let wire_model = model
-			.wire_ids
-			.iter()
-			.find(|(candidate, _)| candidate == &route.id)
-			.expect("embedded Responses wire model")
-			.1
-			.clone();
-		let target = WireTarget {
-			route: route.id.clone(),
-			codec: route.codec.clone(),
-			endpoint: route.endpoint.clone(),
-			wire_model,
-		};
 		let policy = catalog
 			.wire_policy(&model.wire_policy)
 			.expect("embedded Responses wire policy");
@@ -5086,6 +5129,115 @@ mod tests {
 			})
 		});
 		assert_eq!(encoded.request.tools[0].strict, None);
+		assert!(matches!(
+			encoded.adjustments.as_slice(),
+			[super::ResponsesAdjustment::StrictFallback { field, reason }]
+				if field == "tools.strict"
+					&& reason == "catalog.strict-schema-unsupported"
+		));
+		let canonical = super::canonical_responses_adjustments(&encoded.adjustments)
+			.expect("strict fallback is transport-safe");
+		assert!(matches!(
+			canonical.as_slice(),
+			[crate::receipt::Adjustment::Dropped { feature, reason }]
+				if feature.0 == "chat.tool.strict"
+					&& reason.0 == "catalog.strict-schema-unsupported"
+		));
+	}
+
+	#[test]
+	fn unknown_strict_capability_is_unsupported_and_receipted() {
+		let encoded = encode_with_policy(&policy::WirePolicy::baseline(), |_, _| {
+			request_with_tool(ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(serde_json::json!({
+					"type": "object",
+					"properties": {"query": {"type": "string"}}
+				})),
+				strict: true,
+			})
+		});
+		assert_eq!(encoded.request.tools[0].strict, None);
+		assert!(matches!(
+			encoded.adjustments.as_slice(),
+			[super::ResponsesAdjustment::StrictFallback { reason, .. }]
+				if reason == "catalog.strict-schema-unsupported"
+		));
+	}
+
+	#[test]
+	fn strict_responses_schema_uses_shared_nullable_and_keyword_normalization() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.tool.supports_strict_mode = Some(true);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			request_with_tool(ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(serde_json::json!({
+					"type": "object",
+					"properties": {
+						"query": {"type": "string", "pattern": "^x+$"},
+						"limit": {"type": "integer", "minimum": 1}
+					},
+					"required": ["query"],
+					"oneOf": [
+						{"type": "object", "properties": {"query": {"type": "string"}}}
+					]
+				})),
+				strict: true,
+			})
+		});
+		let schema = encoded.request.tools[0].parameters.as_ref().expect("schema");
+		assert_eq!(encoded.request.tools[0].strict, Some(true));
+		assert!(schema.get("oneOf").is_none());
+		assert!(schema.get("anyOf").is_some());
+		assert_eq!(schema["additionalProperties"], false);
+		assert_eq!(schema["required"], serde_json::json!(["query", "limit"]));
+		assert!(schema["properties"]["query"].get("pattern").is_none());
+		assert_eq!(schema["properties"]["limit"]["anyOf"][1]["type"], "null");
+		assert!(encoded.adjustments.is_empty());
+	}
+
+	#[test]
+	fn strict_responses_output_schema_uses_the_same_dialect_normalizer() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.tool.supports_strict_mode = Some(true);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			let mut request = empty_chat_request();
+			request.output = Setting::Require(StructuredOutput::JsonSchema {
+				name:   sf!("answer"),
+				schema: OpaqueJson::new(serde_json::json!({
+					"type": "object",
+					"properties": {"answer": {"type": "string", "maxLength": 20}}
+				})),
+				strict: true,
+			});
+			request
+		});
+		let format = encoded
+			.request
+			.text
+			.as_ref()
+			.and_then(|text| text.format.as_ref())
+			.expect("response format");
+		let schema = format.schema.as_ref().expect("schema");
+		assert_eq!(format.strict, Some(true));
+		assert_eq!(schema["additionalProperties"], false);
+		assert_eq!(schema["required"], serde_json::json!(["answer"]));
+		assert_eq!(schema["properties"]["answer"]["anyOf"][1]["type"], "null");
+		assert!(schema["properties"]["answer"].get("maxLength").is_none());
+	}
+
+	#[test]
+	fn responses_cached_tokens_are_removed_from_uncached_input_dimension() {
+		let usage = Usage::from(&super::ResponsesUsage {
+			input_tokens: 100,
+			output_tokens: 30,
+			input_tokens_details: super::ResponsesInputTokenDetails { cached_tokens: 40 },
+			output_tokens_details: super::ResponsesOutputTokenDetails { reasoning_tokens: 20 },
+			..Default::default()
+		});
+		assert_eq!(usage.input_tokens, 60);
+		assert_eq!(usage.cache_read_tokens, 40);
+		assert_eq!(usage.output_tokens, 30);
+		assert_eq!(usage.reasoning_tokens, 20);
 	}
 
 	/// First-party xAI `/v1/responses` wire policy: no summary, no penalties,
@@ -5152,6 +5304,7 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
+			forced_call:       None,
 		}
 	}
 
@@ -5219,7 +5372,7 @@ mod tests {
 			preserve_signatures: true,
 		});
 		request
-	}
+}
 
 	/// Encodes `effort` against a gpt-5-shaped ladder (`minimal..high`, off
 	/// allowed, no `reasoning-disable-mode`) through the planner's resolution.
@@ -5425,7 +5578,7 @@ mod tests {
 				parameters: OpaqueJson::new(serde_json::json!({"type": "object"})),
 				strict: true,
 			}),
-			br#"[{"type":"function","name":"match_input","parameters":{"type":"object"},"strict":true}]"#,
+			br#"[{"type":"function","name":"match_input","parameters":{"type":"object","properties":{},"required":[],"additionalProperties":false},"strict":true}]"#,
 		);
 	}
 
@@ -5456,7 +5609,7 @@ mod tests {
 		assert!(events.iter().any(|event| matches!(
 			event,
 			ResponsesProjection::Canonical(ChatEvent::Usage(update))
-				if update.usage.input_tokens == 30
+				if update.usage.input_tokens == 10
 					&& update.usage.output_tokens == 8
 					&& update.usage.cache_read_tokens == 20
 		)));
@@ -5910,7 +6063,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
-		}
+	forced_call: None,
+}
 	}
 
 	fn read_call(id: &str, path: &str) -> ContentPart {

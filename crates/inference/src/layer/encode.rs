@@ -430,6 +430,7 @@ mod tests {
 				framing:     FramingProtocol::Raw,
 				bounds:      SizeBounds { request_body: 1, frame: 1, response: 1 },
 				sealed_body: None,
+				adjustments: Vec::new(),
 			},
 			credentials:    None,
 			signature:      None,

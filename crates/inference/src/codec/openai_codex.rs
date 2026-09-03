@@ -956,6 +956,7 @@ impl Codec for OpenAiCodexCodec {
 					response:     256 * 1024 * 1024,
 				},
 				sealed_body: None,
+				adjustments: Vec::new(),
 			});
 		}
 		if let OperationCall::GenerateImage(request) = operation {
@@ -995,6 +996,7 @@ impl Codec for OpenAiCodexCodec {
 					response:     256 * 1024 * 1024,
 				},
 				sealed_body: None,
+				adjustments: Vec::new(),
 			});
 		}
 		let OperationCall::Chat(chat) = operation else {
@@ -1080,6 +1082,7 @@ impl Codec for OpenAiCodexCodec {
 				response:     256 * 1024 * 1024,
 			},
 			sealed_body: None,
+			adjustments: Vec::new(),
 		})
 	}
 

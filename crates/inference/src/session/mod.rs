@@ -1421,7 +1421,8 @@ mod tests {
 				top_logprobs:      None,
 				safety:            Arc::from([]),
 				negotiation:       NegotiationPolicy::default(),
-			})),
+	forced_call: None,
+})),
 		);
 		call.execution = Some(Arc::new(plan));
 		let context = ExecutionContext::new(ExecutionBudget::default());

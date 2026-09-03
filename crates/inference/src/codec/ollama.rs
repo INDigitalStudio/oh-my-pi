@@ -302,6 +302,7 @@ impl Codec for OllamaCodec {
 					response:     MAX_RESPONSE_BYTES,
 				},
 				sealed_body: None,
+				adjustments: Vec::new(),
 			}),
 			_ => Err(capability_error("ollama_operation_not_supported")),
 		}
@@ -504,6 +505,7 @@ fn encode_chat(
 			response:     MAX_RESPONSE_BYTES,
 		},
 		sealed_body: None,
+		adjustments: Vec::new(),
 	})
 }
 

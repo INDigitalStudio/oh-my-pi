@@ -103,6 +103,32 @@ pub struct SchemaViolation {
 	pub from_union_branch: bool,
 }
 
+/// One explicitly declared argument type repair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArgumentCoercion {
+	/// Convert common string boolean spellings.
+	LooseBool,
+	/// Convert an integral string to an integer.
+	Integer,
+	/// Convert a numeric string to a JSON number.
+	Number,
+	/// Encode a non-string JSON value as text.
+	String,
+	/// Wrap one non-array value in a one-element array.
+	Singleton,
+	/// Parse a string containing a complete JSON value.
+	JsonString,
+}
+
+/// Ordered coercions declared for one canonical JSON pointer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArgumentCoercionSpec {
+	/// Canonical argument location, with `/` denoting the root.
+	pub path:      Str,
+	/// Type repairs authorized at this exact location.
+	pub coercions: Box<[ArgumentCoercion]>,
+}
+
 const _: () =
 	assert!(std::mem::size_of::<SchemaViolation>() <= 64, "SchemaViolation must stay compact");
 
@@ -194,6 +220,7 @@ struct PartialCall {
 #[derive(Debug)]
 pub struct ToolAssembler<'a> {
 	definitions:       &'a [ToolDefinition],
+	coercions:         &'a [ArgumentCoercionSpec],
 	limits:            ToolAssemblyLimits,
 	open:              BTreeMap<u32, PartialCall>,
 	accepted_calls:    usize,
@@ -211,6 +238,26 @@ impl<'a> ToolAssembler<'a> {
 	) -> Self {
 		Self {
 			definitions,
+			coercions: &[],
+			limits,
+			open: BTreeMap::new(),
+			accepted_calls: 0,
+			next_generated_id: 1,
+			evidence: Vec::new(),
+			attempt,
+		}
+	}
+
+	/// Creates an assembler with explicit path-addressed argument coercions.
+	pub const fn with_coercions(
+		definitions: &'a [ToolDefinition],
+		coercions: &'a [ArgumentCoercionSpec],
+		limits: ToolAssemblyLimits,
+		attempt: u32,
+	) -> Self {
+		Self {
+			definitions,
+			coercions,
 			limits,
 			open: BTreeMap::new(),
 			accepted_calls: 0,
@@ -460,6 +507,7 @@ impl<'a> ToolAssembler<'a> {
 					&arguments,
 					strict,
 					self.limits,
+					self.coercions,
 				) {
 					Ok((arguments, repairs)) => {
 						if repairs > 0 {
@@ -597,18 +645,24 @@ pub fn validate_schema(
 	let mut budget = limits.max_schema_nodes;
 	validate_node(schema, instance, "", strict, 0, limits.max_schema_depth, &mut budget)
 }
-fn repair_schema_arguments(
+/// Applies schema-preserving repairs plus only the explicitly declared type
+/// coercions.
+pub fn repair_schema_arguments(
 	schema: &Value,
 	instance: &Value,
 	strict: bool,
 	limits: ToolAssemblyLimits,
+	coercions: &[ArgumentCoercionSpec],
 ) -> Result<(Value, u32), (Value, SchemaViolation, u32)> {
 	let mut repaired = instance.clone();
 	let mut repairs = 0_u32;
 	loop {
 		match validate_schema(schema, &repaired, strict, limits) {
 			Ok(()) => return Ok((repaired, repairs)),
-			Err(issue) if repairs < 16 && apply_schema_repair(&mut repaired, &issue) => {
+			Err(issue)
+				if repairs < 16
+					&& apply_schema_repair(&mut repaired, &issue, declared_at(coercions, &issue)) =>
+			{
 				repairs = repairs.saturating_add(1);
 			},
 			Err(issue) => return Err((repaired, issue, repairs)),
@@ -616,7 +670,21 @@ fn repair_schema_arguments(
 	}
 }
 
-fn apply_schema_repair(instance: &mut Value, issue: &SchemaViolation) -> bool {
+fn declared_at<'a>(
+	coercions: &'a [ArgumentCoercionSpec],
+	issue: &SchemaViolation,
+) -> &'a [ArgumentCoercion] {
+	coercions
+		.iter()
+		.find(|spec| spec.path == issue.path)
+		.map_or(&[], |spec| spec.coercions.as_ref())
+}
+
+fn apply_schema_repair(
+	instance: &mut Value,
+	issue: &SchemaViolation,
+	declared: &[ArgumentCoercion],
+) -> bool {
 	// Charitable decoding: models routinely emit stray arguments; under a
 	// strict schema one unknown key would fail the whole call, so drop it and
 	// keep the invocation alive. Union-branch violations are exempt — there a
@@ -629,12 +697,16 @@ fn apply_schema_repair(instance: &mut Value, issue: &SchemaViolation) -> bool {
 	if issue.rule != "type" {
 		return false;
 	}
+	// Type-changing repairs are never inferred from the target schema type.
+	// The exact argument path must opt in using the same stable coercion
+	// declarations as the authoritative typed argument decoder.
 	let Some(value) = pointer_mut(instance, issue.path.as_str()) else {
 		return false;
 	};
 	if let Value::String(text) = value {
 		let trimmed = text.trim();
-		if (trimmed.starts_with('{') || trimmed.starts_with('['))
+		if declared.contains(&ArgumentCoercion::JsonString)
+			&& (trimmed.starts_with('{') || trimmed.starts_with('['))
 			&& let Ok(parsed) = serde_json::from_str::<Value>(trimmed)
 			&& issue
 				.expected_types
@@ -644,10 +716,11 @@ fn apply_schema_repair(instance: &mut Value, issue: &SchemaViolation) -> bool {
 			*value = parsed;
 			return true;
 		}
-		if issue
-			.expected_types
-			.iter()
-			.any(|kind| kind.as_str() == "boolean")
+		if declared.contains(&ArgumentCoercion::LooseBool)
+			&& issue
+				.expected_types
+				.iter()
+				.any(|kind| kind.as_str() == "boolean")
 		{
 			let parsed = match trimmed {
 				"true" | "yes" | "1" => Some(true),
@@ -659,19 +732,21 @@ fn apply_schema_repair(instance: &mut Value, issue: &SchemaViolation) -> bool {
 				return true;
 			}
 		}
-		if issue
-			.expected_types
-			.iter()
-			.any(|kind| kind.as_str() == "integer")
+		if declared.contains(&ArgumentCoercion::Integer)
+			&& issue
+				.expected_types
+				.iter()
+				.any(|kind| kind.as_str() == "integer")
 			&& let Ok(parsed) = trimmed.parse::<i64>()
 		{
 			*value = Value::from(parsed);
 			return true;
 		}
-		if issue
-			.expected_types
-			.iter()
-			.any(|kind| kind.as_str() == "number")
+		if declared.contains(&ArgumentCoercion::Number)
+			&& issue
+				.expected_types
+				.iter()
+				.any(|kind| kind.as_str() == "number")
 		{
 			// "300" repairs to the integer 300, not 300.0 — schema "number"
 			// admits both and integer keeps the value's spelled fidelity.
@@ -687,10 +762,11 @@ fn apply_schema_repair(instance: &mut Value, issue: &SchemaViolation) -> bool {
 			}
 		}
 	}
-	if issue
-		.expected_types
-		.iter()
-		.any(|kind| kind.as_str() == "string")
+	if declared.contains(&ArgumentCoercion::String)
+		&& issue
+			.expected_types
+			.iter()
+			.any(|kind| kind.as_str() == "string")
 		&& !matches!(value, Value::String(_))
 	{
 		if matches!(value, Value::Array(_) | Value::Object(_)) && issue.from_union_branch {
@@ -699,10 +775,11 @@ fn apply_schema_repair(instance: &mut Value, issue: &SchemaViolation) -> bool {
 		*value = Value::String(value.to_string());
 		return true;
 	}
-	if issue
-		.expected_types
-		.iter()
-		.any(|kind| kind.as_str() == "array")
+	if declared.contains(&ArgumentCoercion::Singleton)
+		&& issue
+			.expected_types
+			.iter()
+			.any(|kind| kind.as_str() == "array")
 		&& !matches!(value, Value::Array(_))
 		&& !issue.from_union_branch
 	{
@@ -1906,7 +1983,12 @@ mod tests {
 				strict:     true,
 			},
 		};
-		let (events, _) = call_with(definition, &json!({"count": "42", "extra": true}));
+		let coercions = [ArgumentCoercionSpec {
+			path: sf!("/count"),
+			coercions: Box::new([ArgumentCoercion::Integer]),
+		}];
+		let (events, _) =
+			call_with_coercions(definition, &json!({"count": "42", "extra": true}), &coercions);
 		assert_eq!(ready_arguments(&events), Some(json!({"count": 42})));
 	}
 
@@ -2127,8 +2209,21 @@ mod tests {
 		definition: ToolDefinition,
 		arguments: &Value,
 	) -> (Vec<ToolAssemblyEvent>, Vec<Str>) {
+		call_with_coercions(definition, arguments, &[])
+	}
+
+	fn call_with_coercions(
+		definition: ToolDefinition,
+		arguments: &Value,
+		coercions: &[ArgumentCoercionSpec],
+	) -> (Vec<ToolAssemblyEvent>, Vec<Str>) {
 		let definitions = [definition];
-		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
+		let mut assembler = ToolAssembler::with_coercions(
+			&definitions,
+			coercions,
+			ToolAssemblyLimits::default(),
+			1,
+		);
 		assembler.push(ToolFragment::Start {
 			input_kind:   ToolInputKind::Json,
 			source_index: 0,
@@ -2156,7 +2251,7 @@ mod tests {
 	}
 
 	#[test]
-	fn string_type_union_stringifies_container_arguments() {
+	fn declared_string_coercion_repairs_a_union_target() {
 		let definition = ToolDefinition {
 			name:        sf!("union_string"),
 			description: None,
@@ -2170,8 +2265,64 @@ mod tests {
 				strict:     true,
 			},
 		};
-		let (events, _) = call_with(definition, &json!({"payload": {"a": 1}}));
+		let coercions = [ArgumentCoercionSpec {
+			path: sf!("/payload"),
+			coercions: Box::new([ArgumentCoercion::String]),
+		}];
+		let (events, _) =
+			call_with_coercions(definition, &json!({"payload": {"a": 1}}), &coercions);
 		assert_eq!(ready_arguments(&events), Some(json!({"payload": "{\"a\":1}"})));
+	}
+
+	#[test]
+	fn type_changes_require_matching_declared_coercions() {
+		let limits = ToolAssemblyLimits::default();
+		for (schema, input, expected) in [
+			(
+				json!({"type": "string"}),
+				json!({"value": 1}),
+				json!({"value": 1}),
+			),
+			(
+				json!({"type": "array", "items": {"type": "string"}}),
+				json!("one"),
+				json!("one"),
+			),
+		] {
+			let error = repair_schema_arguments(&schema, &input, true, limits, &[])
+				.expect_err("an undeclared type change must be rejected");
+			assert_eq!(error.0, expected);
+			assert_eq!(error.1.rule, "type");
+			assert_eq!(error.2, 0);
+		}
+
+		for (schema, input, expected) in [
+			(
+				json!({"type": "string"}),
+				json!({"value": 1}),
+				json!("{\"value\":1}"),
+			),
+			(
+				json!({"type": "array", "items": {"type": "string"}}),
+				json!("one"),
+				json!(["one"]),
+			),
+		] {
+			let coercion = if schema["type"] == "string" {
+				ArgumentCoercion::String
+			} else {
+				ArgumentCoercion::Singleton
+			};
+			let specs = [ArgumentCoercionSpec {
+				path: sf!("/"),
+				coercions: Box::new([coercion]),
+			}];
+			let (actual, repairs) =
+				repair_schema_arguments(&schema, &input, true, limits, &specs)
+					.expect("the declared coercion must repair to the schema");
+			assert_eq!(actual, expected);
+			assert_eq!(repairs, 1);
+		}
 	}
 
 	#[test]
@@ -2210,7 +2361,7 @@ mod tests {
 		assert_eq!(ready_arguments(&events), Some(value));
 	}
 	#[test]
-	fn failed_union_branch_still_allows_lossless_scalar_repair() {
+	fn failed_union_branch_allows_a_declared_scalar_repair() {
 		let definition = ToolDefinition {
 			name:        sf!("lossless"),
 			description: None,
@@ -2218,7 +2369,12 @@ mod tests {
 				parameters: OpaqueJson::new(json!({
 					"type": "object",
 					"properties": {
-						"payload": {"anyOf": [{"type": "number"}, {"type": "boolean"}]}
+						"payload": {
+							"anyOf": [
+								{"type": "number"},
+								{"type": "boolean"}
+							]
+						}
 					},
 					"required": ["payload"],
 					"additionalProperties": false
@@ -2226,7 +2382,12 @@ mod tests {
 				strict:     true,
 			},
 		};
-		let (events, _) = call_with(definition, &json!({"payload": "300"}));
+		let coercions = [ArgumentCoercionSpec {
+			path: sf!("/payload"),
+			coercions: Box::new([ArgumentCoercion::Number]),
+		}];
+		let (events, _) =
+			call_with_coercions(definition, &json!({"payload": "300"}), &coercions);
 		assert_eq!(ready_arguments(&events), Some(json!({"payload": 300})));
 	}
 
@@ -2320,7 +2481,11 @@ mod tests {
 				strict:     true,
 			},
 		};
-		let (events, _) = call_with(definition, &value);
+		let coercions = [ArgumentCoercionSpec {
+			path: sf!("/payload"),
+			coercions: Box::new([ArgumentCoercion::String]),
+		}];
+		let (events, _) = call_with_coercions(definition, &value, &coercions);
 		assert_eq!(ready_arguments(&events), Some(json!({"kind": "text", "payload": "{\"a\":1}"})));
 	}
 

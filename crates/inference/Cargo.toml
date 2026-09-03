@@ -26,7 +26,6 @@ local-stt = [
 	"dep:candle-transformers",
 	"dep:tokenizers",
 ]
-local-text = ["local", "dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
 local-tts = [
 	"local",
 	"dep:candle-core",
@@ -56,7 +55,6 @@ hyper-rustls.workspace = true
 hyper-util.workspace = true
 im.workspace = true
 libc.workspace = true
-llama-cpp-sys-2 = { workspace = true, optional = true }
 omp-core.workspace = true
 omp-catalog.workspace = true
 omp-con.workspace = true
@@ -97,7 +95,6 @@ zstd.workspace = true
 candle-core = { workspace = true, optional = true }
 candle-nn = { workspace = true, optional = true }
 candle-transformers = { workspace = true, optional = true }
-llama-cpp-2 = { workspace = true, optional = true }
 security-framework.workspace = true
 [dev-dependencies]
 protox.workspace = true

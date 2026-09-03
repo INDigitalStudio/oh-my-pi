@@ -97,6 +97,7 @@ pub(crate) fn workflow_creation_request(
 			response:     1024 * 1024,
 		},
 		sealed_body: None,
+		adjustments: Vec::new(),
 	})
 }
 
@@ -386,6 +387,7 @@ impl GitLabDirectRoute {
 				response:     1024 * 1024,
 			},
 			sealed_body: None,
+			adjustments: Vec::new(),
 		})
 	}
 }
@@ -648,6 +650,7 @@ impl Codec for GitLabWorkflowCodec {
 						response:     256 * 1024 * 1024,
 					},
 					sealed_body: None,
+					adjustments: Vec::new(),
 				})
 			},
 			OperationCall::DiscoverModels(request) => {
@@ -671,6 +674,7 @@ impl Codec for GitLabWorkflowCodec {
 						response:     16 * 1024 * 1024,
 					},
 					sealed_body: None,
+					adjustments: Vec::new(),
 				})
 			},
 			_ => Err(capability_error("gitlab.workflow.operation_unsupported")),
@@ -2233,7 +2237,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
-		};
+	forced_call: None,
+};
 		let error =
 			match build_start_request(&request, &context, WorkflowSession::new("workflow", "session"))
 			{

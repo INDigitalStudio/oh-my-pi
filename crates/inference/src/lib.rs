@@ -35,6 +35,8 @@ pub mod router;
 pub mod search_settings;
 pub mod session;
 pub mod settings;
+/// Additional literal pi inference-setting convars.
+pub mod pi_settings;
 pub mod staging;
 pub mod transport;
 

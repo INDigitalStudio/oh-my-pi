@@ -979,6 +979,8 @@ message LspServerStatus {
   string source = 5;
   // Installed binding identity, present after successful startup.
   bytes server_id = 6;
+  // Exact InitializeResult capabilities, present after successful startup.
+  bytes capabilities_json = 7;
 }
 
 message LspStatusResponse {

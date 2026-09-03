@@ -408,6 +408,7 @@ impl Codec for DevinCodec {
 						response:     256 * 1024 * 1024,
 					},
 					sealed_body: None,
+					adjustments: Vec::new(),
 				}
 				.with_sealed_body(SealedBodyTemplate::Devin(DevinSealedBody::Chat(template))))
 			},
@@ -430,6 +431,7 @@ impl Codec for DevinCodec {
 						response:     32 * 1024 * 1024,
 					},
 					sealed_body: None,
+					adjustments: Vec::new(),
 				}
 				.with_sealed_body(SealedBodyTemplate::Devin(DevinSealedBody::Discovery(template))))
 			},
@@ -1269,7 +1271,8 @@ mod tests {
 			top_logprobs:      None,
 			safety:            Arc::from([]),
 			negotiation:       Default::default(),
-		};
+	forced_call: None,
+};
 		let session = CascadeSession::new("cascade", "execution");
 		let mut policy = omp_catalog::WirePolicy::baseline();
 		policy.tool.supports_parallel_calls = Some(true);

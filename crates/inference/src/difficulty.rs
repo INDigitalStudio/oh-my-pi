@@ -14,9 +14,6 @@ use sha2::{Digest as _, Sha256};
 use smallvec::SmallVec;
 use strum::IntoStaticStr;
 
-#[cfg(feature = "local-text")]
-use crate::local::{LocalCancellation, LocalResult, text::TextAdapter};
-
 const INPUT_LIMIT: usize = 16 * 1024;
 const MEMO_LIMIT: usize = 256;
 const ONLINE_ATTEMPTS: usize = 2;
@@ -264,44 +261,6 @@ impl DifficultyClassifier {
 			.unwrap_or_else(|| self.finish(&sanitized, backend, auto, None))
 	}
 
-	#[cfg(feature = "local-text")]
-	/// Classifies with the landed llama.cpp constrained-output ladder.
-	pub fn classify_local(
-		&self,
-		input: &str,
-		auto: AutoDifficulty,
-		adapter: &TextAdapter,
-		cancel: &LocalCancellation,
-	) -> LocalResult<DifficultyDecision> {
-		use crate::local::text::{ChatMessage, ChatRole, ClassifierDecisionSource, ClassifierLadder};
-
-		let sanitized = sanitize_classifier_input(input);
-		if let Some(decision) = self.short_circuit(&sanitized, DifficultyBackend::Local, auto) {
-			return Ok(decision);
-		}
-		let ladder = ClassifierLadder::new([sf!("low"), sf!("medium"), sf!("high")].into())?;
-		let fallback = self.fallback_level(auto);
-		let local_fallback = sf!(<&'static str>::from(fallback));
-		let response = adapter.classify(
-			&[ChatMessage { role: ChatRole::User, content: sanitized.clone() }],
-			&ladder,
-			None,
-			&local_fallback,
-			cancel,
-		)?;
-		let selected = match response.label.as_str() {
-			"low" => Difficulty::Low,
-			"medium" => Difficulty::Medium,
-			"high" => Difficulty::High,
-			_ => fallback,
-		};
-		let source = match response.source {
-			ClassifierDecisionSource::Model => Some(selected),
-			ClassifierDecisionSource::Previous | ClassifierDecisionSource::Heuristic => None,
-		};
-		Ok(self.finish(&sanitized, DifficultyBackend::Local, auto, source))
-	}
-
 	fn short_circuit(
 		&self,
 		sanitized: &Str,
@@ -325,16 +284,6 @@ impl DifficultyClassifier {
 				level:  level.clamped(backend_ceiling(backend, auto)),
 				source: DifficultySource::Memo,
 			})
-	}
-
-	#[cfg(feature = "local-text")]
-	fn fallback_level(&self, auto: AutoDifficulty) -> Difficulty {
-		self
-			.state
-			.lock()
-			.previous
-			.unwrap_or_else(|| auto.provisional.provisional(auto.ceiling))
-			.clamped(auto.ceiling)
 	}
 
 	fn finish(

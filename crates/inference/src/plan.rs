@@ -285,7 +285,7 @@ pub fn forced_call_ladder(
 			escalation:    None,
 		};
 	}
-	let native_supported = caps.forced_choice != Some(false)
+	let native_supported = caps.forced_choice == Some(true)
 		&& match choice {
 			Setting::Require(ToolChoice::Named(_)) | Setting::Prefer(ToolChoice::Named(_)) => caps
 				.features
@@ -294,12 +294,13 @@ pub fn forced_call_ladder(
 				.features
 				.contains(omp_catalog::ToolFeatureBits::REQUIRED_CHOICE),
 		};
-	let escalation =
-		(non_compliant && escalations_left != 0 && native_supported && caps.native_penalty.is_some())
-			.then(|| Adjustment::Escalated {
-				feature: FeatureId(sf!("tool_choice")),
-				penalty: Penalty::CacheInvalidated,
-			});
+	let escalation = (non_compliant && escalations_left != 0 && native_supported)
+		.then(|| caps.native_penalty.clone())
+		.flatten()
+		.map(|penalty| Adjustment::Escalated {
+			feature: FeatureId(sf!("tool_choice")),
+			penalty,
+		});
 	ForcedCallDecision {
 		soft_prompt: true,
 		native_choice: native_supported && (caps.native_penalty.is_none() || escalation.is_some()),
@@ -926,20 +927,37 @@ mod tests {
 	#[test]
 	fn supports_forced_tool_choice_matches_pi_behavior() {
 		let choice = CallSetting::Require(CallToolChoice::Named(sf!("lookup")));
-		let mut policy = WirePolicy::baseline();
-		policy.tool.forced_choice = Some(false);
+		for declared in [None, Some(false)] {
+			let mut policy = WirePolicy::baseline();
+			policy.tool.forced_choice = declared;
+			let decision = forced_call_ladder(
+				&choice,
+				ForcedCallCaps::from_wire_policy(
+					omp_catalog::ToolFeatureBits::NAMED_CHOICE,
+					Some(Penalty::Billable),
+					&policy,
+				),
+				true,
+				1,
+			);
+			assert!(decision.soft_prompt);
+			assert!(!decision.native_choice, "unknown is not affirmative support");
+			assert_eq!(decision.escalation, None);
+		}
+
 		let decision = forced_call_ladder(
 			&choice,
-			ForcedCallCaps::from_wire_policy(
-				omp_catalog::ToolFeatureBits::NAMED_CHOICE,
-				None,
-				&policy,
-			),
+			ForcedCallCaps {
+				features:       omp_catalog::ToolFeatureBits::NAMED_CHOICE,
+				forced_choice:  Some(true),
+				native_penalty: Some(Penalty::Billable),
+			},
 			true,
 			1,
 		);
-		assert!(decision.soft_prompt);
-		assert!(!decision.native_choice);
-		assert_eq!(decision.escalation, None);
+		assert!(matches!(
+			decision.escalation,
+			Some(Adjustment::Escalated { penalty: Penalty::Billable, .. })
+		));
 	}
 }

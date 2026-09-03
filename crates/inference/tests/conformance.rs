@@ -121,6 +121,7 @@ fn chat_request(messages: Vec<Message>) -> ChatRequest {
 		top_logprobs:      None,
 		safety:            Arc::from([]),
 		negotiation:       Default::default(),
+		forced_call:       None,
 	}
 }
 

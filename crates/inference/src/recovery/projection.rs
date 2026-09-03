@@ -3,12 +3,16 @@
 use std::{collections::BTreeMap, io::Cursor};
 
 use bytes::{Bytes, BytesMut};
+use omp_catalog::{
+	id::WirePolicyId,
+	policy::WirePolicy,
+};
 use omp_core::Str;
 use xutf::BufReadCharsExt as _;
 
 use super::{
 	RecoveryError, Stage,
-	dialect::{DialectEvent, ToolEnvelope},
+	dialect::{Dialect, DialectEvent, DialectStage, ToolEnvelope},
 	tools::{
 		ToolAssembler, ToolAssemblyEvent, ToolAssemblyLimits, ToolFragment, ToolPairing,
 		ToolRegistration, ToolResultPairer, ToolResultSource,
@@ -58,6 +62,8 @@ pub enum ProjectionInput {
 /// Non-provider recovery failure that permanently stops projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProjectionFailure {
+	/// A complete tool candidate failed assembly or schema authorization.
+	ToolAssemblyRejected,
 	/// The model attempted to fabricate a result after requesting a real tool.
 	FabricatedToolResult,
 	/// A caller result could not be paired to exactly one authorized call.
@@ -79,6 +85,201 @@ pub struct ProjectionBatch {
 	pub evidence: Vec<RecoveryRecord>,
 }
 
+/// Catalog evidence and bounds for live in-band tool recovery.
+#[derive(Clone, Debug)]
+pub struct DialectRecoveryConfig {
+	/// Exact compiled wire policy selected for the attempt.
+	pub wire_policy:          WirePolicyId,
+	/// Catalog-selected model-authored tool syntax, if any.
+	pub dialect:              Option<Dialect>,
+	/// Attempt number written to recovery receipts.
+	pub attempt:              u32,
+	/// Maximum bytes retained for one model-authored envelope.
+	pub max_block_bytes:      usize,
+	/// Maximum bounded raw preview retained in an envelope.
+	pub max_diagnostic_bytes: usize,
+	/// Tool assembly and schema-validation bounds.
+	pub tool_limits:          ToolAssemblyLimits,
+}
+
+impl DialectRecoveryConfig {
+	/// Builds recovery configuration solely from compiled catalog policy.
+	pub fn from_wire_policy(
+		wire_policy: WirePolicyId,
+		policy: &WirePolicy,
+		attempt: u32,
+	) -> Self {
+		let dialect = policy
+			.streaming
+			.markup_healing_pattern
+			.and_then(Dialect::from_markup_pattern)
+			.or_else(|| policy.reasoning.leaked_healer.and_then(Dialect::from_healer));
+		Self {
+			wire_policy,
+			dialect,
+			attempt,
+			max_block_bytes: ToolAssemblyLimits::default().max_argument_bytes,
+			max_diagnostic_bytes: 128,
+			tool_limits: ToolAssemblyLimits::default(),
+		}
+	}
+}
+
+/// Live catalog-selected text recovery with bounded native-channel precedence
+/// followed by canonical event projection.
+#[derive(Debug)]
+pub struct DialectRecoveryPipeline<'a> {
+	dialect:                Option<DialectStage>,
+	projector:              RecoveryProjector<'a>,
+	pending_dialect:        Vec<DialectEvent>,
+	pending_dialect_bytes:  usize,
+	pending_tool_calls:     usize,
+	max_pending_tool_calls: usize,
+	max_pending_bytes:      usize,
+}
+
+impl<'a> DialectRecoveryPipeline<'a> {
+	/// Creates one bounded pipeline for a provider attempt.
+	pub fn new(definitions: &'a [ToolDefinition], config: DialectRecoveryConfig) -> Self {
+		let dialect = config.dialect.map(|dialect| {
+			DialectStage::new(
+				dialect,
+				config.wire_policy,
+				config.attempt,
+				config.max_block_bytes,
+				config.max_diagnostic_bytes,
+			)
+		});
+		Self {
+			dialect,
+			projector: RecoveryProjector::new(definitions, config.tool_limits, config.attempt),
+			pending_dialect: Vec::new(),
+			pending_dialect_bytes: 0,
+			pending_tool_calls: 0,
+			max_pending_tool_calls: config.tool_limits.max_total_calls,
+			max_pending_bytes: config.max_block_bytes,
+		}
+	}
+
+	/// Feeds visible-channel bytes through configured dialect recognition and
+	/// canonical projection.
+	pub fn push_text(&mut self, input: Bytes) -> Result<ProjectionBatch, RecoveryError> {
+		let mut output = ProjectionBatch::default();
+		if let Some(dialect) = self.dialect.as_mut() {
+			let mut events = Vec::new();
+			dialect.push(input, &mut |event| events.push(event))?;
+			self.apply_dialect_events(events, &mut output)?;
+		} else {
+			append_batch(&mut output, self.projector.push(ProjectionInput::Text(input)));
+		}
+		Ok(output)
+	}
+
+	/// Feeds native provider tool fragments through the same projector, so a
+	/// native call deterministically wins over leaked text envelopes.
+	pub fn push_native(&mut self, fragment: ToolFragment) -> ProjectionBatch {
+		self
+			.projector
+			.push(ProjectionInput::Tool { channel: ToolChannel::Native, fragment })
+	}
+
+	/// Reindexes one canonical event from a channel which does not otherwise
+	/// require recovery, reserving its block index in the shared allocator.
+	pub fn push_passthrough(&mut self, event: ChatEvent) -> ProjectionBatch {
+		self.projector.project_passthrough(event)
+	}
+
+	/// Resolves held delimiter suffixes and incomplete projected calls.
+	pub fn finish(&mut self) -> Result<ProjectionBatch, RecoveryError> {
+		let mut output = ProjectionBatch::default();
+		if let Some(dialect) = self.dialect.as_mut() {
+			let mut events = Vec::new();
+			dialect.finish(&mut |event| events.push(event))?;
+			self.apply_dialect_events(events, &mut output)?;
+		}
+		let native_selected = self.projector.selected_channel == Some(ToolChannel::Native);
+		for event in std::mem::take(&mut self.pending_dialect) {
+			if native_selected && matches!(&event, DialectEvent::ToolEnvelope(_)) {
+				continue;
+			}
+			append_batch(
+				&mut output,
+				self.projector.push(ProjectionInput::Dialect(event)),
+			);
+			if output.failure.is_some() {
+				break;
+			}
+		}
+		self.pending_dialect_bytes = 0;
+		self.pending_tool_calls = 0;
+		append_batch(&mut output, self.projector.finish());
+		Ok(output)
+	}
+
+	fn apply_dialect_events(
+		&mut self,
+		events: Vec<DialectEvent>,
+		output: &mut ProjectionBatch,
+	) -> Result<(), RecoveryError> {
+		for event in events {
+			let starts_pending = matches!(&event, DialectEvent::ToolEnvelope(_));
+			if self.pending_dialect.is_empty() && !starts_pending {
+				let DialectEvent::Text(bytes) = event else {
+					unreachable!("only tool envelopes start deferred dialect output");
+				};
+				append_batch(output, self.projector.push(ProjectionInput::Text(bytes)));
+				continue;
+			}
+			if starts_pending {
+				if self.pending_tool_calls >= self.max_pending_tool_calls {
+					return Err(RecoveryError::LimitExceeded {
+						stage: "dialect-tool-calls",
+						limit: self.max_pending_tool_calls,
+					});
+				}
+				self.pending_tool_calls = self.pending_tool_calls.saturating_add(1);
+			}
+			let bytes = match &event {
+				DialectEvent::Text(bytes) => bytes.len(),
+				DialectEvent::ToolEnvelope(envelope) => {
+					envelope.raw.len().saturating_add(envelope.arguments.len())
+				},
+			};
+			if self.pending_dialect_bytes.saturating_add(bytes) > self.max_pending_bytes {
+				return Err(RecoveryError::LimitExceeded {
+					stage: "dialect-precedence",
+					limit: self.max_pending_bytes,
+				});
+			}
+			self.pending_dialect_bytes = self.pending_dialect_bytes.saturating_add(bytes);
+			self.pending_dialect.push(event);
+		}
+		Ok(())
+	}
+}
+
+impl Stage<Bytes, ProjectionBatch> for DialectRecoveryPipeline<'_> {
+	fn push(
+		&mut self,
+		input: Bytes,
+		emit: &mut dyn FnMut(ProjectionBatch),
+	) -> Result<(), RecoveryError> {
+		let output = self.push_text(input)?;
+		if batch_has_output(&output) {
+			emit(output);
+		}
+		Ok(())
+	}
+
+	fn finish(&mut self, emit: &mut dyn FnMut(ProjectionBatch)) -> Result<(), RecoveryError> {
+		let output = DialectRecoveryPipeline::finish(self)?;
+		if batch_has_output(&output) {
+			emit(output);
+		}
+		Ok(())
+	}
+}
+
 /// Stateful projector enforcing one tool channel and fabricated-result
 /// rejection.
 #[derive(Debug)]
@@ -87,6 +288,7 @@ pub struct RecoveryProjector<'a> {
 	text_tools:            ToolAssembler<'a>,
 	selected_channel:      Option<ToolChannel>,
 	canonical_indexes:     BTreeMap<(ToolChannel, u32), u32>,
+	passthrough_indexes:   BTreeMap<u32, u32>,
 	next_index:            u32,
 	text_index:            Option<u32>,
 	next_text_tool_source: u32,
@@ -106,6 +308,7 @@ impl<'a> RecoveryProjector<'a> {
 			text_tools: ToolAssembler::new(definitions, limits, attempt),
 			selected_channel: None,
 			canonical_indexes: BTreeMap::new(),
+			passthrough_indexes: BTreeMap::new(),
 			next_index: 0,
 			text_index: None,
 			next_text_tool_source: 0,
@@ -180,6 +383,39 @@ impl<'a> RecoveryProjector<'a> {
 		output.evidence.extend(self.native.take_evidence());
 		output.evidence.extend(self.text_tools.take_evidence());
 		output
+	}
+
+	/// Reindexes one already-canonical event through the same block allocator
+	/// used by recovered text and tool calls.
+	pub fn project_passthrough(&mut self, event: ChatEvent) -> ProjectionBatch {
+		if self.stopped {
+			return ProjectionBatch::default();
+		}
+		let event = match event {
+			ChatEvent::BlockStarted { index, kind } => {
+				ChatEvent::BlockStarted { index: self.passthrough_index(index), kind }
+			},
+			ChatEvent::TextDelta { index, text } => {
+				ChatEvent::TextDelta { index: self.passthrough_index(index), text }
+			},
+			ChatEvent::ThinkingDelta { index, text } => {
+				ChatEvent::ThinkingDelta { index: self.passthrough_index(index), text }
+			},
+			ChatEvent::ToolCallStarted { index, id, name } => {
+				ChatEvent::ToolCallStarted { index: self.passthrough_index(index), id, name }
+			},
+			ChatEvent::ToolArgumentsDelta { index, bytes } => {
+				ChatEvent::ToolArgumentsDelta { index: self.passthrough_index(index), bytes }
+			},
+			ChatEvent::ToolCallReady { index, call } => {
+				ChatEvent::ToolCallReady { index: self.passthrough_index(index), call }
+			},
+			ChatEvent::Artifact { index, artifact } => {
+				ChatEvent::Artifact { index: self.passthrough_index(index), artifact }
+			},
+			event => event,
+		};
+		ProjectionBatch { events: vec![event], ..ProjectionBatch::default() }
 	}
 
 	/// Returns whether a terminal fabricated/unpaired result stopped the stream.
@@ -311,6 +547,15 @@ impl<'a> RecoveryProjector<'a> {
 				},
 				ToolAssemblyEvent::Rejected { source_index, .. } => {
 					self.canonical_indexes.remove(&(channel, source_index));
+					if self.selected_channel == Some(channel) {
+						self.stopped = true;
+						output.failure = Some(ProjectionFailure::ToolAssemblyRejected);
+						output.evidence.push(self.evidence(
+							RecoveryKind::ToolAssembly,
+							"tool.assembly-rejected",
+							0,
+						));
+					}
 				},
 			}
 		}
@@ -390,6 +635,15 @@ impl<'a> RecoveryProjector<'a> {
 			.push(ChatEvent::TextDelta { index, text: Str::new(text) });
 	}
 
+	fn passthrough_index(&mut self, source: u32) -> u32 {
+		if let Some(&index) = self.passthrough_indexes.get(&source) {
+			return index;
+		}
+		let index = self.allocate_index();
+		self.passthrough_indexes.insert(source, index);
+		index
+	}
+
 	fn allocate_tool_index(&mut self, channel: ToolChannel, source: u32) -> u32 {
 		if let Some(&index) = self.canonical_indexes.get(&(channel, source)) {
 			return index;
@@ -441,6 +695,10 @@ impl Stage<ProjectionInput, ProjectionBatch> for RecoveryProjector<'_> {
 		}
 		Ok(())
 	}
+}
+
+fn batch_has_output(batch: &ProjectionBatch) -> bool {
+	!batch.events.is_empty() || batch.failure.is_some() || !batch.evidence.is_empty()
 }
 
 fn append_batch(target: &mut ProjectionBatch, mut source: ProjectionBatch) {
@@ -519,6 +777,206 @@ mod tests {
 				strict:     true,
 			},
 		}
+	}
+
+	#[test]
+	fn configured_dialect_pipeline_projects_canonical_tool_events() {
+		let mut policy = WirePolicy::baseline();
+		policy.streaming.markup_healing_pattern =
+			Some(omp_catalog::policy::StreamMarkupHealingPattern::Qwen);
+		let config =
+			DialectRecoveryConfig::from_wire_policy(WirePolicyId::new("qwen-wire"), &policy, 2);
+		assert_eq!(config.dialect, Some(Dialect::QwenXml));
+		let definitions = [definition()];
+		let mut pipeline = DialectRecoveryPipeline::new(&definitions, config);
+		let input = b"before<tool_calls><echo text=\"ok\" /></tool_calls>after";
+		let mut output = ProjectionBatch::default();
+		for chunk in input.chunks(7) {
+			append_batch(
+				&mut output,
+				pipeline
+					.push_text(Bytes::copy_from_slice(chunk))
+					.expect("configured recovery remains valid"),
+			);
+		}
+		append_batch(
+			&mut output,
+			pipeline.finish().expect("configured recovery finishes"),
+		);
+		let calls: Vec<_> = output
+			.events
+			.iter()
+			.filter_map(ChatEvent::authorized_tool_call)
+			.collect();
+		assert_eq!(calls.len(), 1);
+		assert_eq!(calls[0].name.as_str(), "echo");
+		assert_eq!(calls[0].arguments.as_value(), &json!({"text": "ok"}));
+		assert!(
+			output
+				.evidence
+				.iter()
+				.any(|record| record.rule.0.as_str() == "dialect/qwen-wire/qwen-xml")
+		);
+	}
+
+	#[test]
+	fn passthrough_and_recovered_blocks_share_one_collision_free_allocator() {
+		let definitions = [definition()];
+		let config = DialectRecoveryConfig {
+			wire_policy: WirePolicyId::new("hermes-wire"),
+			dialect: Some(Dialect::Hermes),
+			attempt: 0,
+			max_block_bytes: 1024,
+			max_diagnostic_bytes: 32,
+			tool_limits: ToolAssemblyLimits::default(),
+		};
+		let mut pipeline = DialectRecoveryPipeline::new(&definitions, config);
+		let thinking = pipeline.push_passthrough(ChatEvent::BlockStarted {
+			index: 0,
+			kind: BlockKind::Thinking,
+		});
+		assert!(matches!(
+			thinking.events.as_slice(),
+			[ChatEvent::BlockStarted { index: 0, kind: BlockKind::Thinking }]
+		));
+		let pending = pipeline
+			.push_text(Bytes::from_static(
+				br#"<tool_call>{"name":"echo","arguments":{"text":"ok"}}</tool_call>"#,
+			))
+			.expect("dialect recovery succeeds");
+		assert!(
+			pending
+				.events
+				.iter()
+				.all(|event| event.authorized_tool_call().is_none())
+		);
+		let artifact = pipeline.push_passthrough(ChatEvent::BlockStarted {
+			index: 1,
+			kind: BlockKind::Artifact,
+		});
+		assert!(matches!(
+			artifact.events.as_slice(),
+			[ChatEvent::BlockStarted { index: 1, kind: BlockKind::Artifact }]
+		));
+		let recovered = pipeline.finish().expect("dialect recovery finishes");
+		assert!(
+			recovered
+				.events
+				.iter()
+				.any(|event| matches!(event, ChatEvent::ToolCallReady { index: 2, .. }))
+		);
+	}
+
+	#[test]
+	fn configured_pipeline_keeps_native_channel_authoritative() {
+		let definitions = [definition()];
+		let config = DialectRecoveryConfig {
+			wire_policy: WirePolicyId::new("hermes-wire"),
+			dialect: Some(Dialect::Hermes),
+			attempt: 0,
+			max_block_bytes: 1024,
+			max_diagnostic_bytes: 32,
+			tool_limits: ToolAssemblyLimits::default(),
+		};
+		let mut pipeline = DialectRecoveryPipeline::new(&definitions, config);
+		let leaked = pipeline
+			.push_text(Bytes::from_static(
+				br#"<tool_call>{"name":"echo","arguments":{"text":"leaked"}}</tool_call>"#,
+			))
+			.expect("dialect scan succeeds");
+		assert!(leaked.events.is_empty());
+		let native = [
+			ToolFragment::Start {
+				source_index: 7,
+				id: Some(ToolCallId::new("native")),
+				name: Bytes::from_static(b"echo"),
+				input_kind: ToolInputKind::Json,
+			},
+			ToolFragment::ArgumentsDelta {
+				source_index: 7,
+				bytes: Bytes::from_static(br#"{"text":"native"}"#),
+			},
+			ToolFragment::End { source_index: 7 },
+		];
+		let mut native_ready = None;
+		for fragment in native {
+			native_ready = pipeline
+				.push_native(fragment)
+				.events
+				.into_iter()
+				.find_map(|event| event.authorized_tool_call().cloned())
+				.or(native_ready);
+		}
+		assert_eq!(
+			native_ready
+				.expect("native call becomes authoritative")
+				.arguments
+				.as_value(),
+			&json!({"text": "native"})
+		);
+		let finished = pipeline.finish().expect("pipeline finishes");
+		assert!(
+			finished
+				.events
+				.iter()
+				.all(|event| event.authorized_tool_call().is_none()),
+			"buffered text calls must be discarded once native output arrives"
+		);
+	}
+
+	#[test]
+	fn completed_invalid_native_call_is_a_terminal_projection_failure() {
+		let definitions = [definition()];
+		let config = DialectRecoveryConfig {
+			wire_policy: WirePolicyId::new("wire"),
+			dialect: None,
+			attempt: 0,
+			max_block_bytes: 1024,
+			max_diagnostic_bytes: 32,
+			tool_limits: ToolAssemblyLimits::default(),
+		};
+		let mut pipeline = DialectRecoveryPipeline::new(&definitions, config);
+		pipeline.push_native(ToolFragment::Start {
+			source_index: 3,
+			id: None,
+			name: Bytes::from_static(b"undeclared"),
+			input_kind: ToolInputKind::Json,
+		});
+		pipeline.push_native(ToolFragment::ArgumentsDelta {
+			source_index: 3,
+			bytes: Bytes::from_static(b"{}"),
+		});
+		let rejected = pipeline.push_native(ToolFragment::End { source_index: 3 });
+		assert_eq!(rejected.failure, Some(ProjectionFailure::ToolAssemblyRejected));
+		assert!(
+			rejected
+				.evidence
+				.iter()
+				.any(|record| record.rule.0.as_str() == "tool.assembly-rejected")
+		);
+	}
+
+	#[test]
+	fn configured_dialect_pipeline_fails_at_its_envelope_bound() {
+		let definitions = [definition()];
+		let config = DialectRecoveryConfig {
+			wire_policy: WirePolicyId::new("bounded-wire"),
+			dialect: Some(Dialect::Hermes),
+			attempt: 0,
+			max_block_bytes: 24,
+			max_diagnostic_bytes: 8,
+			tool_limits: ToolAssemblyLimits::default(),
+		};
+		let mut pipeline = DialectRecoveryPipeline::new(&definitions, config);
+		let error = pipeline
+			.push_text(Bytes::from_static(
+				b"<tool_call>{\"name\":\"echo\",\"arguments\":{\"text\":\"far too long\"}}",
+			))
+			.expect_err("an unterminated envelope must not grow beyond its bound");
+		assert_eq!(
+			error,
+			RecoveryError::LimitExceeded { stage: "tag-scanner", limit: 24 }
+		);
 	}
 
 	#[test]
