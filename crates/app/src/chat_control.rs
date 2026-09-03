@@ -257,11 +257,10 @@ impl<C: omp_agent::Inference> Controller<C> {
 			// A queued prompt runs as soon as the controller is idle and
 			// not paused (pi `followUp`: "for when the agent yields").
 			if !self.paused
-				&& let Some(prompt) = self.pop_queued()?
+				&& let Some(input) = self.pop_queued()?
 			{
-				let quit = self
-					.run_turn(Some(TurnInput { text: prompt, attachments: Vec::new() }), &command_rx)
-					.await? || self.after_turn(&command_rx).await?;
+				let quit =
+					self.run_turn(Some(input), &command_rx).await? || self.after_turn(&command_rx).await?;
 				if quit {
 					self.shutdown()?;
 					return Ok(());
@@ -336,7 +335,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 		Ok(match command {
 			HostCommand::Submit(text) => {
 				if self.paused {
-					self.queue_prompt(text)?;
+					self.queue_prompt(text, Vec::new())?;
 					self.reply(Severity::Info, "Paused: prompt queued until you resume");
 					return Ok(Flow::Idle);
 				}
@@ -344,17 +343,17 @@ impl<C: omp_agent::Inference> Controller<C> {
 				Flow::Turn(TurnInput { text, attachments: Vec::new() })
 			},
 			HostCommand::SubmitWithAttachments { text, attachments } => {
-				if self.paused {
-					self.queue_prompt(text)?;
-					self.reply(Severity::Info, "Paused: prompt queued until you resume");
-					return Ok(Flow::Idle);
-				}
 				// The same seam ACP image blocks take: content-address the
 				// bytes in the session store, journal the references.
 				let attachments = self
 					.session
 					.store_attachments(attachments)
 					.into_diagnostic()?;
+				if self.paused {
+					self.queue_prompt(text, attachments)?;
+					self.reply(Severity::Info, "Paused: prompt queued until you resume");
+					return Ok(Flow::Idle);
+				}
 				self.record_loop_prompt(&text)?;
 				Flow::Turn(TurnInput { text, attachments })
 			},
@@ -485,8 +484,27 @@ impl<C: omp_agent::Inference> Controller<C> {
 						Ok(HostCommand::Overlay { .. }) => {},
 						Ok(HostCommand::PushToTalk { active }) => self.voice.set_active(active, &self.ctx),
 						Ok(HostCommand::LiveVoice { active }) => self.voice.set_live(active, &self.ctx),
-						Ok(HostCommand::Queue { prompt }) => {
-							let _ = self.up.send(Up::Queue(prompt));
+						Ok(HostCommand::Queue { prompt, attachments }) => {
+							let stored = attachments
+								.into_iter()
+								.map(|input| {
+									blobs
+										.put(&input.bytes)
+										.map(|blob| omp_journal::data::Attachment { blob, mime: input.mime })
+								})
+								.collect::<Result<Vec<_>, _>>();
+							match stored {
+								Ok(attachments) => {
+									let _ = self.up.send(Up::Queue { text: prompt, attachments });
+								},
+								Err(error) => {
+									let _ = self.up.send(Up::Env(omp_agent::EnvEvent::Notice {
+										kind: Str::new_static("error"),
+										name: None,
+										body: Str::new(format!("Could not store the queued images: {error}")),
+									}));
+								},
+							}
 						},
 						Ok(other) => {
 							// Session switches and rewinds end the running turn
@@ -730,7 +748,13 @@ impl<C: omp_agent::Inference> Controller<C> {
 				)?;
 			},
 			HostCommand::Compact { method, hint } => self.compact(method, hint).await?,
-			HostCommand::Queue { prompt } => self.queue_prompt(prompt)?,
+			HostCommand::Queue { prompt, attachments } => {
+				let attachments = self
+					.session
+					.store_attachments(attachments)
+					.into_diagnostic()?;
+				self.queue_prompt(prompt, attachments)?;
+			},
 			HostCommand::Dequeue { prompts } => {
 				let dom = self.session.dom();
 				let ops = prompts
@@ -1188,16 +1212,26 @@ impl<C: omp_agent::Inference> Controller<C> {
 		}
 	}
 
-	/// Journals a `/queue` prompt under `<queues><prompts>`.
-	fn queue_prompt(&mut self, prompt: Str) -> miette::Result<()> {
+	/// Journals a `/queue` prompt under `<queues><prompts>`; its attachments
+	/// (already content-addressed) ride the same `data` prop a `msg.user@1`
+	/// fold writes, so the pop that starts the turn hands them on typed.
+	fn queue_prompt(
+		&mut self,
+		prompt: Str,
+		attachments: Vec<omp_journal::data::Attachment>,
+	) -> miette::Result<()> {
 		let dom = self.session.dom();
 		let prompts = prompts_root(dom).ok_or_else(|| miette!("session has no prompt queue"))?;
 		let id = Str::new(format!("queued-{}", Ulid::generate()));
-		let node = NodeSpec::new(KnownTag::Prompt)
+		let mut node = NodeSpec::new(KnownTag::Prompt)
 			.with_prop(PropId::Kind, Value::Str(Str::new_static(QUEUED)))
 			.with_prop(PropId::Id, Value::Str(id))
 			.with_prop(PropId::Status, Value::Str(Str::new_static("pending")))
 			.with_content(prompt);
+		if !attachments.is_empty() {
+			let raw = serde_json::value::to_raw_value(&attachments).into_diagnostic()?;
+			node = node.with_prop(PropId::Data, Value::Json(raw));
+		}
 		let cause = self.head()?;
 		self
 			.session
@@ -1214,36 +1248,16 @@ impl<C: omp_agent::Inference> Controller<C> {
 		Ok(())
 	}
 
-	/// Takes the oldest pending `/queue` prompt, marking it sent.
-	fn pop_queued(&mut self) -> miette::Result<Option<Str>> {
-		let dom = self.session.dom();
-		let Some(prompts) = prompts_root(dom) else {
+	/// Takes the oldest pending `/queue` prompt with its attachments,
+	/// marking it sent.
+	fn pop_queued(&mut self) -> miette::Result<Option<TurnInput>> {
+		let Some((text, attachments)) =
+			omp_agent::pop_queued_prompt(&mut self.session).into_diagnostic()?
+		else {
 			return Ok(None);
 		};
-		let Some((handle, text)) = dom.children(prompts).iter().copied().find_map(|handle| {
-			let node = dom.get(handle)?;
-			(node.tag == Tag::Known(KnownTag::Prompt)
-				&& prop_str(node, PropId::Kind) == Some(QUEUED)
-				&& prop_str(node, PropId::Status) == Some("pending"))
-			.then(|| (handle, node.content.clone().unwrap_or_default()))
-		}) else {
-			return Ok(None);
-		};
-		let cause = self.head()?;
-		self
-			.session
-			.patch(Txn {
-				cause,
-				label: Some(Str::new_static("queue.pop")),
-				ops: vec![Op::Set {
-					h:     handle,
-					prop:  PropId::Status.into(),
-					value: Value::Str(Str::new_static("sent")),
-				}],
-			})
-			.into_diagnostic()?;
 		self.record_loop_prompt(&text)?;
-		Ok(Some(text))
+		Ok(Some(TurnInput { text, attachments }))
 	}
 
 	/// `/loop` without a prompt records the next prompt as the loop prompt
@@ -1275,7 +1289,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 	/// Engages or exits one Director family (ADR 0015 `<meta><directors>`).
 	fn director(&mut self, id: &str, engage: bool, args: &[Str]) -> Result<(), DirectorFailure> {
 		use omp_agent::directors::{
-			force_tool::ForceTool, goal::Goal, loop_mode::LoopMode, vibe::Vibe,
+			advisor::Advisor, force_tool::ForceTool, goal::Goal, loop_mode::LoopMode, vibe::Vibe,
 		};
 		let registry = omp_agent::DirectorRegistry::standard();
 		let mut stack = omp_agent::DirectorStack::from_dom(self.session.dom(), &registry);
@@ -1295,6 +1309,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 			};
 		}
 		let director: Box<dyn omp_agent::Director> = match id {
+			"advisor" => Box::new(Advisor::new()),
 			"vibe" => Box::new(Vibe::new()),
 			"goal" => {
 				let verb = args.first().map(Str::as_str).unwrap_or_default();
@@ -2540,9 +2555,11 @@ mod tests {
 	/// `<prompt kind=queued>` under `<queues><prompts>` (pi `followUp`:
 	/// "for when the agent yields") — never smuggled into the running turn
 	/// as `<user steering>` — and runs as its own turn once the current one
-	/// ends.
+	/// ends, carrying the images queued with it (pi `followUp(text,
+	/// images)`).
 	#[tokio::test]
 	async fn queue_during_a_turn_waits_as_a_pending_prompt_and_never_steers() {
+		const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x04\0\0\0\x03";
 		let harness = harness(Duration::from_millis(300));
 		harness
 			.commands
@@ -2551,7 +2568,13 @@ mod tests {
 		next_event(&harness.events, |event| matches!(event, KernelEvent::InferenceStarted)).await;
 		harness
 			.commands
-			.send(HostCommand::Queue { prompt: Str::new_static("later") })
+			.send(HostCommand::Queue {
+				prompt:      Str::new_static("later [Image #1]"),
+				attachments: vec![omp_session::AttachmentInput {
+					mime:  Str::new_static("image/png"),
+					bytes: bytes::Bytes::from_static(PNG),
+				}],
+			})
 			.expect("queue");
 		next_event(&harness.events, |event| {
 			matches!(event, KernelEvent::TurnEnded { stop: TurnStop::Completed })
@@ -2578,7 +2601,7 @@ mod tests {
 			panic!("exactly one queued prompt is journaled: {queued:?}");
 		};
 		let node = dom.get(*queued).expect("queued prompt node");
-		assert_eq!(node.content.as_deref(), Some("later"));
+		assert_eq!(node.content.as_deref(), Some("later [Image #1]"));
 		assert_eq!(prop_str(node, PropId::Status), Some("sent"), "popped once the turn ended");
 		let turns = dom.children(dom.body());
 		assert_eq!(turns.len(), 2, "the queued prompt ran as its own turn");
@@ -2588,7 +2611,19 @@ mod tests {
 			.filter_map(|handle| dom.get(*handle))
 			.find(|node| node.tag == Tag::Known(KnownTag::User))
 			.expect("second turn opens with the queued prompt");
-		assert_eq!(user.content.as_deref(), Some("later"));
+		assert_eq!(user.content.as_deref(), Some("later [Image #1]"));
+		let Some(Value::Json(raw)) = user.prop(&PropKey::from(PropId::Data)) else {
+			panic!("the popped turn carries the queued attachment: {user:?}");
+		};
+		let attachments: Vec<omp_journal::data::Attachment> =
+			serde_json::from_str(raw.get()).expect("attachment json");
+		assert_eq!(attachments.len(), 1);
+		assert_eq!(attachments[0].mime, "image/png");
+		assert_eq!(
+			session.blobs().get(&attachments[0].blob).expect("queued image blob").as_ref(),
+			PNG,
+			"the queued bytes were content-addressed once and reach the turn"
+		);
 	}
 
 	/// A paused controller hands the `!` line back instead of dropping it,

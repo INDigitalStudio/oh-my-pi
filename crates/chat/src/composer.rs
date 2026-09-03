@@ -57,8 +57,14 @@ pub enum ComposerAction {
 	Command(Str),
 	/// Queue the draft behind the active turn (pi `->` / `=>` yield-queue
 	/// shorthand): the body runs when the agent yields, or at once when it
-	/// is idle with an empty queue.
-	Queue(Str),
+	/// is idle with an empty queue. Image chips travel with it exactly as
+	/// they do for [`ComposerAction::SubmitWithImages`].
+	Queue {
+		/// The body behind the sigil, chips expanded to their wire markers.
+		text:   Str,
+		/// Staged image sources in marker order.
+		images: Vec<Str>,
+	},
 	/// Write text to the clipboard (the host owns OSC 52 / native access).
 	Copy(Str),
 	/// No composer action.
@@ -864,7 +870,7 @@ impl Composer {
 		// pi `parseQueueShorthand` runs before slash commands: `-> body`
 		// queues `body` for the next yield.
 		if let Some(body) = parse_queue_shorthand(&text) {
-			return ComposerAction::Queue(Str::new(body));
+			return ComposerAction::Queue { text: Str::new(body), images };
 		}
 		// pi: a leading `/` line is a command, never a prompt.
 		match text.trim_start().strip_prefix('/') {
@@ -1446,18 +1452,39 @@ mod tests {
 
 		let mut composer = composer();
 		type_text(&mut composer, "-> /help later");
-		assert_eq!(
-			composer.key(Key::Enter),
-			ComposerAction::Queue(Str::new_static("/help later"))
-		);
+		assert_eq!(composer.key(Key::Enter), ComposerAction::Queue {
+			text:   Str::new_static("/help later"),
+			images: Vec::new(),
+		});
 		assert_eq!(composer.text(), "");
 		assert_eq!(composer.key(Key::Up), ComposerAction::Changed);
 		assert_eq!(composer.text(), "-> /help later", "history keeps the shorthand");
 		composer.clear();
 		type_text(&mut composer, "=> second");
-		assert_eq!(composer.key(Key::Enter), ComposerAction::Queue(Str::new_static("second")));
+		assert_eq!(composer.key(Key::Enter), ComposerAction::Queue {
+			text:   Str::new_static("second"),
+			images: Vec::new(),
+		});
 		type_text(&mut composer, "plain -> not shorthand");
 		assert!(matches!(composer.key(Key::Enter), ComposerAction::Submit(_)));
+	}
+
+	/// pi `#queueForYield(text, { images })`: the yield-queue shorthand
+	/// carries the staged image chips with the body, positional against the
+	/// markers that survive the stripped sigil.
+	#[test]
+	fn queue_shorthand_keeps_image_chips() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let image = dir.path().join("shot.png");
+		std::fs::write(&image, b"\x89PNG\r\n\x1a\n").expect("png");
+		let mut composer = composer();
+		type_text(&mut composer, "-> ");
+		composer.paste(&format!("'{}'", image.display()));
+		type_text(&mut composer, "later");
+		assert_eq!(composer.key(Key::Enter), ComposerAction::Queue {
+			text:   Str::new_static("[Image #1] later"),
+			images: vec![Str::new(image.to_string_lossy())],
+		});
 	}
 
 	/// `cl_autocomplete_max_visible`, `cl_emoji_autocomplete`, and

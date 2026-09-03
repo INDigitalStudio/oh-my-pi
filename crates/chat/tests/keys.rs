@@ -41,6 +41,8 @@ bind ctrl+w panel_delete_fast
 bind ctrl+left panel_fold_up
 bind ctrl+right panel_unfold_down
 bind ctrl+o panel_expand
+bind ctrl+q cl_followup
+bind ctrl+enter cl_followup
 "#;
 
 struct Harness {
@@ -475,7 +477,7 @@ fn follow_up_queues_behind_a_streaming_turn_and_submits_when_idle() {
 	assert_eq!(h.host.composer_text(), "");
 	assert!(matches!(
 		h.commands.try_recv(),
-		Ok(HostCommand::Queue { prompt }) if prompt == "after this"
+		Ok(HostCommand::Queue { prompt, attachments }) if prompt == "after this" && attachments.is_empty()
 	));
 	assert!(h.commands.try_recv().is_err(), "queued once, never also submitted or steered");
 	assert!(h.up.try_recv().is_err(), "the host never steers the kernel directly");
@@ -503,6 +505,25 @@ fn follow_up_queues_behind_a_streaming_turn_and_submits_when_idle() {
 	assert_eq!(h.host.composer_text(), "");
 }
 
+/// The keymap's decoded `Key::FollowUp` (Ctrl+Enter or Alt+Enter on the
+/// wire) lowers to pi's primary `app.message.followUp` chord, `ctrl+enter`,
+/// so a decoded-key caller (headless, RPC, debug injection) reaches the
+/// same `cl_followup` bind as the physical chord.
+#[test]
+fn decoded_follow_up_key_runs_the_ctrl_enter_bind() {
+	let mut session = idle_session();
+	open_turn(&mut session);
+	let mut h = harness(session);
+	type_text(&mut h.host, "after this");
+	h.host.key(Key::FollowUp).expect("follow up key");
+	assert_eq!(h.host.composer_text(), "", "the bind queued the draft");
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Queue { prompt, .. }) if prompt == "after this"
+	));
+	assert_eq!(h.host.notice(), Some("Queued message for when the agent yields"));
+}
+
 /// pi `parseQueueShorthand` + `#queueForYield`: `-> body` starts at once
 /// when the agent is idle with an empty queue, otherwise queues behind the
 /// stream / earlier follow-ups.
@@ -524,7 +545,7 @@ fn queue_shorthand_starts_immediately_when_idle_else_queues() {
 	h.host.key(Key::Enter).expect("submit");
 	assert!(matches!(
 		h.commands.try_recv(),
-		Ok(HostCommand::Queue { prompt }) if prompt == "then this"
+		Ok(HostCommand::Queue { prompt, .. }) if prompt == "then this"
 	));
 	assert!(!h.host.turn_active(), "queueing behind an existing queue starts no turn");
 
@@ -535,9 +556,72 @@ fn queue_shorthand_starts_immediately_when_idle_else_queues() {
 	h.host.key(Key::Enter).expect("submit");
 	assert!(matches!(
 		h.commands.try_recv(),
-		Ok(HostCommand::Queue { prompt }) if prompt == "while streaming"
+		Ok(HostCommand::Queue { prompt, .. }) if prompt == "while streaming"
 	));
 	assert!(h.up.try_recv().is_err());
+}
+
+/// pi `handleFollowUp` / `#queueForYield(text, { images })`: an image chip
+/// in the draft goes with the text — queued behind the stream through the
+/// follow-up chord and the `->` shorthand (never steered), and submitted
+/// with its attachments when the agent is idle.
+#[test]
+fn follow_up_and_queue_shorthand_keep_image_attachments() {
+	let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x04\0\0\0\x03";
+	let dir = tempdir().expect("image directory");
+	let path = dir.path().join("shot.png");
+	std::fs::write(&path, png).expect("write png");
+	let source = path.to_str().expect("utf-8 path");
+
+	// Both configured follow-up chords while streaming: queued with the
+	// image, not steered. `Key::FollowUp` is decoded Ctrl+Enter.
+	for key in [Key::Ctrl('q'), Key::FollowUp] {
+		let mut session = idle_session();
+		open_turn(&mut session);
+		let mut h = harness(session);
+		assert_eq!(h.host.paste(source), NativeEffect::Consumed);
+		type_text(&mut h.host, "what is this?");
+		h.host.key(key).expect("follow up");
+		let (prompt, attachments) = match h.commands.try_recv() {
+			Ok(HostCommand::Queue { prompt, attachments }) => (prompt, attachments),
+			other => panic!("follow-up with an image chip queues it, got {other:?}"),
+		};
+		assert_eq!(prompt, "[Image #1, 4x3] what is this?");
+		assert_eq!(attachments.len(), 1);
+		assert_eq!(attachments[0].mime, "image/png");
+		assert_eq!(attachments[0].bytes.as_ref(), png);
+		assert!(h.commands.try_recv().is_err(), "queued once, never also steered");
+		assert!(h.up.try_recv().is_err());
+		assert_eq!(h.host.notice(), Some("Queued message for when the agent yields"));
+	}
+
+	// `->` shorthand while streaming: same queue, same image.
+	let mut session = idle_session();
+	open_turn(&mut session);
+	let mut h = harness(session);
+	type_text(&mut h.host, "-> ");
+	assert_eq!(h.host.paste(source), NativeEffect::Consumed);
+	type_text(&mut h.host, "and this");
+	h.host.key(Key::Enter).expect("submit");
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Queue { prompt, attachments })
+			if prompt == "[Image #1, 4x3] and this" && attachments.len() == 1
+	));
+
+	// Idle with an empty queue: the shorthand submits with the image.
+	let mut h = harness(idle_session());
+	type_text(&mut h.host, "-> ");
+	assert_eq!(h.host.paste(source), NativeEffect::Consumed);
+	type_text(&mut h.host, "now");
+	h.host.key(Key::Enter).expect("submit");
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::SubmitWithAttachments { text, attachments })
+			if text == "[Image #1, 4x3] now" && attachments.len() == 1
+	));
+	assert!(h.host.turn_active());
+	assert_eq!(h.host.notice(), Some("Sent queued message"));
 }
 
 #[test]
@@ -693,7 +777,7 @@ impl Panel for Probe {
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
 		if report.kind == Mouse::Click {
-			PanelEvent::Copy(Str::new_static("clicked"))
+			PanelEvent::Copy(Str::new(format!("clicked:{},{}", report.col, report.row)))
 		} else {
 			PanelEvent::Ignored
 		}
@@ -837,19 +921,29 @@ fn side_panels_keep_terminal_mouse_tracking_on() {
 	open_probe(&mut h.host, "btw", PanelAnchor::Side);
 	assert!(!h.host.overlay_open(), "a side panel is not modal");
 	assert!(h.host.mouse_tracking(), "a side panel still takes pointer reports");
+	let band = h.host.picker_band().expect("side panel band");
+	assert_eq!(band.rows, 1);
+	assert!(
+		band.y < 30 && band.y > 20,
+		"a side panel sits directly above the composer: {band:?}"
+	);
 	h.host
-		.mouse(MouseReport {
-			kind:    Mouse::Click,
-			col:     1,
-			row:     0,
-			button:  MouseButton::Left,
-			mods:    Mods::default(),
-			pressed: true,
-		})
+		.mouse(click(band.x + 1, band.y))
 		.expect("mouse");
-	assert_eq!(h.host.take_clipboard().as_deref(), Some("clicked"));
+	assert_eq!(h.host.take_clipboard().as_deref(), Some("clicked:1,0"));
 	h.host.key(Key::Esc).expect("close");
 	assert!(!h.host.mouse_tracking());
+}
+
+fn click(col: u16, row: u16) -> MouseReport {
+	MouseReport {
+		kind: Mouse::Click,
+		col,
+		row,
+		button: MouseButton::Left,
+		mods: Mods::default(),
+		pressed: true,
+	}
 }
 
 #[test]
@@ -886,21 +980,39 @@ fn panels_receive_lowered_session_and_tree_chords_before_raw_keys() {
 	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::Overlay { open: false, .. })));
 }
 
+/// Pointer reports arrive in terminal cells; the host resolves the
+/// overlay's composited band exactly as it paints it and hands the panel
+/// its own frame coordinates, so a click lands on the row it was painted
+/// on. Reports outside the band never reach the panel.
 #[test]
-fn pointer_reports_reach_the_active_panel() {
+fn pointer_reports_reach_the_active_panel_in_its_own_frame_cells() {
 	let mut h = harness(idle_session());
 	open_probe(&mut h.host, "probe", PanelAnchor::Center);
-	h.host
-		.mouse(MouseReport {
-			kind:    Mouse::Click,
-			col:     2,
-			row:     1,
-			button:  MouseButton::Left,
-			mods:    Mods::default(),
-			pressed: true,
-		})
-		.expect("mouse");
-	assert_eq!(h.host.take_clipboard().as_deref(), Some("clicked"));
+	// A 10x1 frame centered on 100x30: column 45, row 14.
+	let band = h.host.picker_band().expect("centered band");
+	assert_eq!((band.x, band.y, band.rows), (45, 14, 1));
+	h.host.mouse(click(47, 14)).expect("mouse");
+	assert_eq!(h.host.take_clipboard().as_deref(), Some("clicked:2,0"));
+	h.host.mouse(click(2, 1)).expect("mouse outside");
+	assert_eq!(h.host.take_clipboard(), None, "a click outside the band is not the panel's");
+	h.host.key(Key::Esc).expect("close");
+
+	// Bottom pickers replace the composer slot: the last rows of the viewport.
+	open_probe(&mut h.host, "sessions", PanelAnchor::Bottom);
+	let band = h.host.picker_band().expect("bottom band");
+	assert_eq!((band.x, band.y, band.rows), (0, 29, 1));
+	h.host.mouse(click(3, 29)).expect("mouse");
+	assert_eq!(h.host.take_clipboard().as_deref(), Some("clicked:3,0"));
+	h.host.mouse(click(3, 0)).expect("mouse above");
+	assert_eq!(h.host.take_clipboard(), None);
+	h.host.key(Key::Esc).expect("close");
+
+	// Full dashboards cover the viewport from the origin.
+	open_probe(&mut h.host, "usage", PanelAnchor::Full);
+	let band = h.host.picker_band().expect("full band");
+	assert_eq!((band.x, band.y), (0, 0));
+	h.host.mouse(click(4, 0)).expect("mouse");
+	assert_eq!(h.host.take_clipboard().as_deref(), Some("clicked:4,0"));
 }
 
 #[test]

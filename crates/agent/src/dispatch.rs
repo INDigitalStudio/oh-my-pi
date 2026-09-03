@@ -326,8 +326,8 @@ impl CallControl {
 				steering::queue_peer(session, text)?;
 				Ok(Received::None)
 			},
-			Up::Queue(text) => {
-				steering::queue_prompt(session, text)?;
+			Up::Queue { text, attachments } => {
+				steering::queue_prompt(session, text, &attachments)?;
 				Ok(Received::None)
 			},
 			Up::Unqueue(reply) => {

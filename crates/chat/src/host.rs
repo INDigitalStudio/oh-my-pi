@@ -65,8 +65,8 @@ use crate::{
 		CL_AUTOCOMPLETE_MAX_VISIBLE, CL_EMOJI_AUTOCOMPLETE, CL_PASTE_LARGE_MENU_THRESHOLD,
 		CL_SPELLING_AUTOCOMPLETE, CL_SPELLING_AUTOCORRECT, CL_SPELLING_TYPO_DETECTION,
 	},
-	status_band::Speculation,
-	status_line::{StatusLine, director_mode},
+	status_band::{ModeChip, Speculation},
+	status_line::{StatusLine, advisor_badge, director_mode},
 	transcript::Projection,
 	welcome::{WelcomeFacts, tip_seeded, welcome_seed},
 };
@@ -253,12 +253,16 @@ pub enum HostCommand {
 		/// Focus instructions, handoff prompt, or shake mode.
 		hint:   Option<Str>,
 	},
-	/// Append a prompt to `<queues><prompts>` (`/queue`).
+	/// Append a prompt to `<queues><prompts>` (`/queue`, `cl_followup`,
+	/// `->` shorthand); media rides beside it exactly as for
+	/// [`HostCommand::SubmitWithAttachments`] and starts the popped turn.
 	Queue {
 		/// Prompt run after the active turn.
-		prompt: Str,
+		prompt:      Str,
+		/// Media bytes plus MIME in marker order.
+		attachments: Vec<omp_session::AttachmentInput>,
 	},
-	/// Engage or exit a Director by id (`/vibe`, `/goal`, `/loop`, `/force`).
+	/// Engage or exit a Director by id (`/advisor`, `/vibe`, `/goal`, `/loop`, `/force`).
 	Director {
 		/// Director family.
 		id:     Str,
@@ -388,6 +392,25 @@ pub const fn ctrl_c_action(turn_active: bool, repeated: bool) -> CtrlCAction {
 	} else {
 		CtrlCAction::Quit
 	}
+}
+
+/// Reads the composer's staged image sources once, in marker order, into
+/// the media the controller content-addresses. The first unreadable or
+/// non-image source refuses the whole draft with the reason shown.
+fn read_attachments(images: &[Str]) -> Result<Vec<omp_session::AttachmentInput>, String> {
+	let mut attachments = Vec::with_capacity(images.len());
+	for source in images {
+		let bytes = std::fs::read(source.as_str())
+			.map(bytes::Bytes::from)
+			.map_err(|error| format!("Could not read image {source}: {error}"))?;
+		let format = omp_tui::imagefmt::format(&bytes)
+			.ok_or_else(|| format!("Unsupported image format: {source}"))?;
+		attachments.push(omp_session::AttachmentInput {
+			mime: Str::new_static(format.media_type()),
+			bytes,
+		});
+	}
+	Ok(attachments)
 }
 
 /// Observer-local surface shown when the chat actor first paints.
@@ -1393,14 +1416,13 @@ impl Presenter {
 	fn sync_status(&mut self) -> bool {
 		self.adopt_live_model();
 		self.local.sync_con(&self.con, &self.model);
-		let mut facts = status_facts(
+		let facts = status_facts(
 			&self.replica,
 			&self.model,
 			&self.local,
 			self.turn_started,
 			self.focused_agent.as_deref(),
 		);
-		facts.mode = director_mode(&self.replica);
 		// The composer wears the rail while the plan Director is engaged. pi's
 		// status row collapses the editor top gap (`EditorTopGap` /
 		// `statusRowOccupied`); this host paints the notice *in* the gap row
@@ -1547,11 +1569,15 @@ impl Presenter {
 		})
 	}
 
-	/// Routes a pointer report to the focused overlay.
+	/// Routes a pointer report to the focused overlay in that overlay's own
+	/// frame coordinates.
 	fn route_mouse(&mut self, report: MouseReport) -> Result<Routed, HostError> {
 		if self.overlays.approval().is_some() {
 			return Ok(Routed::Repaint);
 		}
+		let Some(report) = self.localize_mouse(report) else {
+			return Ok(Routed::Ignored);
+		};
 		match self.overlays.active_mut() {
 			Some(Overlay::Models(picker)) => {
 				let event = picker.mouse(report);
@@ -1569,6 +1595,33 @@ impl Presenter {
 			Some(Overlay::Approval(_)) => Ok(Routed::Repaint),
 			None => Ok(Routed::Ignored),
 		}
+	}
+
+	/// Translates a terminal-viewport pointer report into the topmost
+	/// overlay's frame cells, resolving its band exactly as [`Host::present`]
+	/// composites it (bottom pickers over the composer slot, centered
+	/// dialogs, side panels above the live composer). `None` when no overlay
+	/// is open or the gesture fell outside the band; a drag or release stays
+	/// captured so a press inside always sees its release.
+	fn localize_mouse(&mut self, report: MouseReport) -> Option<MouseReport> {
+		let (band, width) = self.overlay_band(self.viewport())?;
+		let captured = matches!(report.kind, omp_tui::Mouse::Drag | omp_tui::Mouse::Release);
+		let inside = band.rows > 0
+			&& report.col >= band.x
+			&& report.col < band.x.saturating_add(width)
+			&& report.row >= band.y
+			&& report.row < band.y.saturating_add(band.rows);
+		if !inside && !captured {
+			return None;
+		}
+		Some(MouseReport {
+			col: report.col.saturating_sub(band.x),
+			row: report
+				.row
+				.saturating_sub(band.y)
+				.saturating_add(band.src_top),
+			..report
+		})
 	}
 
 	/// Routes pasted text to the focused picker or panel before the composer.
@@ -1701,7 +1754,7 @@ impl Presenter {
 			// A submitted `/name args` line is the console statement
 			// `name args`, exactly like a bound key.
 			ComposerAction::Command(statement) => self.run_console(statement.as_str())?,
-			ComposerAction::Queue(text) => self.queue_for_yield(text),
+			ComposerAction::Queue { text, images } => self.queue_for_yield(text, &images),
 			ComposerAction::Copy(text) => {
 				self.clipboard = Some(text);
 				Routed::Repaint
@@ -2079,22 +2132,10 @@ impl Presenter {
 		if text.trim().is_empty() {
 			return Routed::Ignored;
 		}
-		let mut attachments = Vec::with_capacity(images.len());
-		for source in images {
-			let bytes = match std::fs::read(source.as_str()) {
-				Ok(bytes) => bytes::Bytes::from(bytes),
-				Err(error) => {
-					return self.refuse_local(&text, format!("Could not read image {source}: {error}"));
-				},
-			};
-			let Some(format) = omp_tui::imagefmt::format(&bytes) else {
-				return self.refuse_local(&text, format!("Unsupported image format: {source}"));
-			};
-			attachments.push(omp_session::AttachmentInput {
-				mime: Str::new_static(format.media_type()),
-				bytes,
-			});
-		}
+		let attachments = match read_attachments(images) {
+			Ok(attachments) => attachments,
+			Err(reason) => return self.refuse_local(&text, reason),
+		};
 		if !self.turn_active {
 			self.set_turn_active(true);
 			self.last_prompt = Some(text.clone());
@@ -2110,17 +2151,27 @@ impl Presenter {
 	/// pi `#queueForYield` / `streamingBehavior: "followUp"`: while a turn
 	/// runs (or earlier follow-ups wait) the prompt is journaled under
 	/// `<queues><prompts>` and runs when the agent yields — never as
-	/// mid-turn steering. Idle with an empty queue, it starts at once.
-	pub(crate) fn queue_for_yield(&mut self, text: Str) -> Routed {
+	/// mid-turn steering. Idle with an empty queue, it starts at once. The
+	/// staged image chips (`images`, positional against `[Image #N]`) go
+	/// wherever the text goes (pi `#queueForYield(text, { images })`).
+	pub(crate) fn queue_for_yield(&mut self, text: Str, images: &[Str]) -> Routed {
 		if text.trim().is_empty() {
 			return Routed::Ignored;
 		}
 		if !self.turn_active && self.queued_prompts().is_empty() {
-			let routed = self.submit(text);
+			let routed = if images.is_empty() {
+				self.submit(text)
+			} else {
+				self.submit_with_images(text, images)
+			};
 			return routed.max(self.notice("Sent queued message"));
 		}
+		let attachments = match read_attachments(images) {
+			Ok(attachments) => attachments,
+			Err(reason) => return self.refuse_local(&text, reason),
+		};
 		self.last_prompt = Some(text.clone());
-		let _ = self.commands.send(HostCommand::Queue { prompt: text });
+		let _ = self.commands.send(HostCommand::Queue { prompt: text, attachments });
 		self.notice("Queued message for when the agent yields")
 	}
 
@@ -2233,7 +2284,15 @@ impl Presenter {
 					ComposerAction::Submit(text)
 						if self.turn_active && crate::composer::parse_local_input(&text).is_none() =>
 					{
-						self.queue_for_yield(text)
+						self.queue_for_yield(text, &[])
+					},
+					// Image chips queue with their text instead of steering
+					// the stream (pi `prompt(text, { streamingBehavior:
+					// "followUp", images })`).
+					ComposerAction::SubmitWithImages { text, images }
+						if self.turn_active && crate::composer::parse_local_input(&text).is_none() =>
+					{
+						self.queue_for_yield(text, &images)
 					},
 					action => self.composer_action(action)?,
 				}
@@ -2753,17 +2812,38 @@ impl Presenter {
 	/// Frame and anchor of the topmost focused overlay (picker or panel),
 	/// when one is open.
 	fn overlay_frame(&mut self, size: Size) -> Option<(Frame, PanelAnchor)> {
+		self.with_overlay_frame(size, |frame, anchor| (frame.clone(), anchor))
+	}
+
+	/// Viewport band the topmost focused overlay is composited into at
+	/// `size`, with its frame width; `None` when no picker or panel is open.
+	fn overlay_band(&mut self, size: Size) -> Option<(omp_tui::OverlayBand, u16)> {
+		let composer = self.composer.height();
+		self.with_overlay_frame(size, |frame, anchor| {
+			let (options, _) = overlay_options(anchor, size.width, composer);
+			let layer = Layer { frame, options: &options, active: false };
+			(layer.band(size), frame.size().width)
+		})
+	}
+
+	/// Reflows the topmost focused overlay for `size` and reads its frame
+	/// and anchor in place; `None` when no picker or panel is open.
+	fn with_overlay_frame<R>(
+		&mut self,
+		size: Size,
+		read: impl FnOnce(&Frame, PanelAnchor) -> R,
+	) -> Option<R> {
 		let center = Size::new(size.width * 4 / 5, size.height.saturating_sub(2));
 		match self.overlays.active_mut() {
-			Some(Overlay::Models(picker)) => Some((picker.frame(size).clone(), PanelAnchor::Bottom)),
-			Some(Overlay::History(picker)) => Some((picker.frame(size).clone(), PanelAnchor::Bottom)),
+			Some(Overlay::Models(picker)) => Some(read(picker.frame(size), PanelAnchor::Bottom)),
+			Some(Overlay::History(picker)) => Some(read(picker.frame(size), PanelAnchor::Bottom)),
 			Some(Overlay::Panel(panel)) => {
 				let anchor = panel.anchor();
 				let viewport = match anchor {
 					PanelAnchor::Center => center,
 					PanelAnchor::Bottom | PanelAnchor::Full | PanelAnchor::Side => size,
 				};
-				Some((panel.frame(viewport).clone(), anchor))
+				Some(read(panel.frame(viewport), anchor))
 			},
 			Some(Overlay::Approval(_)) | None => None,
 		}
@@ -3401,41 +3481,13 @@ impl Host {
 			.width(Dim::Pct(80))
 			.anchor(OverlayAnchor::Center)
 			.z(30);
-		// Pickers replace the composer band (pi swaps the editor slot);
-		// dialogs center; dashboards cover the viewport; side panels sit
-		// above the still-live composer.
-		let (picker_options, picker_modal) = match overlay.as_ref().map(|(_, anchor)| *anchor) {
-			Some(PanelAnchor::Center) => (
-				OverlayOptions::default()
-					.width(Dim::Pct(80))
-					.anchor(OverlayAnchor::Center)
-					.z(20),
-				true,
-			),
-			Some(PanelAnchor::Full) => (
-				OverlayOptions::default()
-					.width(Dim::Cells(size.width))
-					.anchor(OverlayAnchor::TopLeft)
-					.z(20),
-				true,
-			),
-			Some(PanelAnchor::Side) => (
-				OverlayOptions::default()
-					.width(Dim::Cells(size.width))
-					.anchor(OverlayAnchor::BottomLeft)
-					.margin(omp_tui::OverlayMargin { bottom: composer.height(), ..Default::default() })
-					.non_modal()
-					.z(20),
-				false,
-			),
-			Some(PanelAnchor::Bottom) | None => (
-				OverlayOptions::default()
-					.width(Dim::Cells(size.width))
-					.anchor(OverlayAnchor::BottomLeft)
-					.z(20),
-				true,
-			),
-		};
+		let (picker_options, picker_modal) = overlay_options(
+			overlay
+				.as_ref()
+				.map_or(PanelAnchor::Bottom, |(_, anchor)| *anchor),
+			size.width,
+			composer.height(),
+		);
 		let picker = overlay.map(|(frame, _)| frame);
 		let notice_options = OverlayOptions::default()
 			.width(Dim::Cells(size.width))
@@ -3682,6 +3734,12 @@ impl NativeHost {
 			.map(|(frame, _)| frame)
 	}
 
+	/// Viewport band the open picker or panel is composited into — the
+	/// cells whose pointer reports [`NativeHost::mouse`] routes to it.
+	pub fn picker_band(&mut self) -> Option<omp_tui::OverlayBand> {
+		self.presenter.overlay_band(self.size).map(|(band, _)| band)
+	}
+
 	/// Identity of the topmost overlay, when one is open.
 	#[must_use]
 	pub fn overlay_id(&self) -> Option<&'static str> {
@@ -3817,6 +3875,7 @@ impl NativeHost {
 
 	fn refresh(&mut self) {
 		self.presenter.sync_status();
+		self.presenter.viewport_height = self.size.height;
 		let components = self
 			.presenter
 			.blocks()
@@ -3939,14 +3998,15 @@ fn status_facts(
 	};
 	let home = (!status.home.is_empty()).then_some(status.home.as_str());
 	let path = display_path(status.session.as_str(), home, local.tmp.as_deref());
-	// Not yet journaled anywhere the replica can see: the advisor roster.
+	// Both chips project the `<meta><directors>` subtree, so a headless
+	// render and the first frame show the same band as the live loop.
 	StatusFacts {
 		model,
-		mode: None,
+		mode: director_mode(dom),
 		thinking: local.thinking.clone(),
 		compact_thinking: local.compact_thinking,
 		fast: local.fast,
-		advisor: None,
+		advisor: advisor_badge(dom),
 		cwd: path.text,
 		scratch: path.scratch,
 		branch: local.branch.clone(),
@@ -4087,8 +4147,10 @@ pub fn render_surface(
 	let replica = Dom::from_snapshot(snapshot);
 	let working = has_active_turn(&replica).then_some(Duration::ZERO);
 	let facts = status_facts(&replica, model, local, working, None);
-	let composer =
+	let plan = facts.mode == Some(ModeChip::Plan);
+	let mut composer =
 		Composer::new(size.width, ui.clone(), facts, Vec::new(), Arc::new(|_: &str| None), None);
+	let _ = composer.set_plan_mode(plan);
 	let status = StatusLine::from_dom(&replica);
 	let welcome = || RenderedBlock {
 		view:      BlockView {
@@ -4117,4 +4179,45 @@ pub fn render_surface(
 	let projection =
 		Projection::new(size, ResizePolicy::Rebuild, ui, blocks, mirror, Duration::ZERO);
 	projection.document(composer.frame(), size)
+}
+
+/// Compositing options of the focused overlay layer and whether it takes
+/// the keyboard: pickers replace the composer band (pi swaps the editor
+/// slot); dialogs center at 80% width; dashboards cover the viewport; side
+/// panels sit above the still-live composer of `composer_rows`. One
+/// resolver feeds both presentation and pointer translation so a click
+/// lands on the row it was painted on.
+fn overlay_options(anchor: PanelAnchor, width: u16, composer_rows: u16) -> (OverlayOptions, bool) {
+	match anchor {
+		PanelAnchor::Center => (
+			OverlayOptions::default()
+				.width(Dim::Pct(80))
+				.anchor(OverlayAnchor::Center)
+				.z(20),
+			true,
+		),
+		PanelAnchor::Full => (
+			OverlayOptions::default()
+				.width(Dim::Cells(width))
+				.anchor(OverlayAnchor::TopLeft)
+				.z(20),
+			true,
+		),
+		PanelAnchor::Side => (
+			OverlayOptions::default()
+				.width(Dim::Cells(width))
+				.anchor(OverlayAnchor::BottomLeft)
+				.margin(omp_tui::OverlayMargin { bottom: composer_rows, ..Default::default() })
+				.non_modal()
+				.z(20),
+			false,
+		),
+		PanelAnchor::Bottom => (
+			OverlayOptions::default()
+				.width(Dim::Cells(width))
+				.anchor(OverlayAnchor::BottomLeft)
+				.z(20),
+			true,
+		),
+	}
 }
