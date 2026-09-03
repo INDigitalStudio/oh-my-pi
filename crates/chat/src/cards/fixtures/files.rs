@@ -1,7 +1,10 @@
 use super::{CardFixture, FixtureState};
 
 const READ_ARGS: &str = r#"{"path":"packages/coding-agent/src/tools/glob.ts:437-448"}"#;
-const READ_RESULT: &str = r#"{"line_count":12,"lang":"typescript","resolved_path":"/Users/dev/Projects/pi/packages/coding-agent/src/tools/glob.ts","preview_text":"export const globToolRenderer = {\n\tinline: true,\n\trenderCall(args: GlobRenderArgs, _options: RenderResultOptions, uiTheme: Theme): Component {\n\t\tconst meta: string[] = [];\n\t\tif (args.limit !== undefined) meta.push(`limit:${args.limit}`);\n\n\t\tconst text = renderStatusLine(\n\t\t\t{ icon: \"pending\", title: \"Glob\", description: formatGlobRenderPaths(args.paths) || \"*\", meta },\n\t\t\tuiTheme,\n\t\t);\n\t\treturn new Text(text, 0, 0);\n\t},","start_line":437}"#;
+/// `read@1` `Payload`: the hashline-numbered projection the tool journals
+/// (`[<path>#<tag>]` header, `LINE:TEXT` rows); the card derives the gutter
+/// from it.
+const READ_RESULT: &str = r#"{"parts":[{"kind":"text","text":"[packages/coding-agent/src/tools/glob.ts#E48E]\n437:export const globToolRenderer = {\n438:\tinline: true,\n439:\trenderCall(args: GlobRenderArgs, _options: RenderResultOptions, uiTheme: Theme): Component {\n440:\t\tconst meta: string[] = [];\n441:\t\tif (args.limit !== undefined) meta.push(`limit:${args.limit}`);\n442:\n443:\t\tconst text = renderStatusLine(\n444:\t\t\t{ icon: \"pending\", title: \"Glob\", description: formatGlobRenderPaths(args.paths) || \"*\", meta },\n445:\t\t\tuiTheme,\n446:\t\t);\n447:\t\treturn new Text(text, 0, 0);\n448:\t},"}]}"#;
 const READ_GROUP_STREAM: &str = r#"{"targets":[{"path":"packages/coding-agent/test/streaming-preview-height.test.ts:301-409"},{"path":"packages/coding-agent/test/tool-live-region-scrollback.test.ts:143-"}]}"#;
 const READ_GROUP_RUNNING: &str = r#"{"targets":[{"path":"packages/coding-agent/test/streaming-preview-height.test.ts:301-409"},{"path":"packages/coding-agent/test/tool-live-region-scrollback.test.ts:143-310"},{"path":"packages/tui/test/streaming-scrollback-defer.test.ts:89-464"},{"path":"packages/coding-agent/src/task/render.ts:507-605,1070-1194,…,1270-1274"}]}"#;
 const READ_GROUP_DONE: &str = r#"{"targets":[{"path":"packages/coding-agent/test/streaming-preview-height.test.ts:301-409"},{"path":"packages/coding-agent/test/tool-live-region-scrollback.test.ts:143-310"},{"path":"packages/tui/test/streaming-scrollback-defer.test.ts:89-464","usage":{"timestamp":"2026-07-28 21:05:47","input":"2.4K","output":"113","cache":"103K","time":"2.2s","throughput":"21.3/s"}},{"path":"packages/coding-agent/src/task/render.ts:507-605,1070-1194,…,1270-1274","usage":{"timestamp":"2026-07-28 21:05:52","input":"2.4K","output":"113","cache":"103K","time":"1.9s","throughput":"24.0/s"}}]}"#;
@@ -48,7 +51,7 @@ pub(super) const FIXTURES: &[CardFixture] = &[
 				update: None,
 				result: None,
 				fault:  Some(
-					r#"{"message":"ENOENT: no such file or directory, open 'packages/coding-agent/src/tools/glob.ts'"}"#,
+					r#"{"kind":"source","message":"ENOENT: no such file or directory, open 'packages/coding-agent/src/tools/glob.ts'"}"#,
 				),
 			},
 		],

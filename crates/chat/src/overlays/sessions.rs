@@ -17,7 +17,7 @@
 
 use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
 use omp_core::{Str, StrMut, sf};
-use omp_tui::{Frame, Key, Prop, Size, Ui, UiContext, UiEvent, dom};
+use omp_tui::{Frame, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent, dom};
 
 use super::{
 	Outcome, Panel, PanelAction, PanelAnchor, PanelCx, PanelEvent, PanelNote,
@@ -444,7 +444,15 @@ impl SessionPicker {
 		if key == Key::Delete || (key == Key::Backspace && self.query.is_empty()) {
 			return self.action(PanelAction::Delete);
 		}
-		match self.ui.handle_key(key) {
+		let event = self.ui.handle_key(key);
+		self.list_event(event)
+	}
+
+	/// Applies what the list widget reported for a key or pointer gesture:
+	/// highlight moves the cursor, filtering re-seats it, activation (Enter
+	/// or a click on a row, pi `session-selector.ts` `onSelect`) resumes.
+	fn list_event(&mut self, event: UiEvent) -> PanelEvent {
+		match event {
 			UiEvent::Cancel => PanelEvent::Close,
 			UiEvent::Highlighted { value, .. } => {
 				self.cursor_to(&value);
@@ -469,10 +477,15 @@ impl SessionPicker {
 	}
 
 	fn rename_key(&mut self, key: Key) -> PanelEvent {
+		let event = self.ui.handle_key(key);
+		self.rename_event(event)
+	}
+
+	fn rename_event(&mut self, event: UiEvent) -> PanelEvent {
 		let Mode::Rename { index, .. } = self.mode else {
 			return PanelEvent::Ignored;
 		};
-		match self.ui.handle_key(key) {
+		match event {
 			UiEvent::Cancel => self.enter_mode(Mode::List),
 			UiEvent::Submit => {
 				let Mode::Rename { text, .. } = std::mem::replace(&mut self.mode, Mode::List) else {
@@ -597,6 +610,19 @@ impl Panel for SessionPicker {
 		self.mode = Mode::List;
 		self.rebuild();
 		PanelEvent::Consumed
+	}
+
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		if matches!(self.mode, Mode::Confirm { .. }) {
+			return PanelEvent::Consumed;
+		}
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		match self.mode {
+			Mode::List => self.list_event(event),
+			Mode::Rename { .. } | Mode::Confirm { .. } => self.rename_event(event),
+		}
 	}
 
 	fn paste(&mut self, text: &str) -> PanelEvent {
@@ -758,6 +784,49 @@ mod tests {
 		assert_eq!(
 			picker.key(Key::Enter),
 			PanelEvent::Finish(Str::new("resume \"/tmp/sessions/keep.jsonl\""))
+		);
+	}
+
+	/// pi `session-selector.ts` `onSelect`: a click on a session row resumes
+	/// it, and the wheel moves the highlight without committing.
+	#[test]
+	fn click_on_a_row_resumes_it_and_wheel_moves_the_highlight() {
+		use omp_tui::{Mods, Mouse, MouseButton};
+
+		let mut picker = picker(vec![
+			row("newer", Some("Newer"), MODIFIED, CREATED),
+			row("older", Some("Older"), MODIFIED - 60_000, CREATED),
+		]);
+		let shown = text(&mut picker);
+		let (col, row) = shown
+			.lines()
+			.enumerate()
+			.find_map(|(row, line)| {
+				let byte = line.find("Older")?;
+				Some((omp_tui::cell_width(&line[..byte]), u16::try_from(row).unwrap()))
+			})
+			.expect("the Older row is painted");
+		let report = |kind, button| MouseReport {
+			kind,
+			col,
+			row,
+			button,
+			mods: Mods::default(),
+			pressed: true,
+		};
+		assert_eq!(
+			picker.mouse(report(Mouse::WheelDown, MouseButton::WheelDown)),
+			PanelEvent::Consumed
+		);
+		assert_eq!(picker.current(), Some(1), "the wheel highlights without resuming");
+		assert_eq!(
+			picker.mouse(report(Mouse::WheelUp, MouseButton::WheelUp)),
+			PanelEvent::Consumed
+		);
+		assert_eq!(picker.current(), Some(0));
+		assert_eq!(
+			picker.mouse(report(Mouse::Click, MouseButton::Left)),
+			PanelEvent::Finish(Str::new("resume \"/tmp/sessions/older.jsonl\""))
 		);
 	}
 

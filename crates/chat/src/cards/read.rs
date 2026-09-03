@@ -45,34 +45,87 @@ impl Card for ReadCard {
 /// (ADR 0031: the full preview is `@expanded` only).
 const COLLAPSED_LINES: usize = 12;
 
+/// The display content of a read payload (pi `details.displayContent`):
+/// the source rows and the first row's number, recovered from the
+/// hashline projection the tool journals (`[<path>#<tag>]` header, then
+/// `LINE:TEXT` rows), plus the path a suffix match resolved to (pi
+/// `details.resolvedPath`, which omp records as the leading
+/// `[Path '…' not found; resolved to '…' via suffix match]` notice).
+struct DisplayContent {
+	text:     String,
+	start:    u64,
+	resolved: Option<Str>,
+}
+
+fn display_content(text: &str) -> DisplayContent {
+	let mut lines = text.lines().peekable();
+	let mut resolved = None;
+	if let Some(notice) = lines
+		.peek()
+		.and_then(|line| line.strip_prefix("[Path '"))
+		.and_then(|line| line.strip_suffix("' via suffix match]"))
+		.and_then(|line| line.split_once("' not found; resolved to '"))
+	{
+		resolved = Some(Str::new(notice.1));
+		lines.next();
+	}
+	if lines
+		.peek()
+		.is_some_and(|line| line.starts_with('[') && line.ends_with(']') && line.contains('#'))
+	{
+		lines.next();
+	}
+	let rows = lines.collect::<Vec<_>>();
+	let numbered = rows.iter().map(|row| row.split_once(':')).collect::<Vec<_>>();
+	let start = numbered
+		.first()
+		.copied()
+		.flatten()
+		.and_then(|(number, _)| number.parse::<u64>().ok());
+	let all_numbered = !rows.is_empty()
+		&& numbered
+			.iter()
+			.all(|row| row.is_some_and(|(number, _)| number.parse::<u64>().is_ok()));
+	match (start, all_numbered) {
+		(Some(start), true) => DisplayContent {
+			text: numbered
+				.iter()
+				.filter_map(|row| row.map(|(_, text)| text))
+				.collect::<Vec<_>>()
+				.join("\n"),
+			start,
+			resolved,
+		},
+		_ => DisplayContent { text: rows.join("\n"), start: 1, resolved },
+	}
+}
+
 fn render_done(view: &CardView<'_>, target: &str, expanded: bool, ui: &UiContext) -> Component {
 	let result = typed_result::<omp_tools::read::Payload>(view).unwrap_or(Value::Null);
-	let preview = string_at(&result, "preview_text")
-		.or_else(|| {
-			result
-				.get("parts")?
-				.as_array()?
-				.iter()
-				.find_map(|part| string_at(part, "text"))
-		})
-		.map(Str::new);
-	let start = result
-		.get("start_line")
-		.or_else(|| result.get("preview").and_then(|p| p.get("start")))
-		.and_then(Value::as_u64)
-		.unwrap_or(1);
-	let (preview, hidden) = preview.map_or((None, 0), |text| {
-		let total = text.lines().count();
+	let content = result
+		.get("parts")
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.find_map(|part| string_at(part, "text"))
+		.map(display_content);
+	let (preview, hidden) = content.as_ref().map_or((None, 0), |content| {
+		let total = content.text.lines().count();
 		let shown = if expanded {
 			total
 		} else {
 			total.min(COLLAPSED_LINES)
 		};
-		let visible = text.lines().take(shown).collect::<Vec<_>>().join("\n");
-		(Some(number_preview(visible.as_str(), start)), total - shown)
+		let visible = content
+			.text
+			.lines()
+			.take(shown)
+			.collect::<Vec<_>>()
+			.join("\n");
+		(Some(number_preview(visible.as_str(), content.start)), total - shown)
 	});
 	let more = sf!("… {hidden} more line{} ⟨Ctrl+O: Expand⟩", if hidden == 1 { "" } else { "s" });
-	let src = string_at(&result, "resolved_path").map(Str::new);
+	let src = content.and_then(|content| content.resolved);
 	let title = sf!("{} Read {target}", icon(ui, "card-bullet"));
 	let images = result_images(&result, target, ui);
 	dom! {

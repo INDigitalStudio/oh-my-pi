@@ -9,10 +9,7 @@ use std::{
 	process::{Command, ExitStatus, Stdio},
 };
 
-use omp_tui::components::editor::{
-	ExternalEditorCommand, ExternalEditorCommandError, ExternalEditorSuspension,
-	ExternalEditorTerminal, parse_external_editor_command,
-};
+use omp_tui::components::editor::{ExternalEditorSuspension, ExternalEditorTerminal};
 use thiserror::Error;
 
 /// External editor launch options.
@@ -33,9 +30,6 @@ impl Default for EditorOptions<'_> {
 /// Failure to resolve or run an external editor.
 #[derive(Debug, Error)]
 pub enum EditorError {
-	/// Configured command could not be split into safe argv.
-	#[error(transparent)]
-	Command(#[from] ExternalEditorCommandError),
 	/// Temporary extension contains a path separator or unsupported character.
 	#[error("external editor temporary extension is invalid")]
 	InvalidExtension,
@@ -54,8 +48,9 @@ pub enum EditorError {
 
 /// Resolves `VISUAL`, then `EDITOR`, then the platform's baseline editor.
 ///
-/// Environment values are trimmed but otherwise parsed later as shell words;
-/// no shell is invoked.
+/// Environment values are trimmed and otherwise handed verbatim to the
+/// user's shell (pi `openInEditor`): `code --wait`, `emacsclient -nw -a ""`,
+/// a shell function, or `$MY_EDITOR` all work exactly as they do from git.
 pub fn resolve_editor_command() -> String {
 	resolve_editor_command_from(
 		env::var("VISUAL").ok().as_deref(),
@@ -81,16 +76,15 @@ pub fn edit_draft<T: ExternalEditorTerminal + ?Sized>(
 	content: &str,
 	options: EditorOptions<'_>,
 ) -> Result<Option<String>, EditorError> {
-	let configured = resolve_editor_command();
-	let command = parse_external_editor_command(&configured)?;
-	edit_draft_with_command(terminal, &command, content, options)
+	edit_draft_with(terminal, &resolve_editor_command(), content, options)
 }
 
-/// Runs one already parsed command. This is useful when a settings owner has
-/// frozen environment-derived editor configuration for the session.
-pub fn edit_draft_with_command<T: ExternalEditorTerminal + ?Sized>(
+/// Runs one already resolved editor command line. This is useful when a
+/// settings owner has frozen environment-derived editor configuration for
+/// the session.
+pub fn edit_draft_with<T: ExternalEditorTerminal + ?Sized>(
 	terminal: &mut T,
-	command: &ExternalEditorCommand,
+	editor: &str,
 	content: &str,
 	options: EditorOptions<'_>,
 ) -> Result<Option<String>, EditorError> {
@@ -100,7 +94,7 @@ pub fn edit_draft_with_command<T: ExternalEditorTerminal + ?Sized>(
 		path: PathBuf::from("<terminal>"),
 		source,
 	})?;
-	let status = launch_editor(command, draft.path())?;
+	let status = launch_editor(editor, draft.path())?;
 	suspension.restore().map_err(|source| EditorError::Io {
 		operation: "terminal restore",
 		path: PathBuf::from("<terminal>"),
@@ -117,10 +111,8 @@ pub fn edit_draft_detached(
 	content: &str,
 	options: EditorOptions<'_>,
 ) -> Result<Option<String>, EditorError> {
-	let configured = resolve_editor_command();
-	let command = parse_external_editor_command(&configured)?;
 	let mut draft = prepared_draft(content, options.extension)?;
-	let status = launch_editor(&command, draft.path())?;
+	let status = launch_editor(&resolve_editor_command(), draft.path())?;
 	finish_draft(&mut draft, status, options.trim_trailing_newline)
 }
 
@@ -130,19 +122,44 @@ fn prepared_draft(content: &str, extension: &str) -> Result<DraftFile, EditorErr
 	Ok(draft)
 }
 
-fn launch_editor(command: &ExternalEditorCommand, path: &Path) -> Result<ExitStatus, EditorError> {
-	let mut child = Command::new(command.program.as_str());
+/// pi `resolveEditorSpawnCommand`: the configured command line runs through
+/// the platform shell with the draft path appended as a quoted positional,
+/// never re-split by us — `sh -c '<editor> "$1"' sh <draft>` on POSIX,
+/// `cmd.exe /d /s /c "<editor> "<draft>""` on Windows.
+fn launch_editor(editor: &str, path: &Path) -> Result<ExitStatus, EditorError> {
+	let mut child = shell_command(editor, path);
 	child
-		.args(command.arguments.iter().map(|argument| argument.as_str()))
-		.arg(path)
 		.stdin(Stdio::inherit())
 		.stdout(Stdio::inherit())
 		.stderr(Stdio::inherit());
 	child.status().map_err(|source| EditorError::Io {
 		operation: "launch",
-		path: PathBuf::from(command.program.as_str()),
+		path: PathBuf::from(editor),
 		source,
 	})
+}
+
+#[cfg(not(windows))]
+fn shell_command(editor: &str, path: &Path) -> Command {
+	let mut command = Command::new("sh");
+	command
+		.arg("-c")
+		.arg(format!("{editor} \"$1\""))
+		.arg("sh")
+		.arg(path);
+	command
+}
+
+#[cfg(windows)]
+fn shell_command(editor: &str, path: &Path) -> Command {
+	use std::os::windows::process::CommandExt as _;
+	let mut command = Command::new("cmd.exe");
+	// `/s` strips the outer quote pair; the embedded editor and path quotes
+	// must reach cmd.exe verbatim instead of being argv-escaped.
+	command
+		.args(["/d", "/s", "/c"])
+		.raw_arg(format!("\"{editor} \"{}\"\"", path.display()));
+	command
 }
 
 fn finish_draft(
@@ -245,8 +262,6 @@ fn io_error(operation: &'static str, path: PathBuf, source: io::Error) -> Editor
 mod tests {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 
-	use omp_core::Str;
-
 	use super::*;
 
 	struct TerminalProbe {
@@ -281,17 +296,49 @@ mod tests {
 		let executable = directory.path().join("editor");
 		fs::write(&executable, "#!/bin/sh\nprintf 'edited\\n' > \"$1\"\n").unwrap();
 		fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-		let command = ExternalEditorCommand {
-			program:   Str::from(executable.to_string_lossy().into_owned()),
-			arguments: Box::new([]),
-		};
+		let editor = executable.to_string_lossy().into_owned();
 		let mut terminal =
 			TerminalProbe { suspended: AtomicUsize::new(0), restored: AtomicUsize::new(0) };
 		let result =
-			edit_draft_with_command(&mut terminal, &command, "initial", EditorOptions::default())
-				.unwrap();
+			edit_draft_with(&mut terminal, &editor, "initial", EditorOptions::default()).unwrap();
 		assert_eq!(result.as_deref(), Some("edited"));
 		assert_eq!(terminal.suspended.load(Ordering::Relaxed), 1);
 		assert_eq!(terminal.restored.load(Ordering::Relaxed), 1);
+	}
+
+	/// pi `resolveEditorSpawnCommand`: `$EDITOR` is a shell command line, not
+	/// argv — environment expansion, quoting, and operators all belong to
+	/// `sh`, and the draft path arrives as the quoted `"$1"` positional even
+	/// when it contains spaces.
+	#[cfg(unix)]
+	#[test]
+	fn editor_command_runs_through_the_posix_shell() {
+		let directory = tempfile::tempdir().unwrap();
+		let log = directory.path().join("seen args");
+		let editor = format!(
+			concat!(
+				"omp_editor_probe() {{ OMP_EDITOR_PROBE=1; ",
+				"printf '%s\n' \"$OMP_EDITOR_PROBE\" 'two words' > '{}'; }}; omp_editor_probe"
+			),
+			log.display()
+		);
+		let mut terminal =
+			TerminalProbe { suspended: AtomicUsize::new(0), restored: AtomicUsize::new(0) };
+		let result =
+			edit_draft_with(&mut terminal, &editor, "kept", EditorOptions::default()).unwrap();
+		assert_eq!(result.as_deref(), Some("kept"), "the draft survives an editor that leaves it");
+		assert_eq!(fs::read_to_string(&log).unwrap(), "1\ntwo words\n");
+
+		let editor = format!("cp \"$1\" '{}' && printf 'replaced\\n' >", log.display());
+		let result =
+			edit_draft_with(&mut terminal, &editor, "draft body", EditorOptions::default()).unwrap();
+		assert_eq!(result.as_deref(), Some("replaced"), "`\"$1\"` is the draft path");
+		assert_eq!(fs::read_to_string(&log).unwrap(), "draft body");
+
+		let failing = edit_draft_with(&mut terminal, "false", "draft", EditorOptions::default());
+		assert!(
+			matches!(failing, Ok(None)),
+			"a non-zero shell exit keeps the original draft: {failing:?}"
+		);
 	}
 }

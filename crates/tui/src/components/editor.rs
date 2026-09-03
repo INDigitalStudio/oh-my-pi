@@ -2835,96 +2835,6 @@ fn paint_xml_range(
 	x
 }
 
-/// Injection-safe executable and arguments for an external editor.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExternalEditorCommand {
-	/// Executable resolved through the child environment.
-	pub program:   Str,
-	/// Arguments preceding the temporary draft path.
-	pub arguments: Box<[Str]>,
-}
-
-/// Shell-word parsing failure for an external editor command.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum ExternalEditorCommandError {
-	/// The command contained no executable.
-	#[error("external editor command is empty")]
-	Empty,
-	/// A single or double quote was not closed.
-	#[error("external editor command contains an unterminated quote")]
-	UnterminatedQuote,
-	/// A shell control operator was used instead of a literal argv word.
-	#[error("external editor command contains shell operator {0:?}")]
-	ShellOperator(char),
-}
-
-/// Splits a configured editor command into argv without invoking a shell.
-///
-/// Single and double quotes group words, backslash quotes the next scalar, and
-/// unquoted shell control operators are rejected rather than interpreted.
-pub fn parse_external_editor_command(
-	command: &str,
-) -> Result<ExternalEditorCommand, ExternalEditorCommandError> {
-	let mut words = Vec::new();
-	let mut current = String::new();
-	let mut quote = None;
-	let mut escaped = false;
-	let mut started = false;
-	for character in command.chars() {
-		if escaped {
-			current.push(character);
-			escaped = false;
-			started = true;
-			continue;
-		}
-		if character == '\\' {
-			escaped = true;
-			started = true;
-			continue;
-		}
-		if let Some(open) = quote {
-			if character == open {
-				quote = None;
-			} else {
-				current.push(character);
-			}
-			started = true;
-			continue;
-		}
-		match character {
-			'\'' | '"' => {
-				quote = Some(character);
-				started = true;
-			},
-			'|' | '&' | ';' | '<' | '>' | '(' | ')' | '\n' | '\r' => {
-				return Err(ExternalEditorCommandError::ShellOperator(character));
-			},
-			character if character.is_whitespace() => {
-				if started {
-					words.push(Str::from(mem::take(&mut current)));
-					started = false;
-				}
-			},
-			_ => {
-				current.push(character);
-				started = true;
-			},
-		}
-	}
-	if quote.is_some() {
-		return Err(ExternalEditorCommandError::UnterminatedQuote);
-	}
-	if escaped {
-		current.push('\\');
-	}
-	if started {
-		words.push(Str::from(current));
-	}
-	let mut words = words.into_iter();
-	let program = words.next().ok_or(ExternalEditorCommandError::Empty)?;
-	Ok(ExternalEditorCommand { program, arguments: words.collect::<Vec<_>>().into_boxed_slice() })
-}
-
 /// Host lifecycle needed while a full-screen external editor owns the tty.
 pub trait ExternalEditorTerminal {
 	/// Leaves raw/alternate-screen modes before the child starts.
@@ -2967,27 +2877,6 @@ mod tests {
 
 	use super::*;
 	use crate::editcore::Command;
-	#[test]
-	fn external_editor_command_is_shell_worded_without_operators() {
-		assert_eq!(
-			parse_external_editor_command(r#""Visual Studio Code" --wait --reuse-window"#).unwrap(),
-			ExternalEditorCommand {
-				program:   "Visual Studio Code".into(),
-				arguments: vec![Str::from("--wait"), Str::from("--reuse-window")].into_boxed_slice(),
-			}
-		);
-		assert_eq!(
-			parse_external_editor_command("vim --cmd 'set ft=markdown'"),
-			Ok(ExternalEditorCommand {
-				program:   "vim".into(),
-				arguments: vec![Str::from("--cmd"), Str::from("set ft=markdown")].into_boxed_slice(),
-			})
-		);
-		assert_eq!(
-			parse_external_editor_command("vim; rm draft"),
-			Err(ExternalEditorCommandError::ShellOperator(';'))
-		);
-	}
 	use crate::{
 		Color, Icon, Renderer, SlashCommands, Ui,
 		components::{ContextGaugeMode, Input, Segment, Status, StatusPlacement},

@@ -1,19 +1,28 @@
 use super::{CardFixture, FixtureState};
 
 const BASH_ARGS: &str = r#"{"command":"git status --short && git log --oneline -5","cwd":"packages/coding-agent","timeout":30}"#;
+/// `bash@2` transcript and status in the gallery's readable shape; the
+/// gallery materializes the typed `Payload` (byte frames, `ExecStatus`) from
+/// it and streams the frames before settling, exactly as dispatch does.
 const BASH_RESULT: &str = r#"{"transcript":[{"data":" M src/cli/gallery-cli.ts\n M src/tools/bash.ts\n?? src/cli/gallery-fixtures/shell.ts\na1b2c3d Wire gallery command into CLI dispatch\n9f8e7d6 Add ToolExecutionComponent lifecycle states\n4c5b6a7 Extract createShellRenderer from bashToolRenderer\n2d3e4f5 Strip LLM-facing notices before TUI render\n7a8b9c0 Cap preview lines in pending command block\n"}],"status":{"exit_code":0,"wall_clock_ms":184}}"#;
-const BASH_FAULT: &str = r#""src/tools/bash.ts:1142:34 - error TS2339: Property 'requestedTimeoutSeconds' does not exist on\ntype 'BashToolDetails'.\n\n1142   const requestedTimeoutSeconds = details?.requestedTimeoutSeconds;\n                                            ~~~~~~~~~~~~~~~~~~~~~~~~\nFound 1 error in src/tools/bash.ts:1142""#;
+/// A non-zero exit is `Fault::CommandFailed` carrying the complete
+/// transcript and status.
+const BASH_FAULT: &str = r#"{"kind":"command_failed","payload":{"transcript":[{"data":"src/tools/bash.ts:1142:34 - error TS2339: Property 'requestedTimeoutSeconds' does not exist on type 'BashToolDetails'.\n\n1142   const requestedTimeoutSeconds = details?.requestedTimeoutSeconds;\n                                            ~~~~~~~~~~~~~~~~~~~~~~~~\nFound 1 error in src/tools/bash.ts:1142\n"}],"status":{"exit_code":2,"wall_clock_ms":5120}}}"#;
 
 const EVAL_ARGS: &str = r#"{"language":"py","title":"load config","code":"import json\nfrom pathlib import Path\n\ndata = json.loads(Path(\"package.json\").read_text())\ndeps = data.get(\"dependencies\", {})\nprint(f\"{data[\\\"name\\\"]} v{data[\\\"version\\\"]}\")\nprint(f\"{len(deps)} dependencies\")\ndisplay(sorted(deps)[:3])"}"#;
 const EVAL_FAILED_ARGS: &str = r#"{"language":"py","title":"load config","code":"import json\nfrom pathlib import Path\n\ndata = json.loads(Path(\"package.json\").read_text())\ndeps = data.get(\"dependencies\", {})\nprint(f\"{data[\\\"name\\\"]} v{data[\\\"version\\\"]}\")"}"#;
-const EVAL_RESULT: &str = r#"{"frames":[{"data":"@oh-my-pi/coding-agent v0.42.0\n37 dependencies\n"}],"display_outputs":[{"type":"json","data":"@ai-sdk/anthropic"},{"type":"json","data":"@oh-my-pi/pi-ai"},{"type":"json","data":"@oh-my-pi/pi-tui"}],"status":{"duration_ms":64}}"#;
-const EVAL_FAULT: &str = r#""Traceback (most recent call last):\n  File \"<cell 0>\", line 4, in <module>\n    data = json.loads(Path(\"package.json\").read_text())\njson.decoder.JSONDecodeError: Expecting ',' delimiter: line 12 column 3 (char 318)""#;
+/// `eval@1` stdout frames (streamed, never retained in the payload), the
+/// cell's `DisplayOutput`s and `CellStatus`.
+const EVAL_RESULT: &str = r#"{"frames":[{"data":"@oh-my-pi/coding-agent v0.42.0\n37 dependencies\n"}],"display_outputs":[{"type":"json","data":["@ai-sdk/anthropic","@oh-my-pi/pi-ai","@oh-my-pi/pi-tui"]}],"status":{"outcome":"complete","exit_code":0,"duration_ms":64,"exception":null}}"#;
+/// A Python exception is an `Ok` payload whose `CellStatus` is
+/// `CellOutcome::Error` with the traceback, not a tool fault.
+const EVAL_FAILED_RESULT: &str = r#"{"frames":[],"display_outputs":[],"status":{"outcome":"error","exit_code":1,"duration_ms":41,"exception":{"name":"JSONDecodeError","message":"Expecting ',' delimiter: line 12 column 3 (char 318)","traceback":["Traceback (most recent call last):","  File \"<cell 0>\", line 4, in <module>","    data = json.loads(Path(\"package.json\").read_text())","json.decoder.JSONDecodeError: Expecting ',' delimiter: line 12 column 3 (char 318)"]}}}"#;
 
 const AST_GREP_ARGS: &str = r#"{"pat":"useState($A)","path":"packages/tui/src/components"}"#;
 const AST_GREP_RESULT: &str = r#"{"matches":[{"path":"packages/tui/src/components/SearchBox.tsx","line":18,"text":"  const [query, setQuery] = useState(\"\");","bindings":{"A":"\"\""}},{"path":"packages/tui/src/components/StatusBar.tsx","line":27,"text":"  const [expanded, setExpanded] = useState(false);","bindings":{"A":"false"}}],"match_count":2,"file_count":2,"files_searched":14,"scope_path":"packages/tui/src/components"}"#;
 
 const AST_EDIT_ARGS: &str = r#"{"ops":[{"pat":"countEditFiles($$$ARGS)","out":"countDistinctFiles($$$ARGS)"}],"paths":["packages/coding-agent/src/**/*.ts"]}"#;
-const AST_EDIT_RESULT: &str = r#"{"applied":false,"total_replacements":3,"files_touched":2,"proposal_id":"ast-edit-1","scope_path":"packages/coding-agent/src","files":[{"path":"edit/renderer.ts","replacements":2,"diff":[{"kind":"del","line":468,"text":"\t\tfileCount = countEditFiles(editArgs.edits);"},{"kind":"add","line":468,"text":"\t\tfileCount = countDistinctFiles(editArgs.edits);"},{"kind":"del","line":488,"text":"\t\tconst totalFiles = args?.edits ? countEditFiles(args.edits) : 0;"},{"kind":"add","line":488,"text":"\t\tconst totalFiles = args?.edits ? countDistinctFiles(args.edits) : 0;"}]},{"path":"tools/tool-result.ts","replacements":1,"diff":[{"kind":"del","line":42,"text":"\treturn countEditFiles(files);"},{"kind":"add","line":42,"text":"\treturn countDistinctFiles(files);"}]}]}"#;
+const AST_EDIT_RESULT: &str = r#"{"files":[{"path":"edit/renderer.ts","replacements":2,"before_hash":"38ff7e80e412","after_hash":"4cc43b49bba2","diff":"-468       fileCount = countEditFiles(editArgs.edits);\n+468       fileCount = countDistinctFiles(editArgs.edits);\n-488       const totalFiles = args?.edits ? countEditFiles(args.edits) : 0;\n+488       const totalFiles = args?.edits ? countDistinctFiles(args.edits) : 0;"},{"path":"tools/tool-result.ts","replacements":1,"before_hash":"02b7088f6f8c","after_hash":"886c440e2d72","diff":"-42    return countEditFiles(files);\n+42    return countDistinctFiles(files);"}],"advisories":[],"recovery_root":null,"pending_proposal":"ast-edit-1"}"#;
 
 const LSP_ARGS: &str =
 	r#"{"action":"references","file":"src/server/auth.ts","line":42,"symbol":"validateToken"}"#;
@@ -39,12 +48,7 @@ pub(super) const FIXTURES: &[CardFixture] = &[
 			},
 			FixtureState { args: BASH_ARGS, update: None, result: None, fault: None },
 			FixtureState { args: BASH_ARGS, update: None, result: Some(BASH_RESULT), fault: None },
-			FixtureState {
-				args:   BASH_ARGS,
-				update: Some(r#"{"wall_ms":5120,"exit":2}"#),
-				result: None,
-				fault:  Some(BASH_FAULT),
-			},
+			FixtureState { args: BASH_ARGS, update: None, result: None, fault: Some(BASH_FAULT) },
 		],
 	},
 	CardFixture {
@@ -61,9 +65,9 @@ pub(super) const FIXTURES: &[CardFixture] = &[
 			FixtureState { args: EVAL_ARGS, update: None, result: Some(EVAL_RESULT), fault: None },
 			FixtureState {
 				args:   EVAL_FAILED_ARGS,
-				update: Some(r#"{"wall_ms":41}"#),
-				result: None,
-				fault:  Some(EVAL_FAULT),
+				update: None,
+				result: Some(EVAL_FAILED_RESULT),
+				fault:  None,
 			},
 		],
 	},
@@ -168,14 +172,9 @@ pub(super) const FIXTURES: &[CardFixture] = &[
 				result: Some(BROWSER_RESULT),
 				fault:  None,
 			},
-			FixtureState {
-				args:   BROWSER_ARGS,
-				update: Some(
-					r#"{"action":"run","name":"docs","url":"https://bun.sh/docs","browser":"headless"}"#,
-				),
-				result: None,
-				fault:  Some(BROWSER_FAULT),
-			},
+			// `browser::Update` is uninhabited and `Fault` carries no tab
+			// context, so a failed run titles the tab name only.
+			FixtureState { args: BROWSER_ARGS, update: None, result: None, fault: Some(BROWSER_FAULT) },
 		],
 	},
 	CardFixture {

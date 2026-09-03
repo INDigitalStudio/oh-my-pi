@@ -5,7 +5,92 @@ use omp_dom::{Node, PropId};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_result};
+use super::{
+	Card, CardStatus, CardView, Component, elapsed_badge, partial_string, typed_input,
+	typed_result,
+};
+
+/// Agent rows a collapsed batch call shows; the rest fold into one
+/// `… N more agents` line (pi `COLLAPSED_AGENT_LIMIT`).
+const COLLAPSED_AGENT_LIMIT: usize = 4;
+/// Characters of the assignment's first line a call row previews (pi
+/// `previewLine(brief, 64)`).
+const BRIEF_CHARS: usize = 64;
+
+/// The call arguments as far as they have arrived (pi `repairTaskParams`):
+/// the parsed object once complete, else the string fields a torn object
+/// already names, so the live card can show the dispatched agent and its
+/// brief while the provider is still streaming.
+struct CallArgs {
+	agent:    Option<Str>,
+	name:     Option<Str>,
+	task:     Option<Str>,
+	context:  Option<Str>,
+	isolated: bool,
+	tasks:    Vec<Value>,
+}
+
+impl CallArgs {
+	fn read(view: &CardView<'_>) -> Self {
+		let Some(args) = typed_input::<omp_tools::task::Params>(view) else {
+			let text = view.args_text().unwrap_or_default();
+			return Self {
+				agent:    partial_string(text, "agent"),
+				name:     partial_string(text, "name"),
+				task:     partial_string(text, "task"),
+				context:  partial_string(text, "context"),
+				isolated: false,
+				tasks:    Vec::new(),
+			};
+		};
+		let string = |key: &str| {
+			args
+				.get(key)
+				.and_then(Value::as_str)
+				.map(str::trim)
+				.filter(|text| !text.is_empty())
+				.map(Str::new)
+		};
+		Self {
+			agent:    string("agent"),
+			name:     string("name"),
+			task:     string("task"),
+			context:  string("context"),
+			isolated: args.get("isolated").and_then(Value::as_bool) == Some(true),
+			tasks:    args
+				.get("tasks")
+				.and_then(Value::as_array)
+				.cloned()
+				.unwrap_or_default(),
+		}
+	}
+
+	/// The assignment a settled child was given: the flat form's `task`, else
+	/// the batch item named like the child, else the item at its index.
+	fn assignment_for(&self, index: usize, id: &str) -> Option<Str> {
+		if self.tasks.is_empty() {
+			return self.task.clone();
+		}
+		let string = |item: &Value, key: &str| item.get(key).and_then(Value::as_str).map(Str::new);
+		self
+			.tasks
+			.iter()
+			.find(|item| string(item, "name").is_some_and(|name| task_id(&name) == id))
+			.or_else(|| self.tasks.get(index))
+			.and_then(|item| string(item, "task"))
+	}
+
+	/// The frame's leading sections (pi `createContextSectionRenderer` +
+	/// `createAssignmentSectionRenderer`): the shared batch context, then the
+	/// assignment brief, as muted markdown.
+	fn sections(&self) -> Vec<Component> {
+		[&self.context, &self.task]
+			.into_iter()
+			.flatten()
+			.map(|text| dom! { <md fg=muted>{text.clone()}</md> }.into_component())
+			.collect()
+	}
+}
 
 /// Parallel subagent task card.
 pub struct TaskCard;
@@ -16,27 +101,122 @@ impl Card for TaskCard {
 	}
 
 	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
-		let _input = view.input::<omp_tools::task::Params>();
 		let _fault = view.fault::<omp_tools::task::Fault>();
 		match view.status {
-			CardStatus::StreamingArgs | CardStatus::InProgress => dom! {
-				<box border=round title_pad=3 pad="0 1">
-					<row kind=title gap=1 bold>
-						<i:task/><text bold>{"Task: task"}</text>
-						if let Some(badge) = elapsed_badge(view) { {badge} }
-					</row>
-				</box>
-			}
-			.into_component(),
+			CardStatus::StreamingArgs | CardStatus::InProgress => render_live(view),
 			CardStatus::Done | CardStatus::Failed => render_settled(view, expanded, ui),
 		}
 	}
 }
 
+/// The call frame while arguments stream or the children run (pi
+/// `renderCall`): `Task: <agent>` for the flat form, the context and
+/// assignment markdown, then a divider and one `• name: brief ⟨agent⟩` row
+/// per dispatched agent.
+fn render_live(view: &CardView<'_>) -> Component {
+	let args = CallArgs::read(view);
+	let title = args
+		.agent
+		.as_deref()
+		.map_or_else(|| Str::new_static("Task"), |agent| sf!("Task: {agent}"));
+	let sections = args.sections();
+	let rows = call_rows(&args);
+	dom! {
+		<box border=round title_pad=3 pad="0 1">
+			<row kind=title gap=1 bold>
+				<i:task/><text bold>{title}</text>
+				if args.isolated { <text fg=muted>{"isolated"}</text> }
+				if let Some(badge) = elapsed_badge(view) { {badge} }
+			</row>
+			{sections}
+			if !rows.is_empty() {
+				<hr/>
+				{rows}
+			}
+		</box>
+	}
+	.into_component()
+}
+
+/// pi `renderTaskCallLines`: the flat form's single `• name: brief ⟨agent⟩`
+/// row, then the batch items (`#N` when unnamed, `[isolated]` when so),
+/// capped at [`COLLAPSED_AGENT_LIMIT`] with a `… N more agents` fold.
+fn call_rows(args: &CallArgs) -> Vec<Component> {
+	let mut rows = Vec::with_capacity(args.tasks.len().min(COLLAPSED_AGENT_LIMIT) + 2);
+	let brief = args.task.as_deref().and_then(first_line);
+	if args.name.is_some() || brief.is_some() {
+		let label = args.name.as_deref().map_or_else(|| Str::new_static("agent"), task_id);
+		rows.push(call_row(label, brief, args.agent.as_deref(), false));
+	}
+	let shown = args.tasks.len().min(COLLAPSED_AGENT_LIMIT);
+	for (index, item) in args.tasks.iter().take(shown).enumerate() {
+		let label = item
+			.get("name")
+			.and_then(Value::as_str)
+			.map(str::trim)
+			.filter(|name| !name.is_empty())
+			.map_or_else(|| sf!("#{}", index + 1), task_id);
+		let brief = item.get("task").and_then(Value::as_str).and_then(first_line);
+		let agent = item.get("agent").and_then(Value::as_str);
+		let isolated = item.get("isolated").and_then(Value::as_bool) == Some(true);
+		rows.push(call_row(label, brief, agent, isolated));
+	}
+	if shown < args.tasks.len() {
+		let more = sf!("… {} more agents", args.tasks.len() - shown);
+		rows.push(dom! { <row gap=1><text fg=muted>{"•"}</text><text fg=muted>{more}</text></row> }.into_component());
+	}
+	rows
+}
+
+fn call_row(label: Str, brief: Option<Str>, agent: Option<&str>, isolated: bool) -> Component {
+	let name = brief.as_ref().map_or_else(|| label.clone(), |_| sf!("{label}:"));
+	let badge = agent
+		.map(str::trim)
+		.filter(|agent| !agent.is_empty() && *agent != "task")
+		.map(|agent| sf!("⟨{agent}⟩"));
+	dom! {
+		<row gap=1>
+			<text fg=muted>{"•"}</text>
+			<text bold fg=accent>{name}</text>
+			if let Some(brief) = brief { <text fg=muted>{brief}</text> }
+			if let Some(badge) = badge { <text fg=muted>{badge}</text> }
+			if isolated { <text fg=muted>{"[isolated]"}</text> }
+		</row>
+	}
+	.into_component()
+}
+
+/// pi `taskFirstLine` + `previewLine(brief, 64)`: the first line of the
+/// assignment with whitespace runs collapsed, cut to [`BRIEF_CHARS`] with an
+/// ellipsis.
+fn first_line(task: &str) -> Option<Str> {
+	let line = task.trim().lines().next()?;
+	let mut collapsed = String::with_capacity(line.len());
+	for word in line.split_whitespace() {
+		if !collapsed.is_empty() {
+			collapsed.push(' ');
+		}
+		collapsed.push_str(word);
+	}
+	(!collapsed.is_empty()).then(|| preview(&collapsed, BRIEF_CHARS))
+}
+
+/// pi `formatTaskId`: nesting levels (`Anna.Bob`) render as a `>` breadcrumb.
+fn task_id(name: &str) -> Str {
+	if name.contains('.') {
+		Str::from(name.replace('.', ">"))
+	} else {
+		Str::new(name)
+	}
+}
+
 fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
 	let result = typed_result::<omp_tools::task::Payload>(view).unwrap_or(Value::Null);
+	let args = CallArgs::read(view);
+	let sections = args.sections();
+	let sections_empty = sections.is_empty();
 	if let Some(jobs) = result.get("jobs").and_then(Value::as_array) {
-		return render_started(jobs, ui);
+		return render_started(jobs, sections, ui);
 	}
 	let rows = result
 		.get("results")
@@ -49,6 +229,8 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 		let title = sf!("{} Task 1 agent", ui.charset.icon_named("error").unwrap_or("[!!]"));
 		return dom! {
 			<box border=round title={title} title_pad=3 pad="0 1">
+				{sections}
+				if !sections_empty { <hr/> }
 				<text fg=err pad-x=2>{fault}</text>
 			</box>
 		}
@@ -64,33 +246,45 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 			.unwrap_or(if failed { "[!!]" } else { "*" })
 	);
 	let mut rendered_rows = Vec::with_capacity(rows.len());
-	for row in rows {
-		let job = Str::new(
-			row.get("job")
-				.or_else(|| row.get("id"))
-				.and_then(Value::as_str)
-				.unwrap_or("agent"),
-		);
+	for (index, row) in rows.iter().enumerate() {
+		let job = row
+			.get("job")
+			.or_else(|| row.get("id"))
+			.and_then(Value::as_str)
+			.map_or_else(|| Str::new_static("agent"), task_id);
+		// pi's row is `id: description`; omp's child request carries no
+		// description, so the brief of its assignment stands in, as pi's own
+		// running rows do without one.
+		let assignment = args.assignment_for(index, &job);
 		let desc = row
 			.get("description")
-			.or_else(|| row.get("agent"))
 			.and_then(Value::as_str)
+			.map(str::trim)
 			.filter(|text| !text.is_empty())
-			.map(Str::new);
+			.map(|text| preview(text, BRIEF_CHARS))
+			.or_else(|| assignment.as_deref().and_then(first_line));
 		let ok = !row_failed(row);
 		let state = if ok { "⟨done⟩" } else { "⟨failed⟩" };
-		let detail = task_detail(row);
-		let assignment = row
-			.get("assignment")
+		let badge = row
+			.get("agent")
 			.and_then(Value::as_str)
-			.filter(|text| !text.is_empty())
+			.map(str::trim)
+			.filter(|agent| !agent.is_empty() && *agent != "task")
+			.map(|agent| sf!("⟨{agent}⟩"));
+		let detail = task_detail(row);
+		let assignment = assignment
+			.as_deref()
+			.filter(|text| !text.trim().is_empty())
 			.map(|text| preview(text, 70));
+		// pi `renderOutputSection`: the child's final text, three rows
+		// collapsed, ten expanded, each cut at 70 cells.
 		let output = row
 			.get("output")
-			.or_else(|| row.get("text"))
 			.and_then(Value::as_str)
+			.or_else(|| row.get("text").and_then(Value::as_str))
+			.map(str::trim_end)
 			.filter(|text| !text.is_empty())
-			.map(|text| preview(text, 70));
+			.map(|text| output_preview(text, if expanded { 10 } else { 3 }));
 		let error = row
 			.get("error")
 			.and_then(Value::as_str)
@@ -101,9 +295,10 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 				<col>
 					<row gap=1>
 						if ok { <i:done/> } else { <i:error/> }
-						<text bold>{sf!("{job}:")}</text>
+						if desc.is_some() { <text bold>{sf!("{job}:")}</text> } else { <text bold>{job}</text> }
 						if let Some(desc) = desc { <text>{desc}</text> }
 						<text fg=muted>{state}</text>
+						if let Some(badge) = badge { <text fg=muted>{badge}</text> }
 						if let Some(detail) = detail {
 							<text fg=muted>{"·"}</text><text fg=muted>{detail}</text>
 						}
@@ -134,6 +329,8 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 	let summary = sf!("⟨{count} {status} · ↓{tokens_in} · ↑{tokens_out}⟩");
 	dom! {
 		<box border=round title={title} title_pad=3 pad="0 1">
+			{sections}
+			if !sections_empty { <hr/> }
 			{rendered_rows}
 			<text fg=muted>{summary}</text>
 		</box>
@@ -146,7 +343,8 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 /// (`task/render.ts` `renderAgentProgress`) keeps such rows static — the
 /// same dot finished rows use, the id, the agent badge, and the job state —
 /// never an error panel: the spawn itself succeeded.
-fn render_started(jobs: &[Value], ui: &UiContext) -> Component {
+fn render_started(jobs: &[Value], sections: Vec<Component>, ui: &UiContext) -> Component {
+	let sections_empty = sections.is_empty();
 	let count = jobs.len();
 	let agent_word = if count == 1 { "agent" } else { "agents" };
 	let title = sf!("{} Task {count} {agent_word}", ui.charset.icon_named("pending").unwrap_or("…"));
@@ -187,6 +385,8 @@ fn render_started(jobs: &[Value], ui: &UiContext) -> Component {
 	let summary = sf!("⟨{count} started · detached⟩");
 	dom! {
 		<box border=round title={title} title_pad=3 pad="0 1">
+			{sections}
+			if !sections_empty { <hr/> }
 			{rendered_rows}
 			<text fg=muted>{summary}</text>
 		</box>
@@ -209,6 +409,22 @@ fn task_detail(row: &Value) -> Option<Str> {
 		.and_then(Value::as_u64)
 		.unwrap_or_default();
 	Some(sf!("↓{tokens_in} · ↑{tokens_out}"))
+}
+
+/// The first `limit` output lines, each cut at 70 cells, and pi's
+/// `… N more lines` fold when more follow.
+fn output_preview(text: &str, limit: usize) -> Str {
+	let total = text.lines().count();
+	let mut out = text
+		.lines()
+		.take(limit)
+		.map(|line| preview(line, 70))
+		.collect::<Vec<_>>()
+		.join("\n");
+	if total > limit {
+		out.push_str(&sf!("\n… {} more lines", total - limit));
+	}
+	Str::from(out)
 }
 
 fn preview(text: &str, max_chars: usize) -> Str {

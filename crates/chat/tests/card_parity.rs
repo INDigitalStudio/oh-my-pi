@@ -842,3 +842,228 @@ fn recall_card_is_header_only_when_collapsed_and_warns_on_no_matches() {
 	assert!(none.contains("no matches"), "{none}");
 	assert!(!none.contains("Expand"), "{none}");
 }
+
+fn lang_glyph(name: &str) -> &'static str {
+	UiContext::default().charset.icon_named(name).expect("catalog language icon")
+}
+
+#[test]
+fn edit_card_paints_the_language_icon_of_the_edited_path() {
+	// pi `formatEditDescription`: `getLanguageFromPath(path) ?? "text"` picks
+	// the `lang.*` glyph, so a Rust edit never wears the TypeScript badge.
+	let rust = render_done::<omp_tools::edit::Payload>(
+		"edit",
+		"{}",
+		json!({"sections":[section("src/main.rs", "update", None, "@@ -1,1 +1,1 @@\n-a\n+b")]}),
+		false,
+	);
+	assert!(rust.contains(lang_glyph("rust")), "{rust}");
+	assert!(!rust.contains(lang_glyph("typescript")), "{rust}");
+
+	let ts = render_done::<omp_tools::edit::Payload>(
+		"edit",
+		"{}",
+		json!({"sections":[section("src/app.tsx", "update", None, "@@ -1,1 +1,1 @@\n-a\n+b")]}),
+		false,
+	);
+	assert!(ts.contains(lang_glyph("typescript")), "{ts}");
+
+	// Delete and move rows carry the icon of the (source) path.
+	let delete = render_done::<omp_tools::edit::Payload>(
+		"edit",
+		"{}",
+		json!({"sections":[section("README.md", "delete", None, "")]}),
+		false,
+	);
+	assert!(delete.contains(lang_glyph("markdown")), "{delete}");
+	let moved = render_done::<omp_tools::edit::Payload>(
+		"edit",
+		"{}",
+		json!({"sections":[section("Cargo.toml", "move", Some("Cargo.toml.bak"), "")]}),
+		false,
+	);
+	assert!(moved.contains(lang_glyph("toml")), "{moved}");
+
+	// Unknown extensions fall back to pi's `"text"`; extensionless names pi
+	// recognises without an icon paint `lang.default`.
+	let unknown = render_done::<omp_tools::edit::Payload>(
+		"edit",
+		"{}",
+		json!({"sections":[section("notes.xyz", "update", None, "@@ -1,1 +1,1 @@\n-a\n+b")]}),
+		false,
+	);
+	assert!(unknown.contains(lang_glyph("text")), "{unknown}");
+	let makefile = render_done::<omp_tools::edit::Payload>(
+		"edit",
+		"{}",
+		json!({"sections":[section("Makefile", "update", None, "@@ -1,1 +1,1 @@\n-a\n+b")]}),
+		false,
+	);
+	assert!(makefile.contains(lang_glyph("default")), "{makefile}");
+	assert!(!makefile.contains(lang_glyph("text")), "{makefile}");
+
+	// The streaming preview reads the path from the arguments.
+	let streaming = node(
+		KnownTag::Input,
+		r#"{"path":"scripts/run.py","previewDiff":"@@ -1,1 +1,1 @@\n-a\n+b"}"#,
+	);
+	let text = render("edit", &streaming, None, None, CardStatus::StreamingArgs, false);
+	assert!(text.contains(lang_glyph("python")), "{text}");
+}
+
+#[test]
+fn write_card_paints_the_language_icon_of_the_written_path() {
+	let streaming = node(KnownTag::Input, r#"{"path":"src/lib.rs","content":"fn main() {}\n"}"#);
+	let text = render("write", &streaming, None, None, CardStatus::StreamingArgs, false);
+	assert!(text.contains(lang_glyph("rust")), "{text}");
+	assert!(!text.contains(lang_glyph("typescript")), "{text}");
+
+	let done = render_done::<omp_tools::write::Payload>(
+		"write",
+		r##"{"path":"docs/guide.md","content":"# Guide\n"}"##,
+		json!({"resolved_path": "/w/docs/guide.md", "display_path": "docs/guide.md",
+			"byte_len": 8, "reported_len": 8, "disposition": "created", "stripped_wrapper": false,
+			"made_executable": false, "snapshot_tag": null, "operation": {"kind": "plain"}}),
+		false,
+	);
+	assert!(done.contains(lang_glyph("markdown")), "{done}");
+	assert!(!done.contains(lang_glyph("typescript")), "{done}");
+
+	let failed = node(KnownTag::Input, r#"{"path":"config.yml","content":"a: 1\n"}"#);
+	let diag = fault_node("permission denied");
+	let text = render("write", &failed, None, Some(&diag), CardStatus::Failed, false);
+	assert!(text.contains(lang_glyph("yaml")), "{text}");
+}
+
+#[test]
+fn glob_card_paints_each_file_with_its_own_language_icon() {
+	let payload = json!({"matches": [
+		{"path": "src/main.rs", "modified_ms": 0, "is_dir": false},
+		{"path": "web/index.html", "modified_ms": 0, "is_dir": false},
+		{"path": ".gitignore", "modified_ms": 0, "is_dir": false},
+	], "missing_paths": [], "timed_out": false, "truncated": false,
+		"result_limit_reached": null, "partial_match_count": 3, "timeout_ms": 0,
+		"projected_text": "", "output_blob": null, "output_artifact_uri": null,
+		"output_shown_lines": 3, "output_total_lines": 3});
+	let text = render_done::<omp_tools::glob::Payload>("glob", r#"{"path":"**/*"}"#, payload, false);
+	for (path, icon) in [("src/main.rs", "rust"), ("web/index.html", "html"), (".gitignore", "conf")] {
+		let row = text
+			.lines()
+			.find(|line| line.contains(path))
+			.unwrap_or_else(|| panic!("missing {path} in {text}"));
+		assert!(row.contains(lang_glyph(icon)), "{path} row lacks {icon}: {row}");
+	}
+	assert!(!text.contains(lang_glyph("typescript")), "{text}");
+}
+
+#[test]
+fn card_status_spellings_round_trip_through_the_dom_vocabulary() {
+	for (spelling, status) in [
+		("arguments", CardStatus::StreamingArgs),
+		("running", CardStatus::InProgress),
+		("ok", CardStatus::Done),
+		("error", CardStatus::Failed),
+	] {
+		assert_eq!(CardStatus::from_dom(spelling), status);
+		assert_eq!(status.as_str(), spelling);
+	}
+	// The DOM's other terminal-failure spellings fold onto `Failed`, whose
+	// canonical spelling stays `error`; unknown running states are in-progress.
+	assert_eq!(CardStatus::from_dom("cancelled"), CardStatus::Failed);
+	assert_eq!(CardStatus::from_dom("aborted"), CardStatus::Failed);
+	assert_eq!(CardStatus::Failed.as_str(), "error");
+	assert_eq!(CardStatus::from_dom("pending"), CardStatus::InProgress);
+	assert_eq!(CardStatus::from_dom(""), CardStatus::InProgress);
+}
+
+#[test]
+fn task_card_names_the_dispatched_agent_and_brief_while_the_call_is_live() {
+	// pi `renderCall` (task/render.ts): the assignment markdown, a divider,
+	// then `• <name>: <first line of task, 64 chars>` while args stream —
+	// never an empty frame under a static "Task: task" title.
+	let torn = node(
+		KnownTag::Input,
+		r#"{"agent":"task","name":"AuthLoader","task":"Read packages/server/src/auth/*.ts and summarize the session-cookie"#,
+	);
+	let text = render("task", &torn, None, None, CardStatus::StreamingArgs, false);
+	assert!(text.contains("Task: task"), "{text}");
+	assert!(
+		text.contains("• AuthLoader: Read packages/server/src/auth/*.ts and summarize the session-co…"),
+		"{text}"
+	);
+	assert!(text.contains("├"), "divider before the agent rows: {text}");
+	assert!(!text.contains("⟨task⟩"), "the default agent wears no badge: {text}");
+
+	// Complete arguments: the brief is the first line only, the non-default
+	// agent gets its badge, and `isolated` lands in the header.
+	let running = node(
+		KnownTag::Input,
+		r#"{"agent":"scout","name":"Anna.Bob","isolated":true,"task":"Map the auth flow.\n\nThen report file:line evidence."}"#,
+	);
+	let text = render("task", &running, None, None, CardStatus::InProgress, false);
+	assert!(text.contains("Task: scout"), "{text}");
+	assert!(text.contains("isolated"), "{text}");
+	assert!(text.contains("• Anna>Bob: Map the auth flow."), "{text}");
+	assert!(text.contains("⟨scout⟩"), "{text}");
+	assert!(text.contains("Then report file:line evidence."), "the assignment section: {text}");
+	assert!(!text.contains("Anna>Bob: Map the auth flow. Then"), "brief stops at the first line: {text}");
+
+	// Batch form: the shared context, then one row per item (`#N` when
+	// unnamed), folded past four.
+	let batch = node(
+		KnownTag::Input,
+		r##"{"context":"# Goal\nShip auth.","tasks":[
+			{"name":"A","task":"one","agent":"scout"},{"task":"two"},{"name":"C","task":"three","isolated":true},
+			{"name":"D","task":"four"},{"name":"E","task":"five"},{"name":"F","task":"six"}]}"##,
+	);
+	let text = render("task", &batch, None, None, CardStatus::StreamingArgs, false);
+	assert!(text.contains("Ship auth."), "{text}");
+	assert!(text.contains("• A: one"), "{text}");
+	assert!(text.contains("⟨scout⟩"), "{text}");
+	assert!(text.contains("• #2: two"), "{text}");
+	assert!(text.contains("• C: three"), "{text}");
+	assert!(text.contains("[isolated]"), "{text}");
+	assert!(text.contains("• D: four"), "{text}");
+	assert!(!text.contains("• E: five"), "{text}");
+	assert!(text.contains("… 2 more agents"), "{text}");
+	assert!(!text.contains("Task:"), "batch calls carry no agent in the header: {text}");
+
+	// The settled frame keeps the assignment section above its rows; each
+	// row is `name: brief ⟨agent⟩` and the child's final text follows under
+	// "Output", three lines when collapsed, ten when expanded.
+	let text = (1..=12)
+		.map(|line| format!("finding {line}"))
+		.collect::<Vec<_>>()
+		.join("\n");
+	let payload = json!({"children":[{"id":"AuthLoader","agent":"scout","text":text,"session_path":"s.oms",
+		"tokens_in":10,"tokens_out":5,"output":null,"workspace":null,"error":null}]});
+	let args = r#"{"agent":"scout","name":"AuthLoader","task":"Read the auth flow and report.\nCite lines."}"#;
+	let done = render_done::<omp_tools::task::Payload>("task", args, payload.clone(), false);
+	assert!(done.contains("Cite lines."), "assignment section: {done}");
+	assert!(done.contains("AuthLoader: Read the auth flow and report. ⟨done⟩"), "{done}");
+	assert!(done.contains("⟨scout⟩"), "{done}");
+	assert!(done.contains("Output"), "{done}");
+	assert!(done.contains("finding 3"), "{done}");
+	assert!(!done.contains("finding 4"), "{done}");
+	assert!(done.contains("… 9 more lines"), "{done}");
+	let expanded = render_done::<omp_tools::task::Payload>("task", args, payload, true);
+	assert!(expanded.contains("finding 10"), "{expanded}");
+	assert!(!expanded.contains("finding 11"), "{expanded}");
+	assert!(expanded.contains("… 2 more lines"), "{expanded}");
+}
+
+#[test]
+fn vibe_card_derives_the_operation_from_the_op_argument() {
+	// The single `vibe` identity reads its operation from `op`; the completed
+	// row names it with the same spelling, and an unknown op lists sessions.
+	let result = node(KnownTag::Result, "ok");
+	for op in ["spawn", "send", "wait", "kill", "list"] {
+		let input = node(KnownTag::Input, &format!(r#"{{"op":"{op}"}}"#));
+		let text = render("vibe", &input, Some(&result), None, CardStatus::Done, false);
+		assert!(text.contains(&format!("vibe_{op} completed")), "{op}: {text}");
+	}
+	let input = node(KnownTag::Input, r#"{"op":"bogus"}"#);
+	let unknown = render("vibe", &input, Some(&result), None, CardStatus::Done, false);
+	assert!(unknown.contains("vibe sessions"), "{unknown}");
+	assert!(unknown.contains("vibe_list completed"), "{unknown}");
+}

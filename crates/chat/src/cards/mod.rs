@@ -28,7 +28,6 @@ pub mod task;
 pub mod think;
 pub mod todo;
 pub mod utility;
-pub mod vibe;
 pub mod web_search;
 pub mod write;
 
@@ -98,15 +97,23 @@ pub(crate) fn result_image(
 }
 
 /// Tool lifecycle state derived from the tool element's `status` property.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The string form is the canonical session-DOM spelling; the DOM's
+/// terminal-failure spellings (`cancelled`, `aborted`) and every unknown
+/// running spelling fold onto [`Self::Failed`] and [`Self::InProgress`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::EnumString, strum::IntoStaticStr)]
 pub enum CardStatus {
 	/// The provider is still streaming tool arguments.
+	#[strum(serialize = "arguments")]
 	StreamingArgs,
 	/// The tool is executing.
+	#[strum(serialize = "running")]
 	InProgress,
 	/// The tool settled successfully.
+	#[strum(serialize = "ok")]
 	Done,
 	/// The tool faulted or was aborted.
+	#[strum(to_string = "error", serialize = "cancelled", serialize = "aborted")]
 	Failed,
 }
 
@@ -114,23 +121,13 @@ impl CardStatus {
 	/// Derives a card status from the session-DOM lifecycle spelling.
 	#[must_use]
 	pub fn from_dom(status: &str) -> Self {
-		match status.as_bytes() {
-			b"arguments" => Self::StreamingArgs,
-			b"ok" => Self::Done,
-			b"error" | b"cancelled" | b"aborted" => Self::Failed,
-			_ => Self::InProgress,
-		}
+		status.parse().unwrap_or(Self::InProgress)
 	}
 
 	/// Returns the canonical session-DOM spelling.
 	#[must_use]
-	pub const fn as_str(self) -> &'static str {
-		match self {
-			Self::StreamingArgs => "arguments",
-			Self::InProgress => "running",
-			Self::Done => "ok",
-			Self::Failed => "error",
-		}
+	pub fn as_str(self) -> &'static str {
+		self.into()
 	}
 }
 
@@ -254,6 +251,107 @@ pub(crate) fn elapsed_badge(view: &CardView<'_>) -> Option<Component> {
 		dom! { <row gap=1><text fg=muted>{"·"}</text><time kind=elapsed dim ms={since}/></row> }
 			.into_component(),
 	)
+}
+
+/// pi `getLanguageFromPath` composed with `Theme.getLangIcon`: the `lang.*`
+/// icon name a file path is painted with in edit, write, and file-list rows.
+///
+/// The key is the text after the last `.` of the file name (so `.gitignore`
+/// resolves as `gitignore`), else the whole lowercased file name for
+/// extensionless files such as `Dockerfile` and `justfile`. Languages pi
+/// recognises but has no icon for (`zig`, `perl`, …) paint `lang.default`;
+/// paths pi does not recognise at all paint `lang.text`, pi's `?? "text"`
+/// fallback.
+pub(crate) fn path_language_icon(path: &str) -> &'static str {
+	let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_ascii_lowercase();
+	let key = if name.starts_with(".env.") {
+		"env"
+	} else if name.starts_with("dockerfile.") {
+		"dockerfile"
+	} else {
+		name.rsplit('.').next().unwrap_or(&name)
+	};
+	match key {
+		"ts" | "cts" | "mts" | "tsx" => "typescript",
+		"js" | "jsx" | "mjs" | "cjs" => "javascript",
+		"rs" => "rust",
+		"go" => "go",
+		"c" | "h" => "c",
+		"cpp" | "cc" | "cxx" | "hh" | "hpp" | "hxx" | "cu" | "ino" => "cpp",
+		"py" | "pyi" => "python",
+		"rb" | "rbw" | "gemspec" => "ruby",
+		"lua" => "lua",
+		"sh" | "bash" | "zsh" | "ksh" | "bats" | "tmux" | "cgi" | "fcgi" | "command" | "tool"
+		| "fish" | "ps1" | "psm1" | "justfile" => "shell",
+		"php" => "php",
+		"java" => "java",
+		"kt" | "ktm" | "kts" => "kotlin",
+		"cs" => "csharp",
+		"html" | "htm" | "xhtml" | "vue" | "svelte" | "astro" => "html",
+		"css" | "scss" | "sass" | "less" => "css",
+		"json" => "json",
+		"yaml" | "yml" => "yaml",
+		"toml" => "toml",
+		"xml" | "xsl" | "xslt" | "svg" | "plist" => "xml",
+		"ini" => "ini",
+		"md" | "markdown" | "mdx" | "mdc" | "mkd" | "mdown" => "markdown",
+		"sql" => "sql",
+		"dockerfile" | "containerfile" => "docker",
+		"swift" => "swift",
+		"jl" => "julia",
+		"txt" | "text" => "text",
+		"log" => "log",
+		"csv" => "csv",
+		"tsv" => "tsv",
+		"cfg" | "conf" | "config" | "properties" | "gitignore" | "gitattributes" | "gitmodules"
+		| "editorconfig" | "npmrc" | "prettierrc" | "eslintrc" | "prettierignore"
+		| "eslintignore" => "conf",
+		"env" => "env",
+		"zig" | "pl" | "pm" | "perl" | "scala" | "sc" | "sbt" | "groovy" | "clj" | "cljc"
+		| "cljs" | "edn" | "el" | "fs" | "vb" | "jsonc" | "rst" | "adoc" | "tex" | "graphql"
+		| "gql" | "proto" | "tf" | "hcl" | "tfvars" | "nix" | "ex" | "exs" | "erl" | "hrl"
+		| "hs" | "ml" | "mli" | "r" | "dart" | "elm" | "v" | "nim" | "cr" | "d" | "pas"
+		| "pp" | "lisp" | "lsp" | "rkt" | "scm" | "bat" | "cmd" | "tla" | "tlaplus" | "m"
+		| "mm" | "sol" | "odin" | "star" | "bzl" | "sv" | "svh" | "vh" | "vim" | "ipynb"
+		| "hbs" | "hsb" | "handlebars" | "diff" | "patch" | "makefile" | "mk" | "mak"
+		| "cmake" => "default",
+		_ => "text",
+	}
+}
+
+/// The value of string field `key` in still-streaming (possibly unterminated)
+/// JSON arguments: the decoded text following `"key":"` up to its closing
+/// quote or the end of what has arrived, so a card can name its target
+/// before the provider closes the object. JSON escapes are decoded so a
+/// multi-line brief splits on real newlines; a torn escape at the end is
+/// dropped.
+pub(crate) fn partial_string(json: &str, key: &str) -> Option<Str> {
+	let marker = sf!("\"{key}\":\"");
+	let start = json.find(marker.as_str())? + marker.len();
+	let mut out = String::new();
+	let mut chars = json[start..].chars();
+	while let Some(ch) = chars.next() {
+		match ch {
+			'"' => break,
+			'\\' => match chars.next() {
+				Some('n') => out.push('\n'),
+				Some('t') => out.push('\t'),
+				Some('r') => out.push('\r'),
+				Some('b') => out.push('\u{8}'),
+				Some('f') => out.push('\u{c}'),
+				Some('u') => {
+					let Some(hex) = chars.as_str().get(..4) else { break };
+					let code = u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
+					out.push(code.unwrap_or('\u{fffd}'));
+					chars = chars.as_str()[4..].chars();
+				},
+				Some(other) => out.push(other),
+				None => break,
+			},
+			other => out.push(other),
+		}
+	}
+	Some(Str::from(out))
 }
 
 /// pi `previewLines` / `renderCodeCell` `*MaxLines`: the first `limit`
@@ -456,10 +554,6 @@ impl CardRegistry {
 		registry.register(utility::SecurityScanCard);
 		registry.register(utility::TtsCard);
 		registry.register(utility::YieldCard);
-		registry.register(vibe::VibeCard::new());
-		for card in vibe::VibeCard::identities() {
-			registry.register(card);
-		}
 		registry.register(web_search::WebSearchCard);
 		registry.register(write::WriteCard);
 		registry

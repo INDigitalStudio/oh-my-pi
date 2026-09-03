@@ -10,9 +10,11 @@ use std::{
 };
 
 use miette::{IntoDiagnostic as _, miette};
-use omp_agent::{Inference, Kernel, KernelEvent, RunControl, TurnInput, TurnStop, Up};
+use omp_agent::{
+	Inference, Kernel, KernelError, KernelEvent, RunControl, TurnInput, TurnOutcome, TurnStop, Up,
+};
 use omp_core::Str;
-use omp_dom::Event;
+use omp_dom::{Dom, Event};
 use omp_driver::headless::kernel::SessionHome;
 use omp_rpc::{
 	framing::{
@@ -240,6 +242,33 @@ enum Outgoing {
 	Negotiated { frame: Value, protocol: u8 },
 }
 
+/// What a spawned turn hands back: the kernel and session it borrowed plus
+/// the turn's result.
+type TurnCompletion<C> = (Kernel<C>, Session, Result<TurnOutcome, KernelError>);
+
+/// Moves the idle kernel and session into a spawned turn (`prompt`, an idle
+/// `follow_up`, `abort_and_prompt`, and the follow-up pop after a turn all
+/// start turns through this one path) and announces `turn_start`.
+fn start_turn<C>(
+	current: &mut Option<(Kernel<C>, Session)>,
+	turn_tx: &flume::Sender<TurnCompletion<C>>,
+	outgoing_tx: &flume::Sender<Outgoing>,
+	input: TurnInput,
+) -> miette::Result<()>
+where
+	C: Inference + Send + Sync + 'static,
+{
+	let (mut kernel, mut session) = current.take().expect("idle RPC owns kernel and session");
+	let turn_tx = turn_tx.clone();
+	drop(tokio::spawn(async move {
+		let result = kernel.run_turn(&mut session, input, RunControl::default()).await;
+		let _ = turn_tx.send_async((kernel, session, result)).await;
+	}));
+	outgoing_tx
+		.send(Outgoing::Frame(json!({ "type": "turn_start" })))
+		.into_diagnostic()
+}
+
 /// Serves RPC over caller-provided transport halves.
 ///
 /// Exposed for joined scripted-kernel transport proofs. Production passes
@@ -291,6 +320,9 @@ where
 		.into_diagnostic()?;
 
 	let (snapshot, mut dom_events) = session.subscribe();
+	// The actor's own projection of the session tree (ADR 0005): `get_state`
+	// answers from it at any time, including while a turn owns the session.
+	let mut replica = Dom::from_snapshot(&snapshot);
 	outgoing_tx
 		.send(Outgoing::Frame(json!({
 			"type": "snapshot",
@@ -390,9 +422,16 @@ where
 	});
 
 	let ui_requests = ui.as_ref().map(RpcUiBridge::requests);
-	let (turn_tx, turn_rx) = flume::unbounded();
+	let (turn_tx, turn_rx) = flume::unbounded::<TurnCompletion<C>>();
 	let mut current = Some((kernel, session));
 	let mut turn_running = false;
+	// `abort_and_prompt` while a turn runs: the interrupt is sent now and the
+	// prompt starts the moment the aborted turn hands the session back.
+	let mut abort_prompt: Option<TurnInput> = None;
+	// `cancel` kills the session scope (ADR 0011): no further turn can run,
+	// so queued follow-ups stay journaled for a later resume instead of
+	// being popped into immediately-cancelled turns.
+	let mut session_cancelled = false;
 	let mut input_open = true;
 	let mut dom_open = true;
 	let mut kernel_open = true;
@@ -450,39 +489,66 @@ where
 								}
 							},
 							"prompt" => {
-								let text = request.params
-									.get("message")
-									.or_else(|| request.params.get("text"))
-									.and_then(Value::as_str);
-								let mut started = false;
 								let response = if turn_running {
 									busy_response(id, command.as_str())
-								} else if let Some(text) = text {
-									let (mut turn_kernel, mut turn_session) = current.take().expect("idle RPC owns kernel and session");
-									let turn_tx = turn_tx.clone();
-									let input = TurnInput { text: Str::new(text), attachments: Vec::new() };
-									let _task = tokio::spawn(async move {
-										let result = turn_kernel.run_turn(&mut turn_session, input, RunControl::default()).await;
-										let _ = turn_tx.send_async((turn_kernel, turn_session, result)).await;
-									});
-									turn_running = true;
-									started = true;
-									RpcResponse::success(id, command.as_str(), json!({ "accepted": true })).into_diagnostic()?
 								} else {
-									RpcResponse::error(
-										id,
-										command.as_str(),
-										"prompt requires `message` or `text`",
-										Some(RpcErrorCode::new("invalid_params")),
-									)
+									match message_text(&request.params) {
+										Some(text) => {
+											start_turn(&mut current, &turn_tx, &outgoing_tx, text_input(text))?;
+											turn_running = true;
+											RpcResponse::success(id, command.as_str(), json!({ "accepted": true })).into_diagnostic()?
+										},
+										None => missing_message(id, command.as_str()),
+									}
 								};
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
-								if started {
-									outgoing_tx.send(Outgoing::Frame(json!({ "type": "turn_start" }))).into_diagnostic()?;
-								}
 							},
 							"steer" => {
-								let response = up_response(id, command.as_str(), &request.params, &mailbox, true);
+								let response = up_response(id, command.as_str(), &request.params, &mailbox, |text| Up::Steer {
+									text,
+									attachments: Vec::new(),
+								});
+								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
+							},
+							// pi `followUp`: behind a running turn the prompt is
+							// journaled into `<queues><prompts>` and popped when the
+							// turn yields; idle, it runs now (pi's idle queue drain).
+							"follow_up" => {
+								let response = if turn_running {
+									up_response(id, command.as_str(), &request.params, &mailbox, |text| Up::Queue {
+										text,
+										attachments: Vec::new(),
+									})
+								} else {
+									match message_text(&request.params) {
+										Some(text) => {
+											start_turn(&mut current, &turn_tx, &outgoing_tx, text_input(text))?;
+											turn_running = true;
+											RpcResponse::success(id, command.as_str(), json!({ "queued": false })).into_diagnostic()?
+										},
+										None => missing_message(id, command.as_str()),
+									}
+								};
+								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
+							},
+							// pi `abort_and_prompt`: interrupt the running turn, then
+							// prompt; the response acknowledges the abort and the new
+							// turn's events stream after it.
+							"abort_and_prompt" => {
+								let response = match message_text(&request.params) {
+									Some(text) => {
+										let input = text_input(text);
+										if turn_running {
+											abort_prompt = Some(input);
+											let _ = mailbox.send(Up::Interrupt);
+										} else {
+											start_turn(&mut current, &turn_tx, &outgoing_tx, input)?;
+											turn_running = true;
+										}
+										RpcResponse::success_empty(id, command.as_str())
+									},
+									None => missing_message(id, command.as_str()),
+								};
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
 							},
 							"approve" => {
@@ -496,6 +562,7 @@ where
 							},
 							"cancel" => {
 								let _ = mailbox.send(Up::Cancel);
+								session_cancelled = true;
 								let response = RpcResponse::success_empty(id, command.as_str());
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
 							},
@@ -512,15 +579,15 @@ where
 									))).into_diagnostic()?;
 								}
 							},
+							// pi answers `get_state` while streaming (`isStreaming`
+							// is part of the state); the replica projects the tree
+							// whether or not a turn owns the session.
 							"get_state" => {
-								let response = match current.as_ref() {
-									Some((_, session)) => RpcResponse::success(
-										id,
-										command.as_str(),
-										serde_json::from_slice::<Value>(session.dom().snapshot().as_bytes()).into_diagnostic()?,
-									).into_diagnostic()?,
-									None => busy_response(id, command.as_str()),
-								};
+								let response = RpcResponse::success(
+									id,
+									command.as_str(),
+									serde_json::from_slice::<Value>(replica.snapshot().as_bytes()).into_diagnostic()?,
+								).into_diagnostic()?;
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
 							},
 							"new_session" | "switch_session" | "branch" => {
@@ -538,6 +605,7 @@ where
 											let (snapshot, events) = next.subscribe();
 											dom_events = events;
 											dom_open = true;
+											replica = Dom::from_snapshot(&snapshot);
 											let session_path = next.journal_path().to_path_buf();
 											current = Some((idle_kernel, next));
 											outgoing_tx.send(Outgoing::Frame(json!({
@@ -581,8 +649,9 @@ where
 				}
 			},
 			completed = turn_rx.recv_async(), if turn_running => {
-				let (turn_kernel, turn_session, result) = completed.into_diagnostic()?;
+				let (turn_kernel, mut turn_session, result) = completed.into_diagnostic()?;
 				while let Ok(event) = dom_events.try_recv() {
+					replica.apply_event(&event).into_diagnostic()?;
 					outgoing_tx.send(Outgoing::Frame(dom_event_value(event)?)).into_diagnostic()?;
 				}
 				while let Ok(event) = kernel_events.try_recv() {
@@ -608,15 +677,32 @@ where
 					}),
 				};
 				outgoing_tx.send(Outgoing::Frame(terminal)).into_diagnostic()?;
-				current = Some((turn_kernel, turn_session));
-				turn_running = false;
 				if shutting_down || !input_open {
+					current = Some((turn_kernel, turn_session));
 					break;
+				}
+				// The aborted-then-prompted turn outranks the follow-up queue;
+				// otherwise the oldest queued follow-up runs now that the
+				// agent yielded (pi `followUp`).
+				let next = match abort_prompt.take() {
+					Some(input) => Some(input),
+					None if session_cancelled => None,
+					None => omp_agent::pop_queued_prompt(&mut turn_session)
+						.into_diagnostic()?
+						.map(|(text, attachments)| TurnInput { text, attachments }),
+				};
+				current = Some((turn_kernel, turn_session));
+				match next {
+					Some(input) => start_turn(&mut current, &turn_tx, &outgoing_tx, input)?,
+					None => turn_running = false,
 				}
 			},
 			event = dom_events.recv_async(), if dom_open => {
 				match event {
-					Ok(event) => outgoing_tx.send(Outgoing::Frame(dom_event_value(event)?)).into_diagnostic()?,
+					Ok(event) => {
+						replica.apply_event(&event).into_diagnostic()?;
+						outgoing_tx.send(Outgoing::Frame(dom_event_value(event)?)).into_diagnostic()?;
+					},
 					Err(_) => dom_open = false,
 				}
 			},
@@ -739,31 +825,44 @@ fn negotiate(id: Option<RequestId>, params: &Map<String, Value>) -> RpcResponse 
 	}
 }
 
+/// The prompt text of a `prompt`/`steer`/`follow_up`/`abort_and_prompt`
+/// request (`message`, or the legacy `text`).
+fn message_text(params: &Map<String, Value>) -> Option<&str> {
+	params
+		.get("message")
+		.or_else(|| params.get("text"))
+		.and_then(Value::as_str)
+}
+
+fn text_input(text: &str) -> TurnInput {
+	TurnInput { text: Str::new(text), attachments: Vec::new() }
+}
+
+fn missing_message(id: Option<RequestId>, command: &str) -> RpcResponse {
+	RpcResponse::error(
+		id,
+		command,
+		format!("{command} requires `message` or `text`"),
+		Some(RpcErrorCode::new("invalid_params")),
+	)
+}
+
+/// Sends the request's message to the running turn through `up` and reports
+/// it queued (`steer` → [`Up::Steer`], `follow_up` → [`Up::Queue`]).
 fn up_response(
 	id: Option<RequestId>,
 	command: &str,
 	params: &Map<String, Value>,
 	mailbox: &flume::Sender<Up>,
-	steer: bool,
+	up: impl FnOnce(Str) -> Up,
 ) -> RpcResponse {
-	let text = params
-		.get("message")
-		.or_else(|| params.get("text"))
-		.and_then(Value::as_str);
-	match text {
+	match message_text(params) {
 		Some(text) => {
-			if steer {
-				let _ = mailbox.send(Up::Steer { text: Str::new(text), attachments: Vec::new() });
-			}
+			let _ = mailbox.send(up(Str::new(text)));
 			RpcResponse::success(id, command, json!({ "queued": true }))
-				.expect("static steering response serializes")
+				.expect("static queue response serializes")
 		},
-		None => RpcResponse::error(
-			id,
-			command,
-			"steer requires `message` or `text`",
-			Some(RpcErrorCode::new("invalid_params")),
-		),
+		None => missing_message(id, command),
 	}
 }
 

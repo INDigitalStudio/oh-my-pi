@@ -1,42 +1,44 @@
 //! Deterministic, journal-derived tool-card gallery.
 
-use omp_core::Str;
+use bytes::Bytes;
+use omp_core::{CowBytes, Str};
 use omp_dom::{Handle, KnownTag, Node, PropId, Snapshot, Tag, Value as DomValue};
+use omp_journal::EntryId;
 use omp_session::{ComponentRegistry, Session};
 use omp_tool::Part;
+use omp_tools::{eval, shell};
 use omp_tui::{Charset, Frame, IntoComponent as _, Ui, UiContext, dom};
 use serde_json::{Value, value::RawValue};
+use strum::{Display, EnumIter};
 use thiserror::Error;
 
 use crate::cards::{CardRegistry, CardStatus, CardView, fixtures::CardFixture};
 
 /// Tool lifecycle states rendered by the gallery, in display order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The `Display` spelling is the label pi prints above each state
+/// (`gallery-cli.ts` `GALLERY_STATE_LABELS`).
+#[derive(Clone, Copy, Debug, Display, EnumIter, Eq, PartialEq)]
 pub enum GalleryState {
 	/// Arguments are still streaming.
+	#[strum(serialize = "streaming args")]
 	StreamingArgs,
 	/// The call is executing.
+	#[strum(serialize = "in progress")]
 	InProgress,
 	/// The call settled successfully.
+	#[strum(serialize = "done")]
 	Done,
-	/// The call faulted or returned an error-shaped outcome.
+	/// The call faulted, or settled a payload that reports the tool's own
+	/// failure (a Python exception is `eval`'s `CellOutcome::Error`, not a
+	/// fault).
+	#[strum(serialize = "failed")]
 	Failed,
 }
 
 impl GalleryState {
 	/// All states in reference-gallery order.
 	pub const ALL: [Self; 4] = [Self::StreamingArgs, Self::InProgress, Self::Done, Self::Failed];
-
-	/// Human-readable state label used by the captured references.
-	#[must_use]
-	pub const fn label(self) -> &'static str {
-		match self {
-			Self::StreamingArgs => "streaming args",
-			Self::InProgress => "in progress",
-			Self::Done => "done",
-			Self::Failed => "failed",
-		}
-	}
 
 	const fn index(self) -> usize {
 		match self {
@@ -146,33 +148,25 @@ fn render_fixture(
 		if let Some(update) = state_fixture.update {
 			session.call_update(call, raw(update)?)?;
 		}
+		let tool = card_tool(fixture.tool);
 		match state {
 			GalleryState::StreamingArgs | GalleryState::InProgress => {},
-			GalleryState::Done => {
-				let payload = fixture_payload(
-					card_tool(fixture.tool),
-					state_fixture.args,
-					state_fixture.result.unwrap_or("null"),
-				)?;
-				let parts = projected_parts(card_tool(fixture.tool), &payload)?;
+			// A `Failed` fixture without a fault settles a payload that
+			// carries the tool's own failure verdict, exactly as the tool
+			// would (`eval` journals `Ok(Payload)` for a Python exception).
+			GalleryState::Done | GalleryState::Failed if state_fixture.fault.is_none() => {
+				let (payload, frames) =
+					fixture_payload(tool, state_fixture.args, state_fixture.result.unwrap_or("null"))?;
+				stream_output(&mut session, call, &frames)?;
+				let parts = projected_parts(tool, &payload)?;
 				session.settle_projected(call, outcome_value("ok", payload)?, raw_parts(parts)?)?;
 			},
-			GalleryState::Failed => {
-				let raw_fault = state_fixture
-					.fault
-					.map(serde_json::from_str)
-					.transpose()?
-					.unwrap_or_else(|| {
-						serde_json::json!({
-							"message": state_fixture
-								.result
-								.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-								.and_then(|value| value.get("error").and_then(Value::as_str).map(str::to_owned))
-								.unwrap_or_else(|| "operation failed".to_owned())
-						})
-					});
-				let fault = fixture_fault(card_tool(fixture.tool), raw_fault);
-				let parts = projected_parts(card_tool(fixture.tool), &fault)?;
+			GalleryState::Done | GalleryState::Failed => {
+				let raw_fault: Value =
+					serde_json::from_str(state_fixture.fault.expect("fault checked above"))?;
+				let fault = fixture_fault(tool, state_fixture.args, raw_fault);
+				stream_output(&mut session, call, &fault_frames(tool, &fault))?;
+				let parts = projected_parts(tool, &fault)?;
 				session.fail_projected(call, outcome_value("faulted", fault)?, raw_parts(parts)?)?;
 			},
 		}
@@ -205,7 +199,11 @@ fn render_fixture(
 		}
 	}
 	let result = child(&snapshot, tool, KnownTag::Result);
-	let output = result.and_then(node_text);
+	// Like the live projection (`project.rs` `card_view`), `output` is the
+	// text of a running call only; settled cards read the `<result>` element.
+	let output = (status == CardStatus::InProgress)
+		.then(|| result.and_then(node_text))
+		.flatten();
 	let view = CardView {
 		input,
 		result,
@@ -218,9 +216,13 @@ fn render_fixture(
 	let mut ui_context = UiContext::default();
 	ui_context.charset = Charset::NerdFont;
 	let card = registry.render(card_tool(fixture.tool), &view, expanded, &ui_context);
-	// Pi captures tool blocks inside the transcript, where every block
-	// carries a one-row vertical margin; the gallery paints the same block.
-	let component = dom! { <col pad="1 0">{card}</col> }.into_component();
+	// Pi's custom/state renderers already own their vertical extent. Framed
+	// tool calls inherit the transcript block's one-row vertical margin.
+	let component = if matches!(fixture.tool, "context_gauge" | "custom" | "read_group") {
+		card
+	} else {
+		dom! { <col pad="1 0">{card}</col> }.into_component()
+	};
 	let ui = Ui::from_root(component, width, ui_context);
 	Ok(GallerySection { tool: fixture.tool, title: fixture.title, state, frame: ui.frame().clone() })
 }
@@ -228,6 +230,194 @@ fn render_fixture(
 fn raw(text: &str) -> Result<Box<RawValue>, serde_json::Error> {
 	let value: serde_json::Value = serde_json::from_str(text)?;
 	serde_json::value::to_raw_value(&value)
+}
+
+/// One ordered output update a tool emits before it settles, with the text
+/// its bytes reveal on the `<result>` stream.
+struct OutputFrame {
+	update: Value,
+	text:   String,
+}
+
+/// Streams fixture output exactly as dispatch does (`OutputStream::push`):
+/// the bytes are revealed on the bounded `<result>` text stream, then the
+/// typed update is journaled with its `data` emptied so the bytes are never
+/// journaled twice.
+fn stream_output(
+	session: &mut Session,
+	call: EntryId,
+	frames: &[OutputFrame],
+) -> Result<(), GalleryError> {
+	if frames.is_empty() {
+		return Ok(());
+	}
+	let element = session.call_handle(call)?;
+	let dom = session.dom();
+	let result = dom
+		.children(element)
+		.iter()
+		.copied()
+		.find(|child| {
+			dom.get(*child)
+				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Result))
+		})
+		.ok_or(GalleryError::Missing("result element"))?;
+	let sid = session.stream_open(result, PropId::Text.into())?;
+	for frame in frames {
+		session.stream_append(sid, &frame.text)?;
+		let mut update = frame.update.clone();
+		if let Some(data) = update.get_mut("data") {
+			*data = Value::Array(Vec::new());
+		}
+		session.call_update(call, serde_json::value::to_raw_value(&update)?)?;
+	}
+	session.stream_close(sid)?;
+	Ok(())
+}
+
+/// The readable `{"data": "…"}` frames of an exec fixture, in order.
+fn text_frames(value: &Value, key: &str) -> Vec<String> {
+	value
+		.get(key)
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(|frame| frame.get("data").and_then(Value::as_str))
+		.map(str::to_owned)
+		.collect()
+}
+
+/// The live `bash@2` updates for a settled transcript.
+fn shell_frames(payload: &shell::Payload) -> Vec<OutputFrame> {
+	payload
+		.transcript
+		.iter()
+		.map(|frame| OutputFrame {
+			update: serde_json::to_value(shell::Update {
+				channel:  frame.channel,
+				data:     frame.data.clone(),
+				sequence: frame.sequence,
+				exec_id:  payload.exec_id.clone(),
+				started:  frame.sequence == 1,
+				terminal: false,
+			})
+			.expect("shell update serializes"),
+			text:   String::from_utf8_lossy(frame.data.as_ref()).into_owned(),
+		})
+		.collect()
+}
+
+/// Output the tool streamed before faulting with `fault`.
+fn fault_frames(tool: &str, fault: &Value) -> Vec<OutputFrame> {
+	match tool {
+		"bash" => serde_json::from_value::<shell::Fault>(fault.clone())
+			.ok()
+			.and_then(|fault| match fault {
+				shell::Fault::CommandFailed { payload } => Some(shell_frames(&payload)),
+				_ => None,
+			})
+			.unwrap_or_default(),
+		_ => Vec::new(),
+	}
+}
+
+/// The durable `bash@2` payload for a readable fixture transcript
+/// (`{"transcript":[{"data":"…"}],"status":{"exit_code":…,"wall_clock_ms":…}}`).
+fn shell_payload(args: &Value, value: &Value) -> shell::Payload {
+	let exit_code = value
+		.pointer("/status/exit_code")
+		.and_then(Value::as_i64)
+		.and_then(|code| i32::try_from(code).ok());
+	shell::Payload {
+		session_id:  Bytes::new(),
+		exec_id:     Bytes::new(),
+		command:     Str::new(
+			args
+				.get("command")
+				.and_then(Value::as_str)
+				.unwrap_or_default(),
+		),
+		transcript:  text_frames(value, "transcript")
+			.into_iter()
+			.enumerate()
+			.map(|(index, text)| shell::TranscriptFrame {
+				channel:  shell::OutputChannel::Stdout,
+				data:     CowBytes::from(text.into_bytes()),
+				sequence: index as u64 + 1,
+			})
+			.collect(),
+		attachments: Vec::new(),
+		adjustments: Vec::new(),
+		status:      shell::ExecStatus {
+			outcome: shell::ExecOutcome::Exited,
+			exit_code,
+			signal: None,
+			wall_clock_ms: value
+				.pointer("/status/wall_clock_ms")
+				.and_then(Value::as_u64)
+				.unwrap_or_default(),
+			spilled_output: None,
+			aborted: false,
+			effects_unknown: false,
+			final_cwd_uri: None,
+			final_cwd_revision: 0,
+		},
+	}
+}
+
+/// The durable `eval@1` payload for a readable fixture cell
+/// (`{"frames":[{"data":"…"}],"display_outputs":[…],"status":{…}}`) and the
+/// stdout updates the cell streamed before settling: `eval` never retains
+/// stdout in its payload, so the card reads it from the `<result>` stream.
+fn eval_payload(
+	args: &Value,
+	value: &Value,
+) -> Result<(eval::Payload, Vec<OutputFrame>), serde_json::Error> {
+	let frames = text_frames(value, "frames")
+		.into_iter()
+		.enumerate()
+		.map(|(index, text)| {
+			let update = serde_json::to_value(eval::Update {
+				channel:  eval::OutputChannel::Stdout,
+				data:     CowBytes::from(text.clone().into_bytes()),
+				sequence: index as u64 + 1,
+			})?;
+			Ok(OutputFrame { update, text })
+		})
+		.collect::<Result<Vec<_>, serde_json::Error>>()?;
+	let status: eval::CellStatus = serde_json::from_value(
+		value
+			.get("status")
+			.cloned()
+			.unwrap_or_else(|| serde_json::json!({"outcome":"complete","exit_code":0,"duration_ms":0,"exception":null})),
+	)?;
+	let display_outputs: Vec<eval::DisplayOutput> = serde_json::from_value(
+		value
+			.get("display_outputs")
+			.cloned()
+			.unwrap_or_else(|| Value::Array(Vec::new())),
+	)?;
+	let payload = eval::Payload {
+		session_id: Bytes::new(),
+		cell_id: Bytes::new(),
+		language: eval::Language::Py,
+		title: args
+			.get("title")
+			.and_then(Value::as_str)
+			.map(Str::new),
+		code: Str::new(
+			args
+				.get("code")
+				.and_then(Value::as_str)
+				.unwrap_or_default(),
+		),
+		reset: false,
+		had_output: !frames.is_empty(),
+		result: None,
+		display_outputs,
+		status,
+	};
+	Ok((payload, frames))
 }
 
 /// Wraps a fixture payload in the `CallOutcome` envelope the kernel journals
@@ -242,15 +432,28 @@ fn raw_parts(parts: Vec<Part>) -> Result<Box<RawValue>, serde_json::Error> {
 }
 
 /// Produces the exact typed durable shape used by the live tool, rather than
-/// letting an old gallery-only object masquerade as the payload.
+/// letting an old gallery-only object masquerade as the payload, plus the
+/// ordered output the tool streamed before settling it.
 fn fixture_payload(
 	tool: &str,
 	args: &str,
 	text: &str,
-) -> Result<serde_json::Value, serde_json::Error> {
+) -> Result<(serde_json::Value, Vec<OutputFrame>), serde_json::Error> {
 	let value: serde_json::Value = serde_json::from_str(text)?;
 	let args: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
-	Ok(match tool {
+	match tool {
+		"bash" => {
+			let payload = shell_payload(&args, &value);
+			let frames = shell_frames(&payload);
+			return Ok((serde_json::to_value(payload)?, frames));
+		},
+		"eval" => {
+			let (payload, frames) = eval_payload(&args, &value)?;
+			return Ok((serde_json::to_value(payload)?, frames));
+		},
+		_ => {},
+	}
+	let payload = match tool {
 		"hub" => serde_json::json!({ "text": serde_json::to_string(&value)?, "useless": false }),
 		"web_search" => {
 			let mut response = value.as_object().cloned().unwrap_or_default();
@@ -592,13 +795,6 @@ fn fixture_payload(
 				"items": items
 			})
 		},
-		"read" => {
-			let text = value
-				.get("preview_text")
-				.and_then(serde_json::Value::as_str)
-				.unwrap_or_default();
-			serde_json::json!({ "parts": [{ "kind": "text", "text": text }] })
-		},
 		"write" => {
 			let path = args
 				.get("path")
@@ -622,20 +818,39 @@ fn fixture_payload(
 			})
 		},
 		_ => value,
-	})
+	};
+	Ok((payload, Vec::new()))
 }
 
-fn fixture_fault(tool: &str, value: serde_json::Value) -> serde_json::Value {
-	if tool != "web_search" {
-		return value;
+/// Produces the exact typed fault the live tool journals from a readable
+/// fixture fault.
+fn fixture_fault(tool: &str, args: &str, value: serde_json::Value) -> serde_json::Value {
+	let args: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
+	match tool {
+		// `{"kind":"command_failed","payload":{"transcript":…,"status":…}}`:
+		// a non-zero exit is `Fault::CommandFailed` carrying the complete
+		// transcript and status, never a bare message.
+		"bash" if value.get("kind").and_then(Value::as_str) == Some("command_failed") => {
+			let payload = shell_payload(&args, value.get("payload").unwrap_or(&Value::Null));
+			serde_json::to_value(shell::Fault::CommandFailed { payload: Box::new(payload) })
+				.expect("shell fault serializes")
+		},
+		"web_search" => {
+			let message = value
+				.get("message")
+				.or_else(|| value.get("error"))
+				.and_then(Value::as_str)
+				.or_else(|| value.as_str())
+				.unwrap_or("search failed");
+			serde_json::json!({
+				"kind": "search",
+				"provider": value.get("provider").cloned(),
+				"code": "gallery",
+				"message": message
+			})
+		},
+		_ => value,
 	}
-	let message = value
-		.get("message")
-		.or_else(|| value.get("error"))
-		.and_then(Value::as_str)
-		.or_else(|| value.as_str())
-		.unwrap_or("search failed");
-	serde_json::json!({ "kind": "search", "code": "gallery", "message": message })
 }
 
 /// Model-facing parts are persisted beside the outcome exactly as production
@@ -643,16 +858,42 @@ fn fixture_fault(tool: &str, value: serde_json::Value) -> serde_json::Value {
 /// typed outcome; wrapper tools explicitly unwrap their projection contract.
 fn projected_parts(tool: &str, value: &serde_json::Value) -> Result<Vec<Part>, serde_json::Error> {
 	let text = match tool {
+		// `Response::text` for a settled call, `Fault::message` for a fault.
 		"hub" => value
 			.get("text")
+			.or_else(|| value.get("message"))
 			.and_then(Value::as_str)
 			.unwrap_or_default()
 			.to_owned(),
-		"bash" | "eval" => value
-			.get("_projection")
-			.and_then(Value::as_str)
-			.unwrap_or_default()
-			.to_owned(),
+		"bash" => serde_json::from_value::<shell::Payload>(value.clone())
+			.ok()
+			.or_else(|| {
+				serde_json::from_value::<shell::Fault>(value.clone())
+					.ok()
+					.and_then(|fault| match fault {
+						shell::Fault::CommandFailed { payload } => Some(*payload),
+						_ => None,
+					})
+			})
+			.map(|payload| {
+				payload
+					.transcript
+					.iter()
+					.map(|frame| String::from_utf8_lossy(frame.data.as_ref()).into_owned())
+					.collect::<String>()
+			})
+			.unwrap_or_default(),
+		"eval" => value
+			.pointer("/status/exception/traceback")
+			.and_then(Value::as_array)
+			.map(|lines| {
+				lines
+					.iter()
+					.filter_map(Value::as_str)
+					.collect::<Vec<_>>()
+					.join("\n")
+			})
+			.unwrap_or_default(),
 		"web_search" => web_projection(value.pointer("/response").unwrap_or(&Value::Null)),
 		"task" => value
 			.get("children")

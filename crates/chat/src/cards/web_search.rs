@@ -25,9 +25,19 @@ impl Card for WebSearchCard {
 			.and_then(Value::as_str)
 			.unwrap_or_default();
 		if view.status == CardStatus::Failed {
+			let fault = view.fault::<omp_tools::web_search::Fault>();
+			let provider = fault
+				.as_ref()
+				.and_then(|fault| serde_json::to_value(fault).ok())
+				.and_then(|value| value.get("provider").and_then(Value::as_str).map(provider_name))
+				.filter(|provider| !provider.is_empty());
 			let error = typed_fault::<omp_tools::web_search::Fault>(view)
 				.unwrap_or_else(|| omp_core::Str::new_static("search failed"));
-			let title = format!("{} Web Search", ui.charset.icon_named("error").unwrap_or_default());
+			let title = format!(
+				"{} Web Search{}",
+				ui.charset.icon_named("error").unwrap_or_default(),
+				provider.map_or_else(String::new, |provider| format!(": {provider}")),
+			);
 			return dom! { <box border=round title={title} title_pad=3 pad="0 1"><text>{format!("Error: {error}")}</text></box> }.into_component();
 		}
 		let Some(_typed) = typed_result::<omp_tools::web_search::Payload>(view) else {

@@ -6,7 +6,8 @@ use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
 use super::{
-	Card, CardStatus, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result,
+	Card, CardStatus, CardView, Component, elapsed_badge, path_language_icon, typed_fault,
+	typed_input, typed_result,
 };
 
 /// Card for `glob` calls.
@@ -79,7 +80,7 @@ fn render_done(view: &CardView<'_>, query: &str, expanded: bool) -> Component {
 				for (index, file) in files.iter().take(shown).enumerate() {
 					<row gap=1>
 						if index + 1 == shown && hidden == 0 { <i:tree-last/> } else { <i:tree-branch/> }
-						<i:typescript/><text>{file_path(file)}</text>
+						<icon name={path_language_icon(file_path(file))}/><text>{file_path(file)}</text>
 					</row>
 				}
 				if hidden > 0 {

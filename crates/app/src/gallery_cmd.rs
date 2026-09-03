@@ -99,17 +99,17 @@ fn run_tool(args: &GalleryArgs) -> miette::Result<()> {
 		}
 		return Ok(());
 	}
+	// Pi's block layout: a leading blank and the section rule per tool, then a
+	// blank, the dim state label, and the card frame per lifecycle state.
 	let mut current = None;
 	for section in sections {
 		if current != Some(section.tool) {
-			if current.is_some() {
-				println!();
-			}
-			println!("{}", section_rule(&section, width));
 			println!();
+			println!("{}", section_rule(&section, width));
 			current = Some(section.tool);
 		}
-		println!("  · {}", section.state.label());
+		println!();
+		println!("  · {}", section.state);
 		println!(
 			"{}",
 			if args.plain || (!args.ansi && !io::stdout().is_terminal()) {
@@ -119,6 +119,7 @@ fn run_tool(args: &GalleryArgs) -> miette::Result<()> {
 			}
 		);
 	}
+	println!();
 	Ok(())
 }
 

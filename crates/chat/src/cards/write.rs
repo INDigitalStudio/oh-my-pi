@@ -6,7 +6,8 @@ use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
 use super::{
-	Card, CardStatus, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result,
+	Card, CardStatus, CardView, Component, elapsed_badge, path_language_icon, typed_fault,
+	typed_input, typed_result,
 };
 
 /// Card for `write` calls.
@@ -55,7 +56,7 @@ fn render_streaming(path: &str, content: &str, expanded: bool, ui: &UiContext) -
 	if !content.is_empty() {
 		body.push_str(&number_segments(content.split('\n').skip(start), start + 1));
 	}
-	let title = sf!("Write: {} {path}", icon(ui, "typescript"));
+	let title = sf!("Write: {} {path}", icon(ui, path_language_icon(path)));
 	dom! {
 		<box border=round title={title} title_pad=3>
 			if !body.is_empty() { <pre pad-x=1>{body}</pre> }
@@ -75,20 +76,11 @@ fn render_progress(
 	expanded: bool,
 	ui: &UiContext,
 ) -> Component {
-	let lines: Vec<&str> = content.lines().collect();
-	let full = number_lines(&lines.join("\n"), 1);
+	let lines = segments(content);
+	let full = Str::new(number_segments(lines.iter().copied(), 1));
 	let skipped = lines.len().saturating_sub(12);
-	let middle = number_lines(
-		&lines
-			.iter()
-			.skip(skipped)
-			.copied()
-			.collect::<Vec<_>>()
-			.join("\n"),
-		skipped + 1,
-	);
-	let line_count = lines.len();
-	let title = sf!("Write: {} {path}", icon(ui, "typescript"));
+	let middle = Str::new(number_segments(lines.iter().skip(skipped).copied(), skipped + 1));
+	let title = sf!("Write: {} {path}", icon(ui, path_language_icon(path)));
 	dom! {
 		<box border=round title_pad=3>
 			<row kind=title gap=1 bold>
@@ -97,11 +89,9 @@ fn render_progress(
 			</row>
 			if expanded {
 				<pre pad-x=1>{full}</pre>
-				<row pad-x=2><text fg=muted>{sf!("{line_count}")}</text></row>
 			} else {
 				if skipped > 0 { <row pad-x=1><text fg=muted>{sf!("… ({skipped} earlier lines)")}</text></row> }
 				<pre pad-x=1>{middle}</pre>
-				<row pad-x=2><text fg=muted>{sf!("{line_count}")}</text></row>
 			}
 			<row pad-x=1><text fg=muted>{"… (streaming)"}</text></row>
 		</box>
@@ -117,17 +107,19 @@ fn render_done(
 	ui: &UiContext,
 ) -> Component {
 	let _result = typed_result::<omp_tools::write::Payload>(view).unwrap_or(Value::Null);
-	let lines: Vec<&str> = content.lines().collect();
+	let lines = segments(content);
 	let line_count = lines.len();
-	let full = number_lines(&lines.join("\n"), 1);
-	let head = number_lines(&lines.iter().take(6).copied().collect::<Vec<_>>().join("\n"), 1);
-	let title =
-		sf!("{} Write: {} {path} · {line_count} lines", icon(ui, "write"), icon(ui, "typescript"));
+	let full = Str::new(number_segments(lines.iter().copied(), 1));
+	let head = Str::new(number_segments(lines.iter().take(6).copied(), 1));
+	let title = sf!(
+		"{} Write: {} {path} · {line_count} lines",
+		icon(ui, "write"),
+		icon(ui, path_language_icon(path))
+	);
 	dom! {
 		<box border=round title={title} title_pad=3>
 			if expanded {
 				<pre pad-x=1>{full}</pre>
-				<row pad-x=2><text fg=muted>{sf!("{line_count}")}</text></row>
 			} else {
 				<pre pad-x=1>{head}</pre>
 				if line_count > 6 {
@@ -143,7 +135,7 @@ fn render_failed(view: &CardView<'_>, path: &str, ui: &UiContext) -> Component {
 	let fault = typed_fault::<omp_tools::write::Fault>(view)
 		.or_else(|| diag_text(view.diag))
 		.unwrap_or_else(|| Str::new_static("write failed"));
-	let title = sf!("{} Write: {} {path}", icon(ui, "error"), icon(ui, "typescript"));
+	let title = sf!("{} Write: {} {path}", icon(ui, "error"), icon(ui, path_language_icon(path)));
 	dom! {
 		<box border=round bc=err title={title} title_pad=3>
 			<text pad-x=3 fg=err wrap=word>{fault}</text>
@@ -152,8 +144,14 @@ fn render_failed(view: &CardView<'_>, path: &str, ui: &UiContext) -> Component {
 	.into_component()
 }
 
-fn number_lines(text: &str, start: usize) -> Str {
-	Str::new(number_segments(text.lines(), start))
+/// pi `countLines` / `normalizeDisplayText(content).split("\n")`: every
+/// newline-delimited segment, so a trailing newline yields a final empty
+/// numbered row and counts as a line; empty content has none.
+fn segments(content: &str) -> Vec<&str> {
+	if content.is_empty() {
+		return Vec::new();
+	}
+	content.split('\n').collect()
 }
 
 fn number_segments<'a>(lines: impl Iterator<Item = &'a str>, start: usize) -> String {

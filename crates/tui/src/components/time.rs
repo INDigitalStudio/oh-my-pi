@@ -16,6 +16,7 @@ const SECOND_MS: u64 = 1_000;
 const MINUTE_MS: u64 = 60 * SECOND_MS;
 const HOUR_MS: u64 = 60 * MINUTE_MS;
 const DAY_MS: u64 = 24 * HOUR_MS;
+const WEEK_MS: u64 = 7 * DAY_MS;
 const MONTH_MS: u64 = 30 * DAY_MS;
 const YEAR_MS: u64 = 365 * DAY_MS;
 
@@ -40,6 +41,8 @@ enum RelativeUnit {
 	Hour,
 	#[strum(serialize = "d")]
 	Day,
+	#[strum(serialize = "w")]
+	Week,
 	#[strum(serialize = "mo")]
 	Month,
 	#[strum(serialize = "y")]
@@ -210,8 +213,10 @@ fn relative_parts(age: u64) -> (RelativeUnit, u64, u64) {
 		(RelativeUnit::Minute, age / MINUTE_MS, MINUTE_MS)
 	} else if age < DAY_MS {
 		(RelativeUnit::Hour, age / HOUR_MS, HOUR_MS)
-	} else if age < MONTH_MS {
+	} else if age < WEEK_MS {
 		(RelativeUnit::Day, age / DAY_MS, DAY_MS)
+	} else if age < MONTH_MS {
+		(RelativeUnit::Week, age / WEEK_MS, WEEK_MS)
 	} else if age < YEAR_MS {
 		(RelativeUnit::Month, age / MONTH_MS, MONTH_MS)
 	} else {

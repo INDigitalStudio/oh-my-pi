@@ -134,7 +134,7 @@ impl Card for BashCard {
 					<col pad-x=1>
 						if let Some((marker, lines)) = settled {
 							if let Some(marker) = marker { <text fg=muted truncate>{marker}</text> }
-							<pre>{lines}</pre>
+							<text wrap=word>{lines}</text>
 						}
 						if let Some(message) = fault {
 							<pre>{message}</pre>

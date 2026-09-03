@@ -20,7 +20,11 @@ use omp_tui::{
 };
 
 use super::{Panel, PanelAction, PanelAnchor, PanelEvent};
-use crate::{cards::Component, markdown::extract_links};
+use crate::{
+	cards::Component,
+	markdown::extract_links,
+	notices::divider::{SummaryDivider, turn_compactions},
+};
 
 /// Rows the frame chrome occupies: top rule, header, rule, footer hint,
 /// bottom rule.
@@ -80,6 +84,15 @@ enum Segment {
 		name: Option<Str>,
 		body: Str,
 	},
+	/// A custom-rendered notice (`advisor`, `diagnostics`, `tangent`): its
+	/// card title over the text the card carries, lines preserved.
+	Notice {
+		title: Str,
+		body:  Str,
+	},
+	/// A history-collapse divider (`<compaction>`), drawn expanded so the
+	/// summary it would copy is in view.
+	Summary(SummaryDivider),
 }
 
 /// One selectable transcript message (pi `OutlineTarget`): a user prompt,
@@ -393,6 +406,65 @@ fn segment_view(segment: &Segment, expanded: bool) -> Component {
 			}
 			.into_component()
 		},
+		Segment::Notice { title, body } => {
+			let title = title.clone();
+			let body = body.clone();
+			dom! {
+				<col pad-x=1>
+					<text bold fg=accent>{title}</text>
+					if !body.is_empty() { <pre>{body}</pre> }
+				</col>
+			}
+			.into_component()
+		},
+		Segment::Summary(divider) => divider.clone().into_component(),
+	}
+}
+
+/// pi `targetCopy` `custom` for the notices omp renders with their own
+/// cards (`advisor`, `diagnostics`, `tangent`): the card title and the text
+/// the card shows, which is what lands on the clipboard. `None` for the
+/// controller kinds (`error | warn | info | success`), which pi skips.
+fn notice_copy(kind: &str, node: &Node) -> Option<(Str, Str)> {
+	let content = node.content.as_deref().unwrap_or_default().trim();
+	match kind {
+		"advisor" => {
+			let mut body = StrMut::new("");
+			if let Some(summary) = prop_text(node, PropId::Label) {
+				body.push_str(summary.as_str().trim());
+			}
+			if !content.is_empty() {
+				if !body.is_empty() {
+					body.push_str("\n");
+				}
+				body.push_str(content);
+			}
+			let title = match prop_text(node, PropId::Severity) {
+				Some(severity) => sf!("Advisor [{severity}]"),
+				None => Str::new_static("Advisor"),
+			};
+			Some((title, body.freeze()))
+		},
+		"diagnostics" => {
+			let title = match prop_text(node, PropId::Name) {
+				Some(server) => sf!("Late diagnostics · {server}"),
+				None => Str::new_static("Late diagnostics"),
+			};
+			Some((title, Str::new(content)))
+		},
+		"tangent" => {
+			let body = if content.is_empty() {
+				let id = prop_text(node, PropId::Id).unwrap_or_else(|| Str::new_static("unknown"));
+				match prop_text(node, PropId::Label) {
+					Some(work) => sf!("Tangent dispatched [task] {id} — {work}"),
+					None => sf!("Tangent dispatched [task] {id}"),
+				}
+			} else {
+				Str::new(content)
+			};
+			Some((Str::new_static("Tangent"), body))
+		},
+		_ => None,
 	}
 }
 
@@ -530,8 +602,10 @@ impl Panel for CopySelector {
 	}
 }
 
-/// Walks the replica into pi's outline targets: every user prompt, and
-/// every assistant message with the tool results it folded.
+/// Walks the replica into pi's outline targets: every user prompt, every
+/// assistant message with the tool results it folded, every displayed
+/// notice (`message`), and every history-collapse divider (`summary`)
+/// after the turn holding its boundary.
 #[must_use]
 pub fn collect_targets(dom: &Dom, show_thinking: bool) -> Vec<CopyTarget> {
 	let mut targets = Vec::new();
@@ -603,6 +677,28 @@ pub fn collect_targets(dom: &Dom, show_thinking: bool) -> Vec<CopyTarget> {
 						segments: vec![Segment::Message { name: prop_text(node, PropId::Name), body }],
 					});
 				},
+				// pi `custom` messages with their own cards (advisor notes,
+				// late diagnostics, `/tan` breadcrumbs): outline targets
+				// labeled `message` whose clipboard text is the card's text.
+				Tag::Known(KnownTag::Notice) => {
+					let Some((title, body)) = prop_text(node, PropId::Kind)
+						.and_then(|kind| notice_copy(kind.as_str(), node))
+					else {
+						continue;
+					};
+					if body.trim().is_empty() {
+						continue;
+					}
+					targets.extend(open.take());
+					let mut blocks = Vec::new();
+					push_markdown_blocks(&mut blocks, body.as_str());
+					targets.push(CopyTarget {
+						label: Str::new_static("message"),
+						content: body.clone(),
+						blocks,
+						segments: vec![Segment::Notice { title, body }],
+					});
+				},
 				Tag::Custom(tool) => {
 					let Some(input) = child(dom, *handle, KnownTag::Input) else {
 						continue;
@@ -642,6 +738,23 @@ pub fn collect_targets(dom: &Dom, show_thinking: bool) -> Vec<CopyTarget> {
 			}
 		}
 		targets.extend(open.take());
+		// pi `targetCopy` `compactionSummary | branchSummary`: the divider
+		// after the turn is its own target, copying the raw summary.
+		for compaction in turn_compactions(dom, *turn) {
+			let Some(node) = dom.get(compaction) else {
+				continue;
+			};
+			let summary = prop_text(node, PropId::Summary).unwrap_or_default();
+			if summary.trim().is_empty() {
+				continue;
+			}
+			targets.push(CopyTarget {
+				label:    Str::new_static("summary"),
+				content:  summary,
+				blocks:   Vec::new(),
+				segments: vec![Segment::Summary(SummaryDivider::compaction(node, true))],
+			});
+		}
 	}
 	for target in &mut targets {
 		if target.content.is_empty() {
@@ -829,9 +942,11 @@ fn push_markdown_blocks(blocks: &mut Vec<CopyBlock>, text: &str) {
 	}
 }
 
-/// pi `extractBlocks`: fenced code blocks and blockquotes, in order.
+/// pi `extractBlocks`: fenced code blocks and blockquotes, in order. A
+/// fence masks its body (a `>` line inside code is never a quote); an
+/// unclosed fence is ordinary text, matching the fenced-block grammar.
 fn push_code_and_quotes(blocks: &mut Vec<CopyBlock>, text: &str) {
-	let mut fence: Option<(Str, StrMut)> = None;
+	let lines: Vec<&str> = text.lines().collect();
 	let mut quote: Option<StrMut> = None;
 	let flush_quote = |quote: &mut Option<StrMut>, blocks: &mut Vec<CopyBlock>| {
 		if let Some(quote) = quote.take() {
@@ -846,32 +961,29 @@ fn push_code_and_quotes(blocks: &mut Vec<CopyBlock>, text: &str) {
 			}
 		}
 	};
-	for line in text.lines() {
-		if let Some((language, body)) = fence.as_mut() {
-			if line.trim_start().starts_with("```") {
-				let code = Str::new(body.as_str().trim_end_matches('\n'));
-				let label = if language.is_empty() {
-					Str::new_static("code")
-				} else {
-					sf!("{language} code")
-				};
-				blocks.push(CopyBlock {
-					label,
-					content: code,
-					language: (!language.is_empty()).then(|| language.clone()),
-					href: None,
-				});
-				fence = None;
-			} else {
-				body.push_str(line);
-				body.push_str("\n");
-			}
-			continue;
-		}
-		if let Some(rest) = line.trim_start().strip_prefix("```") {
+	let mut index = 0;
+	while index < lines.len() {
+		let line = lines[index];
+		index += 1;
+		if let Some(rest) = line.trim_start().strip_prefix("```")
+			&& let Some(close) = lines[index..]
+				.iter()
+				.position(|line| line.trim_start().starts_with("```"))
+		{
 			flush_quote(&mut quote, blocks);
 			let language = rest.trim().split_whitespace().next().unwrap_or_default();
-			fence = Some((Str::new(language), StrMut::new("")));
+			let label = if language.is_empty() {
+				Str::new_static("code")
+			} else {
+				sf!("{language} code")
+			};
+			blocks.push(CopyBlock {
+				label,
+				content: Str::new(lines[index..index + close].join("\n")),
+				language: (!language.is_empty()).then(|| Str::new(language)),
+				href: None,
+			});
+			index += close + 1;
 			continue;
 		}
 		if let Some(rest) = line.trim_start().strip_prefix('>') {
@@ -883,22 +995,6 @@ fn push_code_and_quotes(blocks: &mut Vec<CopyBlock>, text: &str) {
 		flush_quote(&mut quote, blocks);
 	}
 	flush_quote(&mut quote, blocks);
-	if let Some((language, body)) = fence {
-		let code = Str::new(body.as_str().trim_end_matches('\n'));
-		if !code.is_empty() {
-			let label = if language.is_empty() {
-				Str::new_static("code")
-			} else {
-				sf!("{language} code")
-			};
-			blocks.push(CopyBlock {
-				label,
-				content: code,
-				language: (!language.is_empty()).then(|| language),
-				href: None,
-			});
-		}
-	}
 }
 
 fn child<'a>(dom: &'a Dom, parent: omp_dom::Handle, tag: KnownTag) -> Option<&'a Node> {
@@ -1174,6 +1270,133 @@ mod tests {
 			crate::markdown::last_link(session.dom()).map(|link| link.href),
 			Some(Str::new_static("https://plain.example/"))
 		);
+	}
+
+	/// pi `targetCopy` `compactionSummary | branchSummary` → `summary` and
+	/// `custom` (advisor, late diagnostics, `/tan`) → `message`: every
+	/// displayed transcript entry is an outline target the picker can reach
+	/// and copy, in transcript order (the divider lands after its turn).
+	#[test]
+	fn summary_dividers_and_custom_notices_are_copy_targets() {
+		use omp_dom::{NodeSpec, Op, Txn};
+		use omp_journal::{blob::BlobStore, data::Compaction};
+
+		let directory = tempfile::tempdir().expect("temp directory");
+		let store = BlobStore::open(directory.path()).expect("blob store");
+		let summary = store.put(b"Earlier: wired the parser.").expect("summary blob");
+		let mut session = Session::create(directory.path().join("copy.oms"), ComponentRegistry::standard())
+			.expect("session");
+		session.begin_turn().expect("turn one");
+		session.user("first", Vec::new()).expect("user one");
+		let boundary = session
+			.receipt(omp_journal::data::TurnReceipt::tokens(12, 7, 0))
+			.expect("receipt");
+		session.begin_turn().expect("turn two");
+		session.user("second", Vec::new()).expect("user two");
+		session
+			.compaction(Compaction {
+				summary,
+				boundary,
+				method: Some(Str::new_static("remote")),
+				tokens_before: Some(256_000),
+				tokens_after: Some(20_000),
+				warning: None,
+			})
+			.expect("compaction");
+		let mut notice = |kind: &'static str, props: &[(PropId, &str)], content: Option<&str>| {
+			let turn = *session
+				.dom()
+				.children(session.dom().body())
+				.last()
+				.expect("turn");
+			let mut node =
+				NodeSpec::new(KnownTag::Notice).with_prop(PropId::Kind, Value::Str(Str::new_static(kind)));
+			for (prop, value) in props {
+				node = node.with_prop(*prop, Value::Str(Str::new(*value)));
+			}
+			if let Some(content) = content {
+				node = node.with_content(Str::new(content));
+			}
+			session
+				.patch(Txn {
+					cause: session.head().expect("head"),
+					label: Some(Str::new_static("kernel.notice")),
+					ops:   vec![Op::Ins {
+						parent: turn,
+						after:  session.dom().children(turn).last().copied(),
+						node,
+					}],
+				})
+				.expect("notice");
+		};
+		notice(
+			"advisor",
+			&[(PropId::Severity, "concern"), (PropId::Label, "Tests are missing")],
+			Some("The parser change has no coverage.\nSee [the plan](https://example.com/plan)."),
+		);
+		notice(
+			"diagnostics",
+			&[(PropId::Name, "rust-analyzer")],
+			Some("src/lib.rs:3:5 [error] unused variable"),
+		);
+		notice("tangent", &[(PropId::Id, "tan-1"), (PropId::Label, "check the docs")], None);
+		notice("info", &[], Some("controller chatter pi never lists"));
+
+		let targets = collect_targets(session.dom(), false);
+		let labels = targets
+			.iter()
+			.map(|target| target.label.as_str())
+			.collect::<Vec<_>>();
+		assert_eq!(
+			labels,
+			["user message", "summary", "user message", "message", "message", "message"],
+			"{targets:#?}"
+		);
+		assert_eq!(targets[1].content, "Earlier: wired the parser.", "raw summary, as pi copies it");
+		assert!(targets[1].blocks.is_empty());
+		assert_eq!(
+			targets[3].content,
+			"Tests are missing\nThe parser change has no coverage.\nSee [the plan](https://example.com/plan)."
+		);
+		assert_eq!(
+			targets[3].blocks.iter().filter_map(|block| block.href.as_deref()).collect::<Vec<_>>(),
+			["https://example.com/plan"],
+			"links in a note stay reachable through the picker and /copy link"
+		);
+		assert_eq!(targets[4].content, "src/lib.rs:3:5 [error] unused variable");
+		assert_eq!(targets[5].content, "Tangent dispatched [task] tan-1 — check the docs");
+
+		let mut picker = CopySelector::open(session.dom(), false, &UiContext::default());
+		for _ in 0..4 {
+			assert_eq!(picker.key(Key::Up), PanelEvent::Consumed);
+		}
+		let text = frame_text(picker.frame(Size::new(80, 40)));
+		assert!(text.contains("remote-compacted · 256K→20K"), "the divider is previewed:\n{text}");
+		assert!(text.contains("Earlier: wired the parser."), "expanded so its summary shows:\n{text}");
+		assert_eq!(
+			picker.key(Key::Enter),
+			PanelEvent::Copy(Str::new_static("Earlier: wired the parser.")),
+			"enter copies the outlined summary"
+		);
+	}
+
+	/// pi `extractBlocks`: an unclosed fence is ordinary text — no phantom
+	/// code block, and a `>` line after it is still a quote.
+	#[test]
+	fn unclosed_fence_is_ordinary_text() {
+		let mut blocks = Vec::new();
+		push_markdown_blocks(&mut blocks, "Run this:\n```sh\necho pong\n> quoted after");
+		assert_eq!(
+			blocks
+				.iter()
+				.map(|block| (block.label.as_str(), block.content.as_str()))
+				.collect::<Vec<_>>(),
+			[("quote", "quoted after")]
+		);
+		let mut blocks = Vec::new();
+		push_markdown_blocks(&mut blocks, "```py\nx = 1\n```\n```\nnever closed");
+		assert_eq!(blocks.len(), 1, "a closed fence still extracts; the open tail does not: {blocks:?}");
+		assert_eq!(blocks[0].content, "x = 1");
 	}
 
 	#[test]

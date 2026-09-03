@@ -204,6 +204,181 @@ async fn rpc_reader_dispatches_cancel_while_turn_is_pending() {
 	assert_eq!(terminal[0]["cancelled"], true);
 }
 
+/// Runs one scripted RPC conversation: `initial` is written up front; every
+/// `agent_end` frame is answered by the next request in `after_turns` (the
+/// last one should quit). Returns every frame the server emitted.
+async fn converse(
+	temp: &tempfile::TempDir,
+	scripts: VecDeque<Script>,
+	initial: &'static str,
+	after_turns: &'static [&'static str],
+) -> Vec<Value> {
+	let kernel = scripted_kernel(temp, scripts);
+	let home = session_home(temp, &kernel);
+	let session =
+		Session::create(temp.path().join("rpc.oms"), ComponentRegistry::standard()).expect("session");
+	let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+	let (server_read, server_write) = tokio::io::split(server_io);
+	let server =
+		omp_app::rpc_mode::serve_rpc(kernel, session, home, None, server_read, server_write);
+	let client = async move {
+		let (client_read, mut client_write) = tokio::io::split(client_io);
+		client_write
+			.write_all(initial.as_bytes())
+			.await
+			.expect("initial requests");
+		let mut lines = BufReader::new(client_read).lines();
+		let mut frames = Vec::<Value>::new();
+		let mut pending = after_turns.iter();
+		while let Some(line) = lines.next_line().await.expect("response") {
+			let frame: Value = serde_json::from_str(&line).expect("json response");
+			let terminal = frame["type"] == "agent_end";
+			frames.push(frame);
+			if terminal && let Some(request) = pending.next() {
+				client_write
+					.write_all(request.as_bytes())
+					.await
+					.expect("follow-on request");
+				if pending.as_slice().is_empty() {
+					client_write.shutdown().await.expect("shutdown");
+				}
+			}
+		}
+		frames
+	};
+	let (server, frames) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+		tokio::join!(server, client)
+	})
+	.await
+	.expect("RPC conversation must settle");
+	server.expect("server");
+	frames
+}
+
+fn agent_ends(frames: &[Value]) -> Vec<&Value> {
+	frames
+		.iter()
+		.filter(|frame| frame["type"] == "agent_end")
+		.collect()
+}
+
+fn response<'a>(frames: &'a [Value], id: &str) -> &'a Value {
+	frames
+		.iter()
+		.find(|frame| frame["type"] == "response" && frame["id"] == id)
+		.unwrap_or_else(|| panic!("missing response {id}: {frames:#?}"))
+}
+
+/// pi `follow_up`: behind a running turn the message is queued (not
+/// steering) and runs as its own turn once the agent yields; idle, it runs
+/// immediately. Each follow-up produces a `turn_start` and one `agent_end`.
+#[tokio::test]
+async fn rpc_follow_up_runs_after_the_turn_yields_and_immediately_when_idle() {
+	let temp = tempfile::tempdir().expect("tempdir");
+	let frames = converse(
+		&temp,
+		VecDeque::from([
+			Script::Pending,
+			completed_script("second"),
+			completed_script("third"),
+		]),
+		"{\"id\":\"prompt\",\"type\":\"prompt\",\"message\":\"wait\"}\n{\"id\":\"queue\",\"type\":\"\
+		 follow_up\",\"message\":\"later\"}\n{\"id\":\"abort\",\"type\":\"abort\"}\n",
+		&[
+			"",
+			"{\"id\":\"idle\",\"type\":\"follow_up\",\"message\":\"now\"}\n",
+			"{\"id\":\"quit\",\"type\":\"quit\"}\n",
+		],
+	)
+	.await;
+	let queued = response(&frames, "queue");
+	assert_eq!(queued["success"], true);
+	assert_eq!(queued["data"]["queued"], true, "behind a turn the follow-up is queued");
+	let idle = response(&frames, "idle");
+	assert_eq!(idle["success"], true);
+	assert_eq!(idle["data"]["queued"], false, "idle, the follow-up runs at once");
+	let ends = agent_ends(&frames);
+	assert_eq!(ends.len(), 3, "aborted prompt, queued follow-up, idle follow-up: {frames:#?}");
+	assert_eq!(ends[0]["cancelled"], true);
+	assert_eq!(ends[1]["text"], "second");
+	assert_eq!(ends[2]["text"], "third");
+	assert_eq!(
+		frames
+			.iter()
+			.filter(|frame| frame["type"] == "turn_start")
+			.count(),
+		3,
+		"every started turn announces itself"
+	);
+	// The queued follow-up was journaled as `<prompt kind=queued>` and popped
+	// (`sent`) rather than injected as steering.
+	let session = Session::open(temp.path().join("rpc.oms"), ComponentRegistry::standard())
+		.expect("journal reopens");
+	let dom = session.dom();
+	let prompts = omp_session::components::prompts::prompts_handle(dom).expect("prompt queue");
+	let statuses: Vec<_> = dom
+		.children(prompts)
+		.iter()
+		.filter_map(|handle| dom.get(*handle))
+		.filter_map(|node| {
+			node
+				.prop(&omp_dom::PropKey::from(omp_dom::PropId::Status))
+				.and_then(omp_dom::Value::as_str)
+				.map(str::to_owned)
+		})
+		.collect();
+	assert_eq!(statuses, ["sent"]);
+}
+
+/// pi `abort_and_prompt`: the running turn is interrupted and the new prompt
+/// starts as soon as the session comes back, ahead of anything queued.
+#[tokio::test]
+async fn rpc_abort_and_prompt_interrupts_then_starts_the_new_turn() {
+	let temp = tempfile::tempdir().expect("tempdir");
+	let frames = converse(
+		&temp,
+		VecDeque::from([Script::Pending, completed_script("replacement")]),
+		"{\"id\":\"prompt\",\"type\":\"prompt\",\"message\":\"wait\"}\n{\"id\":\"swap\",\"type\":\"\
+		 abort_and_prompt\",\"message\":\"instead\"}\n",
+		&["", "{\"id\":\"quit\",\"type\":\"quit\"}\n"],
+	)
+	.await;
+	assert_eq!(response(&frames, "swap")["success"], true);
+	let ends = agent_ends(&frames);
+	assert_eq!(ends.len(), 2, "{frames:#?}");
+	assert_eq!(ends[0]["cancelled"], true);
+	assert_eq!(ends[1]["text"], "replacement");
+	assert_eq!(ends[1]["cancelled"], false);
+}
+
+/// pi answers `get_state` while streaming; the actor's replica serves the
+/// tree even though the running turn owns the session.
+#[tokio::test]
+async fn rpc_get_state_answers_while_a_turn_is_running() {
+	let temp = tempfile::tempdir().expect("tempdir");
+	let frames = converse(
+		&temp,
+		VecDeque::from([Script::Pending]),
+		"{\"id\":\"prompt\",\"type\":\"prompt\",\"message\":\"wait\"}\n{\"id\":\"state\",\"type\":\"\
+		 get_state\"}\n{\"id\":\"abort\",\"type\":\"abort\"}\n",
+		&["{\"id\":\"quit\",\"type\":\"quit\"}\n"],
+	)
+	.await;
+	let state = response(&frames, "state");
+	assert_eq!(state["success"], true, "get_state must not report SESSION_BUSY: {state}");
+	assert!(state["data"].is_object(), "state carries the session snapshot: {state}");
+	let position = |id: &str| {
+		frames
+			.iter()
+			.position(|frame| frame["type"] == "response" && frame["id"] == id)
+			.expect("response order")
+	};
+	assert!(
+		position("state") < position("abort"),
+		"the state answer arrives while the turn is still running"
+	);
+}
+
 #[tokio::test]
 async fn rpc_v2_reassembles_large_requests_and_chunks_large_responses() {
 	let temp = tempfile::tempdir().expect("tempdir");

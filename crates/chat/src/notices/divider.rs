@@ -73,7 +73,7 @@ impl Method {
 }
 
 /// One history-collapse banner and its `ctrl+o` detail.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SummaryDivider {
 	/// Theme icon name painted before the label.
 	pub icon:     &'static str,
@@ -220,6 +220,20 @@ fn handoff_document(text: &str) -> &str {
 /// after `turn`'s id and before the following turn's id.
 #[must_use]
 pub fn compaction_dividers(dom: &Dom, turn: Handle, expanded: bool) -> Vec<(Handle, Component)> {
+	turn_compactions(dom, turn)
+		.into_iter()
+		.filter_map(|handle| {
+			let node = dom.get(handle)?;
+			Some((handle, SummaryDivider::compaction(node, expanded).into_component()))
+		})
+		.collect()
+}
+
+/// Handles of every `<compaction>` under `<meta>` whose boundary entry was
+/// journaled inside `turn` (the attribution rule of
+/// [`compaction_dividers`]), in meta order.
+#[must_use]
+pub fn turn_compactions(dom: &Dom, turn: Handle) -> Vec<Handle> {
 	let turns = dom.children(dom.body());
 	let Some(index) = turns.iter().position(|handle| *handle == turn) else {
 		return Vec::new();
@@ -233,15 +247,20 @@ pub fn compaction_dividers(dom: &Dom, turn: Handle, expanded: bool) -> Vec<(Hand
 		.and_then(entry_ulid);
 	dom.children(dom.meta())
 		.iter()
-		.filter_map(|handle| {
-			let node = dom.get(*handle)?;
+		.copied()
+		.filter(|handle| {
+			let Some(node) = dom.get(*handle) else {
+				return false;
+			};
 			if node.tag != Tag::Known(KnownTag::Compaction) {
-				return None;
+				return false;
 			}
-			let boundary = prop_text(node, PropId::Boundary)?;
-			let boundary = Ulid::from_string(&boundary).ok()?;
-			(boundary >= start && end.is_none_or(|end| boundary < end))
-				.then(|| (*handle, SummaryDivider::compaction(node, expanded).into_component()))
+			let Some(boundary) = prop_text(node, PropId::Boundary)
+				.and_then(|boundary| Ulid::from_string(&boundary).ok())
+			else {
+				return false;
+			};
+			boundary >= start && end.is_none_or(|end| boundary < end)
 		})
 		.collect()
 }

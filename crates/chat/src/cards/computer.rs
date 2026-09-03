@@ -98,7 +98,7 @@ impl Card for ComputerCard {
 			<col>
 				<row gap=1>
 					match view.status {
-						CardStatus::StreamingArgs | CardStatus::InProgress => <spinner kind=status/>,
+						CardStatus::StreamingArgs | CardStatus::InProgress => <i:pending/>,
 						CardStatus::Done => <i:success/>,
 						CardStatus::Failed => <i:error/>,
 					}

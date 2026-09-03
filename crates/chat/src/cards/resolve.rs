@@ -9,6 +9,7 @@
 use omp_core::{Str, sf};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
+use strum::EnumMessage as _;
 
 use super::{Card, CardStatus, CardView, Component, elapsed_badge};
 
@@ -36,20 +37,26 @@ impl Card for RejectCard {
 	}
 }
 
-/// pi `ResolveAction`: what the resolution device does to the proposal.
-#[derive(Clone, Copy, Eq, PartialEq)]
+/// pi `ResolveAction`: what the resolution device does to the proposal. The
+/// string form is pi's `renderCall` description; the `message` is its badge,
+/// the staged → settled transition.
+#[derive(Clone, Copy, Eq, PartialEq, strum::EnumMessage, strum::IntoStaticStr)]
 enum Action {
+	#[strum(serialize = "apply", message = "⟨proposed -> resolved⟩")]
 	Apply,
+	#[strum(serialize = "reject", message = "⟨proposed -> rejected⟩")]
 	Discard,
 }
 
 impl Action {
 	/// pi `renderCall` badge: the staged → settled transition.
-	const fn badge(self) -> &'static str {
-		match self {
-			Self::Apply => "⟨proposed -> resolved⟩",
-			Self::Discard => "⟨proposed -> rejected⟩",
-		}
+	fn badge(self) -> &'static str {
+		self.get_message().unwrap_or_default()
+	}
+
+	/// pi `ResolveAction`, the `renderCall` description.
+	fn name(self) -> &'static str {
+		self.into()
 	}
 }
 
@@ -95,7 +102,7 @@ fn render_resolution(view: &CardView<'_>, action: Action, _ui: &UiContext) -> Co
 		CardStatus::StreamingArgs | CardStatus::InProgress => {
 			let reason = reason(view);
 			dom! {
-				<row gap=1><i:pending/><text>{sf!("Resolve {}", action.badge())}</text>
+				<row gap=1><i:pending/><text>{sf!("Resolve: {} {}", action.name(), action.badge())}</text>
 					if let Some(reason) = reason { <text fg=muted>{reason}</text> }
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
@@ -118,13 +125,18 @@ fn render_resolution(view: &CardView<'_>, action: Action, _ui: &UiContext) -> Co
 				(_, true) => "error",
 				(Action::Discard, false) => "warning",
 			};
+			// pi frames the block as five inverse rows: blank, header,
+			// blank, reason, blank.
 			dom! {
-				<col gap=1 fg={color}>
+				<col fg={color}>
+					<spacer h=1/>
 					<row gap=1 pad-x=1>
 						if action == Action::Apply && !failed { <i:resolve/> } else { <i:error/> }
 						<text bold>{header}</text>
 					</row>
+					<spacer h=1/>
 					<text pad-x=1 italic>{reason}</text>
+					<spacer h=1/>
 				</col>
 			}
 			.into_component()

@@ -159,7 +159,10 @@ pub fn chord(key: Key) -> Option<Str> {
 		Key::End => "end",
 		Key::PageUp => "pageup",
 		Key::PageDown => "pagedown",
-		Key::FollowUp => "alt+enter",
+		// The keymap folds Ctrl+Enter and Alt+Enter into one intent; the
+		// bind table spells it as pi's primary `app.message.followUp` chord
+		// (`config/keybindings.ts` `ctrl+enter`), which the default cfg binds.
+		Key::FollowUp => "ctrl+enter",
 		Key::ShiftEnter => "shift+enter",
 		Key::RestoreQueue => "alt+up",
 		Key::CyclePrevious => "ctrl+shift+p",
@@ -235,7 +238,7 @@ mod tests {
 			(Key::Function(5), "F5"),
 			(Key::RestoreQueue, "alt+up"),
 			(Key::PlanToggle, "alt+shift+p"),
-			(Key::FollowUp, "alt+enter"),
+			(Key::FollowUp, "ctrl+enter"),
 			(Key::Esc, "escape"),
 			(Key::CtrlAlt(']'), "ctrl+alt+]"),
 		];

@@ -253,9 +253,11 @@ pub(crate) fn project(
 /// `new Markdown(text, 1, 0, …, { italic: true })`) whose stable prefix may
 /// retire into scrollback mid-stream; reasoning hidden while the model is
 /// still reasoning: the breathing starburst pulse with the speed badge; the
-/// answer: a mutable markdown block typed out through the reveal cursor,
-/// snapped to its full text once a tool call starts (a transcript order
-/// boundary) or the message ends.
+/// answer: an append-only Markdown head as well (ADR 0034: streaming text
+/// is append-only, so rows pushed off the top of a long reply retire into
+/// native scrollback while it still streams), typed out through the reveal
+/// cursor and snapped to its full text once a tool call starts (a
+/// transcript order boundary) or the message ends.
 fn assistant_blocks(
 	dom: &Dom,
 	handle: Handle,
@@ -316,8 +318,14 @@ fn assistant_blocks(
 		} else {
 			dom! { <md id={omp_tui::slots::STREAM_ID} pad-x=1>{text.clone()}</md> }
 		};
-		let mut block =
-			rendered(handle, BlockKind::Assistant, text.clone(), Mode::Mutable, finalized, component);
+		let mut block = rendered(
+			handle,
+			BlockKind::Assistant,
+			text.clone(),
+			Mode::AppendOnly,
+			finalized,
+			component,
+		);
 		block.stream = Some(text);
 		blocks.push(block);
 	}
@@ -999,6 +1007,26 @@ mod tests {
 		let text = render(block.component, 40);
 		assert!(!text.contains("**"), "emphasis markers must not leak:\n{text}");
 		assert!(text.contains("- first step") && text.contains("- second step"), "{text}");
+	}
+
+	/// ADR 0034 §Decision: streaming text is append-only, so the answer's
+	/// stable prefix may retire into native scrollback while the reply still
+	/// streams. A mutable answer block would pin every row on screen until
+	/// the message ended (`Projection::retire_under_pressure` never retires
+	/// an unfinalized block and `Slots::append` is only driven for
+	/// append-only heads).
+	#[test]
+	fn streaming_answer_is_an_append_only_head() {
+		let local = Local::default();
+		let options = Options { smooth: false, ..Options::new(&local) };
+		let session = streaming("", "first paragraph\n\nsecond paragraph");
+		let block = projected(&session, &options)
+			.into_iter()
+			.find(|block| block.view.kind == BlockKind::Assistant)
+			.expect("assistant block");
+		assert_eq!(block.view.mode, Mode::AppendOnly);
+		assert!(!block.view.finalized);
+		assert_eq!(block.stream.as_deref(), Some("first paragraph\n\nsecond paragraph"));
 	}
 
 	/// pi `#shouldAnimateThinking`: with reasoning hidden, the pulse shows
