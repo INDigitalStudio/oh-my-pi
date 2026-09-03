@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the Model Hub sidebar scroll/selection jumping to the top when an on-focus provider refresh rebuilt the list; the focused entry (or its nearest survivor) now stays put ([#10722](https://github.com/can1357/oh-my-pi/issues/10722)).
+
 ## [18.1.7] - 2026-09-03
 
 ### Breaking Changes
