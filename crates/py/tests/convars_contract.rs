@@ -20,9 +20,11 @@ class ConvarBackend:
     def __init__(self):
         self.values = {"sv_test": ("bool", True, 0)}
         self.changes = asyncio.Queue()
+        self.declarations = []
 
     async def request(self, operation, arguments):
         if operation == "omp.convars.declare":
+            self.declarations.append(arguments)
             name = f"ext::dev.example.demo::{arguments['key']}"
             self.values[name] = (arguments["kind"], arguments["default"], 0)
             return {
@@ -63,7 +65,19 @@ async def exercise():
         kind="boolean",
         default=False,
         description="Enable demo behavior",
+        ui={
+            "tab": "tools",
+            "group": "Extensions",
+            "label": "Demo behavior",
+            "description": "Enable the demo extension",
+        },
     )
+    assert backend.declarations[-1]["ui"] == {
+        "tab": "tools",
+        "group": "Extensions",
+        "label": "Demo behavior",
+        "description": "Enable the demo extension",
+    }
     assert declared == omp.convars.Snapshot(
         "ext::dev.example.demo::enabled", "boolean", False, 0
     )

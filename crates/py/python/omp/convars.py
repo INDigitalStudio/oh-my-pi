@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,6 +44,7 @@ async def declare(
     default: object,
     description: str | None = None,
     values: Sequence[str] = (),
+    ui: Mapping[str, object] | None = None,
 ) -> Snapshot:
     """Declare one extension-owned dynamic convar.
 
@@ -64,6 +65,8 @@ async def declare(
         raise ValueError("enum convars require values")
     if kind != "enum" and values:
         raise ValueError("values are valid only for enum convars")
+    if ui is not None and not isinstance(ui, Mapping):
+        raise TypeError("ui must be a mapping or None")
     if _control_backend.get() is None:
         raise NotWiredError("omp.convars.declare")
     return _snapshot(
@@ -74,6 +77,7 @@ async def declare(
             default=default,
             description=description,
             values=values,
+            ui=dict(ui) if ui is not None else None,
         )
     )
 
