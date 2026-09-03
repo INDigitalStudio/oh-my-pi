@@ -18,31 +18,56 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 /// GitHub operation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, strum::Display)]
+///
+/// The `message` is the human title a transcript card paints after the shared
+/// `GitHub` prefix (pi `OP_TITLES`).
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	JsonSchema,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumMessage,
+)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Operation {
 	/// Read repository metadata.
+	#[strum(message = "Repo")]
 	RepoView,
 	/// Read a repository file.
+	#[strum(message = "File")]
 	FileRead,
 	/// Create a pull request.
+	#[strum(message = "PR Create")]
 	PrCreate,
 	/// Check out pull request heads into isolated worktrees.
+	#[strum(message = "PR Checkout")]
 	PrCheckout,
 	/// Push a previously checked-out pull request branch.
+	#[strum(message = "PR Push")]
 	PrPush,
 	/// Search issues.
+	#[strum(message = "Search Issues")]
 	SearchIssues,
 	/// Search pull requests.
+	#[strum(message = "Search PRs")]
 	SearchPrs,
 	/// Search code.
+	#[strum(message = "Search Code")]
 	SearchCode,
 	/// Search commits.
+	#[strum(message = "Search Commits")]
 	SearchCommits,
 	/// Search repositories.
+	#[strum(message = "Search Repos")]
 	SearchRepos,
 	/// Watch Actions runs and jobs.
+	#[strum(message = "Run Watch")]
 	RunWatch,
 }
 /// Pull request selector accepted as either one value or a batch.

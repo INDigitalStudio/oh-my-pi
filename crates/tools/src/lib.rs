@@ -47,7 +47,6 @@ const BUILTIN_TOOL_IDENTITIES: &[BuiltinToolIdentity] = &[
 	BuiltinToolIdentity { name: "image_gen", hidden: false },
 	BuiltinToolIdentity { name: "tts", hidden: false },
 	BuiltinToolIdentity { name: "report_issue", hidden: true },
-	BuiltinToolIdentity { name: "vibe", hidden: true },
 	BuiltinToolIdentity { name: "learn", hidden: true },
 	BuiltinToolIdentity { name: "manage_skill", hidden: true },
 	BuiltinToolIdentity { name: "computer", hidden: false },

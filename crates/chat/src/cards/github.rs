@@ -5,6 +5,7 @@ use omp_dom::{Node, PropId};
 use omp_tools::github::Operation;
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
+use strum::EnumMessage as _;
 
 use super::{Card, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result};
 
@@ -23,9 +24,9 @@ impl Card for GithubCard {
 			.cloned()
 			.and_then(|value| serde_json::from_value::<Operation>(value).ok());
 		let mut heading = String::from("GitHub");
-		if let Some(op) = op {
+		if let Some(title) = op.and_then(|op| op.get_message()) {
 			heading.push(' ');
-			heading.push_str(operation_title(op));
+			heading.push_str(title);
 		}
 		for (index, item) in operation_meta(op, &args).iter().enumerate() {
 			heading.push_str(if index == 0 { " " } else { " · " });
@@ -62,24 +63,6 @@ impl Card for GithubCard {
 			}
 			.into_component(),
 		}
-	}
-}
-
-/// Operation titles (pi `OP_TITLES`, minus the shared `GitHub` prefix), plus
-/// the file and PR-create operations omp adds.
-fn operation_title(op: Operation) -> &'static str {
-	match op {
-		Operation::RepoView => "Repo",
-		Operation::FileRead => "File",
-		Operation::PrCreate => "PR Create",
-		Operation::PrCheckout => "PR Checkout",
-		Operation::PrPush => "PR Push",
-		Operation::SearchPrs => "Search PRs",
-		Operation::SearchIssues => "Search Issues",
-		Operation::SearchCommits => "Search Commits",
-		Operation::SearchCode => "Search Code",
-		Operation::SearchRepos => "Search Repos",
-		Operation::RunWatch => "Run Watch",
 	}
 }
 

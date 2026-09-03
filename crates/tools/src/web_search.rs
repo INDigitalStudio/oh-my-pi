@@ -84,17 +84,20 @@ pub struct BackendError {
 pub enum Fault {
 	/// The application-owned inference backend rejected or failed the request.
 	Search {
+		/// Provider selected explicitly for the failed attempt, when known.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		provider: Option<Str>,
 		/// Stable error classification.
-		code:    Str,
+		code:     Str,
 		/// Secret-free diagnostic.
-		message: Str,
+		message:  Str,
 	},
 }
 
 impl Display for Fault {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::Search { code, message } => {
+			Self::Search { code, message, .. } => {
 				write!(formatter, "web search failed ({code}): {message}")
 			},
 		}
@@ -180,10 +183,15 @@ impl<B: SearchBackend> Tool for WebSearch<B> {
 				yield commit_event(error);
 				return;
 			}
+			let provider = params.provider.clone();
 			let request = into_request(params);
 			let result = self.backend.search(request).await
 				.map(|response| Payload { response })
-				.map_err(|error| Fault::Search { code: error.code, message: error.message });
+				.map_err(|error| Fault::Search {
+					provider,
+					code: error.code,
+					message: error.message,
+				});
 			yield Ev::Done(ToolTerminal::Done { result, useless: false });
 		}
 	}

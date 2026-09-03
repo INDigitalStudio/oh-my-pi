@@ -138,7 +138,7 @@ fn source_domain(url: &str) -> Option<&str> {
 }
 
 fn render_web_search_fault(fault: &WebSearchFault) -> El {
-	let WebSearchFault::Search { code, message } = fault;
+	let WebSearchFault::Search { code, message, .. } = fault;
 	view! {
 		<callout kind="error">{"Provider error ("}{code}{"): "}{message}</callout>
 	}
