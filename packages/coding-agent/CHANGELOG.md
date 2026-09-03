@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed multi-minute TUI freezes during subagent batches caused by re-wrapped live model-header proxies resolving in exponential time; nested header sources are now folded so resolution stays linear ([#10605](https://github.com/can1357/oh-my-pi/issues/10605)).
 - Fixed subagent activity freezing the TUI by repeatedly rediscovering the current VCS repository during status-line repaints ([#10605](https://github.com/can1357/oh-my-pi/issues/10605)).
 
 ## [18.1.3] - 2026-09-02
