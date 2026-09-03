@@ -224,7 +224,7 @@ async fn sync_backlog_reviews_before_the_next_primary_request() {
 	let (inference, calls) = RoutedInference::new(
 		[text_script("done")],
 		[
-			AdvisorReply::Events(advisor_note("Check the boundary.", "concern")),
+			AdvisorReply::Events(advisor_note("Check the boundary.", "blocker")),
 			AdvisorReply::Events(empty_script()),
 		],
 	);
@@ -251,7 +251,7 @@ async fn sync_backlog_reviews_before_the_next_primary_request() {
 	assert!(request_contains(
 		&primary[0],
 		Role::System,
-		"<advisory severity=\"concern\""
+		"<advisory severity=\"blocker\""
 	));
 	drop(primary);
 	let advisor_requests = calls.advisor.lock();
