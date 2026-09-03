@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed snapcompact accepting a context-inflating result when the archived history carried a large opaque reasoning-replay signature (e.g. OpenAI Codex `encrypted_content`); the no-reduction guard now excludes opaque reasoning bytes symmetrically so an inflating archive is rejected and the next compaction method runs ([#10716](https://github.com/can1357/oh-my-pi/issues/10716)).
+
 ## [18.1.7] - 2026-09-03
 
 ### Breaking Changes
