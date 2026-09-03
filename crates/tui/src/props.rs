@@ -1,11 +1,6 @@
 //! Typed component properties with allocation-free well-known slots.
 
-use std::{
-	error,
-	fmt::{self, Display},
-	str::FromStr,
-	time::Duration,
-};
+use std::{str::FromStr, time::Duration};
 
 use omp_core::{IntoStr, Str, sf};
 use strum::{Display, EnumIter, EnumString};
@@ -310,18 +305,12 @@ macro_rules! define_props {
 omp_vocab::for_each_prop! { define_props }
 
 /// A property value rejected by the key-aware parser.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("bad value {value:?} for property {prop:?}")]
 pub struct PropError {
 	pub prop:  Prop,
 	pub value: Str,
 }
-
-impl Display for PropError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "bad value {:?} for property {:?}", self.value, self.prop)
-	}
-}
-impl error::Error for PropError {}
 
 trait ToPropValue {
 	fn to_prop_value(&self) -> PropValue;

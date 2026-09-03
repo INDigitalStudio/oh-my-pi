@@ -8,11 +8,9 @@ use std::{
 };
 
 use omp_agent::{DispatchPolicy, Inference, Kernel, StaticPrompt};
+use omp_app::rpc_mode::RpcUiBridge;
 use omp_core::Str;
-use omp_driver::{
-	headless::kernel::SessionHome,
-	sessions::SessionRegistry,
-};
+use omp_driver::{headless::kernel::SessionHome, sessions::SessionRegistry};
 use omp_inference::{
 	BlockKind, ChatEvent, ChatRequest, ChatStream, Completion, ExecutionReceipt, FinishReason,
 	ProviderId, RequestId, ResponseMeta, RouteId, Usage,
@@ -24,8 +22,6 @@ use omp_tool::Registry;
 use omp_tools::ask::{AskPresenter as _, OptionItem, Question};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-
-use omp_app::rpc_mode::RpcUiBridge;
 
 enum Script {
 	Events(Vec<ChatEvent>),
@@ -69,7 +65,10 @@ fn streaming(events: Vec<ChatEvent>) -> ChatStream {
 	ChatStream::ordinary(Box::pin(futures::stream::iter(events)))
 }
 
-fn scripted_kernel(temp: &tempfile::TempDir, scripts: VecDeque<Script>) -> Kernel<ScriptedInference> {
+fn scripted_kernel(
+	temp: &tempfile::TempDir,
+	scripts: VecDeque<Script>,
+) -> Kernel<ScriptedInference> {
 	let spill = BlobStore::open(temp.path().join("blobs")).expect("blob store");
 	Kernel::new(
 		ScriptedInference { scripts: Mutex::new(scripts) },
@@ -79,15 +78,13 @@ fn scripted_kernel(temp: &tempfile::TempDir, scripts: VecDeque<Script>) -> Kerne
 	)
 }
 
-fn session_home(
-	temp: &tempfile::TempDir,
-	kernel: &Kernel<ScriptedInference>,
-) -> SessionHome {
+fn session_home(temp: &tempfile::TempDir, kernel: &Kernel<ScriptedInference>) -> SessionHome {
 	SessionHome {
 		sessions_dir: temp.path().join("sessions"),
 		project_root: temp.path().to_path_buf(),
 		model:        Str::new_static("scripted/test"),
 		prompt:       Default::default(),
+		facts:        Default::default(),
 		live:         Arc::new(SessionRegistry::new()),
 		up:           kernel.mailbox(),
 	}
@@ -115,14 +112,8 @@ async fn rpc_prompt_is_acknowledged_then_emits_one_terminal_agent_end() {
 		Session::create(temp.path().join("rpc.oms"), ComponentRegistry::standard()).expect("session");
 	let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 	let (server_read, server_write) = tokio::io::split(server_io);
-	let server = omp_app::rpc_mode::serve_rpc(
-		kernel,
-		session,
-		home,
-		None,
-		server_read,
-		server_write,
-	);
+	let server =
+		omp_app::rpc_mode::serve_rpc(kernel, session, home, None, server_read, server_write);
 	let client = async move {
 		let (client_read, mut client_write) = tokio::io::split(client_io);
 		client_write
@@ -170,14 +161,8 @@ async fn rpc_reader_dispatches_cancel_while_turn_is_pending() {
 		Session::create(temp.path().join("rpc.oms"), ComponentRegistry::standard()).expect("session");
 	let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 	let (server_read, server_write) = tokio::io::split(server_io);
-	let server = omp_app::rpc_mode::serve_rpc(
-		kernel,
-		session,
-		home,
-		None,
-		server_read,
-		server_write,
-	);
+	let server =
+		omp_app::rpc_mode::serve_rpc(kernel, session, home, None, server_read, server_write);
 	let client = async move {
 		let (client_read, mut client_write) = tokio::io::split(client_io);
 		client_write
@@ -202,10 +187,9 @@ async fn rpc_reader_dispatches_cancel_while_turn_is_pending() {
 		}
 		frames
 	};
-	let (server, frames) = tokio::time::timeout(
-		std::time::Duration::from_secs(2),
-		async { tokio::join!(server, client) },
-	)
+	let (server, frames) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+		tokio::join!(server, client)
+	})
 	.await
 	.expect("live cancel must not wait for inference");
 	server.expect("server");
@@ -237,19 +221,15 @@ async fn rpc_v2_reassembles_large_requests_and_chunks_large_responses() {
 	}
 	let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 	let (server_read, server_write) = tokio::io::split(server_io);
-	let server = omp_app::rpc_mode::serve_rpc(
-		kernel,
-		session,
-		home,
-		None,
-		server_read,
-		server_write,
-	);
+	let server =
+		omp_app::rpc_mode::serve_rpc(kernel, session, home, None, server_read, server_write);
 	let client = async move {
 		let (client_read, mut client_write) = tokio::io::split(client_io);
 		let writer = async move {
 			client_write
-				.write_all(b"{\"id\":\"negotiate\",\"type\":\"negotiate_protocol\",\"protocolVersion\":2}\n")
+				.write_all(
+					b"{\"id\":\"negotiate\",\"type\":\"negotiate_protocol\",\"protocolVersion\":2}\n",
+				)
 				.await
 				.expect("negotiate");
 			let request = json!({
@@ -291,7 +271,11 @@ async fn rpc_v2_reassembles_large_requests_and_chunks_large_responses() {
 		.find(|frame| frame["type"] == "response" && frame["id"] == "large")
 		.expect("reassembled get_state response");
 	assert_eq!(response["success"], true);
-	assert!(serde_json::to_vec(&response["data"]).expect("snapshot JSON").len() > MAX_FRAME_BYTES);
+	assert!(
+		serde_json::to_vec(&response["data"])
+			.expect("snapshot JSON")
+			.len() > MAX_FRAME_BYTES
+	);
 }
 
 #[tokio::test]
@@ -303,25 +287,26 @@ async fn rpc_session_commands_publish_reset_snapshots() {
 	let source_path = home.sessions_dir.join("source.oms");
 	let mut session = Session::create(&source_path, ComponentRegistry::standard()).expect("session");
 	session.begin_turn().expect("turn");
-	let branch_at = session.user("branch point", Vec::new()).expect("user entry");
+	let branch_at = session
+		.user("branch point", Vec::new())
+		.expect("user entry");
 	let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 	let (server_read, server_write) = tokio::io::split(server_io);
-	let server = omp_app::rpc_mode::serve_rpc(
-		kernel,
-		session,
-		home,
-		None,
-		server_read,
-		server_write,
-	);
+	let server =
+		omp_app::rpc_mode::serve_rpc(kernel, session, home, None, server_read, server_write);
 	let client = async move {
 		let (client_read, mut client_write) = tokio::io::split(client_io);
 		let requests = format!(
-			"{{\"id\":\"new\",\"type\":\"new_session\"}}\n{{\"id\":\"switch\",\"type\":\"switch_session\",\"sessionPath\":{}}}\n{{\"id\":\"branch\",\"type\":\"branch\",\"entryId\":\"{}\"}}\n{{\"id\":\"quit\",\"type\":\"quit\"}}\n",
+			"{{\"id\":\"new\",\"type\":\"new_session\"}}\n{{\"id\":\"switch\",\"type\":\"\
+			 switch_session\",\"sessionPath\":{}}}\n{{\"id\":\"branch\",\"type\":\"branch\",\"\
+			 entryId\":\"{}\"}}\n{{\"id\":\"quit\",\"type\":\"quit\"}}\n",
 			serde_json::to_string(&source_path).expect("path JSON"),
 			branch_at,
 		);
-		client_write.write_all(requests.as_bytes()).await.expect("session commands");
+		client_write
+			.write_all(requests.as_bytes())
+			.await
+			.expect("session commands");
 		client_write.shutdown().await.expect("shutdown");
 		let mut lines = BufReader::new(client_read).lines();
 		let mut frames = Vec::<Value>::new();
@@ -333,12 +318,18 @@ async fn rpc_session_commands_publish_reset_snapshots() {
 	let (server, frames) = tokio::join!(server, client);
 	server.expect("server");
 	for id in ["new", "switch", "branch"] {
-		assert!(frames.iter().any(|frame| {
-			frame["type"] == "response" && frame["id"] == id && frame["success"] == true
-		}), "missing successful {id} response");
+		assert!(
+			frames.iter().any(|frame| {
+				frame["type"] == "response" && frame["id"] == id && frame["success"] == true
+			}),
+			"missing successful {id} response"
+		);
 	}
 	assert_eq!(
-		frames.iter().filter(|frame| frame["type"] == "snapshot").count(),
+		frames
+			.iter()
+			.filter(|frame| frame["type"] == "snapshot")
+			.count(),
 		4,
 		"initial plus one reset snapshot per transition",
 	);
@@ -375,14 +366,8 @@ async fn rpc_ui_routes_retained_select_dialogs_and_responses() {
 	};
 	let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 	let (server_read, server_write) = tokio::io::split(server_io);
-	let server = omp_app::rpc_mode::serve_rpc(
-		kernel,
-		session,
-		home,
-		Some(ui),
-		server_read,
-		server_write,
-	);
+	let server =
+		omp_app::rpc_mode::serve_rpc(kernel, session, home, Some(ui), server_read, server_write);
 	let client = async move {
 		let (client_read, mut client_write) = tokio::io::split(client_io);
 		let mut lines = BufReader::new(client_read).lines();
@@ -412,7 +397,9 @@ async fn rpc_ui_routes_retained_select_dialogs_and_responses() {
 	let (server, request, presentation) = tokio::join!(server, client, presenter);
 	server.expect("server");
 	assert_eq!(request["method"], "select");
-	let presentation = presentation.expect("presenter task").expect("dialog answer");
+	let presentation = presentation
+		.expect("presenter task")
+		.expect("dialog answer");
 	assert!(!presentation.headless);
 	assert_eq!(presentation.answers[0].selected, [Str::new_static("A")]);
 }

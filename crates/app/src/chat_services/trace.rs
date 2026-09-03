@@ -79,6 +79,11 @@ fn label(event: &KernelEvent) -> Option<Str> {
 		KernelEvent::CompactionSettled { applied } => {
 			sf!("compaction {}", if *applied { "applied" } else { "abandoned" })
 		},
+		KernelEvent::JobsDelivered { ids } => sf!("jobs delivered: {}", ids.join(", ")),
+		KernelEvent::ApprovalRequested(ticket) => sf!("approval requested: {}", ticket.ticket_id),
+		KernelEvent::WorkflowActionAnswered { name, is_error, .. } => {
+			sf!("workflow action {name}{}", if *is_error { " (error)" } else { "" })
+		},
 		KernelEvent::Usage { .. }
 		| KernelEvent::ToolUpdate { .. }
 		| KernelEvent::TextDelta(_)
@@ -107,7 +112,8 @@ mod tests {
 		assert_eq!(events[0].label, "e2");
 		assert!(label(&KernelEvent::TextDelta(Str::new_static("x"))).is_none());
 		assert_eq!(
-			label(&KernelEvent::ToolSettled { call_id: Str::new_static("c1"), is_error: true }).unwrap(),
+			label(&KernelEvent::ToolSettled { call_id: Str::new_static("c1"), is_error: true })
+				.unwrap(),
 			"tool settled: c1 (error)"
 		);
 	}

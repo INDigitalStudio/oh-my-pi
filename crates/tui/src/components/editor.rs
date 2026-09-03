@@ -227,6 +227,30 @@ pub enum InlineAccent {
 /// Pure host decoration from full editor text to accented byte spans.
 pub type InlineDecorator = Box<dyn Fn(&str) -> SmallVec<(usize, usize, InlineAccent), 4>>;
 
+/// Which leading sigil recolors the composer chrome for the whole draft
+/// (pi `isBashMode` / `isPythonMode`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrefixAccent {
+	/// `!` — the draft runs as a shell command (theme `warn`).
+	Bash,
+	/// `$` — the draft runs as an eval expression (theme `info`).
+	Eval,
+}
+
+/// Host classification of a draft's leading sigil. The host owns the
+/// grammar (pi's `pythonCommandPrefixLength` and pasted-shell-prompt
+/// guard); the editor only paints the verdict.
+pub type PrefixClassifier = fn(&str) -> Option<PrefixAccent>;
+
+/// Default classifier: a bare leading `!` or `$` byte.
+fn leading_sigil(text: &str) -> Option<PrefixAccent> {
+	match text.trim_start().as_bytes().first() {
+		Some(b'!') => Some(PrefixAccent::Bash),
+		Some(b'$') => Some(PrefixAccent::Eval),
+		_ => None,
+	}
+}
+
 /// HSL hue sweep painted across one magic keyword (pi
 /// `GradientHighlightSpec`): stop `i` of [`STOPS`](Self::STOPS) takes hue
 /// `start + (i / STOPS) * span` at 90% saturation and 62% lightness.
@@ -376,6 +400,7 @@ pub struct EditInput {
 	keyword_spans:     SmallVec<(usize, usize, usize), 8>,
 	inline_decorator:  Option<InlineDecorator>,
 	decoration_spans:  SmallVec<(usize, usize, InlineAccent), 4>,
+	prefix_classifier: PrefixClassifier,
 	spelling:          SpellingAssist,
 	spelling_features: SpellingFeatures,
 	spelling_mask:     SmallVec<Range<usize>, 8>,
@@ -403,6 +428,7 @@ impl EditInput {
 			keyword_spans:     SmallVec::new(),
 			inline_decorator:  None,
 			decoration_spans:  SmallVec::new(),
+			prefix_classifier: leading_sigil,
 			spelling:          SpellingAssist::new(),
 			spelling_features: SpellingFeatures::default(),
 			spelling_mask:     SmallVec::new(),
@@ -448,6 +474,17 @@ impl EditInput {
 	fn set_inline_decorator(&mut self, decorator: Option<InlineDecorator>) {
 		self.inline_decorator = decorator;
 		self.refresh_keyword_spans();
+	}
+
+	/// Replaces the leading-sigil classifier that recolors the chrome.
+	pub const fn set_prefix_classifier(&mut self, classifier: PrefixClassifier) {
+		self.prefix_classifier = classifier;
+	}
+
+	/// The chrome accent the current draft's leading sigil selects.
+	#[must_use]
+	pub fn prefix_accent(&self) -> Option<PrefixAccent> {
+		(self.prefix_classifier)(self.editor.text())
 	}
 
 	fn refresh_keyword_spans(&mut self) {
@@ -529,6 +566,55 @@ impl EditInput {
 	pub fn set_spelling_features(&mut self, features: SpellingFeatures) {
 		self.spelling_features = features;
 		self.refresh_spelling();
+	}
+
+	/// Replaces the editor feature switches at runtime (dropdown window,
+	/// emoji expansion, history, XML affordances).
+	pub fn set_editor_options(&mut self, options: EditorOptions) {
+		self.editor.set_options(options);
+	}
+
+	/// Stages `text` as a text-attachment chip (pi `insertTextAttachment`):
+	/// a compact `<icon> #N` token in the buffer whose submitted form is
+	/// `expansion` (default: the sanitized text itself), plus a band card.
+	/// Returns whether a chip was inserted (needs staged attachments).
+	pub fn stage_text_attachment(
+		&mut self,
+		text: &str,
+		expansion: Option<&str>,
+		charset: Charset,
+	) -> bool {
+		let Some(attachments) = &self.attachments else {
+			return false;
+		};
+		let attachment = attachments.push_text(text);
+		let expansion = expansion.map_or_else(|| sanitize_paste(text), str::to_owned);
+		let references = [(chip_label(&attachment, charset).to_string(), expansion)];
+		let _ = self.editor.insert_reference_group(&references, " ");
+		self.refresh_keyword_spans();
+		true
+	}
+
+	/// The editor feature switches currently in force.
+	#[must_use]
+	pub const fn editor_options(&self) -> EditorOptions {
+		self.editor.options()
+	}
+
+	/// Native spelling feature gates currently applied.
+	pub const fn active_spelling_features(&self) -> SpellingFeatures {
+		self.spelling_features
+	}
+
+	/// Records a submitted prompt for Up/Down recall (pi `addToHistory`).
+	pub fn add_to_history(&mut self, text: &str) {
+		self.editor.add_to_history(text);
+	}
+
+	/// Replaces the Up/Down prompt history, newest first (pi
+	/// `setHistoryStorage`).
+	pub fn seed_history(&mut self, prompts: impl IntoIterator<Item = Str>) {
+		self.editor.seed_history(prompts);
 	}
 
 	/// Hides staged attachments whose chip left the buffer (an undo that
@@ -648,14 +734,14 @@ impl EditInput {
 	}
 
 	fn picker_height(&self, ctx: &UiContext, width: u16) -> u16 {
-		const MAX_ROWS: u16 = 10;
 		let Some(picker) = self.editor.picker() else {
 			return 0;
 		};
+		let max_rows = u16::try_from(picker.rows()).unwrap_or(u16::MAX);
 		let icon_width = self.picker_icon_width(ctx);
 		let mut rows = 0_u16;
 		for picker_row in picker.visible_rows() {
-			if rows >= MAX_ROWS {
+			if rows >= max_rows {
 				break;
 			}
 			let height = match picker_row {
@@ -683,22 +769,22 @@ impl EditInput {
 					}
 				},
 			};
-			rows = rows.saturating_add(height.min(MAX_ROWS - rows));
+			rows = rows.saturating_add(height.min(max_rows - rows));
 		}
 		rows
 	}
 
 	fn paint_picker(&self, pc: &mut PaintCtx<'_>, rect: Rect, y: u16) {
-		const MAX_ROWS: u16 = 10;
 		let Some(picker) = self.editor.picker() else {
 			return;
 		};
+		let max_rows = u16::try_from(picker.rows()).unwrap_or(u16::MAX);
 		let right = rect.x.saturating_add(rect.width);
 		let icon_width = self.picker_icon_width(pc.ctx);
 		let mut offset = 0_u16;
 		for picker_row in picker.visible_rows() {
 			let row = y.saturating_add(offset);
-			if offset >= MAX_ROWS || row >= pc.clip || row >= rect.y.saturating_add(rect.height) {
+			if offset >= max_rows || row >= pc.clip || row >= rect.y.saturating_add(rect.height) {
 				break;
 			}
 			let PickerRow::Suggestion { index, suggestion } = picker_row else {
@@ -760,7 +846,7 @@ impl EditInput {
 			if rest.is_empty() {
 				continue;
 			}
-			if offset >= MAX_ROWS || y.saturating_add(offset) >= pc.clip {
+			if offset >= max_rows || y.saturating_add(offset) >= pc.clip {
 				let truncated = truncate_to_width(description, description_width);
 				pc.frame.put(description_x, row, truncated.text, style);
 				if truncated.ellipsis {
@@ -1057,11 +1143,10 @@ impl Component for EditInput {
 		};
 		// pi `isBashMode` / `isPythonMode`: a `!` or `$` prefix recolors the
 		// composer chrome (here the prompt gutter) for the whole draft.
-		let prefix_mode = match text.trim_start().as_bytes().first() {
-			Some(b'!') => Some(pc.ctx.theme.warn),
-			Some(b'$') => Some(pc.ctx.theme.info),
-			_ => None,
-		};
+		let prefix_mode = (self.prefix_classifier)(text).map(|accent| match accent {
+			PrefixAccent::Bash => pc.ctx.theme.warn,
+			PrefixAccent::Eval => pc.ctx.theme.info,
+		});
 		let shell = prefix_mode.is_some();
 		let keyword_accent = !self.keyword_spans.is_empty();
 		// pi `CustomEditor.decorateText`: the keyword gradient shimmers only
@@ -1477,7 +1562,10 @@ impl Component for EditInput {
 			}
 		}
 
+		// pi `cursorUp`/`cursorDown`: prompt history first; only a draft
+		// edge that history does not claim is handed to the host.
 		if self.editor.picker().is_none()
+			&& !self.editor.history_navigates(key)
 			&& (matches!(key, Key::Up) && self.editor.buffer().at_visual_start()
 				|| matches!(key, Key::Down) && self.editor.buffer().at_visual_end())
 		{
@@ -1589,11 +1677,19 @@ impl Component for EditInput {
 					.iter()
 					.all(|path| is_image_path(path) && Path::new(path.as_str()).exists())
 			{
+				// pi `#insertPendingImage`: the buffer holds the compact chip;
+				// its submitted form is the positional wire marker.
 				let references: Vec<_> = paths
 					.into_iter()
 					.map(|path| {
-						let attachment = attachments.push_image(path.clone());
-						(chip_label(&attachment, ec.ctx.charset).to_string(), path.to_string())
+						let attachment = attachments.push_image(path);
+						let marker = match &attachment.content {
+							AttachmentContent::Image { dimensions, .. } => {
+								image_wire_marker(attachment.marker, *dimensions)
+							},
+							AttachmentContent::Text { .. } => unreachable!("push_image stages an image"),
+						};
+						(chip_label(&attachment, ec.ctx.charset).to_string(), marker.to_string())
 					})
 					.collect();
 				let _ = self.editor.insert_reference_group(&references, " ");
@@ -1602,14 +1698,8 @@ impl Component for EditInput {
 				return Flow::Consumed;
 			}
 		}
-		if let Some(attachments) = &self.attachments
-			&& collapses_to_chip(text)
-		{
-			let attachment = attachments.push_text(text);
-			let references =
-				[(chip_label(&attachment, ec.ctx.charset).to_string(), sanitize_paste(text))];
-			let _ = self.editor.insert_reference_group(&references, " ");
-			self.refresh_keyword_spans();
+		if self.attachments.is_some() && marker_sized_paste(text) {
+			self.stage_text_attachment(text, None, ec.ctx.charset);
 			ec.request_layout();
 			return Flow::Consumed;
 		}
@@ -1713,8 +1803,11 @@ fn chip_style(marker: &str) -> Option<Style> {
 	(marker > 0).then(|| Style::new().fg(attachment_color(marker)).bold())
 }
 
-/// Whether a paste is large enough to collapse into an attachment chip.
-fn collapses_to_chip(text: &str) -> bool {
+/// Whether a paste is "marker-sized" (pi `isMarkerSized`: more than ten
+/// lines or more than 1000 characters) and so collapses into an attachment
+/// chip instead of flooding the buffer.
+#[must_use]
+pub fn marker_sized_paste(text: &str) -> bool {
 	text.len() > 1000 || text.bytes().filter(|byte| *byte == b'\n').count() >= 10
 }
 
@@ -1806,6 +1899,29 @@ impl Attachment {
 		};
 		Self { content, marker, color, preview_names, size_label }
 	}
+
+	/// The submitted form of an image chip (pi `#insertPendingImage`):
+	/// `[Image #N, WxH]`, or `[Image #N]` when the header gave no
+	/// dimensions. The marker is positional — `#N` names the N-th image
+	/// handed to the host on submit. `None` for a collapsed text paste,
+	/// whose submitted form is the paste itself.
+	#[must_use]
+	pub fn wire_marker(&self) -> Option<Str> {
+		match &self.content {
+			AttachmentContent::Image { dimensions, .. } => {
+				Some(image_wire_marker(self.marker, *dimensions))
+			},
+			AttachmentContent::Text { .. } => None,
+		}
+	}
+}
+
+/// pi's positional image marker: `[Image #N, WxH]` / `[Image #N]`.
+fn image_wire_marker(marker: usize, dimensions: Option<(u32, u32)>) -> Str {
+	match dimensions {
+		Some((width, height)) => sf!("[Image #{marker}, {width}x{height}]"),
+		None => sf!("[Image #{marker}]"),
+	}
 }
 /// Content behind one [`Attachment`].
 #[derive(Clone)]
@@ -1854,8 +1970,12 @@ pub struct Attachments {
 #[derive(Default)]
 struct AttachmentState {
 	staged:  Vec<Staged>,
-	/// Monotonic marker source; survives hides so numbers stay stable.
-	counter: usize,
+	/// Monotonic image marker source (pi `pendingImages.length`); survives
+	/// hides so numbers stay stable. Images and text pastes number
+	/// separately so `[Image #N]` stays positional over the images alone.
+	images:  usize,
+	/// Monotonic text-chip marker source (pi `#textAttachmentCounter`).
+	texts:   usize,
 	version: u64,
 }
 
@@ -1900,8 +2020,12 @@ impl Attachments {
 
 	fn stage(&self, content: AttachmentContent) -> Attachment {
 		let mut state = self.state.borrow_mut();
-		state.counter += 1;
-		let marker = state.counter;
+		let counter = match content {
+			AttachmentContent::Image { .. } => &mut state.images,
+			AttachmentContent::Text { .. } => &mut state.texts,
+		};
+		*counter += 1;
+		let marker = *counter;
 		let attachment = Attachment::new(content, marker, attachment_color(marker));
 		state
 			.staged
@@ -1931,7 +2055,8 @@ impl Attachments {
 		if !state.staged.is_empty() {
 			state.version += 1;
 		}
-		state.counter = 0;
+		state.images = 0;
+		state.texts = 0;
 		mem::take(&mut state.staged)
 			.into_iter()
 			.filter(|staged| !staged.hidden)
@@ -1949,7 +2074,11 @@ impl Attachments {
 		}
 		let mut state = self.state.borrow_mut();
 		for attachment in attachments {
-			state.counter = state.counter.max(attachment.marker);
+			let counter = match attachment.content {
+				AttachmentContent::Image { .. } => &mut state.images,
+				AttachmentContent::Text { .. } => &mut state.texts,
+			};
+			*counter = (*counter).max(attachment.marker);
 			state.staged.push(Staged { attachment, hidden: false });
 		}
 		state.version += 1;
@@ -2108,6 +2237,24 @@ impl EditorPane {
 		}
 	}
 
+	/// Installs the host's leading-sigil grammar for chrome recoloring; see
+	/// [`EditInput::set_prefix_classifier`].
+	pub fn set_prefix_classifier(&mut self, classifier: PrefixClassifier) {
+		if let Some(input) = self.children[0].comp_mut().downcast_mut::<EditInput>() {
+			input.set_prefix_classifier(classifier);
+			self.children[0].invalidate();
+		}
+	}
+
+	/// The chrome accent the current draft's leading sigil selects.
+	#[must_use]
+	pub fn prefix_accent(&self) -> Option<PrefixAccent> {
+		self.children[0]
+			.comp()
+			.downcast_ref::<EditInput>()
+			.and_then(EditInput::prefix_accent)
+	}
+
 	/// Selects native editor spelling features.
 	pub fn spelling_features(mut self, features: SpellingFeatures) -> Self {
 		self.set_spelling_features(features);
@@ -2120,6 +2267,48 @@ impl EditorPane {
 			input.set_spelling_features(features);
 			self.children[0].invalidate();
 		}
+	}
+
+	/// Native spelling feature gates the editable surface currently applies.
+	pub fn active_spelling_features(&self) -> SpellingFeatures {
+		self.children[0]
+			.comp()
+			.downcast_ref::<EditInput>()
+			.map_or_else(SpellingFeatures::default, EditInput::active_spelling_features)
+	}
+
+	/// Replaces the editable surface's feature switches at runtime (pi
+	/// `setAutocompleteMaxVisible`, `emojiAutocomplete`).
+	pub fn set_editor_options(&mut self, options: EditorOptions) {
+		if let Some(input) = self.children[0].comp_mut().downcast_mut::<EditInput>() {
+			input.set_editor_options(options);
+			self.children[0].invalidate();
+		}
+	}
+
+	/// Stages a text-attachment chip on the editable surface; see
+	/// [`EditInput::stage_text_attachment`]. The caller relayouts (the band
+	/// grew).
+	pub fn stage_text_attachment(
+		&mut self,
+		text: &str,
+		expansion: Option<&str>,
+		charset: Charset,
+	) -> bool {
+		let Some(input) = self.children[0].comp_mut().downcast_mut::<EditInput>() else {
+			return false;
+		};
+		let staged = input.stage_text_attachment(text, expansion, charset);
+		self.children[0].invalidate();
+		staged
+	}
+
+	/// The editable surface's feature switches currently in force.
+	pub fn editor_options(&self) -> EditorOptions {
+		self.children[0]
+			.comp()
+			.downcast_ref::<EditInput>()
+			.map_or_else(EditorOptions::default, EditInput::editor_options)
 	}
 
 	/// Returns the active composer chrome.
@@ -2150,6 +2339,17 @@ impl EditorPane {
 	pub fn undo_past_transient(&mut self, transient: &str) {
 		self.input_mut().undo_past_transient(transient);
 		self.children[0].invalidate();
+	}
+
+	/// Records a submitted prompt for Up/Down recall (pi `addToHistory`).
+	pub fn add_to_history(&mut self, text: &str) {
+		self.input_mut().add_to_history(text);
+	}
+
+	/// Replaces the Up/Down prompt history, newest first (pi
+	/// `setHistoryStorage`).
+	pub fn seed_history(&mut self, prompts: impl IntoIterator<Item = Str>) {
+		self.input_mut().seed_history(prompts);
 	}
 
 	fn input_mut(&mut self) -> &mut EditInput {
@@ -3478,6 +3678,119 @@ mod tests {
 		}
 	}
 
+	/// The host owns the sigil grammar: the chrome recolors only on the
+	/// installed classifier's verdict, never on a bare leading `$` byte.
+	#[test]
+	fn prefix_classifier_decides_the_chrome_accent() {
+		let ctx = UiContext::default();
+		let boxed = || EditorPane::new().composer_style(ComposerStyle::Box);
+		let naive = Ui::from_root(boxed().with(Prop::Value, "$HOME is set"), 20, ctx.clone());
+		assert_eq!(naive.frame().cell(0, 0).style().foreground_color(), ctx.theme.info);
+
+		let mut pane = boxed();
+		pane.set_prefix_classifier(|text| {
+			(text.starts_with("$ ") && !text.starts_with("$ git")).then_some(PrefixAccent::Eval)
+		});
+		assert_eq!(pane.prefix_accent(), None);
+		let prose = Ui::from_root(pane.with(Prop::Value, "$HOME is set"), 20, ctx.clone());
+		assert_eq!(prose.frame().cell(0, 0).style().foreground_color(), ctx.theme.border);
+
+		let mut pane = boxed();
+		pane.set_prefix_classifier(|text| {
+			(text.starts_with("$ ") && !text.starts_with("$ git")).then_some(PrefixAccent::Eval)
+		});
+		let pasted = Ui::from_root(pane.with(Prop::Value, "$ git status"), 20, ctx.clone());
+		assert_eq!(pasted.frame().cell(0, 0).style().foreground_color(), ctx.theme.border);
+
+		let mut pane = boxed();
+		pane.set_prefix_classifier(|text| {
+			(text.starts_with("$ ") && !text.starts_with("$ git")).then_some(PrefixAccent::Eval)
+		});
+		let eval = Ui::from_root(pane.with(Prop::Value, "$ 1+1"), 20, ctx.clone());
+		assert_eq!(eval.frame().cell(0, 0).style().foreground_color(), ctx.theme.info);
+	}
+
+	/// `picker_rows` (pi `autocompleteMaxVisible`) bounds the open dropdown
+	/// live and is clamped to `[3, 20]`.
+	#[test]
+	fn editor_options_resize_the_open_dropdown() {
+		let commands = (0..30)
+			.map(|index| Command::new(&format!("cmd{index:02}"), "", &[]))
+			.collect::<Vec<_>>();
+		let pane = EditorPane::new()
+			.with(Prop::Id, "input")
+			.completion(Box::new(SlashCommands::new(commands.into_boxed_slice())));
+		let mut ui = Ui::from_root(pane, 40, UiContext::default());
+		ui.focus_first();
+		ui.handle_key(Key::Char('/'));
+		let rows = |ui: &Ui| {
+			ui.root()
+				.comp()
+				.downcast_ref::<EditorPane>()
+				.expect("pane")
+				.children[0]
+				.comp()
+				.downcast_ref::<EditInput>()
+				.expect("input")
+				.editor
+				.picker()
+				.expect("dropdown open")
+				.visible_suggestions()
+				.1
+				.len()
+		};
+		assert_eq!(rows(&ui), 10, "default window");
+		for (requested, shown) in [(4, 4), (1, 3), (99, 20)] {
+			ui.with_component_mut::<EditorPane, _>("input", |pane| {
+				pane.set_editor_options(EditorOptions {
+					picker_rows: requested,
+					..EditorOptions::default()
+				});
+			});
+			assert_eq!(rows(&ui), shown, "picker_rows {requested}");
+		}
+	}
+
+	/// Turning `emoji` off at runtime closes the built-in `:shortcode:`
+	/// dropdown and stops shortcode expansion.
+	#[test]
+	fn editor_options_toggle_emoji_live() {
+		let mut ui =
+			Ui::from_root(EditorPane::new().with(Prop::Id, "input"), 40, UiContext::default());
+		ui.focus_first();
+		for character in ":joy".chars() {
+			ui.handle_key(Key::Char(character));
+		}
+		let open = |ui: &Ui| {
+			ui.root()
+				.comp()
+				.downcast_ref::<EditorPane>()
+				.expect("pane")
+				.popup_open()
+		};
+		assert!(open(&ui), "emoji dropdown opens by default");
+		ui.with_component_mut::<EditorPane, _>("input", |pane| {
+			pane.set_editor_options(EditorOptions { emoji: false, ..EditorOptions::default() });
+		});
+		assert!(!open(&ui), "the switch closes the built-in dropdown");
+		ui.handle_key(Key::Char(':'));
+		assert_eq!(ui.values()["input"], ":joy:", "no shortcode expansion while emoji is off");
+	}
+
+	/// `stage_text_attachment` inserts a chip whose submitted form is the
+	/// caller's expansion (pi `insertTextAttachment(content, expansion)`).
+	#[test]
+	fn staged_text_attachment_expands_to_the_given_text() {
+		let mut pane = EditorPane::new().with(Prop::Id, "input");
+		assert!(pane.stage_text_attachment(
+			"raw body",
+			Some("<attachment>\nraw body\n</attachment>"),
+			Charset::Unicode
+		));
+		let ui = Ui::from_root(pane, 40, UiContext::default());
+		assert_eq!(ui.values()["input"], "<attachment>\nraw body\n</attachment> ");
+	}
+
 	#[test]
 	fn editor_pane_placeholder_disappears_after_input() {
 		let pane = EditorPane::new().with(Prop::Placeholder, "Ask anything");
@@ -3840,7 +4153,28 @@ mod tests {
 		assert!(visible.contains("#1"));
 		assert!(!visible.contains(&pasted));
 		assert!(visible.ends_with(' '));
-		assert_eq!(editor_pane(&ui).buffer().expanded_text(), format!("{normalized} "));
+		// pi wire form: a header without IHDR gives no dimensions.
+		assert_eq!(editor_pane(&ui).buffer().expanded_text(), "[Image #1] ");
+		assert!(matches!(
+			&attachments.snapshot()[0].content,
+			AttachmentContent::Image { source, .. } if source.as_str() == normalized
+		));
+		fs::remove_dir_all(path.parent().unwrap()).ok();
+	}
+
+	#[test]
+	fn probed_image_drop_expands_to_a_dimensioned_marker() {
+		let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x04\0\0\0\x03";
+		let path = temp_drop_file("probed-marker", "probed.png", png);
+		let pane = EditorPane::new().with(Prop::Id, "composer");
+		let attachments = pane.attachments();
+		let mut ui = Ui::from_root(pane, 60, UiContext::default());
+		ui.focus_first();
+
+		ui.handle_paste(path.to_str().expect("temp path is UTF-8"));
+
+		assert_eq!(editor_pane(&ui).buffer().expanded_text(), "[Image #1, 4x3] ");
+		assert_eq!(attachments.snapshot()[0].wire_marker().as_deref(), Some("[Image #1, 4x3]"));
 		fs::remove_dir_all(path.parent().unwrap()).ok();
 	}
 
@@ -3857,7 +4191,11 @@ mod tests {
 		ui.handle_paste(&pasted);
 
 		assert_eq!(attachments.len(), 1);
-		assert_eq!(editor_pane(&ui).buffer().expanded_text(), format!("{normalized} "));
+		assert_eq!(editor_pane(&ui).buffer().expanded_text(), "[Image #1] ");
+		assert!(matches!(
+			&attachments.snapshot()[0].content,
+			AttachmentContent::Image { source, .. } if source.as_str() == normalized
+		));
 		fs::remove_dir_all(path.parent().unwrap()).ok();
 	}
 
@@ -3879,7 +4217,16 @@ mod tests {
 		assert_eq!(attachments.len(), 2);
 		let visible = editor_pane(&ui).buffer().text();
 		assert!(visible.find("#1").unwrap() < visible.find("#2").unwrap());
-		assert_eq!(editor_pane(&ui).buffer().expanded_text(), format!("{first_text} {second_text} "));
+		assert_eq!(editor_pane(&ui).buffer().expanded_text(), "[Image #1] [Image #2] ");
+		let sources = attachments
+			.snapshot()
+			.iter()
+			.map(|attachment| match &attachment.content {
+				AttachmentContent::Image { source, .. } => source.to_string(),
+				AttachmentContent::Text { .. } => unreachable!("image drop"),
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(sources, [first_text, second_text]);
 		ui.handle_key(Key::Ctrl('_'));
 		assert_eq!(
 			editor_pane(&ui).buffer().text(),

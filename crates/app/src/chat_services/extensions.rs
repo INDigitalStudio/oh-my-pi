@@ -127,21 +127,21 @@ fn mcp_rows(state: &ServiceState) -> Vec<ExtensionRow> {
 	}
 	for (name, (enabled, transport)) in declared {
 		rows.entry(name.clone()).or_insert_with(|| ExtensionRow {
-			id:          sf!("{MCP_PREFIX}{name}"),
-			name:        name.clone(),
-			kind:        ExtensionKind::Mcp,
-			status:      if enabled {
+			id: sf!("{MCP_PREFIX}{name}"),
+			name: name.clone(),
+			kind: ExtensionKind::Mcp,
+			status: if enabled {
 				ExtensionStatus::Disconnected
 			} else {
 				ExtensionStatus::Disabled
 			},
 			enabled,
-			version:     None,
+			version: None,
 			description: Some(transport),
-			tools:       Vec::new(),
-			resources:   Vec::new(),
-			prompts:     Vec::new(),
-			error:       None,
+			tools: Vec::new(),
+			resources: Vec::new(),
+			prompts: Vec::new(),
+			error: None,
 		});
 	}
 	rows.into_values().collect()
@@ -269,21 +269,21 @@ fn plugin_rows(state: &ServiceState) -> ServiceResult<Vec<ExtensionRow>> {
 				description = sf!("{description} · shadowed by the project install");
 			}
 			ExtensionRow {
-				id: sf!("{PLUGIN_PREFIX}{spec}"),
-				name: spec,
-				kind: ExtensionKind::Plugin,
-				status: if view.enabled {
+				id:          sf!("{PLUGIN_PREFIX}{spec}"),
+				name:        spec,
+				kind:        ExtensionKind::Plugin,
+				status:      if view.enabled {
 					ExtensionStatus::Ready
 				} else {
 					ExtensionStatus::Disabled
 				},
-				enabled: view.enabled,
-				version: view.version,
+				enabled:     view.enabled,
+				version:     view.version,
 				description: Some(description),
-				tools: Vec::new(),
-				resources: Vec::new(),
-				prompts: Vec::new(),
-				error: None,
+				tools:       Vec::new(),
+				resources:   Vec::new(),
+				prompts:     Vec::new(),
+				error:       None,
 			}
 		})
 		.collect())

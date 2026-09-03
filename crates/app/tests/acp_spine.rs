@@ -109,11 +109,8 @@ fn harness(
 		kernel.mailbox(),
 	)
 	.expect("session home");
-	let session = Session::create(
-		sessions_dir.join("startup.oms"),
-		ComponentRegistry::standard(),
-	)
-	.expect("startup session");
+	let session = Session::create(sessions_dir.join("startup.oms"), ComponentRegistry::standard())
+		.expect("startup session");
 	(kernel, session, home)
 }
 
@@ -137,10 +134,9 @@ async fn exchange(
 		}
 		frames
 	};
-	let (server, frames) = tokio::time::timeout(
-		std::time::Duration::from_secs(2),
-		async { tokio::join!(server, client) },
-	)
+	let (server, frames) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+		tokio::join!(server, client)
+	})
 	.await
 	.expect("ACP exchange must not deadlock");
 	server.expect("ACP server");
@@ -186,19 +182,92 @@ async fn control_requests_remain_live_during_a_prompt() {
 }
 
 #[tokio::test]
+async fn standard_acp_cancel_interrupts_the_active_prompt() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let (kernel, session, home) = harness(&directory, [Script::Pending]);
+	let frames = exchange(
+		kernel,
+		session,
+		home,
+		br#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":1}}
+{"jsonrpc":"2.0","id":"prompt","method":"session/prompt","params":{"sessionId":"startup","prompt":[{"type":"text","text":"wait"}]}}
+{"jsonrpc":"2.0","id":"cancel","method":"cancel","params":{"sessionId":"startup"}}
+{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":{}}
+"#,
+	)
+	.await;
+
+	assert_eq!(
+		response(&frames, "cancel")["result"],
+		serde_json::json!({}),
+		"the ACP `cancel` method must be accepted, not rejected as unknown: {frames:#?}"
+	);
+	assert_eq!(response(&frames, "prompt")["result"]["stopReason"], "cancelled");
+}
+
+#[tokio::test]
+async fn content_block_prompts_journal_text_and_image_attachments() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let (kernel, session, home) = harness(&directory, [Script::Text("seen")]);
+	let journal_path = session.journal_path().to_path_buf();
+	let frames = exchange(
+		kernel,
+		session,
+		home,
+		br#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":1}}
+{"jsonrpc":"2.0","id":"prompt","method":"session/prompt","params":{"sessionId":"startup","prompt":[{"type":"text","text":"describe this"},{"type":"resource","resource":{"uri":"file:///notes.md","mimeType":"text/markdown","text":"embedded notes"}},{"type":"resource_link","uri":"file:///spec.md","name":"spec.md"},{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}]}}
+{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":{}}
+"#,
+	)
+	.await;
+
+	let init = response(&frames, "init");
+	assert_eq!(init["result"]["agentCapabilities"]["promptCapabilities"]["image"], true);
+	let prompt = response(&frames, "prompt");
+	assert_ne!(
+		prompt["error"]["code"],
+		serde_json::json!(-32602),
+		"content-block prompts must be accepted as valid params: {prompt:#?}"
+	);
+
+	let reopened = Session::open(&journal_path, ComponentRegistry::standard()).expect("reopen");
+	let dom = reopened.dom();
+	let turn = *dom.children(dom.body()).last().expect("journaled turn");
+	let user = dom
+		.children(turn)
+		.iter()
+		.filter_map(|handle| dom.get(*handle))
+		.find(|node| node.tag == omp_dom::Tag::Known(omp_dom::KnownTag::User))
+		.expect("journaled user message");
+	assert_eq!(
+		user.content.as_deref(),
+		Some("describe this\n\nembedded notes\n\nspec.md"),
+		"text, embedded text resources, and resource links join as pi does"
+	);
+	let attachments = match user.prop(&omp_dom::PropKey::Known(omp_dom::PropId::Data)) {
+		Some(omp_dom::Value::Json(raw)) => {
+			serde_json::from_str::<Vec<omp_journal::blob::BlobRef>>(raw.get()).expect("blob refs")
+		},
+		other => panic!("user message must carry its image attachments, got {other:?}"),
+	};
+	assert_eq!(attachments.len(), 1);
+	let stored = reopened
+		.blobs()
+		.get(&attachments[0])
+		.expect("image blob is content-addressed in the session store");
+	assert_eq!(stored.as_ref(), b"\x89PNG\r\n\x1a\n");
+}
+
+#[tokio::test]
 async fn new_load_and_resume_switch_the_authoritative_durable_session() {
 	let directory = tempfile::tempdir().expect("temporary directory");
 	let target_path = directory.path().join("sessions").join("target.oms");
 	let resumed_path = directory.path().join("sessions").join("resumed.oms");
 	std::fs::create_dir_all(target_path.parent().expect("session parent"))
 		.expect("sessions directory");
+	drop(Session::create(&target_path, ComponentRegistry::standard()).expect("durable load target"));
 	drop(
-		Session::create(&target_path, ComponentRegistry::standard())
-			.expect("durable load target"),
-	);
-	drop(
-		Session::create(&resumed_path, ComponentRegistry::standard())
-			.expect("durable resume target"),
+		Session::create(&resumed_path, ComponentRegistry::standard()).expect("durable resume target"),
 	);
 	let (kernel, session, home) = harness(&directory, [Script::Text("written")]);
 	let frames = exchange(
@@ -220,7 +289,13 @@ async fn new_load_and_resume_switch_the_authoritative_durable_session() {
 		.expect("new session id");
 	assert_ne!(new_id, "startup");
 	assert_ne!(new_id, "target");
-	assert!(directory.path().join("sessions").join(format!("{new_id}.oms")).exists());
+	assert!(
+		directory
+			.path()
+			.join("sessions")
+			.join(format!("{new_id}.oms"))
+			.exists()
+	);
 	assert_eq!(response(&frames, "load")["result"]["sessionId"], "target");
 	assert_eq!(response(&frames, "resume")["result"]["sessionId"], "resumed");
 
@@ -231,8 +306,8 @@ async fn new_load_and_resume_switch_the_authoritative_durable_session() {
 		!String::from_utf8_lossy(target_snapshot.as_bytes()).contains("durable marker"),
 		"resuming another session must switch authority away from the prior load target"
 	);
-	let resumed = Session::open(&resumed_path, ComponentRegistry::standard())
-		.expect("resume target reopens");
+	let resumed =
+		Session::open(&resumed_path, ComponentRegistry::standard()).expect("resume target reopens");
 	let resumed_snapshot = resumed.dom().snapshot();
 	assert!(
 		String::from_utf8_lossy(resumed_snapshot.as_bytes()).contains("durable marker"),

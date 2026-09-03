@@ -888,7 +888,9 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		"yield and think must stay selectable for child/external-thinking sessions while hidden \
 		 from the top-level agent"
 	);
-	let write_spec = registry.live_spec("write").expect("write remains a live dyn device");
+	let write_spec = registry
+		.live_spec("write")
+		.expect("write remains a live dyn device");
 	assert!(write_spec.description.contains("`.tar.zst`"));
 	assert!(write_spec.description.contains("other archive formats"));
 	assert!(write_spec.description.contains("SQLite row operations"));
@@ -969,7 +971,9 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 			}
 		})
 	);
-	let eval_spec = registry.live_spec("eval").expect("eval remains a live dyn device");
+	let eval_spec = registry
+		.live_spec("eval")
+		.expect("eval remains a live dyn device");
 	let eval_schema: Value = serde_json::from_slice(&eval_spec.schema).expect("eval schema");
 	assert_eq!(eval_schema["required"], json!(["i", "language", "code"]));
 	let bash_schema = schema("bash");
@@ -1767,7 +1771,11 @@ async fn uds_clients_invoke_owner_eval_and_retain_ordinary_tools() {
 		"eval must remain a dyn device rather than tax the wire roster",
 	);
 	assert_eq!(
-		harness.server.registry().presentation("eval").expect("eval presentation"),
+		harness
+			.server
+			.registry()
+			.presentation("eval")
+			.expect("eval presentation"),
 		Presentation::Device,
 	);
 	let local_eval = invoke_builtin(
@@ -1857,7 +1865,12 @@ async fn opt_in_python_admits_its_soft_declaration_without_shadowing_native_eval
 		})
 		.expect("advertise worker registry");
 	assert_eq!(advertised.len(), 5);
-	assert_eq!(registry.presentation("py_eval").expect("python presentation"), Presentation::Device);
+	assert_eq!(
+		registry
+			.presentation("py_eval")
+			.expect("python presentation"),
+		Presentation::Device
+	);
 	assert!(matches!(registry.route("py_eval").expect("python route"), ToolRoute::Worker { .. }));
 	assert_eq!(
 		registry

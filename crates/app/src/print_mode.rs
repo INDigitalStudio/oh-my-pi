@@ -1,28 +1,33 @@
 //! Single-shot adapter over the journal-first production agent kernel.
 //!
+//! Text mode keeps stdout clean for shell captures (pi `print-mode.ts`): the
+//! only bytes written there are the final assistant response (thinking first
+//! when `--print-thoughts`), after every prompt settled. Progress (`Working...`)
+//! and failures go to stderr, and a failed or aborted turn exits non-zero.
+//!
 //! JSON mode is an NDJSON lifecycle stream: one `session` header, then
 //! `agent_start` → `turn_start` → message/tool events → `turn_end` →
-//! `agent_end` for each submitted prompt. `--shape-transcript` removes repeated
-//! message/partial snapshots from `message_update` while preserving its
-//! incremental `assistantMessageEvent`; terminal messages and tool results
-//! remain complete.
+//! `agent_end` for each submitted prompt. A failed turn still closes with
+//! `turn_end` and `agent_end`; the terminal assistant message carries
+//! `stopReason` and `errorMessage` instead of the stream ending without a
+//! terminal frame. `--shape-transcript` removes repeated message/partial
+//! snapshots from `message_update` while preserving its incremental
+//! `assistantMessageEvent`; terminal messages and tool results remain complete.
 
-use std::{fs, io::IsTerminal as _, path::PathBuf, sync::Arc, time::Instant};
+use std::{fs, io::IsTerminal as _, sync::Arc, time::Instant};
 
 use miette::{IntoDiagnostic as _, miette};
-use omp_agent::{RunControl, TurnInput, TurnStop};
+use omp_agent::{RunControl, TurnInput, TurnStop, Up};
 use omp_core::{FastHashMap, Str};
-use omp_dom::{
-	Dom, Event, Handle, KnownTag, Node, Op, PropId, PropKey, Sid, StreamOp, Tag, Value,
-};
-use omp_driver::{
-	discovery::roles,
-	headless::kernel::{KernelOptions, compose_kernel},
-};
+use omp_dom::{Dom, Event, Handle, KnownTag, Node, Op, PropId, PropKey, Sid, StreamOp, Tag, Value};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
 
-use crate::{cli::PrintArgs, usage_error::CliUsageError};
+use crate::{
+	chat_cmd::{Launch, LaunchEnv},
+	cli::PrintArgs,
+	usage_error::CliUsageError,
+};
 
 /// Runs prompts through the new durable headless kernel.
 pub async fn run(args: PrintArgs) -> miette::Result<()> {
@@ -35,97 +40,33 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 	}
 }
 
+/// Output shaping selected by the print flags that are not launch flags.
+struct PrintOptions {
+	mode:             String,
+	print_thoughts:   bool,
+	shape_transcript: bool,
+}
+
 async fn run_inner(args: PrintArgs) -> miette::Result<()> {
-	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
-	let project = fs::canonicalize(&args.project).into_diagnostic()?;
-	let ctx = Arc::new(crate::process_ctx(&project)?);
-	for overlay in &args.config {
-		let script = fs::read_to_string(overlay).into_diagnostic()?;
-		ctx.exec(&script, omp_con::Source::Config(Str::new(overlay.to_string_lossy())))
-			.into_diagnostic()?;
-	}
-	let home = std::env::var_os("HOME").map_or_else(|| project.clone(), PathBuf::from);
-	let prompt = crate::chat_cmd::prompt_overrides(&project, &home, &args.prompt_settings)?;
-	let extensions = crate::chat_cmd::driver_extension_policy(&args.extension_launch);
-	let model_settings =
-		omp_catalog::settings::ModelSettings::from_con(&ctx).resolve_path_scopes(&project, &home);
-	let catalog =
-		omp_driver::registry::production_catalog(&data_dir).map_err(|source| miette!(source))?;
-	let launch_roles = roles::resolve_launch_roles(
-		catalog.as_ref(),
-		&model_settings,
-		None,
-		args.smol.as_deref(),
-		args.slow.as_deref(),
-		args.plan.as_deref(),
-	)
-	.map_err(|source| miette!(source))?;
-	let model = args
-		.model
-		.clone()
-		.or_else(|| launch_roles.primary.map(|model| Str::from(model.as_str())))
-		.ok_or_else(|| miette!("print mode requires a configured default model role"))?;
-	if args.api_key.is_some() && args.model.is_none() && args.models.is_none() {
-		return Err(miette!("--api-key requires a model to be specified via --model or --models"));
-	}
-	if args.from_claude || args.from_codex {
+	let PrintArgs { launch, mode, print_thoughts, follow_ups, shape_transcript } = args;
+	let args = PrintOptions { mode, print_thoughts, shape_transcript };
+	if launch.from_claude || launch.from_codex {
 		return Err(miette!("print mode does not accept interactive legacy session imports"));
 	}
-
-	let initial = initial_prompt(&args.prompt).await?;
+	let project = fs::canonicalize(&launch.project).into_diagnostic()?;
+	let ctx = Arc::new(crate::process_ctx(&project)?);
+	let env = LaunchEnv::production(&project, launch.gateway.is_some())?;
+	let launch = Launch::prepare(launch, ctx, env).await?;
+	let initial = initial_prompt(&launch).await?;
 	if initial.is_empty() {
 		return Err(
 			CliUsageError::new("print mode requires a prompt or piped standard input").into(),
 		);
 	}
-	let explicit_session = args
-		.resume
-		.as_ref()
-		.map(|value| PathBuf::from(value.as_str()));
-	let (mut kernel, mut session, _) =
-		compose_kernel(&data_dir, &project, model.as_str(), Arc::clone(&ctx), KernelOptions {
-			continue_session:   args.continue_session,
-			session:            explicit_session,
-			fork:               args
-				.fork
-				.as_ref()
-				.map(|value| PathBuf::from(value.as_str())),
-			sessions_dir:       args.session_dir.clone(),
-			ephemeral:          args.no_session,
-			no_tools:           args.no_tools,
-			tools:              args.tools.as_ref().map(|tools| tools.0.clone()),
-			py_eval:            args.py_eval,
-			spawn_idle_timeout: args.envd_idle_timeout,
-			api_key:            args.api_key.clone(),
-			approval_mode:      args.effective_approval().map(Into::into),
-			model_override:     args.model.is_some(),
-			prompt,
-			extensions,
-			provider:           args
-				.provider
-				.as_ref()
-				.map(|value| omp_catalog::ProviderId::from(value.as_str()))
-				.or_else(|| {
-					args.api_key.as_ref().and_then(|_| {
-						model
-							.split_once('/')
-							.map(|(provider, _)| omp_catalog::ProviderId::from(provider))
-					})
-				}),
-			gateway:            None,
-			sessions:           None,
-						session_name: None,
-			tool_registry: None,
-			output_schema: None,
-			schema_mode: None,
-		})
-		.await
-		.into_diagnostic()?;
-	crate::chat_cmd::apply_launch_thinking(&ctx, args.thinking).into_diagnostic()?;
-	crate::chat_cmd::apply_launch_plan(&mut session, args.plan_mode, args.plan_yolo)
-		.into_diagnostic()?;
-	let ephemeral_path = args
-		.no_session
+	let (mut kernel, mut session) = launch.compose().await?;
+	let model = &launch.model;
+	let ephemeral_path = launch
+		.ephemeral
 		.then(|| session.journal_path().to_path_buf());
 	let session_id = session
 		.journal_path()
@@ -136,21 +77,52 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 	let (snapshot, events) = session.subscribe();
 	let mut replica = Dom::from_snapshot(&snapshot);
 	let mut json = JsonState::default();
+	// pi `wrapper.ts`: without an interactive UI an approval-requiring call
+	// is denied immediately (`--approval-mode yolo` or `tools.approval.<tool>
+	// allow` opt it back in); the denial is journaled like any other.
+	let kernel_events = kernel.subscribe();
+	let mailbox = kernel.mailbox();
+	let approvals = tokio::spawn(async move {
+		while let Ok(event) = kernel_events.recv_async().await {
+			if let omp_agent::KernelEvent::ApprovalRequested(ticket) = event {
+				let _ = mailbox.send(Up::Approve {
+					id:       ticket.ticket_id,
+					decision: omp_agent::ApprovalDecision {
+						approved:   false,
+						scope:      omp_agent::ApprovalScope::Once,
+						source:     omp_agent::ApprovalSource::Unavailable,
+						decided_by: None,
+						reason:     Some(Str::new_static(
+							"requires approval but no interactive UI is available; use \
+							 --approval-mode yolo or tools.approval.<tool> allow",
+						)),
+						audited:    false,
+					},
+				});
+			}
+		}
+	});
 	let mut stdout = tokio::io::stdout();
 	if args.mode == "json" {
-		write_json_line(&mut stdout, &session_header(&session_id, model.as_str()))
-		.await?;
+		write_json_line(&mut stdout, &session_header(&session_id, model.as_str())).await?;
 	}
-	let mut prompts = Vec::with_capacity(1 + args.follow_ups.len());
+	let mut prompts = Vec::with_capacity(1 + follow_ups.len());
 	prompts.push(initial);
-	prompts.extend(args.follow_ups.iter().cloned());
+	prompts.extend(follow_ups);
+	let first_turn = replica.children(replica.body()).len();
 
+	if args.mode == "text" {
+		tokio::io::stderr()
+			.write_all(b"Working...\n")
+			.await
+			.into_diagnostic()?;
+	}
 	for prompt in prompts {
 		let submission_turn = replica.children(replica.body()).len();
 		if args.mode == "json" {
 			write_json_line(&mut stdout, &serde_json::json!({"type":"agent_start"})).await?;
 		}
-		let deadline = args.max_time.map(|duration| Instant::now() + duration.0);
+		let deadline = launch.max_time.map(|duration| Instant::now() + duration);
 		let control = RunControl::new(CancellationToken::new(), deadline);
 		let turn = kernel.run_turn(
 			&mut session,
@@ -158,63 +130,145 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 			control,
 		);
 		tokio::pin!(turn);
-		let mut ended_with_newline = true;
-		let outcome = loop {
+		let result = loop {
 			tokio::select! {
 				biased;
 				event = events.recv_async() => {
 					if let Ok(event) = event {
-						print_event(
-							&mut stdout,
-							&args,
-							&mut replica,
-							&mut json,
-							event,
-							&mut ended_with_newline,
-						).await?;
+						print_event(&mut stdout, &args, &mut replica, &mut json, event).await?;
 					}
 				},
-				result = &mut turn => break result.into_diagnostic()?,
+				result = &mut turn => break result,
 			}
 		};
+		// The kernel journals how a turn ended (assistant close + notice)
+		// before returning; those patches are still queued here and the
+		// terminal frames must reflect them.
 		while let Ok(event) = events.try_recv() {
-			print_event(
-				&mut stdout,
-				&args,
-				&mut replica,
-				&mut json,
-				event,
-				&mut ended_with_newline,
-			)
-			.await?;
+			print_event(&mut stdout, &args, &mut replica, &mut json, event).await?;
 		}
-		if args.mode == "text" && !ended_with_newline {
-			stdout.write_all(b"\n").await.into_diagnostic()?;
-		} else if args.mode == "json" {
+		if args.mode == "json" {
 			if let Some(event) = json.finish_turn(&replica) {
 				write_json_line(&mut stdout, &event).await?;
 			}
-			write_json_line(
-				&mut stdout,
-				&serde_json::json!({
-					"type": "agent_end",
-					"messages": transcript_messages_from(&replica, submission_turn),
-					"isTerminal": true,
-				}),
-			)
-			.await?;
+			write_json_line(&mut stdout, &agent_end_value(&replica, submission_turn)).await?;
 		}
 		stdout.flush().await.into_diagnostic()?;
-		if outcome.stop != TurnStop::Completed {
-			return Err(miette!("print turn stopped before completion: {:?}", outcome.stop));
+		let stop = match result {
+			Ok(outcome) => outcome.stop,
+			Err(error) => return Err(miette::Report::from_err(error)),
+		};
+		if stop != TurnStop::Completed {
+			return Err(miette!(
+				"{}",
+				turn_error_message(&replica, submission_turn)
+					.unwrap_or_else(|| Str::new(format!("Request {}", stop_reason_name(stop))))
+			));
 		}
 	}
 
+	if args.mode == "text" {
+		stdout
+			.write_all(final_response_text(&replica, first_turn, args.print_thoughts).as_bytes())
+			.await
+			.into_diagnostic()?;
+		stdout.flush().await.into_diagnostic()?;
+	}
+
+	approvals.abort();
 	drop(session);
 	if let Some(path) = ephemeral_path {
 		let _ = fs::remove_file(path);
 	}
 	Ok(())
+}
+
+/// pi's stop-reason vocabulary for a turn that did not complete.
+const fn stop_reason_name(stop: TurnStop) -> &'static str {
+	match stop {
+		TurnStop::Completed => "stop",
+		TurnStop::Cancelled | TurnStop::Steered => "aborted",
+		TurnStop::Failed => "error",
+	}
+}
+
+/// The final `agent_end` frame: every message the submission produced, with
+/// the terminal assistant carrying `stopReason`/`errorMessage` when the turn
+/// failed or was aborted (pi `agent_end.messages`).
+fn agent_end_value(dom: &Dom, first_turn: usize) -> serde_json::Value {
+	serde_json::json!({
+		"type": "agent_end",
+		"messages": transcript_messages_from(dom, first_turn),
+		"isTerminal": true,
+	})
+}
+
+/// The journaled reason the newest turn at or after `first_turn` failed or
+/// was interrupted: the content of its last `<notice kind=error|warn>`.
+fn turn_error_message(dom: &Dom, first_turn: usize) -> Option<Str> {
+	let turns = dom.children(dom.body());
+	turns
+		.iter()
+		.skip(first_turn)
+		.rev()
+		.find_map(|turn| turn_failure_notice(dom, *turn))
+}
+
+/// The last `<notice kind=error|warn>` under `turn`, which is how the kernel
+/// journals a failed or interrupted turn.
+fn turn_failure_notice(dom: &Dom, turn: Handle) -> Option<Str> {
+	dom.children(turn).iter().rev().find_map(|handle| {
+		let node = dom.get(*handle)?;
+		if node.tag != Tag::Known(KnownTag::Notice) {
+			return None;
+		}
+		match node_text(node, PropId::Kind) {
+			Some("error" | "warn") => node.content.clone(),
+			_ => None,
+		}
+	})
+}
+
+/// Text-mode stdout: the last assistant response across the submitted
+/// prompts, thinking first when requested, each block newline-terminated.
+/// Intermediate assistant messages before tool calls and the tool calls
+/// themselves never reach stdout (pi `print-mode.ts` text output).
+fn final_response_text(dom: &Dom, first_turn: usize, print_thoughts: bool) -> String {
+	let mut output = String::new();
+	let Some(assistant) = dom
+		.children(dom.body())
+		.iter()
+		.skip(first_turn)
+		.rev()
+		.find_map(|turn| last_assistant(dom, *turn))
+	else {
+		return output;
+	};
+	let Some(node) = dom.get(assistant) else {
+		return output;
+	};
+	if print_thoughts
+		&& let Some(thinking) = node_text(node, PropId::Thinking)
+		&& !thinking.trim().is_empty()
+	{
+		output.push_str(thinking);
+		output.push('\n');
+	}
+	let text = node_text(node, PropId::Text)
+		.or(node.content.as_deref())
+		.unwrap_or_default();
+	if !text.is_empty() {
+		output.push_str(text);
+		output.push('\n');
+	}
+	output
+}
+
+fn last_assistant(dom: &Dom, turn: Handle) -> Option<Handle> {
+	dom.children(turn).iter().rev().copied().find(|handle| {
+		dom.get(*handle)
+			.is_some_and(|node| node.tag == Tag::Known(KnownTag::Assistant))
+	})
 }
 
 #[derive(Clone, Copy)]
@@ -238,48 +292,32 @@ impl JsonState {
 	}
 }
 
+/// Folds one session event into the replica; JSON mode additionally writes
+/// the projected lifecycle frames. Text mode writes nothing here: its stdout
+/// is the final response, written once every prompt settled.
 async fn print_event(
 	stdout: &mut tokio::io::Stdout,
-	args: &PrintArgs,
+	args: &PrintOptions,
 	replica: &mut Dom,
 	state: &mut JsonState,
 	event: Event,
-	ended_with_newline: &mut bool,
 ) -> miette::Result<()> {
-	let (values, text, tools) = project_print_event(args, replica, state, event)?;
+	let values = project_print_event(args, replica, state, event)?;
 	if args.mode == "json" {
 		for value in values {
 			write_json_line(stdout, &value).await?;
 		}
-		*ended_with_newline = true;
-		return Ok(());
-	}
-	if let Some(text) = text {
-		stdout.write_all(text.as_bytes()).await.into_diagnostic()?;
-		*ended_with_newline = text.ends_with('\n');
-	}
-	for name in tools {
-		if !*ended_with_newline {
-			stdout.write_all(b"\n").await.into_diagnostic()?;
-		}
-		stdout
-			.write_all(format!("[tool: {name}]\n").as_bytes())
-			.await
-			.into_diagnostic()?;
-		*ended_with_newline = true;
 	}
 	Ok(())
 }
 
 fn project_print_event(
-	args: &PrintArgs,
+	args: &PrintOptions,
 	replica: &mut Dom,
 	state: &mut JsonState,
 	event: Event,
-) -> miette::Result<(Vec<serde_json::Value>, Option<Str>, Vec<Str>)> {
+) -> miette::Result<Vec<serde_json::Value>> {
 	let mut values = Vec::new();
-	let mut text = None;
-	let mut tools = Vec::new();
 	let mut inserted = Vec::new();
 	let mut appended = None;
 
@@ -308,9 +346,7 @@ fn project_print_event(
 				Tag::Known(KnownTag::Assistant) if *prop == PropId::Thinking.into() => {
 					Some(PrintedStream::Thinking(*node))
 				},
-				Tag::Known(KnownTag::Input) => {
-					replica.parent(*node).map(PrintedStream::ToolArguments)
-				},
+				Tag::Known(KnownTag::Input) => replica.parent(*node).map(PrintedStream::ToolArguments),
 				Tag::Known(KnownTag::Result | KnownTag::Diag) => {
 					replica.parent(*node).map(PrintedStream::ToolResult)
 				},
@@ -321,7 +357,11 @@ fn project_print_event(
 			}
 		},
 		Event::Stream { sid, op: StreamOp::Append, text: Some(delta), .. } => {
-			appended = state.streams.get(sid).copied().map(|stream| (stream, delta.clone()));
+			appended = state
+				.streams
+				.get(sid)
+				.copied()
+				.map(|stream| (stream, delta.clone()));
 		},
 		Event::Reset { .. } => {
 			state.streams.clear();
@@ -352,19 +392,12 @@ fn project_print_event(
 					"message": message_value(replica, handle),
 				}));
 			},
-			Tag::Custom(name) => {
-				tools.push(name);
+			Tag::Custom(_) => {
 				values.push(tool_call_update(replica, handle, "toolcall_start", "", args));
 				if prop_text(replica.get(handle), PropId::Status) == Some("running") {
 					let delta = serde_json::to_string(&tool_args(replica, handle))
 						.unwrap_or_else(|_| "{}".to_owned());
-					values.push(tool_call_update(
-						replica,
-						handle,
-						"toolcall_delta",
-						&delta,
-						args,
-					));
+					values.push(tool_call_update(replica, handle, "toolcall_delta", &delta, args));
 					values.push(tool_call_update(replica, handle, "toolcall_end", "", args));
 					values.push(tool_execution_start(replica, handle));
 				}
@@ -376,20 +409,10 @@ fn project_print_event(
 	if let Some((stream, delta)) = appended {
 		match stream {
 			PrintedStream::Text(assistant) => {
-				text = Some(delta.clone());
 				values.push(message_delta(replica, assistant, "text_delta", delta.as_str(), args));
 			},
 			PrintedStream::Thinking(assistant) => {
-				if args.print_thoughts {
-					text = Some(delta.clone());
-				}
-				values.push(message_delta(
-					replica,
-					assistant,
-					"thinking_delta",
-					delta.as_str(),
-					args,
-				));
+				values.push(message_delta(replica, assistant, "thinking_delta", delta.as_str(), args));
 			},
 			PrintedStream::ToolArguments(call) => {
 				values.push(tool_call_update(replica, call, "toolcall_delta", delta.as_str(), args));
@@ -448,7 +471,7 @@ fn project_print_event(
 	if let Event::Stream { sid, op: StreamOp::Close, .. } = event {
 		state.streams.remove(&sid);
 	}
-	Ok((values, text, tools))
+	Ok(values)
 }
 
 fn session_header(id: &str, model: &str) -> serde_json::Value {
@@ -469,7 +492,7 @@ fn message_delta(
 	assistant: Handle,
 	kind: &str,
 	delta: &str,
-	args: &PrintArgs,
+	args: &PrintOptions,
 ) -> serde_json::Value {
 	let stream = serde_json::json!({"type":kind,"contentIndex":0,"delta":delta});
 	shaped_message_update(dom, assistant, stream, args.shape_transcript)
@@ -480,7 +503,7 @@ fn tool_call_update(
 	call: Handle,
 	kind: &str,
 	delta: &str,
-	args: &PrintArgs,
+	args: &PrintOptions,
 ) -> serde_json::Value {
 	let id = prop_text(dom.get(call), PropId::Id).unwrap_or_default();
 	let name = tool_name(dom.get(call)).unwrap_or_default();
@@ -608,7 +631,11 @@ fn message_value(dom: &Dom, handle: Handle) -> serde_json::Value {
 	let Some(node) = dom.get(handle) else {
 		return serde_json::Value::Null;
 	};
-	let role = if node.tag == Tag::Known(KnownTag::User) { "user" } else { "assistant" };
+	let role = if node.tag == Tag::Known(KnownTag::User) {
+		"user"
+	} else {
+		"assistant"
+	};
 	let mut content = Vec::new();
 	if let Some(text) = node_text(node, PropId::Thinking)
 		&& !text.is_empty()
@@ -628,7 +655,17 @@ fn message_value(dom: &Dom, handle: Handle) -> serde_json::Value {
 	if role == "assistant"
 		&& let Some(reason) = prop_text(Some(node), PropId::StopReason)
 	{
+		let reason = match reason {
+			"cancelled" => "aborted",
+			reason => reason,
+		};
 		message["stopReason"] = serde_json::json!(reason);
+		if matches!(reason, "error" | "aborted")
+			&& let Some(turn) = dom.parent(handle)
+			&& let Some(text) = turn_failure_notice(dom, turn)
+		{
+			message["errorMessage"] = serde_json::json!(text);
+		}
 	}
 	message
 }
@@ -640,7 +677,12 @@ fn tool_result_value(dom: &Dom, call: Handle) -> serde_json::Value {
 		matches!(node.tag, Tag::Known(KnownTag::Result | KnownTag::Diag)).then_some(node)
 	});
 	let text = terminal
-		.and_then(|node| node.content.as_deref().or_else(|| node_text(node, PropId::Text)))
+		.and_then(|node| {
+			node
+				.content
+				.as_deref()
+				.or_else(|| node_text(node, PropId::Text))
+		})
 		.unwrap_or_default();
 	serde_json::json!({
 		"role": "toolResult",
@@ -655,7 +697,12 @@ fn tool_args(dom: &Dom, call: Handle) -> serde_json::Value {
 	let raw = dom.children(call).iter().find_map(|handle| {
 		let node = dom.get(*handle)?;
 		(node.tag == Tag::Known(KnownTag::Input))
-			.then(|| node.content.as_deref().or_else(|| node_text(node, PropId::Text)))
+			.then(|| {
+				node
+					.content
+					.as_deref()
+					.or_else(|| node_text(node, PropId::Text))
+			})
 			.flatten()
 	});
 	raw.and_then(|raw| serde_json::from_str(raw).ok())
@@ -664,7 +711,8 @@ fn tool_args(dom: &Dom, call: Handle) -> serde_json::Value {
 
 fn usage_value(node: Option<&Node>) -> serde_json::Value {
 	let integer = |prop| {
-		node.and_then(|node| node.prop(&PropKey::Known(prop)))
+		node
+			.and_then(|node| node.prop(&PropKey::Known(prop)))
 			.and_then(|value| match value {
 				Value::Int(value) => Some(*value),
 				_ => None,
@@ -681,8 +729,7 @@ fn usage_value(node: Option<&Node>) -> serde_json::Value {
 }
 
 fn node_text(node: &Node, prop: PropId) -> Option<&str> {
-	node.prop(&PropKey::Known(prop))
-		.and_then(Value::as_str)
+	node.prop(&PropKey::Known(prop)).and_then(Value::as_str)
 }
 
 fn prop_text(node: Option<&Node>, prop: PropId) -> Option<&str> {
@@ -696,9 +743,11 @@ fn tool_name(node: Option<&Node>) -> Option<&str> {
 	}
 }
 
-async fn initial_prompt(words: &[Str]) -> miette::Result<Str> {
-	if !words.is_empty() {
-		return Ok(Str::new(words.iter().map(Str::as_str).collect::<Vec<_>>().join(" ")));
+/// The prompt words (a leading `/template` expanded, pi
+/// `expandPromptTemplate`), else piped standard input.
+async fn initial_prompt(launch: &Launch) -> miette::Result<Str> {
+	if let Some(text) = launch.initial_prompt() {
+		return Ok(text);
 	}
 	if std::io::stdin().is_terminal() {
 		return Ok(Str::default());
@@ -743,10 +792,168 @@ pub fn transcript_text(dom: &Dom) -> String {
 
 #[cfg(test)]
 mod tests {
+	use omp_dom::{NodeSpec, Txn};
 	use serde_json::value::RawValue;
 	use tempfile::tempdir;
 
 	use super::*;
+
+	fn current_turn(session: &omp_session::Session) -> Handle {
+		*session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn node")
+	}
+
+	fn assistant_with(
+		session: &mut omp_session::Session,
+		thinking: Option<&str>,
+		text: &str,
+		stop: &str,
+	) {
+		session
+			.assistant_start("test/model", "test", "test/model")
+			.expect("assistant");
+		let turn = current_turn(session);
+		let assistant = last_assistant(session.dom(), turn).expect("assistant node");
+		if let Some(thinking) = thinking {
+			let sid = session
+				.stream_open(assistant, PropId::Thinking.into())
+				.expect("thinking stream");
+			session.stream_append(sid, thinking).expect("thinking delta");
+			session.stream_close(sid).expect("thinking close");
+		}
+		let sid = session
+			.stream_open(assistant, PropId::Text.into())
+			.expect("text stream");
+		session.stream_append(sid, text).expect("text delta");
+		session.stream_close(sid).expect("text close");
+		session.assistant_end(stop).expect("assistant end");
+	}
+
+	fn settled_call(session: &mut omp_session::Session, name: &str) {
+		let call = session
+			.call(
+				name,
+				1,
+				"call-1",
+				None,
+				Some(RawValue::from_string(r#"{"path":"note.txt"}"#.to_owned()).expect("args")),
+				None,
+			)
+			.expect("call");
+		session
+			.settle(
+				call,
+				RawValue::from_string(
+					r#"{"content":[{"type":"text","text":"hello from fixture"}]}"#.to_owned(),
+				)
+				.expect("outcome"),
+			)
+			.expect("settle");
+	}
+
+	fn error_notice(session: &mut omp_session::Session, text: &str) {
+		let turn = current_turn(session);
+		let after = session.dom().children(turn).last().copied();
+		let cause = session.head().expect("head");
+		session
+			.patch(Txn {
+				cause,
+				label: Some(Str::new_static("kernel.notice")),
+				ops: vec![Op::Ins {
+					parent: turn,
+					after,
+					node: NodeSpec::new(KnownTag::Notice)
+						.with_prop(PropId::Kind, Value::Str(Str::new_static("error")))
+						.with_content(Str::new(text)),
+				}],
+			})
+			.expect("notice");
+	}
+
+	#[test]
+	fn text_mode_stdout_is_only_the_final_response() {
+		let scratch = tempdir().expect("scratch");
+		let mut session = omp_session::Session::create(
+			scratch.path().join("text.oms"),
+			omp_session::ComponentRegistry::standard(),
+		)
+		.expect("session");
+		session.begin_turn().expect("turn");
+		session.user("read note.txt", Vec::new()).expect("user");
+		assistant_with(&mut session, None, "Let me read that file.", "tool_calls");
+		settled_call(&mut session, "read");
+		assistant_with(
+			&mut session,
+			Some("The file says hello."),
+			"hello from fixture",
+			"stream_closed",
+		);
+
+		assert_eq!(
+			final_response_text(session.dom(), 0, false),
+			"hello from fixture\n",
+			"intermediate assistant text and tool markers must never reach stdout",
+		);
+		assert_eq!(
+			final_response_text(session.dom(), 0, true),
+			"The file says hello.\nhello from fixture\n",
+		);
+		assert_eq!(final_response_text(session.dom(), 1, false), "");
+	}
+
+	#[test]
+	fn failed_turn_agent_end_carries_stop_reason_and_error_message() {
+		let scratch = tempdir().expect("scratch");
+		let mut session = omp_session::Session::create(
+			scratch.path().join("failed.oms"),
+			omp_session::ComponentRegistry::standard(),
+		)
+		.expect("session");
+		session.begin_turn().expect("turn");
+		session.user("hi", Vec::new()).expect("user");
+		assistant_with(&mut session, None, "partial", "error");
+		error_notice(&mut session, "provider exploded: http 500");
+
+		let end = agent_end_value(session.dom(), 0);
+		assert_eq!(end["type"], "agent_end");
+		assert_eq!(end["isTerminal"], true);
+		let assistant = end["messages"]
+			.as_array()
+			.expect("messages")
+			.iter()
+			.rev()
+			.find(|message| message["role"] == "assistant")
+			.expect("terminal assistant");
+		assert_eq!(assistant["stopReason"], "error");
+		assert_eq!(assistant["errorMessage"], "provider exploded: http 500");
+		assert_eq!(
+			turn_error_message(session.dom(), 0).as_deref(),
+			Some("provider exploded: http 500"),
+		);
+		assert_eq!(turn_error_message(session.dom(), 1), None);
+	}
+
+	#[test]
+	fn interrupted_assistant_reports_pi_aborted_stop_reason() {
+		let scratch = tempdir().expect("scratch");
+		let mut session = omp_session::Session::create(
+			scratch.path().join("aborted.oms"),
+			omp_session::ComponentRegistry::standard(),
+		)
+		.expect("session");
+		session.begin_turn().expect("turn");
+		assistant_with(&mut session, None, "part", "cancelled");
+		let turn = current_turn(&session);
+		let assistant = last_assistant(session.dom(), turn).expect("assistant");
+		let message = message_value(session.dom(), assistant);
+		assert_eq!(message["stopReason"], "aborted");
+		assert!(message.get("errorMessage").is_none());
+		assert_eq!(stop_reason_name(TurnStop::Cancelled), "aborted");
+		assert_eq!(stop_reason_name(TurnStop::Failed), "error");
+	}
 
 	#[test]
 	fn json_stream_starts_with_resumable_session_header() {
@@ -773,7 +980,11 @@ mod tests {
 		session
 			.assistant_start("test/model", "test", "test/model")
 			.expect("assistant");
-		let turn = *session.dom().children(session.dom().body()).last().expect("turn node");
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn node");
 		let assistant = *session
 			.dom()
 			.children(turn)
@@ -830,13 +1041,15 @@ mod tests {
 		session
 			.settle(
 				call,
-				RawValue::from_string(
-					r#"{"content":[{"type":"text","text":"ok"}]}"#.to_owned(),
-				)
-				.expect("outcome"),
+				RawValue::from_string(r#"{"content":[{"type":"text","text":"ok"}]}"#.to_owned())
+					.expect("outcome"),
 			)
 			.expect("settle");
-		let turn = *session.dom().children(session.dom().body()).last().expect("turn node");
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn node");
 		let event = turn_end_value(session.dom(), turn);
 		assert_eq!(event["type"], "turn_end");
 		assert_eq!(event["toolResults"][0]["toolCallId"], "call-1");
@@ -847,7 +1060,15 @@ mod tests {
 		);
 		let messages = transcript_messages_from(session.dom(), 0);
 		assert!(messages.iter().any(|message| message["role"] == "user"));
-		assert!(messages.iter().any(|message| message["role"] == "assistant"));
-		assert!(messages.iter().any(|message| message["role"] == "toolResult"));
+		assert!(
+			messages
+				.iter()
+				.any(|message| message["role"] == "assistant")
+		);
+		assert!(
+			messages
+				.iter()
+				.any(|message| message["role"] == "toolResult")
+		);
 	}
 }

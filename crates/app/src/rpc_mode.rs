@@ -2,9 +2,9 @@
 
 use std::{
 	collections::{BTreeMap, HashSet},
-	env, fs,
+	fs,
 	future::Future,
-	path::{Path, PathBuf},
+	path::Path,
 	pin::Pin,
 	sync::Arc,
 };
@@ -13,10 +13,7 @@ use miette::{IntoDiagnostic as _, miette};
 use omp_agent::{Inference, Kernel, KernelEvent, RunControl, TurnInput, TurnStop, Up};
 use omp_core::Str;
 use omp_dom::Event;
-use omp_driver::{
-	discovery::roles,
-	headless::kernel::{KernelOptions, SessionHome},
-};
+use omp_driver::headless::kernel::SessionHome;
 use omp_rpc::{
 	framing::{
 		JsonLineDecoder, MAX_FRAME_BYTES, MAX_REASSEMBLED_BYTES, RpcFrameDecoder, encode_json_v1,
@@ -32,7 +29,10 @@ use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, stdin, stdout};
 
-use crate::cli::{ChatArgs, RpcArgs};
+use crate::{
+	chat_cmd::{Launch, LaunchEnv},
+	cli::{ChatArgs, RpcArgs},
+};
 
 /// Runs the RPC server using stdin exclusively for protocol input and stdout
 /// exclusively for protocol output.
@@ -48,99 +48,16 @@ pub async fn run(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 }
 
 async fn run_inner(args: ChatArgs, ui_enabled: bool) -> miette::Result<()> {
-	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let project = fs::canonicalize(&args.project).into_diagnostic()?;
 	let ctx = Arc::new(crate::process_ctx(&project)?);
-	for overlay in &args.config {
-		let script = fs::read_to_string(overlay).into_diagnostic()?;
-		ctx.exec(&script, omp_con::Source::Config(Str::new(overlay.to_string_lossy())))
-			.into_diagnostic()?;
-	}
-	let home_dir = env::var_os("HOME").map_or_else(|| project.clone(), PathBuf::from);
-	let model_settings =
-		omp_catalog::settings::ModelSettings::from_con(&ctx).resolve_path_scopes(&project, &home_dir);
-	let catalog = if args.gateway.is_some() {
-		Arc::new(omp_catalog::snapshot::Catalog::embedded().clone())
-	} else {
-		omp_driver::registry::production_catalog(&data_dir).map_err(|source| miette!(source))?
-	};
-	let launch_roles = roles::resolve_launch_roles(
-		catalog.as_ref(),
-		&model_settings,
-		None,
-		args.smol.as_deref(),
-		args.slow.as_deref(),
-		args.plan.as_deref(),
-	)
-	.map_err(|source| miette!(source))?;
-	let model = args
-		.model
-		.clone()
-		.or_else(|| launch_roles.primary.map(|value| Str::from(value.as_str())))
-		.ok_or_else(|| miette!("rpc mode requires a configured default model role"))?;
-	let prompt = crate::chat_cmd::prompt_overrides(&project, &home_dir, &args.prompt_settings)?;
-	let gateway = match args.gateway.as_ref() {
-		Some(endpoint) => Some(endpoint.connect().await.into_diagnostic()?),
-		None => None,
-	};
-	let live_sessions = Arc::new(omp_driver::sessions::SessionRegistry::new());
-	let extensions = crate::chat_cmd::driver_extension_policy(&args.extension_launch);
-	let options = KernelOptions {
-		continue_session: args.continue_session,
-		session: args
-			.resume
-			.as_ref()
-			.map(|value| PathBuf::from(value.as_str())),
-		fork: args
-			.fork
-			.as_ref()
-			.map(|value| PathBuf::from(value.as_str())),
-		sessions_dir: args.session_dir.clone(),
-		ephemeral: args.no_session,
-		no_tools: args.no_tools,
-		tools: args.tools.as_ref().map(|tools| tools.0.clone()),
-		py_eval: args.py_eval,
-		spawn_idle_timeout: args.envd_idle_timeout,
-		api_key: args.api_key.clone(),
-		approval_mode: args.effective_approval().map(Into::into),
-		model_override: args.model.is_some(),
-		prompt,
-		extensions,
-		provider: args
-			.provider
-			.as_ref()
-			.map(|value| omp_catalog::ProviderId::from(value.as_str()))
-			.or_else(|| {
-				args.api_key.as_ref().and_then(|_| {
-					model
-						.split_once('/')
-						.map(|(provider, _)| omp_catalog::ProviderId::from(provider))
-				})
-			}),
-		gateway,
-		sessions: Some(Arc::clone(&live_sessions)),
-		session_name: None,
-		tool_registry: None,
-		..KernelOptions::default()
-	};
-	let (mut kernel, mut session, _) = omp_driver::headless::kernel::compose_kernel(
-		&data_dir,
-		&project,
-		model.as_str(),
-		Arc::clone(&ctx),
-		options.clone(),
-	)
-	.await
-	.into_diagnostic()?;
-	crate::chat_cmd::apply_launch_thinking(&ctx, args.thinking).into_diagnostic()?;
-	if args.plan_mode || args.plan_yolo {
-		crate::chat_cmd::set_plan_mode(&mut session, true).into_diagnostic()?;
-	}
+	let env = LaunchEnv::production(&project, args.gateway.is_some())?;
+	let launch = Launch::prepare(args, ctx, env).await?;
+	let (kernel, session) = launch.compose().await?;
 	let home = SessionHome::new(
-		&data_dir,
-		&project,
-		&options,
-		model,
+		&launch.data_dir,
+		&launch.project,
+		&launch.options,
+		launch.model.clone(),
 		kernel.mailbox(),
 	)
 	.into_diagnostic()?;
@@ -261,9 +178,12 @@ impl AskPresenter for RpcUiBridge {
 						message: Str::new_static("RPC UI host went away before showing ask"),
 					});
 				}
-				let fields = reply_rx.recv_async().await.map_err(|_| AskFault::Presenter {
-					message: Str::new_static("RPC UI host went away before answering ask"),
-				})?;
+				let fields = reply_rx
+					.recv_async()
+					.await
+					.map_err(|_| AskFault::Presenter {
+						message: Str::new_static("RPC UI host went away before answering ask"),
+					})?;
 				drop(pending);
 				if fields.get("cancelled").and_then(Value::as_bool) == Some(true) {
 					return Err(AskFault::cancelled());
@@ -282,7 +202,10 @@ impl AskPresenter for RpcUiBridge {
 				answers.push(Answer {
 					id: question.id.clone(),
 					selected,
-					custom_input: fields.get("customInput").and_then(Value::as_str).map(Str::new),
+					custom_input: fields
+						.get("customInput")
+						.and_then(Value::as_str)
+						.map(Str::new),
 					note: fields.get("note").and_then(Value::as_str).map(Str::new),
 					timed_out: false,
 				});
@@ -387,12 +310,14 @@ where
 			let count = match input.read(&mut buffer).await {
 				Ok(count) => count,
 				Err(source) => {
-					let _ = incoming_tx.send_async(Incoming::Error(error_frame(
-						None,
-						"transport",
-						"io_error",
-						&source.to_string(),
-					))).await;
+					let _ = incoming_tx
+						.send_async(Incoming::Error(error_frame(
+							None,
+							"transport",
+							"io_error",
+							&source.to_string(),
+						)))
+						.await;
 					break;
 				},
 			};
@@ -441,7 +366,11 @@ where
 				};
 				match serde_json::from_value::<RpcRequest>(value) {
 					Ok(request) => {
-						if incoming_tx.send_async(Incoming::Request(request)).await.is_err() {
+						if incoming_tx
+							.send_async(Incoming::Request(request))
+							.await
+							.is_err()
+						{
 							return;
 						}
 					},
@@ -554,6 +483,10 @@ where
 							},
 							"steer" => {
 								let response = up_response(id, command.as_str(), &request.params, &mailbox, true);
+								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
+							},
+							"approve" => {
+								let response = approve_response(id, command.as_str(), &request.params, &mailbox);
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
 							},
 							"interrupt" | "abort" => {
@@ -717,7 +650,9 @@ where
 	kernel.flush_session_state(&mut session).into_diagnostic()?;
 	session.process_exit().into_diagnostic()?;
 	while let Ok(event) = dom_events.try_recv() {
-		outgoing_tx.send(Outgoing::Frame(dom_event_value(event)?)).into_diagnostic()?;
+		outgoing_tx
+			.send(Outgoing::Frame(dom_event_value(event)?))
+			.into_diagnostic()?;
 	}
 	drop(session);
 	drop(outgoing_tx);
@@ -737,7 +672,9 @@ fn transition_session(
 			let Some(path) = params.get("sessionPath").and_then(Value::as_str) else {
 				return Err(("switch_session requires `sessionPath`".into(), old));
 			};
-			home.open(Path::new(path)).map_err(|source| source.to_string())
+			home
+				.open(Path::new(path))
+				.map_err(|source| source.to_string())
 		},
 		"branch" => {
 			let Some(entry) = params.get("entryId").and_then(Value::as_str) else {
@@ -816,7 +753,7 @@ fn up_response(
 	match text {
 		Some(text) => {
 			if steer {
-				let _ = mailbox.send(Up::Steer(Str::new(text)));
+				let _ = mailbox.send(Up::Steer { text: Str::new(text), attachments: Vec::new() });
 			}
 			RpcResponse::success(id, command, json!({ "queued": true }))
 				.expect("static steering response serializes")
@@ -874,8 +811,82 @@ fn kernel_event_value(event: KernelEvent) -> Option<Value> {
 			"type": "auto_compaction_end",
 			"applied": applied,
 		})),
+		KernelEvent::JobsDelivered { ids } => Some(json!({
+			"type": "async_result",
+			"jobIds": ids,
+		})),
+		KernelEvent::WorkflowActionAnswered { invocation, name, is_error } => Some(json!({
+			"type": "workflow_action_end",
+			"invocation": invocation,
+			"toolName": name,
+			"isError": is_error,
+		})),
+		// pi surfaces the wrapper's approval `select` as an extension UI
+		// request; the journal-first host names the durable prompt so the
+		// client answers with `approve`.
+		KernelEvent::ApprovalRequested(ticket) => {
+			let first = ticket.reasons.first();
+			Some(json!({
+				"type": "tool_approval_request",
+				"promptId": ticket.ticket_id,
+				"toolCallId": ticket.invocation_id,
+				"title": first.map(|spec| spec.title.as_str()),
+				"body": first.map(|spec| spec.body.as_str()),
+				"subject": first.map(|spec| spec.subject.as_str()),
+				"kind": first.map(|spec| spec.kind.as_str()),
+				"scopes": first.map(|spec| spec.scopes.clone()),
+				"timeoutMs": first.map(|spec| spec.timeout_ms),
+			}))
+		},
 		KernelEvent::TurnEnded { .. } => None,
 	}
+}
+
+/// `approve {promptId, approved, scope?, reason?}` → [`Up::Approve`].
+fn approve_response(
+	id: Option<RequestId>,
+	command: &str,
+	params: &Map<String, Value>,
+	mailbox: &flume::Sender<Up>,
+) -> RpcResponse {
+	let Some(prompt_id) = params
+		.get("promptId")
+		.or_else(|| params.get("id"))
+		.and_then(Value::as_str)
+	else {
+		return RpcResponse::error(
+			id,
+			command,
+			"approve requires `promptId`",
+			Some(RpcErrorCode::new("invalid_params")),
+		);
+	};
+	let approved = params
+		.get("approved")
+		.and_then(Value::as_bool)
+		.unwrap_or(false);
+	let scope = params
+		.get("scope")
+		.and_then(Value::as_str)
+		.unwrap_or("once")
+		.parse::<omp_agent::ApprovalScope>()
+		.expect("approval scope parsing is infallible");
+	let _ = mailbox.send(Up::Approve {
+		id:       Str::new(prompt_id),
+		decision: omp_agent::ApprovalDecision {
+			approved,
+			scope,
+			source: omp_agent::ApprovalSource::External,
+			decided_by: None,
+			reason: params
+				.get("reason")
+				.and_then(Value::as_str)
+				.map(Str::new),
+			audited: false,
+		},
+	});
+	RpcResponse::success(id, command, json!({ "queued": true }))
+		.expect("static approval response serializes")
 }
 
 fn dom_event_value(event: Event) -> miette::Result<Value> {

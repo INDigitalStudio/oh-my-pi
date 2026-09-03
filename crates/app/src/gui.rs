@@ -6,7 +6,6 @@
 //! pixel snapshots from the last production-native frame.
 
 use std::{cell::RefCell, rc::Rc, time::Duration};
-
 #[cfg(unix)]
 use std::{
 	fs,
@@ -155,23 +154,28 @@ fn serve_debug_client(mut client: UnixStream, requests: &flume::Sender<GuiDebugR
 		let resize = serde_json::from_str::<serde_json::Value>(&line)
 			.ok()
 			.and_then(|value| {
-				let cols = value.get("cols")?.as_u64().and_then(|value| u16::try_from(value).ok())?;
-				let rows = value.get("rows")?.as_u64().and_then(|value| u16::try_from(value).ok())?;
+				let cols = value
+					.get("cols")?
+					.as_u64()
+					.and_then(|value| u16::try_from(value).ok())?;
+				let rows = value
+					.get("rows")?
+					.as_u64()
+					.and_then(|value| u16::try_from(value).ok())?;
 				(cols > 0 && rows > 0).then(|| Size::new(cols, rows))
 			});
 		let request = match debug::parse_request(line.as_bytes()) {
 			Ok(request) => request,
 			Err(error) => {
-				let _ = writeln!(
-					client,
-					"{}",
-					serde_json::json!({"ok":false,"error":error})
-				);
+				let _ = writeln!(client, "{}", serde_json::json!({"ok":false,"error":error}));
 				continue;
 			},
 		};
 		let (reply, receive) = flume::bounded(1);
-		if requests.send(GuiDebugRequest { request, resize, reply }).is_err() {
+		if requests
+			.send(GuiDebugRequest { request, resize, reply })
+			.is_err()
+		{
 			return;
 		}
 		let Ok(response) = receive.recv() else {
@@ -241,7 +245,9 @@ impl GuiScene {
 					.lines()
 					.map(str::to_owned)
 					.collect::<Vec<_>>();
-				let start = lines.len().saturating_sub(usize::from(self.viewport.height));
+				let start = lines
+					.len()
+					.saturating_sub(usize::from(self.viewport.height));
 				(
 					serde_json::json!({"ok":true,"lines":&lines[start..],"surface":"native"}),
 					Effect::Ignored,
@@ -257,15 +263,13 @@ impl GuiScene {
 					}),
 					Effect::Ignored,
 				),
-				Err(error) => (
-					serde_json::json!({"ok":false,"error":error.to_string()}),
-					Effect::Ignored,
-				),
+				Err(error) => {
+					(serde_json::json!({"ok":false,"error":error.to_string()}), Effect::Ignored)
+				},
 			},
-			DebugRequest::Tree => (
-				serde_json::json!({"ok":true,"tree":self.debug_tree()}),
-				Effect::Ignored,
-			),
+			DebugRequest::Tree => {
+				(serde_json::json!({"ok":true,"tree":self.debug_tree()}), Effect::Ignored)
+			},
 			DebugRequest::Values => (
 				serde_json::json!({
 					"ok": true,
@@ -310,11 +314,28 @@ impl GuiScene {
 					Effect::Consumed,
 				)
 			},
-			DebugRequest::Quit => (
-				serde_json::json!({"ok":true,"injected":"C-c"}),
-				Scene::key(self, Key::Ctrl('c')),
-			),
+			DebugRequest::Quit => {
+				(serde_json::json!({"ok":true,"injected":"C-c"}), Scene::key(self, Key::Ctrl('c')))
+			},
 			DebugRequest::Inject(events) => self.inject_debug_events(events),
+			DebugRequest::Chords(chords) => {
+				// The native window has no terminal decoder; physical chords
+				// resolve through the default keymap exactly as the PTY host's
+				// `keys` op does.
+				let keymap = omp_tui::Keymap::default();
+				self.inject_debug_events(
+					chords
+						.into_iter()
+						.map(|chord| {
+							InputEvent::Chord(omp_tui::KeyEvent {
+								chord,
+								key: keymap.resolve(chord),
+								pressed: true,
+							})
+						})
+						.collect(),
+				)
+			},
 			DebugRequest::Events(events) => {
 				let mut input = Vec::new();
 				for event in events {
@@ -325,10 +346,7 @@ impl GuiScene {
 							Scene::resize(self, viewport, true);
 						},
 						TerminalEvent::Closed => {
-							return (
-								serde_json::json!({"ok":true,"injected":"closed"}),
-								Effect::Quit,
-							);
+							return (serde_json::json!({"ok":true,"injected":"closed"}), Effect::Quit);
 						},
 						TerminalEvent::Debug(_) | TerminalEvent::Effect(_) => {},
 					}
@@ -355,9 +373,9 @@ impl GuiScene {
 		for event in events {
 			let next = match event {
 				InputEvent::Key(key) => Scene::key(self, key),
-				InputEvent::Chord(event) if event.pressed => {
-					event.key.map_or(Effect::Ignored, |key| Scene::key(self, key))
-				},
+				InputEvent::Chord(event) if event.pressed => event
+					.key
+					.map_or(Effect::Ignored, |key| Scene::key(self, key)),
 				InputEvent::Mouse(report) => Scene::mouse(self, report),
 				InputEvent::Paste(text) => Scene::paste(self, text.as_str(), false),
 				InputEvent::Chord(_) | InputEvent::Focus(_) | InputEvent::Response(_) => {
@@ -378,8 +396,13 @@ impl GuiScene {
 	fn debug_tree(&self) -> serde_json::Value {
 		let frame_rows = self.host.frame().size().height;
 		let editor_rows = self.host.editor_rows();
-		let status_rows = self.host.status_frame().map_or(0, |frame| frame.size().height);
-		let transcript_rows = frame_rows.saturating_sub(editor_rows).saturating_sub(status_rows);
+		let status_rows = self
+			.host
+			.status_frame()
+			.map_or(0, |frame| frame.size().height);
+		let transcript_rows = frame_rows
+			.saturating_sub(editor_rows)
+			.saturating_sub(status_rows);
 		let status_top = transcript_rows;
 		let editor_top = status_top.saturating_add(status_rows);
 		let mut children = vec![
@@ -480,10 +503,7 @@ impl Scene for GuiScene {
 /// Drains every toast the detached chat actor decided during this poll.
 /// Delivery is supplied so the adapter contract can be proved without
 /// posting a real desktop notification in tests.
-fn deliver_notifications(
-	notifications: Vec<Notification>,
-	mut deliver: impl FnMut(&Notification),
-) {
+fn deliver_notifications(notifications: Vec<Notification>, mut deliver: impl FnMut(&Notification)) {
 	for notification in &notifications {
 		deliver(notification);
 	}
@@ -505,9 +525,7 @@ mod tests {
 		HostOptions, ModelBadge, NativeHost, overlays::NoServices, welcome::WelcomeFacts,
 	};
 	use omp_core::Str;
-	use omp_tui::{
-		Dim, Notification, OverlayOptions, Size, UiContext, debug, slots::ResizePolicy,
-	};
+	use omp_tui::{Dim, Notification, OverlayOptions, Size, UiContext, debug, slots::ResizePolicy};
 	use tempfile::tempdir;
 
 	use super::{GuiDebug, GuiScene, deliver_notifications};
@@ -568,8 +586,7 @@ mod tests {
 		assert_eq!(response["injected"], 6);
 		assert_eq!(scene.host.composer_text(), "hello world");
 
-		let resize = debug::parse_request(br#"{"op":"resize","cols":64,"rows":20}"#)
-			.expect("resize");
+		let resize = debug::parse_request(br#"{"op":"resize","cols":64,"rows":20}"#).expect("resize");
 		let (response, _) = scene.debug_response(resize, Some(Size::new(64, 20)));
 		assert_eq!(response["cols"], 64);
 		assert_eq!(scene.viewport, Size::new(64, 20));
@@ -582,9 +599,15 @@ mod tests {
 		let frame = debug::parse_request(br#"{"op":"frame"}"#).expect("frame");
 		let (response, _) = scene.debug_response(frame, None);
 		assert_eq!(response["surface"], "native");
-		assert!(response["lines"].as_array().is_some_and(|lines| !lines.is_empty()));
 		assert!(
-			response["png"].as_array().is_some_and(|bytes| bytes.len() > 8),
+			response["lines"]
+				.as_array()
+				.is_some_and(|lines| !lines.is_empty())
+		);
+		assert!(
+			response["png"]
+				.as_array()
+				.is_some_and(|bytes| bytes.len() > 8),
 			"native pixel screenshot missing",
 		);
 
@@ -614,12 +637,9 @@ mod tests {
 				notification.body.clone().unwrap_or_default(),
 			));
 		});
-		assert_eq!(
-			delivered,
-			[
-				(Str::new_static("session"), Str::new_static("Complete")),
-				(Str::new_static("session"), Str::new_static("Waiting for input")),
-			]
-		);
+		assert_eq!(delivered, [
+			(Str::new_static("session"), Str::new_static("Complete")),
+			(Str::new_static("session"), Str::new_static("Waiting for input")),
+		]);
 	}
 }

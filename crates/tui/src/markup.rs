@@ -71,12 +71,7 @@
 //! `<option>` accepts the same `<td>` cells and the hosting `<select>`
 //! owns cursor, filter, hover, and activation over aligned rows.
 
-use std::{
-	error,
-	fmt::{self, Display, Formatter},
-	num::ParseIntError,
-	str::FromStr,
-};
+use std::{num::ParseIntError, str::FromStr};
 
 use omp_core::{Str, StrMut};
 use strum::{EnumString, IntoStaticStr};
@@ -204,21 +199,14 @@ pub enum VAlign {
 }
 
 /// Markup rejection with byte position context.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("markup error at byte {at}: {message}")]
 pub struct ParseError {
 	/// Human-readable failure description.
 	pub message: String,
 	/// Byte offset into the source.
 	pub at:      usize,
 }
-
-impl Display for ParseError {
-	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-		write!(f, "markup error at byte {}: {}", self.at, self.message)
-	}
-}
-
-impl error::Error for ParseError {}
 
 /// Origin of a TML document.
 ///

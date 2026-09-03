@@ -645,7 +645,7 @@ pub async fn run(args: ExtArgs) -> miette::Result<()> {
 		ExtCommand::Enable { id } => enable(&scoped_state, &id, true),
 		ExtCommand::Disable { id } => enable(&scoped_state, &id, false),
 		ExtCommand::Features(args) => features(&state, args),
-		ExtCommand::Config(args) => config::run(&project, Some(&data_dir), layer, args).await,
+		ExtCommand::Config(args) => config::run(&project, layer, args).await,
 		ExtCommand::Lock(args) => lock(&state, args),
 		ExtCommand::Resolve(args) => {
 			resolve(
@@ -2111,7 +2111,6 @@ fn where_paths(state: &StatePaths, args: ExtWhereArgs, json: bool) -> miette::Re
 
 #[derive(Clone)]
 pub(crate) struct StatePaths {
-	data_dir:            PathBuf,
 	project:             PathBuf,
 	project_state:       PathBuf,
 	client_installed:    PathBuf,
@@ -2158,7 +2157,6 @@ impl StatePaths {
 		};
 		let workspace = project.join(".omp");
 		Self {
-			data_dir:            data_dir.to_path_buf(),
 			project:             project.clone(),
 			project_state:       project_state.clone(),
 			client_installed:    data_dir.join("ext/installed.toml"),

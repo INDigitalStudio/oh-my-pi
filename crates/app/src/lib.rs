@@ -4,8 +4,6 @@
 
 pub mod acp_mode;
 pub mod audio_coordinator;
-/// Push-to-talk capture and recognition for `omp chat`.
-pub mod chat_voice;
 pub mod auth_broker_cmd;
 pub mod auth_cli;
 pub mod auth_gateway_cmd;
@@ -17,6 +15,8 @@ pub mod chat_cmd;
 pub(crate) mod chat_control;
 /// Application feeds behind the chat host's dashboards and account commands.
 pub mod chat_services;
+/// Push-to-talk capture and recognition for `omp chat`.
+pub mod chat_voice;
 pub mod cleanse_cmd;
 pub mod cli;
 pub mod commit_cmd;
@@ -52,10 +52,10 @@ pub mod progress_reporter;
 pub mod ps_cmd;
 pub mod render_cmd;
 pub mod rpc_mode;
-/// Process- and presentation-level pi setting convars.
-pub mod settings;
 #[cfg(feature = "local-tts")]
 pub mod say_cmd;
+/// Process- and presentation-level pi setting convars.
+pub mod settings;
 /// Feature-disabled local speech command.
 #[cfg(not(feature = "local-tts"))]
 pub mod say_cmd {

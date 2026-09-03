@@ -22,7 +22,9 @@ fn cwd_is_applied_before_export_session_resolution() {
 	let journal = sessions.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.oms");
 	let mut session = Session::create(&journal, ComponentRegistry::standard()).expect("session");
 	session.begin_turn().expect("turn");
-	session.user("cwd export", Vec::new()).expect("user message");
+	session
+		.user("cwd export", Vec::new())
+		.expect("user message");
 	drop(session);
 
 	let output = Command::new(env!("CARGO_BIN_EXE_omp"))
@@ -37,12 +39,16 @@ fn cwd_is_applied_before_export_session_resolution() {
 		])
 		.output()
 		.expect("run omp export");
+	assert!(output.status.success(), "export failed: {}", String::from_utf8_lossy(&output.stderr));
 	assert!(
-		output.status.success(),
-		"export failed: {}",
-		String::from_utf8_lossy(&output.stderr)
+		project
+			.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.export.oms")
+			.is_file()
 	);
-	assert!(project.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.export.oms").is_file());
 	assert!(project.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.txt").is_file());
-	assert!(!launch.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.export.oms").exists());
+	assert!(
+		!launch
+			.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.export.oms")
+			.exists()
+	);
 }

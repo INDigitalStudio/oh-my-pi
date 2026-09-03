@@ -18,6 +18,7 @@ use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand, V
 use clap_complete::Shell;
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
+use omp_catalog::settings::TierSetting;
 use omp_core::{SecretString, Str, encoding::hex};
 use omp_driver::{cleanse::CleanseArgs, compress::CompressArgs};
 use omp_envd::{site::TrustedModule, worker::ExtHostSpec};
@@ -39,7 +40,7 @@ fn parse_cli_secret(value: &str) -> Result<SecretString, convert::Infallible> {
 
 use std::{convert, env, fs, time};
 
-use omp_catalog::{ModelKey, SelectionError, compile::compile_oracle, role_assignment_selector};
+use omp_catalog::{ModelKey, compile::compile_oracle};
 use omp_driver::bridges::{AgentGoalControl, InferenceBridge};
 use omp_envd::{
 	exthost::{ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest},
@@ -141,53 +142,23 @@ impl FromStr for ThinkingLevel {
 	}
 }
 
-/// Formats the invocation-local default role recorded for `--model`.
-///
-/// An explicit `--thinking` replaces a model suffix; without it, the suffix is
-/// retained so cycling away from and back to the default role restores the
-/// launch effort.
-pub(crate) fn default_model_role_override(
-	model: Option<&str>,
-	thinking: Option<ThinkingLevel>,
-) -> Result<Option<Str>, SelectionError> {
-	model
-		.map(|selector| role_assignment_selector(selector, thinking.map(<&'static str>::from)))
-		.transpose()
-}
-
-/// Validated provider service tier.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ServiceTier {
-	/// Disable provider tier routing.
-	None,
-	/// Let the provider choose a tier.
-	Auto,
-	/// Use the provider default tier.
-	Default,
-	/// Select the flex tier.
-	Flex,
-	/// Select the priority tier.
-	Priority,
-	/// Select the scale tier.
-	Scale,
-	/// Select the standard tier.
-	Standard,
-}
-
-impl FromStr for ServiceTier {
-	type Err = String;
-
-	fn from_str(value: &str) -> Result<Self, Self::Err> {
-		match value {
-			"none" => Ok(Self::None),
-			"auto" => Ok(Self::Auto),
-			"default" => Ok(Self::Default),
-			"flex" => Ok(Self::Flex),
-			"priority" => Ok(Self::Priority),
-			"scale" => Ok(Self::Scale),
-			"standard" => Ok(Self::Standard),
-			_ => Err(format!("unknown service tier `{value}`")),
-		}
+/// Parses `--service-tier` into the session's OpenAI-family tier setting
+/// (`ai_tier_openai`; pi `SERVICE_TIER_OPENAI_VALUES`). `inherit` is a
+/// subagent-only value and is rejected at the CLI.
+fn parse_service_tier(value: &str) -> Result<TierSetting, String> {
+	use strum::VariantNames as _;
+	match value.parse::<TierSetting>() {
+		Ok(TierSetting::Inherit) => Err("`inherit` is not valid for --service-tier".into()),
+		Ok(tier) => Ok(tier),
+		Err(_) => Err(format!(
+			"unknown service tier `{value}`; expected one of {}",
+			TierSetting::VARIANTS
+				.iter()
+				.filter(|name| **name != "inherit")
+				.copied()
+				.collect::<Vec<_>>()
+				.join(", ")
+		)),
 	}
 }
 
@@ -1755,9 +1726,9 @@ pub struct ChatArgs {
 	/// Select provider reasoning effort with unambiguous prefix abbreviations.
 	#[arg(long, value_parser = <ThinkingLevel as FromStr>::from_str)]
 	pub thinking:            Option<ThinkingLevel>,
-	/// Select the provider's service tier.
-	#[arg(long)]
-	pub service_tier:        Option<ServiceTier>,
+	/// Select the OpenAI-family service tier for this session.
+	#[arg(long, value_parser = parse_service_tier)]
+	pub service_tier:        Option<TierSetting>,
 	/// Tool approval policy.
 	#[arg(long)]
 	pub approval_mode:       Option<ApprovalMode>,
@@ -1962,13 +1933,6 @@ impl std::ops::Deref for PrintArgs {
 
 	fn deref(&self) -> &Self::Target {
 		&self.launch
-	}
-}
-
-impl PrintArgs {
-	/// Effective tool approval policy for this launch.
-	pub fn effective_approval(&self) -> Option<ApprovalMode> {
-		self.launch.effective_approval()
 	}
 }
 
@@ -3651,34 +3615,6 @@ mod tests {
 	}
 
 	#[test]
-	fn model_role_override_preserves_and_prioritizes_effort() {
-		assert_eq!(
-			default_model_role_override(Some("anthropic/claude:low"), None)
-				.expect("valid selector")
-				.as_deref(),
-			Some("anthropic/claude:low")
-		);
-		assert_eq!(
-			default_model_role_override(Some("anthropic/claude:low"), Some(ThinkingLevel::High),)
-				.expect("valid selector")
-				.as_deref(),
-			Some("anthropic/claude:high")
-		);
-		assert_eq!(
-			default_model_role_override(Some("anthropic/claude"), Some(ThinkingLevel::High))
-				.expect("valid selector")
-				.as_deref(),
-			Some("anthropic/claude:high")
-		);
-		assert_eq!(
-			default_model_role_override(Some("anthropic/claude"), None)
-				.expect("valid selector")
-				.as_deref(),
-			Some("anthropic/claude")
-		);
-	}
-
-	#[test]
 	fn parses_exclusive_embedded_license_flag() {
 		let cli = parse(&["omp", "--license"]);
 		assert!(cli.license);
@@ -4687,7 +4623,7 @@ mod tests {
 			panic!("print command");
 		};
 		assert_eq!(args.thinking, Some(ThinkingLevel::Minimal));
-		assert_eq!(args.service_tier, Some(ServiceTier::Priority));
+		assert_eq!(args.service_tier, Some(TierSetting::Priority));
 		assert_eq!(args.approval_mode, Some(ApprovalMode::Write));
 		assert_eq!(args.max_time, Some(CliDuration(Duration::from_secs(120))));
 		assert_eq!(args.follow_ups, vec![sf!("then summarize")]);

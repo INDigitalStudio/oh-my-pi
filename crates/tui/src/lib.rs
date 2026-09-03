@@ -19,6 +19,8 @@ mod debug;
 mod editcore;
 mod escape;
 mod frame;
+/// Word-local fuzzy matching shared by filterable lists.
+pub mod fuzzy;
 mod graphics;
 mod icons;
 /// Image format dimension probing without full decodes.
@@ -116,6 +118,9 @@ pub use rich::{
 pub use runtime::{App, AppEnv, AppEvent, AppOptions, ImageLoader, UiHandle, is_core_chord};
 pub use spelling::{SpellingAssist, SpellingFeatures, SpellingResult, TypoRange};
 pub use terminal::{AltScreenUse, CursorStyle, Progress, Terminal, TerminalOptions};
-pub use theme::{JsonTheme, ThemeError, session_accent_color};
+pub use theme::{
+	JsonTheme, LoadedTheme, ThemeCatalog, ThemeError, ThemeLoadError, ThemeWarning,
+	session_accent_color,
+};
 pub use tty::{TtyOut, overridden as tty_overridden};
 pub use ui::Ui;

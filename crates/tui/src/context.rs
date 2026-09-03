@@ -5,11 +5,11 @@
 //! `warn`, …) and structural markup; the context decides what a border,
 //! cursor, or `warn` actually looks like on this terminal.
 
-use std::{time, time::Duration};
+use std::{sync::Arc, time, time::Duration};
 
 use crate::{
 	Icon, TerminalCaps, anim::Frames, color::SystemColor, component::Elements, frame::Color,
-	markup::Border, rich, runtime::ImageLoader,
+	markup::Border, rich, runtime::ImageLoader, theme::JsonTheme,
 };
 /// Terminal policy for Hangul Compatibility Jamo (`U+3131..=U+318E`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -615,6 +615,10 @@ pub struct UiContext {
 	pub jamo_width:   JamoWidth,
 	/// Semantic color palette.
 	pub theme:        Theme,
+	/// Named theme the palette was selected from (`--theme`, `cl_theme`).
+	/// An appearance change re-selects its dark or light variant instead of
+	/// falling back to the stock palette; `None` means the stock palette.
+	pub palette:      Option<Arc<JsonTheme>>,
 	/// Custom element registry.
 	pub elements:     Elements,
 	/// Presentation clock of the pass in flight: [`crate::Ui::tick`] advances
@@ -642,6 +646,7 @@ impl Default for UiContext {
 			native_decor: false,
 			jamo_width:   rich::jamo_width(),
 			theme:        Theme::default(),
+			palette:      None,
 			elements:     Elements::default(),
 			now:          time::Duration::default(),
 			revision:     0,
@@ -684,15 +689,17 @@ impl UiContext {
 
 	/// Applies a terminal-reported dark/light appearance change.
 	///
-	/// Stock palettes follow the terminal, including their 256-color
-	/// quantized form. A caller-supplied custom theme is preserved so the
-	/// host can choose whether and how to restyle it.
+	/// Stock palettes and named themes follow the terminal, including their
+	/// 256-color quantized form. A caller-supplied ad-hoc theme is preserved
+	/// so the host can choose whether and how to restyle it.
 	pub fn apply_appearance(&mut self, appearance: Appearance) -> bool {
 		if self.appearance == appearance {
 			return false;
 		}
-		let stock = Theme::for_appearance(self.appearance);
-		let next = Theme::for_appearance(appearance);
+		let (stock, next) = match &self.palette {
+			Some(palette) => (palette.for_appearance(self.appearance), palette.for_appearance(appearance)),
+			None => (Theme::for_appearance(self.appearance), Theme::for_appearance(appearance)),
+		};
 		if self.theme == stock {
 			self.theme = next;
 		} else if self.theme == stock.quantized_256() {
@@ -700,6 +707,27 @@ impl UiContext {
 		}
 		self.appearance = appearance;
 		true
+	}
+
+	/// Selects the palette of a named theme for the current appearance and
+	/// remembers the theme so later appearance changes re-select its
+	/// variant; `None` returns to the stock palette.
+	pub fn set_palette(&mut self, palette: Option<Arc<JsonTheme>>) -> bool {
+		let theme = match &palette {
+			Some(palette) => palette.for_appearance(self.appearance),
+			None => Theme::for_appearance(self.appearance),
+		};
+		let changed = self.theme != theme || self.palette.is_some() != palette.is_some();
+		self.theme = theme;
+		self.palette = palette;
+		changed
+	}
+
+	/// Returns this context showing `palette` (see [`Self::set_palette`]).
+	#[must_use]
+	pub fn with_palette(mut self, palette: Option<Arc<JsonTheme>>) -> Self {
+		self.set_palette(palette);
+		self
 	}
 
 	/// Returns this context configured for the detected terminal.

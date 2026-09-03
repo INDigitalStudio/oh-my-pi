@@ -138,9 +138,9 @@ pub(super) fn run(state: &ServiceState, op: McpOp) -> ServiceResult<McpRun> {
 					{
 						Ok(true) => Ok(sf!("Reauthorized \"{name}\".")),
 						Ok(false) => Ok(sf!("Server \"{name}\" does not use OAuth.")),
-						Err(error) => Err(ServiceError::Failed(sf!(
-							"Failed to reauthorize server: {error}"
-						))),
+						Err(error) => {
+							Err(ServiceError::Failed(sf!("Failed to reauthorize server: {error}")))
+						},
 					},
 				};
 				let _ = tx.send(result);
@@ -155,9 +155,7 @@ pub(super) fn run(state: &ServiceState, op: McpOp) -> ServiceResult<McpRun> {
 					Some(_) => match mcp.clear_authorization(&name).await {
 						Ok(true) => Ok(sf!("Cleared auth for \"{name}\".")),
 						Ok(false) => Ok(sf!("No stored auth for \"{name}\".")),
-						Err(error) => {
-							Err(ServiceError::Failed(sf!("Failed to clear auth: {error}")))
-						},
+						Err(error) => Err(ServiceError::Failed(sf!("Failed to clear auth: {error}"))),
 					},
 				};
 				let _ = tx.send(result);
@@ -188,7 +186,9 @@ fn list(state: &ServiceState) -> Str {
 	};
 	let mut out = String::new();
 	let mut declared = std::collections::BTreeSet::new();
-	for (label, store) in [("User level", &user), ("Project level", &project), ("Project root", &root)] {
+	for (label, store) in
+		[("User level", &user), ("Project level", &project), ("Project root", &root)]
+	{
 		let Ok(file) = store.read() else { continue };
 		if file.mcp_servers.is_empty() {
 			continue;
@@ -221,7 +221,9 @@ fn list(state: &ServiceState) -> Str {
 		out.push('\n');
 	}
 	if out.is_empty() {
-		return Str::new_static("No MCP servers configured. Add one with /mcp add <name> -- <command>.");
+		return Str::new_static(
+			"No MCP servers configured. Add one with /mcp add <name> -- <command>.",
+		);
 	}
 	Str::new(out.trim_end())
 }
@@ -245,20 +247,20 @@ fn shorten(path: &Path, project: &Path) -> String {
 fn add_server(state: &ServiceState, add: &McpAdd) -> ServiceResult<Str> {
 	let store = store_for(state, add.scope);
 	let mut config = McpServerConfig {
-		transport: None,
-		enabled: true,
-		command: None,
-		args: Vec::new(),
-		env: Default::default(),
-		env_policy: None,
-		cwd: None,
-		url: None,
-		headers: Default::default(),
-		header_policy: None,
-		timeout: None,
+		transport:         None,
+		enabled:           true,
+		command:           None,
+		args:              Vec::new(),
+		env:               Default::default(),
+		env_policy:        None,
+		cwd:               None,
+		url:               None,
+		headers:           Default::default(),
+		header_policy:     None,
+		timeout:           None,
 		request_id_format: None,
-		auth: None,
-		oauth: None,
+		auth:              None,
+		oauth:             None,
 		protocol_versions: Vec::new(),
 	};
 	if let Some(url) = &add.url {
@@ -295,7 +297,11 @@ fn remove_server(state: &ServiceState, name: &str, scope: McpScope) -> ServiceRe
 /// pi `#handleSetEnabled`.
 fn set_enabled(state: &ServiceState, name: &str, enabled: bool) -> ServiceResult<Str> {
 	let known = declared_config(state, name).is_some()
-		|| state.mcp.snapshots().iter().any(|server| server.server == name);
+		|| state
+			.mcp
+			.snapshots()
+			.iter()
+			.any(|server| server.server == name);
 	if !known {
 		return Err(ServiceError::Failed(sf!("Server \"{name}\" not found.")));
 	}
@@ -341,11 +347,17 @@ async fn test_server(
 		)));
 	}
 	if let Err(error) = mcp.reconnect(name).await {
-		return Err(ServiceError::Failed(sf!("Failed to connect to \"{name}\": {error}{}", tip(&error.to_string()))));
+		return Err(ServiceError::Failed(sf!(
+			"Failed to connect to \"{name}\": {error}{}",
+			tip(&error.to_string())
+		)));
 	}
 	let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
 	loop {
-		let snapshot = mcp.snapshots().into_iter().find(|server| server.server == name);
+		let snapshot = mcp
+			.snapshots()
+			.into_iter()
+			.find(|server| server.server == name);
 		match snapshot {
 			Some(server) if server.health == McpInspectorHealth::Connected => {
 				return Ok(test_report(name, &server));
@@ -384,7 +396,8 @@ fn tip(message: &str) -> &'static str {
 }
 
 fn test_report(name: &str, server: &McpInspectorSnapshot) -> Str {
-	let mut out = format!("✓ Successfully connected to \"{name}\"\n\n  Server: {} v{}\n  Tools: {}",
+	let mut out = format!(
+		"✓ Successfully connected to \"{name}\"\n\n  Server: {} v{}\n  Tools: {}",
 		server.implementation.as_deref().unwrap_or(name),
 		server.version.as_deref().unwrap_or("?"),
 		server.tools.len()

@@ -53,7 +53,9 @@ pub fn sync(data_dir: &Path, extra_sessions_dir: &Path) -> ServiceResult<StatsRe
 	for path in &journals {
 		let key = Str::new(path.to_string_lossy());
 		keep.push(key.clone());
-		let Some(state) = file_state(path) else { continue };
+		let Some(state) = file_state(path) else {
+			continue;
+		};
 		if index.file_state(&key).map_err(ServiceError::failed)? == Some(state) {
 			continue;
 		}
@@ -251,12 +253,27 @@ mod tests {
 		let mut session = Session::create(path.clone(), ComponentRegistry::standard()).unwrap();
 		session.begin_turn().unwrap();
 		session.user("hi", Vec::new()).unwrap();
-		session.assistant_start("anthropic/claude-sonnet-4-5", "anthropic", "anthropic").unwrap();
+		session
+			.assistant_start("anthropic/claude-sonnet-4-5", "anthropic", "anthropic")
+			.unwrap();
 		let call = session
-			.call("read", 1, "c1", None, Some(serde_json::value::to_raw_value(&serde_json::json!({})).unwrap()), None)
+			.call(
+				"read",
+				1,
+				"c1",
+				None,
+				Some(serde_json::value::to_raw_value(&serde_json::json!({})).unwrap()),
+				None,
+			)
 			.unwrap();
 		session
-			.fail(call, serde_json::value::to_raw_value(&serde_json::json!({"kind": "faulted", "value": "nope"})).unwrap())
+			.fail(
+				call,
+				serde_json::value::to_raw_value(
+					&serde_json::json!({"kind": "faulted", "value": "nope"}),
+				)
+				.unwrap(),
+			)
 			.unwrap();
 		session.assistant_end("tool_calls").unwrap();
 		session
@@ -268,9 +285,12 @@ mod tests {
 				cache_write:   0,
 				ttft_ms:       Some(100),
 				duration_ms:   Some(1_000),
+				premium_requests_millionths: 0,
 			})
 			.unwrap();
-		session.assistant_start("anthropic/claude-sonnet-4-5", "anthropic", "anthropic").unwrap();
+		session
+			.assistant_start("anthropic/claude-sonnet-4-5", "anthropic", "anthropic")
+			.unwrap();
 		session.assistant_end("error").unwrap();
 		session
 			.receipt(TurnReceipt {
@@ -281,6 +301,7 @@ mod tests {
 				cache_write:   0,
 				ttft_ms:       None,
 				duration_ms:   None,
+				premium_requests_millionths: 0,
 			})
 			.unwrap();
 		path
@@ -301,7 +322,11 @@ mod tests {
 		assert_eq!(report.cost_nano_usd, 5_000);
 		assert_eq!(report.unpriced, 1);
 		assert_eq!(report.by_model[0].key, "anthropic/claude-sonnet-4-5");
-		assert_eq!(report.tools, vec![StatsTool { tool: Str::new_static("read"), calls: 1, errors: 1 }]);
+		assert_eq!(report.tools, vec![StatsTool {
+			tool:   Str::new_static("read"),
+			calls:  1,
+			errors: 1,
+		}]);
 		// Unchanged files are not re-read; a removed file drops its rows.
 		let again = sync(data.path(), &sessions).unwrap();
 		assert_eq!(again.synced, 0);

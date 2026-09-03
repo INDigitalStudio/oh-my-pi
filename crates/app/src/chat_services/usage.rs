@@ -28,8 +28,7 @@ const EXHAUSTED: f64 = 1.0;
 const WARNING: f64 = 0.8;
 /// Fraction at or below which a window is untouched (pi `IDLE_FRACTION`).
 const IDLE: f64 = 0.005;
-const NO_ACTIVITY: &str =
-	"Usage history unavailable (this host keeps no per-day cost telemetry).";
+const NO_ACTIVITY: &str = "Usage history unavailable (this host keeps no per-day cost telemetry).";
 
 /// Starts the quota fetch on the runtime; the receiver settles with the
 /// dashboard report.
@@ -49,42 +48,36 @@ pub fn reset_accounts(state: &ServiceState) -> ServiceResult<Pending<Vec<ResetAc
 	let (tx, rx) = flume::bounded(1);
 	let data_dir = state.data_dir.clone();
 	state.runtime.spawn(async move {
-		let result = usage_cmd::collect_quota(
-			&data_dir,
-			Some(&ProviderId::from("openai-codex")),
-			None,
-		)
-		.await
-		.map(|snapshot| {
-			snapshot
-				.reports
-				.into_iter()
-				.enumerate()
-				.map(|(index, report)| {
-					let label = report
-						.account_meta
-						.email
-						.as_ref()
-						.or(report.account_meta.provider_account_id.as_ref())
-						.map_or_else(
-							|| usage_cmd::mask(report.account.as_str()),
-							ToString::to_string,
-						);
-					ResetAccountRow {
-						target: report.account.to_string().into(),
-						label: label.into(),
-						available: report
-							.reset_credits
-							.as_ref()
-							.map_or(0, |credits| {
-								u32::try_from(credits.available).unwrap_or(u32::MAX)
-							}),
-						active: index == 0,
-					}
+		let result =
+			usage_cmd::collect_quota(&data_dir, Some(&ProviderId::from("openai-codex")), None)
+				.await
+				.map(|snapshot| {
+					snapshot
+						.reports
+						.into_iter()
+						.enumerate()
+						.map(|(index, report)| {
+							let label = report
+								.account_meta
+								.email
+								.as_ref()
+								.or(report.account_meta.provider_account_id.as_ref())
+								.map_or_else(
+									|| usage_cmd::mask(report.account.as_str()),
+									ToString::to_string,
+								);
+							ResetAccountRow {
+								target:    report.account.to_string().into(),
+								label:     label.into(),
+								available: report.reset_credits.as_ref().map_or(0, |credits| {
+									u32::try_from(credits.available).unwrap_or(u32::MAX)
+								}),
+								active:    index == 0,
+							}
+						})
+						.collect()
 				})
-				.collect()
-		})
-		.map_err(ServiceError::failed);
+				.map_err(ServiceError::failed);
 		let _ = tx.send(result);
 	});
 	Ok(rx)
@@ -128,10 +121,10 @@ async fn build(data_dir: &Path, catalog: Option<&Catalog>) -> ServiceResult<Usag
 				.max()
 				.unwrap_or(now_ms),
 		),
-		accounts: cards(&snapshot, catalog, now_ms),
-		activity: Vec::new(),
+		accounts:      cards(&snapshot, catalog, now_ms),
+		activity:      Vec::new(),
 		activity_note: Some(Str::new_static(NO_ACTIVITY)),
-		detail: detail(&snapshot),
+		detail:        detail(&snapshot),
 	})
 }
 
@@ -213,15 +206,10 @@ fn cards(snapshot: &QuotaSnapshot, catalog: Option<&Catalog>, now_ms: u64) -> Ve
 						.filter_map(|(fraction, _)| *fraction)
 						.collect::<Vec<_>>();
 					#[allow(clippy::cast_precision_loss, reason = "account counts are tiny")]
-					let mean = (!known.is_empty())
-						.then(|| known.iter().sum::<f64>() / known.len() as f64);
+					let mean = (!known.is_empty()).then(|| known.iter().sum::<f64>() / known.len() as f64);
 					let worst = observations
 						.iter()
-						.max_by(|a, b| {
-							a.0
-								.unwrap_or(-1.0)
-								.total_cmp(&b.0.unwrap_or(-1.0))
-						})
+						.max_by(|a, b| a.0.unwrap_or(-1.0).total_cmp(&b.0.unwrap_or(-1.0)))
 						.and_then(|(_, reset)| *reset)
 						.filter(|reset| *reset > now_ms)
 						.map(|reset| Duration::from_millis(reset - now_ms));
@@ -293,11 +281,7 @@ fn detail(snapshot: &QuotaSnapshot) -> Str {
 			&& let Some(now) = unix_ms(SystemTime::now())
 			&& reset > now
 		{
-			let _ = write!(
-				out,
-				" · resets in {}",
-				omp_chat::notices::format_duration(reset - now)
-			);
+			let _ = write!(out, " · resets in {}", omp_chat::notices::format_duration(reset - now));
 		}
 		if row["fresh"].as_bool() != Some(true) {
 			out.push_str(" · stale");

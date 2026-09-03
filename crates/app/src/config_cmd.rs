@@ -11,6 +11,7 @@ use miette::IntoDiagnostic as _;
 use omp_con::{Ctx, Origin, RegItem, Source, Span, TypeSpec, Value, ValueKind, VarFlags};
 use omp_core::Str;
 use omp_envd::mcp::{
+	McpConfigPaths,
 	config::McpServerConfig,
 	config_store::{McpConfigStore, set_server_enabled},
 	json_rpc,
@@ -26,7 +27,8 @@ pub fn run(data_dir: &Path, command: &ConfigCommand) -> miette::Result<()> {
 		return init_xdg(data_dir, *json);
 	}
 	if let ConfigCommand::Mcp { command } = command {
-		return run_mcp(data_dir, &project, command);
+		let user_root = omp_core::dirs::user_config_root().into_diagnostic()?;
+		return run_mcp(&user_root, &project, command);
 	}
 	match command {
 		ConfigCommand::Migrate => {
@@ -172,10 +174,13 @@ fn migrate_without_overwrite(
 	Ok(())
 }
 
-fn run_mcp(data_dir: &Path, project: &Path, command: &McpConfigCommand) -> miette::Result<()> {
-	let user = McpConfigStore::new(mcp_path(data_dir, project, McpConfigScope::Global));
-	let project_store = McpConfigStore::new(mcp_path(data_dir, project, McpConfigScope::Project));
-	let root = McpConfigStore::new(mcp_path(data_dir, project, McpConfigScope::Root));
+fn run_mcp(user_root: &Path, project: &Path, command: &McpConfigCommand) -> miette::Result<()> {
+	// The same three files `omp-envd` binds for `/mcp` mutations: the user
+	// file lives in the `~/.o2` configuration root, never the data directory.
+	let paths = McpConfigPaths::new(user_root, project);
+	let user = McpConfigStore::new(paths.user);
+	let project_store = McpConfigStore::new(paths.project);
+	let root = McpConfigStore::new(paths.root);
 	match command {
 		McpConfigCommand::List { scope, json } => {
 			let stores: Vec<(McpConfigScope, &McpConfigStore)> = match scope {
@@ -266,14 +271,6 @@ fn mcp_store<'a>(
 	}
 }
 
-fn mcp_path(data_dir: &Path, project: &Path, scope: McpConfigScope) -> PathBuf {
-	match scope {
-		McpConfigScope::Global => data_dir.join("mcp.json"),
-		McpConfigScope::Project => project.join(".omp/mcp.json"),
-		McpConfigScope::Root => project.join(".mcp.json"),
-	}
-}
-
 fn mcp_scope_name(scope: McpConfigScope) -> &'static str {
 	scope.into()
 }
@@ -315,7 +312,7 @@ pub fn path(project: &Path, scope: ConfigScope) -> miette::Result<PathBuf> {
 /// Loads an existing cfg leniently: lines this build no longer understands are
 /// reported and dropped, so an edit never fails on a stale variable and the
 /// re-dumped file no longer carries it.
-fn load_cfg(path: &Path) -> miette::Result<Ctx> {
+pub(crate) fn load_cfg(path: &Path) -> miette::Result<Ctx> {
 	let ctx = Ctx::new();
 	// The default bind cfg is the baseline the persisted script diffs
 	// against; without it a dump would `unbindall` the defaults away.
@@ -326,9 +323,8 @@ fn load_cfg(path: &Path) -> miette::Result<Ctx> {
 	.into_diagnostic()?;
 	ctx.seal_bind_defaults();
 	if path.is_file() {
-		let script = omp_driver::cfg::migrate_generated_preamble(
-			&fs::read_to_string(path).into_diagnostic()?,
-		);
+		let script =
+			omp_driver::cfg::migrate_generated_preamble(&fs::read_to_string(path).into_diagnostic()?);
 		let outcome =
 			ctx.exec_configs(&|name: &str| (name == "config.cfg").then(|| Str::new(&script)), None);
 		if outcome.failed > 0 {
@@ -342,7 +338,7 @@ fn load_cfg(path: &Path) -> miette::Result<Ctx> {
 	Ok(ctx)
 }
 
-fn persist_cfg(path: &Path, ctx: &Ctx) -> miette::Result<()> {
+pub(crate) fn persist_cfg(path: &Path, ctx: &Ctx) -> miette::Result<()> {
 	if let Some(parent) = path.parent() {
 		fs::create_dir_all(parent).into_diagnostic()?;
 	}

@@ -31,14 +31,13 @@ const PI_DEFAULTS: &[(&str, &[&str])] = &[
 	("tui.editor.pageDown", &["pagedown"]),
 	("tui.editor.deleteCharBackward", &["backspace"]),
 	("tui.editor.deleteCharForward", &["delete", "ctrl+d"]),
-	(
-		"tui.editor.deleteWordBackward",
-		&["ctrl+w", "alt+backspace", "ctrl+backspace", "super+alt+backspace"],
-	),
-	(
-		"tui.editor.deleteWordForward",
-		&["alt+delete", "alt+d", "super+alt+delete", "super+alt+d"],
-	),
+	("tui.editor.deleteWordBackward", &[
+		"ctrl+w",
+		"alt+backspace",
+		"ctrl+backspace",
+		"super+alt+backspace",
+	]),
+	("tui.editor.deleteWordForward", &["alt+delete", "alt+d", "super+alt+delete", "super+alt+d"]),
 	("tui.editor.deleteToLineStart", &["ctrl+u"]),
 	("tui.editor.deleteToLineEnd", &["ctrl+k"]),
 	("tui.editor.yank", &["ctrl+y"]),
@@ -120,7 +119,9 @@ fn literal_full_pi_keymap_is_expressed_by_default_cfg() {
 				.command_for(chord.as_str())
 				.unwrap_or_else(|| panic!("{action} default `{chord}` is not bound"));
 			assert!(
-				script.split(";").any(|statement| statement.trim() == command),
+				script
+					.split(";")
+					.any(|statement| statement.trim() == command),
 				"{action} default `{chord}` runs `{script}`, missing `{command}`"
 			);
 		}

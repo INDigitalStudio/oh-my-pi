@@ -68,9 +68,7 @@ pub(super) fn rename(state: &ServiceState, id: &str, title: &str) -> ServiceResu
 pub(super) fn delete(state: &ServiceState, id: &str) -> ServiceResult<()> {
 	let path = journal_path(state, id);
 	if path == *state.live_journal.read() {
-		return Err(ServiceError::Failed(Str::new_static(
-			"the live session is deleted with /drop",
-		)));
+		return Err(ServiceError::Failed(Str::new_static("the live session is deleted with /drop")));
 	}
 	fs::remove_file(&path).map_err(|error| io(&error))
 }
@@ -106,6 +104,23 @@ pub(super) fn read_local(state: &ServiceState, url: &str) -> ServiceResult<Str> 
 		.map_err(|error| io(&error))
 }
 
+/// Writes one `local://` artifact of the live session (a large-paste
+/// `paste-N.md`) and returns its URL. `name` is a bare file name: directory
+/// segments are refused so a menu choice can never escape the session root.
+pub(super) fn write_local(state: &ServiceState, name: &str, content: &str) -> ServiceResult<Str> {
+	if name.is_empty() || name == ".." || name.contains(['/', '\\']) {
+		return Err(ServiceError::Failed(Str::new_static("invalid local:// name")));
+	}
+	let root = local_root(state).ok_or(ServiceError::Unavailable("local artifacts"))?;
+	fs::create_dir_all(&root).map_err(|error| io(&error))?;
+	let path = root.join(name);
+	// Write beside, then rename: a reader never sees a half-written paste.
+	let staging = root.join(format!(".{name}.tmp"));
+	fs::write(&staging, content).map_err(|error| io(&error))?;
+	fs::rename(&staging, &path).map_err(|error| io(&error))?;
+	Ok(Str::new(format!("local://{name}")))
+}
+
 /// Lists `local://` artifacts of the live session ending in `suffix`,
 /// newest first.
 pub(super) fn list_local(state: &ServiceState, suffix: &str) -> ServiceResult<Vec<Str>> {
@@ -138,7 +153,8 @@ pub(super) fn list_local(state: &ServiceState, suffix: &str) -> ServiceResult<Ve
 /// text previews, and live-chain membership.
 pub(super) fn journal_tree(state: &ServiceState) -> ServiceResult<Vec<TreeEntry>> {
 	let path = state.live_journal.read().clone();
-	let entries = Journal::scan(&path).map_err(|error| ServiceError::Failed(Str::new(error.to_string())))?;
+	let entries =
+		Journal::scan(&path).map_err(|error| ServiceError::Failed(Str::new(error.to_string())))?;
 	let live = omp_journal::live_chain(&entries)
 		.map(|entry| entry.id)
 		.collect::<std::collections::HashSet<_>>();
@@ -154,12 +170,15 @@ pub(super) fn journal_tree(state: &ServiceState) -> ServiceResult<Vec<TreeEntry>
 		let mut text = String::new();
 		match entry.kind.name.as_str() {
 			kind::MSG_USER => {
-				if let Ok(payload) = serde_json::from_str::<omp_journal::data::MsgUser>(entry.data.as_str()) {
+				if let Ok(payload) =
+					serde_json::from_str::<omp_journal::data::MsgUser>(entry.data.as_str())
+				{
 					text = payload.text.to_string();
 				}
 			},
 			kind::STREAM => {
-				if let Ok(payload) = serde_json::from_str::<omp_journal::data::Stream>(entry.data.as_str())
+				if let Ok(payload) =
+					serde_json::from_str::<omp_journal::data::Stream>(entry.data.as_str())
 				{
 					match payload.op {
 						omp_journal::data::StreamOp::Open => {

@@ -1,6 +1,11 @@
 //! JSON theme loading with rich-slot lowering and appearance selection.
 
-use std::collections::BTreeMap;
+use std::{
+	collections::BTreeMap,
+	fs, io,
+	path::{Path, PathBuf},
+	sync::Arc,
+};
 
 use omp_core::{IntoStr, Str};
 use serde::Deserialize;
@@ -73,6 +78,174 @@ impl JsonTheme {
 	pub const fn for_appearance_256(&self, appearance: Appearance) -> Theme {
 		self.for_appearance(appearance).quantized_256()
 	}
+}
+
+/// One theme file loaded into a [`ThemeCatalog`].
+#[derive(Clone, Debug)]
+pub struct LoadedTheme {
+	/// Lookup name: the file stem (pi `loadThemeJson(name)` reads
+	/// `<themes>/<name>.json`).
+	pub name:  Str,
+	/// Source file.
+	pub path:  PathBuf,
+	/// Parsed palette.
+	pub theme: Arc<JsonTheme>,
+}
+
+/// Non-fatal diagnostic from a discovered theme directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThemeWarning {
+	/// Offending file or directory.
+	pub path:    PathBuf,
+	/// Human-readable reason.
+	pub message: Str,
+}
+
+/// Failure loading a theme path the operator named explicitly.
+#[derive(Debug, Error)]
+pub enum ThemeLoadError {
+	/// The path could not be read.
+	#[error("cannot read theme {}", path.display())]
+	Io {
+		/// Offending path.
+		path:   PathBuf,
+		/// Underlying error.
+		#[source]
+		source: io::Error,
+	},
+	/// The file is not a valid theme.
+	#[error("invalid theme {}", path.display())]
+	Theme {
+		/// Offending file.
+		path:   PathBuf,
+		/// Parse failure.
+		#[source]
+		source: ThemeError,
+	},
+}
+
+/// Named themes loaded from disk, in precedence order: paths named on the
+/// command line (`--theme <file|dir>`) first, then each discovered theme
+/// directory (`<config root>/agent/themes`, `<project>/.omp/themes`). Within
+/// a name the first source wins.
+#[derive(Clone, Debug, Default)]
+pub struct ThemeCatalog {
+	themes:   Vec<LoadedTheme>,
+	explicit: usize,
+	/// Unreadable or malformed files inside discovered directories.
+	pub warnings: Vec<ThemeWarning>,
+}
+
+impl ThemeCatalog {
+	/// Loads `explicit` files or directories (every failure is an error: the
+	/// operator asked for them) and then scans `dirs` for `*.json` themes
+	/// (a missing directory is nothing; a broken file is a warning).
+	pub fn load(explicit: &[PathBuf], dirs: &[PathBuf]) -> Result<Self, ThemeLoadError> {
+		let mut catalog = Self::default();
+		for path in explicit {
+			let metadata = fs::metadata(path)
+				.map_err(|source| ThemeLoadError::Io { path: path.clone(), source })?;
+			if metadata.is_dir() {
+				for file in theme_files(path)
+					.map_err(|source| ThemeLoadError::Io { path: path.clone(), source })?
+				{
+					let theme = load_theme_file(&file)?;
+					catalog.push(file, theme);
+				}
+			} else {
+				let theme = load_theme_file(path)?;
+				catalog.push(path.clone(), theme);
+			}
+		}
+		catalog.explicit = catalog.themes.len();
+		for dir in dirs {
+			let files = match theme_files(dir) {
+				Ok(files) => files,
+				Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+				Err(error) => {
+					catalog.warnings.push(ThemeWarning {
+						path:    dir.clone(),
+						message: Str::new(format!("cannot read theme directory: {error}")),
+					});
+					continue;
+				},
+			};
+			for file in files {
+				match load_theme_file(&file) {
+					Ok(theme) => catalog.push(file, theme),
+					Err(error) => catalog.warnings.push(ThemeWarning {
+						path:    file,
+						message: Str::new(error_chain(&error)),
+					}),
+				}
+			}
+		}
+		Ok(catalog)
+	}
+
+	fn push(&mut self, path: PathBuf, theme: JsonTheme) {
+		let name = path
+			.file_stem()
+			.map(|stem| Str::new(stem.to_string_lossy()))
+			.unwrap_or_else(|| theme.name.clone());
+		if self.get(&name).is_some() {
+			return;
+		}
+		self.themes.push(LoadedTheme { name, path, theme: Arc::new(theme) });
+	}
+
+	/// The theme filed under `name` (its file stem), when loaded.
+	#[must_use]
+	pub fn get(&self, name: &str) -> Option<Arc<JsonTheme>> {
+		self
+			.themes
+			.iter()
+			.find(|loaded| loaded.name.as_str() == name)
+			.map(|loaded| Arc::clone(&loaded.theme))
+	}
+
+	/// The first theme named explicitly on the command line, if any.
+	#[must_use]
+	pub fn first_explicit(&self) -> Option<Arc<JsonTheme>> {
+		(self.explicit > 0).then(|| Arc::clone(&self.themes[0].theme))
+	}
+
+	/// Every loaded theme in precedence order.
+	#[must_use]
+	pub fn themes(&self) -> &[LoadedTheme] {
+		&self.themes
+	}
+}
+
+fn load_theme_file(path: &Path) -> Result<JsonTheme, ThemeLoadError> {
+	let source =
+		fs::read_to_string(path).map_err(|source| ThemeLoadError::Io { path: path.to_path_buf(), source })?;
+	JsonTheme::parse(&source).map_err(|source| ThemeLoadError::Theme { path: path.to_path_buf(), source })
+}
+
+/// Sorted `*.json` files directly below `dir`.
+fn theme_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+	let mut files = fs::read_dir(dir)?
+		.filter_map(Result::ok)
+		.map(|entry| entry.path())
+		.filter(|path| {
+			path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+				&& path.is_file()
+		})
+		.collect::<Vec<_>>();
+	files.sort();
+	Ok(files)
+}
+
+fn error_chain(error: &dyn std::error::Error) -> String {
+	let mut text = error.to_string();
+	let mut source = error.source();
+	while let Some(cause) = source {
+		text.push_str(": ");
+		text.push_str(&cause.to_string());
+		source = cause.source();
+	}
+	text
 }
 
 /// Theme parsing failure with a stable diagnostic.
@@ -512,6 +685,62 @@ mod tests {
 				assert!(ratio >= MIN_FENCE_CONTRAST, "{name} fence border contrast was {ratio:.3}:1");
 			}
 		}
+	}
+
+	#[test]
+	fn catalog_prefers_explicit_files_and_warns_on_broken_discovered_themes() {
+		let dir = tempfile::tempdir().unwrap();
+		let explicit = dir.path().join("ocean.json");
+		fs::write(&explicit, r##"{"name":"Ocean","dark":{"accent":"#0000ff"}}"##).unwrap();
+		let themes = dir.path().join("themes");
+		fs::create_dir_all(&themes).unwrap();
+		fs::write(themes.join("ocean.json"), r##"{"name":"Other","dark":{"accent":"#00ff00"}}"##)
+			.unwrap();
+		fs::write(themes.join("forest.json"), r##"{"name":"Forest","dark":{"accent":"#00aa00"}}"##)
+			.unwrap();
+		fs::write(themes.join("broken.json"), "{").unwrap();
+		fs::write(themes.join("notes.txt"), "ignored").unwrap();
+
+		let catalog = ThemeCatalog::load(
+			std::slice::from_ref(&explicit),
+			&[themes.clone(), dir.path().join("missing")],
+		)
+		.unwrap();
+		let names = catalog
+			.themes()
+			.iter()
+			.map(|loaded| loaded.name.as_str())
+			.collect::<Vec<_>>();
+		assert_eq!(names, ["ocean", "forest"], "explicit file shadows the discovered one");
+		assert_eq!(
+			catalog.get("ocean").unwrap().for_appearance(Appearance::Dark).accent,
+			Color::Rgb(0, 0, 255)
+		);
+		assert_eq!(catalog.first_explicit().unwrap().name, "Ocean");
+		assert_eq!(catalog.warnings.len(), 1, "{:?}", catalog.warnings);
+		assert_eq!(catalog.warnings[0].path, themes.join("broken.json"));
+
+		let error = ThemeCatalog::load(&[dir.path().join("nope.json")], &[]).unwrap_err();
+		assert!(matches!(error, ThemeLoadError::Io { .. }), "{error}");
+		let error = ThemeCatalog::load(&[themes.join("broken.json")], &[]).unwrap_err();
+		assert!(matches!(error, ThemeLoadError::Theme { .. }), "{error}");
+	}
+
+	#[test]
+	fn named_palette_follows_appearance_changes() {
+		let theme = Arc::new(
+			JsonTheme::parse(
+				r##"{"name":"two","dark":{"accent":"#111111"},"light":{"accent":"#eeeeee"}}"##,
+			)
+			.unwrap(),
+		);
+		let mut ui = crate::UiContext::default().with_palette(Some(Arc::clone(&theme)));
+		assert_eq!(ui.appearance, Appearance::Dark);
+		assert_eq!(ui.theme.accent, Color::Rgb(0x11, 0x11, 0x11));
+		assert!(ui.apply_appearance(Appearance::Light));
+		assert_eq!(ui.theme.accent, Color::Rgb(0xee, 0xee, 0xee), "light variant selected");
+		assert!(ui.set_palette(None));
+		assert_eq!(ui.theme, Theme::for_appearance(Appearance::Light), "stock palette restored");
 	}
 
 	#[test]

@@ -35,15 +35,15 @@ impl SpeechSynth for EnvSpeechSynth {
 		let voice = <&'static str>::from(super::settings::CL_SPEECH_VOICE.get(&self.con));
 		let model = <&'static str>::from(super::settings::CL_TTS_MODEL.get(&self.con));
 		let request = inference_pb::SpeakRequest {
-			model: model.to_owned(),
-			text: text.to_string(),
-			voice: voice.to_owned(),
-			encoding: inference_pb::AudioEncoding::Pcm16 as i32,
+			model:          model.to_owned(),
+			text:           text.to_string(),
+			voice:          voice.to_owned(),
+			encoding:       inference_pb::AudioEncoding::Pcm16 as i32,
 			sample_rate_hz: Some(SAMPLE_RATE_HZ),
-			speed: None,
-			instructions: String::new(),
-			clone: None,
-			props: None,
+			speed:          None,
+			instructions:   String::new(),
+			clone:          None,
+			props:          None,
 		};
 		Box::pin(async move {
 			let audio = self

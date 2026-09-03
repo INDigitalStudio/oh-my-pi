@@ -143,10 +143,9 @@ impl PushToTalk {
 					mailbox.post(HostAction::SubmitDraft);
 				}
 			},
-			Err(error) => mailbox.post(HostAction::Reply {
-				severity: omp_con::Severity::Warn,
-				text:     error,
-			}),
+			Err(error) => {
+				mailbox.post(HostAction::Reply { severity: omp_con::Severity::Warn, text: error })
+			},
 		});
 	}
 }
@@ -198,7 +197,8 @@ fn transcribe(samples: &[f32], model: SttModel, language: Str) -> Result<Str, St
 		stt::{SpeechToTextAdapter, SttRuntimeOptions, TranscriptionOptions},
 	};
 
-	let fail = |error: &dyn std::fmt::Display| Str::new(format!("Speech recognition failed: {error}"));
+	let fail =
+		|error: &dyn std::fmt::Display| Str::new(format!("Speech recognition failed: {error}"));
 	let data_dir = omp_core::dirs::data_dir(None).map_err(|error| fail(&error))?;
 	let root = data_dir.join("models");
 	fs::create_dir_all(&root).map_err(|error| fail(&error))?;
@@ -220,11 +220,9 @@ fn transcribe(samples: &[f32], model: SttModel, language: Str) -> Result<Str, St
 		memory,
 		&cancel,
 	)
-			.map_err(|error| {
-				Str::new(format!(
-					"Speech recognition is not set up ({error}); run `omp setup speech` first"
-				))
-			})?;
+	.map_err(|error| {
+		Str::new(format!("Speech recognition is not set up ({error}); run `omp setup speech` first"))
+	})?;
 	let transcription = adapter
 		.transcribe_mono_16khz(
 			samples,
@@ -241,9 +239,7 @@ fn transcribe(samples: &[f32], model: SttModel, language: Str) -> Result<Str, St
 /// Feature-disabled recognizer: the build carries no local speech models.
 #[cfg(not(feature = "local-stt"))]
 fn transcribe(_samples: &[f32], _model: SttModel, _language: Str) -> Result<Str, Str> {
-	Err(Str::new_static(
-		"Speech-to-text is not built; rebuild omp with `--features local-stt`",
-	))
+	Err(Str::new_static("Speech-to-text is not built; rebuild omp with `--features local-stt`"))
 }
 
 #[cfg(test)]

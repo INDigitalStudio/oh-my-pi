@@ -46,7 +46,13 @@ fn create_worktree_at(cwd: &Path, base: &Path, branch: &str) -> ServiceResult<Wo
 	fs::create_dir_all(base).map_err(ServiceError::failed)?;
 	let slug = branch
 		.chars()
-		.map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+		.map(|c| {
+			if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+				c
+			} else {
+				'-'
+			}
+		})
 		.collect::<String>();
 	let stem = format!("{slug}-{}", hash_path(&root));
 	let mut path = base.join(&stem);
@@ -57,7 +63,9 @@ fn create_worktree_at(cwd: &Path, base: &Path, branch: &str) -> ServiceResult<Wo
 	}
 	// A stash object captures tracked changes without touching the source
 	// checkout; untracked files are copied after the checkout exists.
-	let stash = git(&root, &["stash", "create"]).ok().map(|sha| sha.trim().to_owned());
+	let stash = git(&root, &["stash", "create"])
+		.ok()
+		.map(|sha| sha.trim().to_owned());
 	git(&root, &["worktree", "add", "-b", branch, &path.to_string_lossy(), "HEAD"])
 		.map_err(|error| ServiceError::Failed(sf!("git worktree add failed: {error}")))?;
 	if let Some(stash) = stash.filter(|sha| !sha.is_empty())
@@ -87,7 +95,9 @@ fn create_worktree_at(cwd: &Path, base: &Path, branch: &str) -> ServiceResult<Wo
 /// `/`, no `..`).
 fn validate_branch(branch: &str) -> ServiceResult<()> {
 	let bad = branch.is_empty()
-		|| branch.chars().any(|c| c.is_whitespace() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+		|| branch
+			.chars()
+			.any(|c| c.is_whitespace() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
 		|| branch.starts_with('-')
 		|| branch.ends_with('/')
 		|| branch.contains("..");
@@ -169,9 +179,6 @@ mod tests {
 		assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "two\n", "source untouched");
 		let head = git(&worktree.path, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
 		assert_eq!(head.trim(), "wt/test");
-		assert!(
-			create_worktree_at(&root, &base, "wt/test").is_err(),
-			"existing branch is rejected"
-		);
+		assert!(create_worktree_at(&root, &base, "wt/test").is_err(), "existing branch is rejected");
 	}
 }

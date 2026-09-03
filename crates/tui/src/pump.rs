@@ -35,7 +35,7 @@ use parking_lot::Mutex;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::watch;
 
-use crate::input::{InputDecoder, InputEvent, Keymap};
+use crate::input::{Chord, InputDecoder, InputEvent, Keymap};
 
 /// One decoded terminal event.
 ///
@@ -107,6 +107,9 @@ enum Ctl {
 	Event(TerminalEvent),
 	/// Raw bytes to run through the live decoder.
 	Bytes(Vec<u8>),
+	/// Physical chords to emit through the live keymap, exactly like
+	/// decoded bytes.
+	Chords(Vec<Chord>),
 	/// Replace the chord keymap.
 	Keymap(Keymap),
 }
@@ -126,6 +129,13 @@ pub fn send_event(event: TerminalEvent) -> bool {
 /// decode happens before any later ingress action is emitted.
 pub fn inject_bytes(bytes: Vec<u8>) -> bool {
 	send_ctl(Ctl::Bytes(bytes))
+}
+
+/// Emits debug-injected physical chords through the active actor's live
+/// keymap, so a bound chord reaches the host as the same
+/// [`crate::InputEvent::Chord`] edge the terminal would have produced.
+pub fn inject_chords(chords: Vec<Chord>) -> bool {
+	send_ctl(Ctl::Chords(chords))
 }
 
 fn send_ctl(ctl: Ctl) -> bool {
@@ -485,6 +495,12 @@ fn apply_ctl(
 	match ctl {
 		Ctl::Bytes(bytes) => {
 			decoder.feed(&bytes, Instant::now(), events);
+			true
+		},
+		Ctl::Chords(chords) => {
+			for chord in chords {
+				decoder.inject(chord, events);
+			}
 			true
 		},
 		Ctl::Event(event) => {

@@ -54,7 +54,8 @@ pub(crate) fn prepare(args: &mut ChatArgs) -> miette::Result<()> {
 		[only] => only.clone(),
 		_ if !io::stdin().is_terminal() => {
 			return Err(miette!(
-				"multiple foreign sessions were found; rerun from an interactive terminal to select one"
+				"multiple foreign sessions were found; rerun from an interactive terminal to select \
+				 one"
 			));
 		},
 		_ => {
@@ -129,7 +130,7 @@ pub fn import_file(
 		.patch(Txn {
 			cause,
 			label: Some(Str::new_static("session.import")),
-			ops:   vec![
+			ops: vec![
 				Op::Set {
 					h:     session.dom().meta(),
 					prop:  PropKey::Custom(Str::new_static("import-source")),
@@ -328,22 +329,19 @@ mod tests {
 		let directory = tempfile::tempdir().unwrap();
 		let source = directory.path().join("source.jsonl");
 		let destination = directory.path().join("destination.oms");
-		fs::write(
-			&source,
-			r#"{"type":"user","message":{"content":"hello"}}"#,
-		)
-		.unwrap();
+		fs::write(&source, r#"{"type":"user","message":{"content":"hello"}}"#).unwrap();
 		assert_eq!(import_file(ForeignFormat::Claude, &source, &destination).unwrap(), 1);
-		let session =
-			Session::open(&destination, ComponentRegistry::standard()).unwrap();
+		let session = Session::open(&destination, ComponentRegistry::standard()).unwrap();
 		let meta = session.dom().get(session.dom().meta()).unwrap();
 		assert_eq!(
-			meta.prop(&PropKey::Custom(Str::new_static("import-source")))
+			meta
+				.prop(&PropKey::Custom(Str::new_static("import-source")))
 				.and_then(DomValue::as_str),
 			Some(source.to_string_lossy().as_ref())
 		);
 		assert_eq!(
-			meta.prop(&PropKey::Custom(Str::new_static("import-format")))
+			meta
+				.prop(&PropKey::Custom(Str::new_static("import-format")))
 				.and_then(DomValue::as_str),
 			Some("claude")
 		);

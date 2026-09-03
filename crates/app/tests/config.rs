@@ -75,10 +75,14 @@ fn config_migrate_keeps_project_values_out_of_the_user_cfg() {
 	assert!(!project_script.contains("cl_voice_stt_enabled"));
 	let ctx = omp_app::process_ctx(project.path()).expect("reload context");
 	assert_eq!(
-		ctx.get_typed::<omp_app::voice::settings::SttModel>("cl_stt_model").expect("convar"),
+		ctx.get_typed::<omp_app::voice::settings::SttModel>("cl_stt_model")
+			.expect("convar"),
 		omp_app::voice::settings::SttModel::Turbo
 	);
-	assert!(ctx.get_typed::<bool>("cl_voice_stt_enabled").expect("convar"));
+	assert!(
+		ctx.get_typed::<bool>("cl_voice_stt_enabled")
+			.expect("convar")
+	);
 }
 
 #[test]
@@ -99,7 +103,11 @@ fn profile_selects_its_own_config_cfg() {
 	let ctx = omp_app::process_ctx(project.path()).expect("reload context");
 	assert!(!ctx.get_typed::<bool>("cl_showthinking").expect("convar"));
 	assert_eq!(
-		omp_driver::settings::current().expect("driver settings").worktree.base.as_deref(),
+		omp_driver::settings::current()
+			.expect("driver settings")
+			.worktree
+			.base
+			.as_deref(),
 		Some(std::path::Path::new("/tmp/omp-worktrees"))
 	);
 }
@@ -114,10 +122,12 @@ fn exec_and_writecfg_use_the_installed_cfg_files() {
 	fs::write(config.path().join("focus.cfg"), "cl_showthinking false\n").expect("user profile");
 	fs::write(project.path().join(".omp/focus.cfg"), "ai_fastmode true\n").expect("project overlay");
 	let ctx = omp_app::process_ctx(project.path()).expect("context");
-	ctx.run("exec focus").expect("exec resolves through the installed loader");
+	ctx.run("exec focus")
+		.expect("exec resolves through the installed loader");
 	assert!(!ctx.get_typed::<bool>("cl_showthinking").expect("convar"));
 	assert!(ctx.get_typed::<bool>("ai_fastmode").expect("convar"));
-	ctx.run("writecfg").expect("writecfg resolves through the installed saver");
+	ctx.run("writecfg")
+		.expect("writecfg resolves through the installed saver");
 	let script = fs::read_to_string(config.path().join("config.cfg")).expect("config.cfg");
 	assert!(script.contains("cl_showthinking false"));
 	assert!(script.contains("ai_fastmode true"));

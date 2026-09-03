@@ -28,7 +28,11 @@ use crate::{
 
 const KILL_CAP: usize = 60;
 const UNDO_CAP: usize = 100;
+/// Default dropdown window (pi `autocompleteMaxVisible` default).
 const PICKER_ROWS: usize = 10;
+/// pi `setAutocompleteMaxVisible` clamps the window to `[3, 20]`.
+const PICKER_ROWS_MIN: usize = 3;
+const PICKER_ROWS_MAX: usize = 20;
 const MAX_INPUT_ROWS: usize = 16;
 const MAX_EMOJI_SUGGESTIONS: usize = 12;
 const HISTORY_CAPACITY: usize = 100;
@@ -1393,11 +1397,28 @@ pub struct EditorOptions {
 	/// XML affordances: `</` completes the innermost open tag, and
 	/// renderers should apply structural markup highlighting.
 	pub xml:     bool,
+	/// Rows the completion dropdown shows at once (pi
+	/// `autocompleteMaxVisible`), clamped to `[3, 20]` on use.
+	pub picker_rows: usize,
 }
 
 impl Default for EditorOptions {
 	fn default() -> Self {
-		Self { emoji: true, history: true, xml: true }
+		Self { emoji: true, history: true, xml: true, picker_rows: PICKER_ROWS }
+	}
+}
+
+impl EditorOptions {
+	/// The dropdown window after pi's `[3, 20]` clamp.
+	#[must_use]
+	pub const fn picker_rows(&self) -> usize {
+		if self.picker_rows < PICKER_ROWS_MIN {
+			PICKER_ROWS_MIN
+		} else if self.picker_rows > PICKER_ROWS_MAX {
+			PICKER_ROWS_MAX
+		} else {
+			self.picker_rows
+		}
 	}
 }
 
@@ -1661,14 +1682,23 @@ pub struct Picker {
 	selected:    usize,
 	/// Produced by the registered engine (vs the built-in emoji dropdown).
 	provided:    bool,
+	/// Window height, from [`EditorOptions::picker_rows`] at open time.
+	rows:        usize,
 }
 
 impl Picker {
-	/// Returns the centered ten-row suggestion window and its first index.
+	/// The dropdown window height this picker opened with.
+	#[must_use]
+	pub const fn rows(&self) -> usize {
+		self.rows
+	}
+
+	/// Returns the centered suggestion window (`rows` tall) and its first
+	/// index.
 	pub fn visible_suggestions(&self) -> (usize, &[Suggestion]) {
-		let visible = self.suggestions.len().min(PICKER_ROWS);
+		let visible = self.suggestions.len().min(self.rows);
 		let max_start = self.suggestions.len().saturating_sub(visible);
-		let start = self.selected.saturating_sub(PICKER_ROWS / 2).min(max_start);
+		let start = self.selected.saturating_sub(self.rows / 2).min(max_start);
 		(start, &self.suggestions[start..start + visible])
 	}
 
@@ -1770,10 +1800,77 @@ impl Editor {
 	}
 
 	/// Replaces the editor text without adding an undo entry, preserving
-	/// completion and history configuration.
+	/// completion and history configuration. Leaves history browsing (pi
+	/// `setText`: `historyIndex = -1`).
 	pub fn set_text(&mut self, text: &str) {
+		self.history_index = None;
+		self.history_query = None;
 		self.buffer.replace_external(text, false);
 		self.refresh();
+	}
+
+	/// Records a submitted prompt as the newest history entry (pi
+	/// `addToHistory`): blank text is ignored, an earlier copy of the same
+	/// text is dropped, the list is capped, and browsing state resets so the
+	/// next Up starts from the newest entry. The host calls this after it
+	/// decides the submission really happened, exactly as pi's input
+	/// controller does.
+	pub fn add_to_history(&mut self, text: &str) {
+		self.history_index = None;
+		self.history_query = None;
+		if !self.options.history {
+			return;
+		}
+		let trimmed = text.trim();
+		if trimmed.is_empty() {
+			return;
+		}
+		self.history.retain(|entry| entry.as_str() != trimmed);
+		self.history.insert(0, Str::new(trimmed));
+		self.history.truncate(HISTORY_CAPACITY);
+	}
+
+	/// Replaces the history list with `prompts`, newest first (pi
+	/// `setHistoryStorage`: a resumed session seeds Up/Down from its stored
+	/// prompts). Duplicates keep their first (newest) position.
+	pub fn seed_history(&mut self, prompts: impl IntoIterator<Item = Str>) {
+		self.history_index = None;
+		self.history_query = None;
+		self.history.clear();
+		if !self.options.history {
+			return;
+		}
+		for prompt in prompts {
+			let trimmed = prompt.trim();
+			if trimmed.is_empty() || self.history.iter().any(|entry| entry.as_str() == trimmed) {
+				continue;
+			}
+			self.history.push(if trimmed.len() == prompt.len() {
+				prompt
+			} else {
+				Str::new(trimmed)
+			});
+			if self.history.len() == HISTORY_CAPACITY {
+				break;
+			}
+		}
+	}
+
+	/// Whether `key` would step prompt history instead of moving the caret
+	/// (pi `cursorUp`/`cursorDown`): Up on an empty draft or while browsing
+	/// from the first visual row, Down while browsing from the last visual
+	/// row. Hosts that borrow Up/Down at the draft's edges (transcript
+	/// scrolling) yield to the editor when this holds.
+	#[must_use]
+	pub fn history_navigates(&self, key: Key) -> bool {
+		if !self.options.history || self.picker.is_some() {
+			return false;
+		}
+		match key {
+			Key::Up => self.history_gate_up() && !self.history.is_empty(),
+			Key::Down => self.history_index.is_some() && self.buffer.at_visual_end(),
+			_ => false,
+		}
 	}
 
 	/// Replaces the editor text without an undo entry, optionally parking the
@@ -1793,6 +1890,19 @@ impl Editor {
 	/// renderers can honor them (e.g. XML highlighting).
 	pub const fn options(&self) -> EditorOptions {
 		self.options
+	}
+
+	/// Replaces the feature switches at runtime (pi `setAutocompleteMaxVisible`
+	/// and the `emojiAutocomplete` setting): an open dropdown re-queries so
+	/// its window and the built-in emoji source follow the new switches.
+	pub fn set_options(&mut self, options: EditorOptions) {
+		self.options = options;
+		self.buffer.set_xml(options.xml);
+		if !options.history {
+			self.history_index = None;
+			self.history_query = None;
+		}
+		self.refresh();
 	}
 
 	/// Returns the visible text, with paste markers unexpanded.
@@ -1823,7 +1933,7 @@ impl Editor {
 			self
 				.picker
 				.as_ref()
-				.map_or(0, |picker| picker.visible_rows().len().min(PICKER_ROWS)),
+				.map_or(0, |picker| picker.visible_rows().len().min(picker.rows)),
 		)
 		.unwrap_or(u16::MAX)
 	}
@@ -1947,7 +2057,9 @@ impl Editor {
 				self.history_newer()
 			},
 			_ => {
-				if matches!(key, Key::Char(_) | Key::Space | Key::Backspace | Key::Delete) {
+				// pi: any edit leaves history browsing; caret motion inside a
+				// recalled entry keeps it (and never pops the dropdown).
+				if !is_caret_motion(key) {
 					self.history_index = None;
 					self.history_query = None;
 				}
@@ -1963,7 +2075,11 @@ impl Editor {
 							_ => {},
 						}
 					}
-					self.refresh();
+					if self.history_index.is_some() {
+						self.refresh_recalled();
+					} else {
+						self.refresh();
+					}
 					EditOutcome::Changed
 				} else {
 					EditOutcome::Ignored
@@ -2020,8 +2136,17 @@ impl Editor {
 		self.history_query = None;
 		self.history_index = Some(next);
 		self.buffer.replace_external(&self.history[next], true);
-		self.refresh();
+		self.refresh_recalled();
 		EditOutcome::Changed
+	}
+
+	/// Re-queries completion after a history step but keeps the dropdown
+	/// closed (pi `#setTextInternal` never opens autocomplete): a recalled
+	/// `/command` is a prompt to resend, and Up/Down keep stepping history
+	/// instead of walking a popup that popped over it.
+	fn refresh_recalled(&mut self) {
+		self.refresh();
+		self.picker = None;
 	}
 
 	fn history_search(&mut self) -> EditOutcome {
@@ -2052,7 +2177,7 @@ impl Editor {
 		};
 		self.history_index = Some(index);
 		self.buffer.replace_external(&self.history[index], false);
-		self.refresh();
+		self.refresh_recalled();
 		EditOutcome::Changed
 	}
 
@@ -2075,7 +2200,7 @@ impl Editor {
 			self.history_query = None;
 			self.buffer.replace_external(&self.history_draft, false);
 		}
-		self.refresh();
+		self.refresh_recalled();
 		EditOutcome::Changed
 	}
 
@@ -2148,15 +2273,16 @@ impl Editor {
 		{
 			return false;
 		}
+		let rows = self.options.picker_rows();
 		let suggestions: SuggestionList = items
 			.into_iter()
-			.take(PICKER_ROWS)
+			.take(rows)
 			.map(|item| Suggestion::new(item.clone(), item))
 			.collect();
 		if suggestions.is_empty() {
 			return false;
 		}
-		self.picker = Some(Picker { range, suggestions, selected: 0, provided: false });
+		self.picker = Some(Picker { range, suggestions, selected: 0, provided: false, rows });
 		true
 	}
 
@@ -2164,16 +2290,8 @@ impl Editor {
 		if self.buffer.text().trim().is_empty() {
 			return EditOutcome::Ignored;
 		}
-		if self.options.history {
-			let submitted = self.buffer.expanded_text();
-			self
-				.history
-				.retain(|entry| entry.as_str() != submitted.as_str());
-			self.history.insert(0, submitted.into_str());
-			self.history.truncate(HISTORY_CAPACITY);
-		}
-		self.history_index = None;
-		self.history_query = None;
+		let submitted = self.buffer.expanded_text();
+		self.add_to_history(&submitted);
 		self.picker = None;
 		self.hint = None;
 		EditOutcome::Submitted(self.buffer.clear_after_submit())
@@ -2200,10 +2318,10 @@ impl Editor {
 		picker.selected = if down {
 			picker
 				.selected
-				.saturating_add(PICKER_ROWS)
+				.saturating_add(picker.rows)
 				.min(picker.len() - 1)
 		} else {
-			picker.selected.saturating_sub(PICKER_ROWS)
+			picker.selected.saturating_sub(picker.rows)
 		};
 		EditOutcome::Changed
 	}
@@ -2317,21 +2435,24 @@ impl Editor {
 				.iter()
 				.all(|&(start, end)| range.end <= start || range.start >= end)
 		};
+		let rows = self.options.picker_rows();
 		let mut picker = self
 			.completion
 			.as_mut()
 			.and_then(|completion| {
 				let suggestions = completion.suggest(text, cursor)?;
 				(!suggestions.items.is_empty()).then(|| Picker {
-					range:       clamp_completion_range(text, cursor, suggestions.range),
+					range: clamp_completion_range(text, cursor, suggestions.range),
 					suggestions: suggestions.items,
-					selected:    0,
-					provided:    true,
+					selected: 0,
+					provided: true,
+					rows,
 				})
 			})
 			.filter(|picker| clear_of_atoms(&picker.range));
 		if picker.is_none() && self.options.emoji {
-			picker = emoji_picker(text, cursor).filter(|picker| clear_of_atoms(&picker.range));
+			picker =
+				emoji_picker(text, cursor, rows).filter(|picker| clear_of_atoms(&picker.range));
 		}
 		self.hint = self
 			.completion
@@ -2901,7 +3022,7 @@ impl EditorCompletion for SlashCommands {
 	}
 }
 
-fn emoji_picker(text: &str, cursor: usize) -> Option<Picker> {
+fn emoji_picker(text: &str, cursor: usize, rows: usize) -> Option<Picker> {
 	let (prefix_start, query) = emoji_trigger(&text[..cursor])?;
 	let mut suggestions = SuggestionList::new();
 	let wanted = format!(":{query}");
@@ -2949,6 +3070,7 @@ fn emoji_picker(text: &str, cursor: usize) -> Option<Picker> {
 			suggestions,
 			selected: 0,
 			provided: false,
+			rows,
 		})
 	}
 }
@@ -3053,6 +3175,35 @@ fn breakout_match_tier(query: &str, target: &str) -> u16 {
 	} else {
 		0
 	}
+}
+
+/// Keys that move or select without editing text (the readline motions
+/// included), so browsing prompt history survives them.
+const fn is_caret_motion(key: Key) -> bool {
+	matches!(
+		key,
+		Key::Up
+			| Key::Down
+			| Key::Left
+			| Key::Right
+			| Key::SelectLeft
+			| Key::SelectRight
+			| Key::SelectUp
+			| Key::SelectDown
+			| Key::Home
+			| Key::End
+			| Key::SelectHome
+			| Key::SelectEnd
+			| Key::PageUp
+			| Key::PageDown
+			| Key::WordLeft
+			| Key::WordRight
+			| Key::SelectWordLeft
+			| Key::SelectWordRight
+			| Key::SelectAll
+			| Key::Copy
+			| Key::Ctrl('a' | 'e' | 'b' | 'f')
+	)
 }
 
 fn history_entry_matches(query: &str, entry: &str) -> bool {
@@ -3717,6 +3868,52 @@ mod tests {
 		assert_eq!(editor.handle(Key::Down), EditOutcome::Changed);
 		assert_eq!(editor.handle(Key::Down), EditOutcome::Changed);
 		assert_eq!(editor.text(), "draft");
+	}
+
+	#[test]
+	fn host_recorded_and_seeded_history_drives_up_down_navigation() {
+		// pi `addToHistory` / `setHistoryStorage`: the host records what it
+		// actually sent; a resumed session seeds newest-first.
+		let mut editor = editor();
+		assert!(!editor.history_navigates(Key::Up), "nothing recorded yet");
+		editor.seed_history(["older".into(), "  ".into(), "newest".into(), "older".into()]);
+		assert_eq!(editor.history, vec![Str::new_static("older"), Str::new_static("newest")]);
+		editor.add_to_history("  older ");
+		assert_eq!(editor.history, vec![Str::new_static("older"), Str::new_static("newest")]);
+		editor.add_to_history("");
+		assert_eq!(editor.history.len(), 2);
+		assert!(editor.history_navigates(Key::Up));
+		assert!(!editor.history_navigates(Key::Down), "not browsing yet");
+		assert_eq!(editor.handle(Key::Up), EditOutcome::Changed);
+		assert_eq!(editor.text(), "older");
+		assert!(editor.history_navigates(Key::Up));
+		editor.handle(Key::End);
+		assert!(editor.history_navigates(Key::Down));
+		assert_eq!(editor.handle(Key::Down), EditOutcome::Changed);
+		assert_eq!(editor.text(), "");
+		// A non-empty draft owns Up unless the editor is already browsing.
+		type_text(&mut editor, "draft");
+		editor.handle(Key::Home);
+		assert!(!editor.history_navigates(Key::Up));
+		// The host replacing the draft leaves browsing mode.
+		editor.set_text("");
+		editor.handle(Key::Up);
+		assert_eq!(editor.text(), "older");
+		assert_eq!(editor.history_index, Some(0));
+		editor.set_text("");
+		assert!(editor.history_index.is_none());
+		assert_eq!(editor.handle(Key::Up), EditOutcome::Changed);
+		assert_eq!(editor.text(), "older", "Up restarts from the newest entry");
+		// A recalled `/command` never opens the dropdown (pi
+		// `#setTextInternal`), so the next Down steps history, not rows.
+		editor.set_text("");
+		editor.add_to_history("/settings");
+		assert_eq!(editor.handle(Key::Up), EditOutcome::Changed);
+		assert_eq!(editor.text(), "/settings");
+		assert!(editor.picker().is_none(), "recall keeps the popup closed");
+		editor.handle(Key::End);
+		assert_eq!(editor.handle(Key::Down), EditOutcome::Changed);
+		assert_eq!(editor.text(), "");
 	}
 
 	#[test]

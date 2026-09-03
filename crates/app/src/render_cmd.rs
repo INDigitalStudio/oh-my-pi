@@ -121,9 +121,8 @@ fn render_session(args: &RenderArgs, data_dir: &Path, cwd: &Path) -> miette::Res
 	let open = open_start.elapsed();
 
 	let replay_start = Instant::now();
-	let mut session =
-		omp_session::Session::open(&path, omp_session::ComponentRegistry::standard())
-			.into_diagnostic()?;
+	let mut session = omp_session::Session::open(&path, omp_session::ComponentRegistry::standard())
+		.into_diagnostic()?;
 	let replay = replay_start.elapsed();
 	let items = omp_session::project_thread(session.dom()).len();
 	let width = args.width.unwrap_or(100);
@@ -363,7 +362,9 @@ mod tests {
 			.stream_append(stream, "hello back")
 			.expect("append text");
 		session.stream_close(stream).expect("close text");
-		session.assistant_end("tool_calls").expect("finish assistant");
+		session
+			.assistant_end("tool_calls")
+			.expect("finish assistant");
 		let call = session
 			.call(
 				"custom_tool",
@@ -372,8 +373,7 @@ mod tests {
 				None,
 				Some(
 					RawValue::from_string(
-						r#"{"i":"Inspecting fixture","path":"a/very/long/fixture/path.txt"}"#
-							.to_owned(),
+						r#"{"i":"Inspecting fixture","path":"a/very/long/fixture/path.txt"}"#.to_owned(),
 					)
 					.expect("args"),
 				),

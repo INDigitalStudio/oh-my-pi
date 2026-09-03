@@ -15,6 +15,7 @@ use crate::{
 	},
 	context::{Theme, UiContext},
 	frame::{Rect, Style},
+	fuzzy::{Query, SearchIndex},
 	input::{Key, Mouse, UiEvent, sanitize_paste, word_rubout_start},
 	props::{Prop, PropValue, Props},
 	rich::cell_width,
@@ -95,6 +96,8 @@ impl Default for SelectOption {
 
 struct OptionData {
 	label:       Str,
+	/// The label indexed once for every keystroke's filter pass.
+	search:      SearchIndex,
 	value:       Str,
 	desc:        Option<Str>,
 	recommended: bool,
@@ -104,6 +107,23 @@ struct OptionData {
 	/// Grid cells rendered as this option's row; empty for label options.
 	cells:       Range<usize>,
 	custom:      bool,
+}
+
+impl OptionData {
+	fn new(label: Str, value: Str, preview: Range<usize>, cells: Range<usize>) -> Self {
+		Self {
+			search: SearchIndex::new(&label),
+			label,
+			value,
+			desc: None,
+			recommended: false,
+			selected: false,
+			active: false,
+			preview,
+			cells,
+			custom: false,
+		}
+	}
 }
 
 #[derive(Clone, Copy, Default)]
@@ -128,23 +148,36 @@ struct SelectState {
 	header_rows: u16,
 	/// Option rows that fit the last placed viewport; page-jump stride.
 	page:        u16,
+	/// Indices of options matching the query in display order, recomputed
+	/// by [`Self::refilter`] whenever the query or the option set changes.
+	visible:     Vec<u16>,
 }
 
 impl SelectState {
-	/// Indices of options matching the query, best fuzzy score first
-	/// (stable by declaration order); an empty query keeps every option.
-	fn visible(&self) -> SmallVec<u16, 16> {
-		if self.filter_q.is_empty() {
-			return (0..self.options.len() as u16).collect();
-		}
-		let mut scored: SmallVec<(i32, u16), 16> = (0..self.options.len() as u16)
-			.filter_map(|index| {
-				fuzzy_score(&self.options[usize::from(index)].label, &self.filter_q)
-					.map(|score| (-score, index))
+	/// Recomputes the visible rows: every option for an empty query,
+	/// otherwise pi's word-local ranking (contiguous literal matches ahead
+	/// of fuzzy-only ones), the recommended option first within a relevance
+	/// bucket, then declaration order.
+	fn refilter(&mut self) {
+		self.visible.clear();
+		let Some(query) = Query::new(&self.filter_q) else {
+			self.visible.extend(0..self.options.len() as u16);
+			return;
+		};
+		let mut scored: Vec<(i32, bool, u16)> = self
+			.options
+			.iter()
+			.enumerate()
+			.filter_map(|(index, option)| {
+				let score = option.search.score(&query)?;
+				// pi `model-browser.ts` buckets `Math.round(score / 10)`.
+				Some(((score + 500).div_euclid(1000), !option.recommended, index as u16))
 			})
 			.collect();
 		scored.sort_unstable();
-		scored.into_iter().map(|(_, index)| index).collect()
+		self
+			.visible
+			.extend(scored.into_iter().map(|(_, _, index)| index));
 	}
 
 	/// Whether typing edits the query directly: a filterable single select needs
@@ -179,7 +212,23 @@ impl Select {
 
 	#[allow(dead_code, reason = "acceptance-suite probe")]
 	pub(crate) fn visible_len(&self) -> usize {
-		self.state.visible().len()
+		self.state.visible.len()
+	}
+
+	/// Option index under the cursor, in declaration order.
+	#[allow(dead_code, reason = "acceptance-suite probe")]
+	pub(crate) fn cursor_option(&self) -> Option<usize> {
+		self
+			.state
+			.visible
+			.get(usize::from(self.state.cursor))
+			.map(|&index| usize::from(index))
+	}
+
+	/// Position of the first painted visible row.
+	#[allow(dead_code, reason = "acceptance-suite probe")]
+	pub(crate) fn scroll_offset(&self) -> usize {
+		usize::from(self.state.scroll)
 	}
 
 	/// Sets one select property.
@@ -213,20 +262,17 @@ impl Select {
 		} else {
 			option.label
 		};
+		let value = option
+			.props
+			.str_of(Prop::Value)
+			.cloned()
+			.unwrap_or_else(|| label.clone());
 		let data = OptionData {
-			value: option
-				.props
-				.str_of(Prop::Value)
-				.cloned()
-				.unwrap_or_else(|| label.clone()),
 			desc: option.props.str_of(Prop::Desc).cloned(),
 			recommended: option.props.flag(Prop::Recommended),
 			selected: option.props.flag(Prop::Selected),
 			active: option.props.flag(Prop::Active),
-			custom: false,
-			label,
-			preview,
-			cells,
+			..OptionData::new(label, value, preview, cells)
 		};
 		let at = self
 			.state
@@ -261,6 +307,7 @@ impl Select {
 					self.state.filter = true;
 					self.state.filter_q.clear();
 					self.state.filter_q.push_str(seed.as_str());
+					self.state.refilter();
 				},
 				_ => self.state.filter = false,
 			},
@@ -279,6 +326,12 @@ impl Select {
 		self.state.options.insert(at, option);
 		self.state.layouts.insert(at, OptionLayout::default());
 		self.state.chosen = chosen;
+		if self.state.filter_q.is_empty() && at + 1 == self.state.options.len() {
+			// The builder's append path: every option is visible in order.
+			self.state.visible.push(at as u16);
+		} else {
+			self.state.refilter();
+		}
 		if recommended && !self.state.multi && self.state.chosen.iter().next().is_none() {
 			self.state.chosen.set(at, true);
 		}
@@ -293,6 +346,7 @@ impl Select {
 	fn remove_option(&mut self, at: usize) {
 		self.state.options.remove(at);
 		self.state.layouts.remove(at);
+		self.state.refilter();
 		let mut chosen = smol_bitmap::SmolBitmap::new();
 		for index in &self.state.chosen {
 			if index < at {
@@ -314,15 +368,8 @@ impl Select {
 			(true, None) => {
 				let end = self.children.len();
 				self.insert_option(self.state.options.len(), OptionData {
-					label:       sf!("Other (type your own)"),
-					value:       Str::default(),
-					desc:        None,
-					recommended: false,
-					selected:    false,
-					active:      false,
-					preview:     end..end,
-					cells:       end..end,
-					custom:      true,
+					custom: true,
+					..OptionData::new(sf!("Other (type your own)"), Str::default(), end..end, end..end)
 				});
 			},
 			(false, Some(index)) => self.remove_option(index),
@@ -381,42 +428,19 @@ impl Select {
 	}
 
 	fn option_height(&mut self, ctx: &UiContext, width: u16, index: usize, columns: &[u16]) -> u16 {
-		let desc_rows = self.state.options[index]
-			.desc
-			.as_ref()
-			.map_or(0, |desc| desc_lines(desc, width.saturating_sub(6)).len() as u16);
-		let cells = self.state.options[index].cells.clone();
-		let row = if cells.is_empty() {
-			label_lines(
-				&self.state.options[index].label,
-				option_label_width(ctx, self.state.multi, width),
-			)
-			.len() as u16
-		} else {
-			cells
-				.enumerate()
-				.map(|(column, cell)| {
-					let cell_width = columns.get(column).copied().unwrap_or(1).max(1);
-					self.children[cell].height(ctx, cell_width)
-				})
-				.max()
-				.unwrap_or(1)
-				.max(1)
-		};
-		let preview = self.state.options[index].preview.clone();
-		let preview_h = self.children[preview]
-			.iter_mut()
-			.filter(|child| child.visible)
-			.fold(0u16, |height, child| {
-				height.saturating_add(child.height(ctx, width.saturating_sub(8)))
-			});
-		row.saturating_add(desc_rows).saturating_add(preview_h)
+		option_height(
+			ctx,
+			&mut self.children,
+			&self.state.options[index],
+			self.state.multi,
+			width,
+			columns,
+		)
 	}
 
 	/// Value of the option under the cursor, `None` when nothing matches.
 	fn cursor_value(&self) -> Option<Str> {
-		let visible = self.state.visible();
-		let &index = visible.get(usize::from(self.state.cursor))?;
+		let &index = self.state.visible.get(usize::from(self.state.cursor))?;
 		let option = &self.state.options[usize::from(index)];
 		Some(if option.custom {
 			Str::new(self.state.custom_text.as_str())
@@ -433,11 +457,24 @@ impl Select {
 		}
 	}
 
-	/// Wraps a query edit into an event for identified selects, clamping
-	/// the cursor instead of resetting it (pi `#applyQuery`).
+	/// Re-filters after a query edit and wraps it into an event for
+	/// identified selects. The cursor stays on its row only while every
+	/// visible row up to it survives unchanged; otherwise it returns to the
+	/// best match (pi `#applyQuery("reset-changed-prefix")`).
 	fn filter_flow(&mut self) -> Flow {
-		let count = self.state.visible().len();
-		self.state.cursor = self.state.cursor.min(count.saturating_sub(1) as u16);
+		let cursor = usize::from(self.state.cursor);
+		let previous: SmallVec<u16, 16> = self
+			.state
+			.visible
+			.iter()
+			.take(cursor + 1)
+			.copied()
+			.collect();
+		self.state.refilter();
+		let stable = previous.len() == cursor + 1
+			&& self.state.visible.len() > cursor
+			&& self.state.visible[..=cursor] == previous[..];
+		self.state.cursor = if stable { cursor as u16 } else { 0 };
 		match self.props.id() {
 			Some(id) => Flow::Event(UiEvent::Filtered {
 				id:    id.clone(),
@@ -452,7 +489,7 @@ impl Select {
 	/// browsers, clamping jumps and form selects. `false` leaves the
 	/// cursor untouched (the edge of a clamping select).
 	fn move_cursor(&mut self, delta: i64, wrap: bool) -> bool {
-		let count = self.state.visible().len() as i64;
+		let count = self.state.visible.len() as i64;
 		if count == 0 {
 			return false;
 		}
@@ -501,7 +538,7 @@ impl Select {
 	/// navigation. Identified selects surface cursor, query, and commit
 	/// changes as [`UiEvent`]s.
 	fn dispatch(&mut self, key: Key) -> Flow {
-		let visible = self.state.visible();
+		let has_rows = !self.state.visible.is_empty();
 		if self.state.editing {
 			match key {
 				// Enter commits the typed value: the custom row's `Changed`
@@ -584,21 +621,21 @@ impl Select {
 			}
 		}
 		match key {
-			Key::Up if !visible.is_empty() => {
+			Key::Up if has_rows => {
 				if self.move_cursor(-1, self.state.filter) {
 					self.highlight_flow()
 				} else {
 					Flow::Skip
 				}
 			},
-			Key::Down if !visible.is_empty() => {
+			Key::Down if has_rows => {
 				if self.move_cursor(1, self.state.filter) {
 					self.highlight_flow()
 				} else {
 					Flow::Skip
 				}
 			},
-			Key::PageUp | Key::PageDown if !visible.is_empty() => {
+			Key::PageUp | Key::PageDown if has_rows => {
 				let stride = i64::from(self.state.page.max(1));
 				let delta = if key == Key::PageUp { -stride } else { stride };
 				if self.move_cursor(delta, false) {
@@ -607,7 +644,7 @@ impl Select {
 					Flow::Consumed
 				}
 			},
-			Key::Home | Key::End if !visible.is_empty() => {
+			Key::Home | Key::End if has_rows => {
 				let delta = i64::from(u16::MAX);
 				let delta = if key == Key::Home { -delta } else { delta };
 				if self.move_cursor(delta, false) {
@@ -620,13 +657,13 @@ impl Select {
 			// aggregate (including an empty one), so a dialog host can submit
 			// one question or advance to the next without mutating it.
 			Key::Enter if self.state.multi => Flow::Event(UiEvent::Submit),
-			Key::Enter if !visible.is_empty() => {
-				let position = usize::from(self.state.cursor.min(visible.len() as u16 - 1));
-				self.commit(visible[position])
+			Key::Enter if has_rows => {
+				let position = usize::from(self.state.cursor).min(self.state.visible.len() - 1);
+				self.commit(self.state.visible[position])
 			},
-			Key::Space if !visible.is_empty() && !self.state.types_to_filter() => {
-				let position = usize::from(self.state.cursor.min(visible.len() as u16 - 1));
-				self.commit(visible[position])
+			Key::Space if has_rows && !self.state.types_to_filter() => {
+				let position = usize::from(self.state.cursor).min(self.state.visible.len() - 1);
+				self.commit(self.state.visible[position])
 			},
 			Key::Char('/') if self.state.filter && !self.state.types_to_filter() => {
 				self.state.searching = true;
@@ -794,14 +831,15 @@ impl Component for Select {
 		let header = self.header_rows();
 		self.state.header_rows = header;
 		let columns = self.solve_cells(ctx, width);
-		let visible = self.state.visible();
 		self.state.cursor = self
 			.state
 			.cursor
-			.min(visible.len().saturating_sub(1) as u16);
-		let used = visible.iter().fold(0u16, |height, &index| {
-			height.saturating_add(self.option_height(ctx, width, usize::from(index), &columns))
-		});
+			.min(self.state.visible.len().saturating_sub(1) as u16);
+		let mut used = 0u16;
+		for position in 0..self.state.visible.len() {
+			let index = usize::from(self.state.visible[position]);
+			used = used.saturating_add(self.option_height(ctx, width, index, &columns));
+		}
 		header.saturating_add(used)
 	}
 
@@ -811,26 +849,38 @@ impl Component for Select {
 		self.state.header_rows = header;
 		let columns = self.solve_cells(ctx, content.width);
 		let gap = self.cell_gap();
-		let visible = self.state.visible();
+		let count = self.state.visible.len();
 		self.state.cursor = self
 			.state
 			.cursor
-			.min(visible.len().saturating_sub(1) as u16);
+			.min(count.saturating_sub(1) as u16);
 		let cursor_at = usize::from(self.state.cursor);
-		let mut scroll = usize::from(self.state.scroll).min(visible.len().saturating_sub(1));
+		let cap = content.height.saturating_sub(header).max(1);
+		let mut scroll = usize::from(self.state.scroll).min(count.saturating_sub(1));
 		if cursor_at < scroll {
 			scroll = cursor_at;
 		}
+		// Pull the window forward until the cursor row fits, however far it
+		// jumped (a preselected model deep in the catalog, Page Down, End):
+		// the window moves in one pass, never one row per frame.
+		let mut span = 0u16;
+		for position in (scroll..=cursor_at).rev().take(count) {
+			let index = usize::from(self.state.visible[position]);
+			span = span.saturating_add(self.option_height(ctx, content.width, index, &columns));
+			if span > cap {
+				scroll = (position + 1).min(cursor_at);
+				break;
+			}
+		}
 		self.state.scroll = scroll as u16;
-		let cap = content.height.saturating_sub(header).max(1);
 		let mut y = content.y.saturating_add(header);
 		let mut used = 0u16;
 		let mut shown = 0u16;
-		for (position, &index) in visible.iter().enumerate().skip(scroll) {
+		for position in scroll..count {
 			if used >= cap {
 				break;
 			}
-			let index = usize::from(index);
+			let index = usize::from(self.state.visible[position]);
 			let desc_rows = self.state.options[index]
 				.desc
 				.as_ref()
@@ -875,9 +925,6 @@ impl Component for Select {
 			y = y.saturating_add(block);
 			used = used.saturating_add(block);
 			shown = shown.saturating_add(1);
-			if used >= cap && cursor_at > position {
-				self.state.scroll = self.state.scroll.saturating_add(1);
-			}
 		}
 		self.state.page = shown.max(1);
 	}
@@ -913,7 +960,7 @@ impl Component for Select {
 				if focused {
 					pc.frame.set_cursor(x, y);
 				}
-				let count = format!("{}/{}", self.state.visible().len(), self.state.options.len());
+				let count = format!("{}/{}", self.state.visible.len(), self.state.options.len());
 				let count_x = rect
 					.x
 					.saturating_add(rect.width.saturating_sub(cell_width(&count)));
@@ -935,7 +982,7 @@ impl Component for Select {
 						.frame
 						.put(x, y, pc.ctx.charset.beam(), Style::new().fg(pc.ctx.theme.accent));
 				}
-				let count = format!("{}/{}", self.state.visible().len(), self.state.options.len());
+				let count = format!("{}/{}", self.state.visible.len(), self.state.options.len());
 				let count_x = rect
 					.x
 					.saturating_add(rect.width.saturating_sub(cell_width(&count)));
@@ -947,8 +994,8 @@ impl Component for Select {
 			}
 		}
 
-		let visible = self.state.visible();
-		for (position, &raw_index) in visible.iter().enumerate() {
+		for position in 0..self.state.visible.len() {
+			let raw_index = self.state.visible[position];
 			let index = usize::from(raw_index);
 			let layout = self.state.layouts[index];
 			if layout.height == 0 {
@@ -1079,7 +1126,7 @@ impl Component for Select {
 	/// its chosen option (the active model), otherwise the
 	/// entry edge.
 	fn enter(&mut self, forward: bool) {
-		let visible = self.state.visible();
+		let visible = &self.state.visible;
 		if visible.is_empty() {
 			return;
 		}
@@ -1117,8 +1164,12 @@ impl Component for Select {
 	) -> Flow {
 		match (mouse, tag) {
 			(Mouse::Click, HitTag::Row(index)) if usize::from(index) < self.state.options.len() => {
-				let visible = self.state.visible();
-				if let Some(position) = visible.iter().position(|&candidate| candidate == index) {
+				if let Some(position) = self
+					.state
+					.visible
+					.iter()
+					.position(|&candidate| candidate == index)
+				{
 					self.state.cursor = position as u16;
 				}
 				self.commit(index)
@@ -1127,7 +1178,7 @@ impl Component for Select {
 				let delta = if mouse == Mouse::WheelUp { -1 } else { 1 };
 				if self.move_cursor(delta, false) {
 					self.highlight_flow()
-				} else if self.state.visible().is_empty() {
+				} else if self.state.visible.is_empty() {
 					Flow::Skip
 				} else {
 					Flow::Consumed
@@ -1198,27 +1249,42 @@ fn option_value(state: &SelectState, index: usize) -> serde_json::Value {
 	}
 }
 
-/// Case-insensitive subsequence match, scoring contiguous runs and early
-/// matches higher. `None` when `needle` is not a
-/// subsequence of `hay`.
-fn fuzzy_score(hay: &str, needle: &str) -> Option<i32> {
-	let hay: SmallVec<char, 64> = hay.chars().flat_map(char::to_lowercase).collect();
-	let mut score = 0_i32;
-	let mut position = 0_usize;
-	let mut previous: Option<usize> = None;
-	for ch in needle.chars().flat_map(char::to_lowercase) {
-		let found = hay[position..]
-			.iter()
-			.position(|&candidate| candidate == ch)?;
-		let at = position + found;
-		score += match previous {
-			Some(prev) if at == prev + 1 => 10,
-			_ => 10 - i32::try_from(found.min(8)).expect("bounded gap"),
-		};
-		previous = Some(at);
-		position = at + 1;
-	}
-	Some(score - i32::try_from(hay.len().min(64)).expect("bounded length"))
+/// Rows one option occupies at `width`: its label or cell row, description
+/// lines, and visible preview children.
+fn option_height(
+	ctx: &UiContext,
+	children: &mut [Cached],
+	option: &OptionData,
+	multi: bool,
+	width: u16,
+	columns: &[u16],
+) -> u16 {
+	let desc_rows = option
+		.desc
+		.as_ref()
+		.map_or(0, |desc| desc_lines(desc, width.saturating_sub(6)).len() as u16);
+	let row = if option.cells.is_empty() {
+		label_lines(&option.label, option_label_width(ctx, multi, width)).len() as u16
+	} else {
+		option
+			.cells
+			.clone()
+			.enumerate()
+			.map(|(column, cell)| {
+				let cell_width = columns.get(column).copied().unwrap_or(1).max(1);
+				children[cell].height(ctx, cell_width)
+			})
+			.max()
+			.unwrap_or(1)
+			.max(1)
+	};
+	let preview_h = children[option.preview.clone()]
+		.iter_mut()
+		.filter(|child| child.visible)
+		.fold(0u16, |height, child| {
+			height.saturating_add(child.height(ctx, width.saturating_sub(8)))
+		});
+	row.saturating_add(desc_rows).saturating_add(preview_h)
 }
 
 fn option_label_indent(ctx: &UiContext, multi: bool) -> u16 {

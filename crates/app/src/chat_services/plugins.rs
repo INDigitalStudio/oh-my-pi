@@ -40,9 +40,7 @@ pub(super) fn report(state: &ServiceState) -> ServiceResult<PluginsReport> {
 		.map(|index| MarketplaceSource { name: index.name, uri: Str::new(index.url) })
 		.collect::<Vec<_>>();
 	let installed = transactions.installed().map_err(ServiceError::failed)?;
-	let available = transactions
-		.discover(None)
-		.map_err(ServiceError::failed)?;
+	let available = transactions.discover(None).map_err(ServiceError::failed)?;
 	let mut plugins = Vec::with_capacity(installed.len() + available.len());
 	for view in &installed {
 		let marketplace = view.marketplace.clone().unwrap_or_default();

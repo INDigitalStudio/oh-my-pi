@@ -2,7 +2,6 @@
 
 use std::{
 	collections::BTreeSet,
-	env,
 	fs::{self, OpenOptions},
 	io,
 	path::{Path, PathBuf},
@@ -70,7 +69,7 @@ pub async fn run(args: AuthBrokerArgs) -> miette::Result<()> {
 		AuthBrokerCommand::Token { regenerate } => token(&data_dir, regenerate),
 		AuthBrokerCommand::Login { provider, via, dry_run } => {
 			if let Some(alias) = via {
-				remote_login(&data_dir, provider.as_str(), alias.as_str(), dry_run).await
+				remote_login(provider.as_str(), alias.as_str(), dry_run).await
 			} else {
 				auth_cli::run(data_dir.join("credentials.db"), AuthCommand::Login { provider }).await
 			}
@@ -105,7 +104,6 @@ pub(crate) fn token(data_dir: &Path, regenerate: bool) -> miette::Result<()> {
 }
 
 async fn remote_login(
-	data_dir: &Path,
 	provider: &str,
 	alias: &str,
 	dry_run: bool,
@@ -121,11 +119,7 @@ async fn remote_login(
 		}
 		return Ok(());
 	}
-	let project = env::current_dir()
-		.into_diagnostic()?
-		.join(".omp/hosts.toml");
-	let user = data_dir.join("hosts.toml");
-	let service = ssh_cmd::service(alias, &project, &user)?;
+	let service = ssh_cmd::service(alias, &ssh_cmd::host_paths()?)?;
 	let forward = match callback_port {
 		Some(port) => Some(
 			service

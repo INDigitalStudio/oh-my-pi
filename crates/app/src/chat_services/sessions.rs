@@ -30,11 +30,22 @@ const DEFAULT_AGENT: &str = "task";
 
 /// On-disk sessions in `scope`, pinned first, then newest first.
 pub fn rows(state: &ServiceState, scope: SessionScope) -> ServiceResult<Vec<SessionRow>> {
+	rows_in(&state.data_dir, &state.sessions_dir, &state.state_dir, scope)
+}
+
+/// [`rows`] over explicit roots: `data_dir/projects/*/sessions` for every
+/// project, else this project's `sessions_dir` beside its `state_dir`.
+pub(crate) fn rows_in(
+	data_dir: &Path,
+	sessions_dir: &Path,
+	state_dir: &Path,
+	scope: SessionScope,
+) -> ServiceResult<Vec<SessionRow>> {
 	if scope == SessionScope::Project {
-		return rows_from(&state.sessions_dir, &state.state_dir);
+		return rows_from(sessions_dir, state_dir);
 	}
 	let mut rows = Vec::new();
-	let projects = state.data_dir.join("projects");
+	let projects = data_dir.join("projects");
 	let entries = match fs::read_dir(&projects) {
 		Ok(entries) => Some(entries),
 		Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -47,8 +58,8 @@ pub fn rows(state: &ServiceState, scope: SessionScope) -> ServiceResult<Vec<Sess
 		}
 		rows.extend(rows_from(&project_state.join("sessions"), &project_state)?);
 	}
-	if !rows.iter().any(|row| row.path.starts_with(&state.sessions_dir)) {
-		rows.extend(rows_from(&state.sessions_dir, &state.state_dir)?);
+	if !rows.iter().any(|row| row.path.starts_with(sessions_dir)) {
+		rows.extend(rows_from(sessions_dir, state_dir)?);
 	}
 	rows.sort_by(|left, right| {
 		right

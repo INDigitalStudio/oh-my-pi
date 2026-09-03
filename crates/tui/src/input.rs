@@ -341,6 +341,14 @@ impl InputDecoder {
 		&mut self.keymap
 	}
 
+	/// Emits one physical chord exactly as if the terminal had reported it:
+	/// resolved through the live keymap and delivered as a chord edge or a
+	/// semantic key by the same rule as decoded bytes. Debug key injection
+	/// rides this path so a bound chord runs its bind instead of typing.
+	pub fn inject(&self, chord: Chord, out: &mut Vec<InputEvent>) {
+		emit_chord(&self.keymap, chord, out);
+	}
+
 	/// Tells the framer whether Kitty keyboard reporting is active.
 	///
 	/// Active Kitty mode extends the hold for every partial escape because a
@@ -1429,7 +1437,8 @@ impl Chord {
 		Str::from(label)
 	}
 
-	const fn plain(key: Key) -> Self {
+	/// Creates an unmodified chord.
+	pub const fn plain(key: Key) -> Self {
 		Self::new(key, Mods {
 			shift:     false,
 			alt:       false,

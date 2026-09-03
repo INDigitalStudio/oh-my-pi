@@ -24,9 +24,8 @@ static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// pi `dumpLlmRequestToTmpDir`: `<tmp>/omp-request-<stem>.json`.
 pub(super) fn dump_request(state: &ServiceState) -> ServiceResult<PathBuf> {
 	let journal = state.live_journal.read().clone();
-	let session =
-		omp_session::Session::open(&journal, omp_session::ComponentRegistry::standard())
-			.map_err(ServiceError::failed)?;
+	let session = omp_session::Session::open(&journal, omp_session::ComponentRegistry::standard())
+		.map_err(ServiceError::failed)?;
 	let items = omp_session::project_thread(session.dom());
 	let stem = journal
 		.file_stem()
@@ -155,12 +154,10 @@ mod tests {
 		let temp = tempfile::tempdir().expect("tempdir");
 		let journal = temp.path().join("s.oms");
 		fs::write(&journal, "").unwrap();
-		let argv = args(&["chat", "--model", "m", "-c", "--resume", "abc", "--fork=x", "--", "hello", "m"]);
+		let argv =
+			args(&["chat", "--model", "m", "-c", "--resume", "abc", "--fork=x", "--", "hello", "m"]);
 		let out = restart_argv(&argv, &["hello", "m"], Some(&journal));
-		assert_eq!(
-			out,
-			args(&["chat", "--model", "m", "--resume", journal.to_str().unwrap()])
-		);
+		assert_eq!(out, args(&["chat", "--model", "m", "--resume", journal.to_str().unwrap()]));
 	}
 
 	#[test]

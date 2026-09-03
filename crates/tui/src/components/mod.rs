@@ -161,7 +161,8 @@ pub use diffstat::DiffStat;
 pub use editor::{
 	Attachment, AttachmentContent, Attachments, ComposerLayout, ComposerStatusAttachment,
 	ComposerStyle, EditInput, EditorPane, InlineAccent, InlineDecorator, KeywordAccent,
-	KeywordGradient, attachment_color, chip_label,
+	KeywordGradient, PrefixAccent, PrefixClassifier, attachment_color, chip_label,
+	marker_sized_paste,
 };
 pub use fact::Fact;
 pub use files::Files;

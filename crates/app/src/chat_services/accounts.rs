@@ -13,8 +13,7 @@ use omp_chat::overlays::services::{
 use omp_core::{ExposeSecret as _, SecretString, Str, sf};
 use omp_inference::{
 	answer::{
-		AccountSummary, AuthAnswer, AuthEvent, AuthPrompt, AuthPromptKind, AuthResponse,
-		AuthSession,
+		AccountSummary, AuthAnswer, AuthEvent, AuthPrompt, AuthPromptKind, AuthResponse, AuthSession,
 	},
 	auth::{AuthControlHandle, AuthManager},
 	call::{AuthInput, AuthRequest, LoginRequest},
@@ -27,7 +26,10 @@ const GATEWAY: &str = "provider accounts (remote gateway)";
 const LOGIN_CANCELLED: &str = "Login cancelled";
 
 fn stack(state: &ServiceState) -> ServiceResult<&StackHandles> {
-	state.stack.as_ref().ok_or(ServiceError::Unavailable(GATEWAY))
+	state
+		.stack
+		.as_ref()
+		.ok_or(ServiceError::Unavailable(GATEWAY))
 }
 
 fn provider_name(state: &ServiceState, provider: &ProviderId<str>) -> Str {
@@ -96,12 +98,10 @@ pub fn providers(state: &ServiceState) -> ServiceResult<Vec<ProviderRow>> {
 				}
 			}
 			login.then(|| ProviderRow {
-				id:        provider.id.as_inner().clone(),
-				name:      provider.name.clone(),
+				id: provider.id.as_inner().clone(),
+				name: provider.name.clone(),
 				oauth,
-				logged_in: accounts
-					.iter()
-					.any(|record| record.provider == provider.id),
+				logged_in: accounts.iter().any(|record| record.provider == provider.id),
 			})
 		})
 		.collect())
@@ -131,7 +131,14 @@ pub fn login(state: &ServiceState, provider: &str) -> ServiceResult<LoginFlow> {
 		let outcome = driver.run(request, &title, &database).await;
 		let _ = done_tx.send(outcome);
 	});
-	Ok(LoginFlow { provider: provider_id.into_inner(), provider_name: name, events, input, done, cancel })
+	Ok(LoginFlow {
+		provider: provider_id.into_inner(),
+		provider_name: name,
+		events,
+		input,
+		done,
+		cancel,
+	})
 }
 
 /// Deletes one stored account; settles once the encrypted store commits.
@@ -223,7 +230,9 @@ impl Driver {
 						return Err(ServiceError::Failed(sf!("Login to {name} ended without a result")));
 					}
 				},
-				AuthEvent::Waiting => self.show(LoginEvent::Info(sf!("Waiting for {name} authorization…"))),
+				AuthEvent::Waiting => {
+					self.show(LoginEvent::Info(sf!("Waiting for {name} authorization…")))
+				},
 				AuthEvent::Complete(summary) => return Ok(success(name, &summary, database)),
 			}
 		}
@@ -321,8 +330,17 @@ mod tests {
 			Ok(AuthInput::AuthorizationCode(_))
 		));
 		assert!(auth_input(&prompt(AuthPromptKind::ApiKey), "").is_err());
-		assert!(matches!(auth_input(&prompt(AuthPromptKind::Confirmation), "YES"), Ok(AuthInput::DeviceConfirmed)));
-		assert!(matches!(auth_input(&prompt(AuthPromptKind::Confirmation), "n"), Ok(AuthInput::Cancel)));
-		assert!(matches!(auth_input(&prompt(AuthPromptKind::OptionalSecret), ""), Ok(AuthInput::OptionalSecret(_))));
+		assert!(matches!(
+			auth_input(&prompt(AuthPromptKind::Confirmation), "YES"),
+			Ok(AuthInput::DeviceConfirmed)
+		));
+		assert!(matches!(
+			auth_input(&prompt(AuthPromptKind::Confirmation), "n"),
+			Ok(AuthInput::Cancel)
+		));
+		assert!(matches!(
+			auth_input(&prompt(AuthPromptKind::OptionalSecret), ""),
+			Ok(AuthInput::OptionalSecret(_))
+		));
 	}
 }

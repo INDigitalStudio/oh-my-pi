@@ -12,7 +12,9 @@ use std::{
 use omp_chat::welcome::{LspServer, LspStatus, RecentSession};
 use omp_docserver::{
 	lsp_binary::{BinaryPlatform, resolve_lsp_binary},
-	lsp_config::{ResolvedLspConfig, ResolvedLspServer, discover_native_lsp_sources, load_lsp_config},
+	lsp_config::{
+		ResolvedLspConfig, ResolvedLspServer, discover_native_lsp_sources, load_lsp_config,
+	},
 	lsp_registry::root_marker_ancestor,
 };
 use omp_proto::document::v1::{LspServerStage, LspStatusResponse};
@@ -83,8 +85,8 @@ pub fn lsp_from_status(status: &LspStatusResponse) -> Vec<LspServer> {
 /// whose binary resolves is `Available` (pi's "not started" state); one
 /// whose binary is missing is `Error`.
 pub fn lsp_servers(project: &Path, user_root: Option<&Path>) -> Vec<LspServer> {
-	let config = discover_native_lsp_sources(user_root, project)
-		.and_then(|sources| load_lsp_config(&sources));
+	let config =
+		discover_native_lsp_sources(user_root, project).and_then(|sources| load_lsp_config(&sources));
 	let config = match config {
 		Ok(config) => config,
 		Err(error) => {

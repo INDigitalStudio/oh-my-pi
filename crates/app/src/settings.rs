@@ -32,11 +32,6 @@ omp_con::var! {
 		default: Vec::new(),
 		flags: archive,
 	};
-	/// pi `disabledExtensions` (array, default: EMPTY_STRING_ARRAY).
-	pub static CL_DISABLED_EXTENSIONS = cl_disabled_extensions: Vec<Str> {
-		default: Vec::new(),
-		flags: archive,
-	};
 	/// pi `startup.showSplash` (boolean, default: false).
 	pub static CL_STARTUP_SHOW_SPLASH = cl_startup_show_splash: bool {
 		default: false,

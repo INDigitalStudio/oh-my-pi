@@ -17,7 +17,7 @@ use omp_driver::cleanse::{
 	CleanseArgs, CleanseStatus, TargetChoice,
 	production::{CleansePresentation, PresentationError, ProductionCleanseHost},
 };
-use omp_envd::ssh::{AuthPolicy, HostConfig, HostStore};
+use omp_envd::ssh::{AuthPolicy, HostConfig, HostPaths, HostStore};
 use tokio_util::sync::CancellationToken;
 
 use super::ServiceState;
@@ -34,9 +34,8 @@ fn failed(error: impl std::fmt::Display) -> ServiceError {
 /// `/export [path]`: the pure transcript projection of the live journal.
 pub fn export(state: &ServiceState, path: Option<&Path>) -> ServiceResult<PathBuf> {
 	let journal = state.live_journal.read().clone();
-	let session =
-		omp_session::Session::open(&journal, omp_session::ComponentRegistry::standard())
-			.map_err(failed)?;
+	let session = omp_session::Session::open(&journal, omp_session::ComponentRegistry::standard())
+		.map_err(failed)?;
 	let target = match path {
 		Some(path) if path.is_absolute() => path.to_path_buf(),
 		Some(path) => state.project.join(path),
@@ -110,16 +109,18 @@ pub fn changelog() -> ServiceResult<Str> {
 	Err(ServiceError::Unavailable("changelog (the tree ships no CHANGELOG.md)"))
 }
 
-fn ssh_paths(state: &ServiceState) -> (PathBuf, PathBuf) {
-	(state.project.join(".omp/hosts.toml"), state.data_dir.join("hosts.toml"))
+/// Project `.omp/hosts.toml` over the user configuration root (`~/.o2`).
+fn ssh_paths(state: &ServiceState) -> ServiceResult<HostPaths> {
+	let user_root = omp_core::dirs::user_config_root().map_err(failed)?;
+	Ok(HostPaths::new(&user_root, &state.project))
 }
 
 /// `/ssh list`: project declarations shadow user ones with the same alias.
 pub fn ssh_hosts(state: &ServiceState) -> ServiceResult<Vec<SshHostRow>> {
-	let (project, user) = ssh_paths(state);
+	let paths = ssh_paths(state)?;
 	let mut rows = Vec::new();
 	let mut seen = std::collections::BTreeSet::new();
-	for (scope, path) in [("project", &project), ("user", &user)] {
+	for (scope, path) in [("project", &paths.project), ("user", &paths.user)] {
 		let store = HostStore::load(path).map_err(failed)?;
 		for alias in store.aliases() {
 			if !seen.insert(alias.clone()) {
@@ -142,8 +143,8 @@ pub fn ssh_hosts(state: &ServiceState) -> ServiceResult<Vec<SshHostRow>> {
 
 /// `/ssh add`.
 pub fn ssh_add(state: &ServiceState, spec: &SshHostSpec) -> ServiceResult<Str> {
-	let (project, user) = ssh_paths(state);
-	let path = if spec.project { &project } else { &user };
+	let paths = ssh_paths(state)?;
+	let path = if spec.project { &paths.project } else { &paths.user };
 	if let Some(parent) = path.parent() {
 		fs::create_dir_all(parent).map_err(failed)?;
 	}
@@ -166,8 +167,8 @@ pub fn ssh_add(state: &ServiceState, spec: &SshHostSpec) -> ServiceResult<Str> {
 
 /// `/ssh remove`.
 pub fn ssh_remove(state: &ServiceState, alias: &str, project: bool) -> ServiceResult<Str> {
-	let (project_path, user) = ssh_paths(state);
-	let path = if project { &project_path } else { &user };
+	let paths = ssh_paths(state)?;
+	let path = if project { &paths.project } else { &paths.user };
 	let removed = HostStore::load(path)
 		.map_err(failed)?
 		.remove(path, alias)
@@ -175,10 +176,7 @@ pub fn ssh_remove(state: &ServiceState, alias: &str, project: bool) -> ServiceRe
 	if removed {
 		Ok(sf!("Removed SSH host `{alias}` from {}.", path.display()))
 	} else {
-		Err(ServiceError::Failed(sf!(
-			"SSH host `{alias}` is not configured in {}",
-			path.display()
-		)))
+		Err(ServiceError::Failed(sf!("SSH host `{alias}` is not configured in {}", path.display())))
 	}
 }
 
@@ -186,9 +184,7 @@ pub fn ssh_remove(state: &ServiceState, alias: &str, project: bool) -> ServiceRe
 /// URL (pi `Share URL: …`).
 pub fn share(state: &ServiceState, snapshot: serde_json::Value) -> ServiceResult<Pending<Str>> {
 	let Some(stack) = state.stack.as_ref() else {
-		return Err(ServiceError::Unavailable(
-			"share (credentials live on the remote gateway host)",
-		));
+		return Err(ServiceError::Unavailable("share (credentials live on the remote gateway host)"));
 	};
 	let settings = omp_driver::settings::Settings::from_con(&state.con);
 	let secrets = omp_driver::secrets::session::SecretSessionSnapshot::build(
@@ -274,9 +270,11 @@ pub fn cleanse(state: &ServiceState, request: CleanseRequest) -> ServiceResult<C
 		request: request.request.clone(),
 		..CleanseArgs::default()
 	};
-	let presentation = Arc::new(ChatCleansePresentation { request: request.request, all: args.all });
-	let host = ProductionCleanseHost::open(state.project.clone(), state.data_dir.clone(), presentation)
-		.map_err(failed)?;
+	let presentation =
+		Arc::new(ChatCleansePresentation { request: request.request, all: args.all });
+	let host =
+		ProductionCleanseHost::open(state.project.clone(), state.data_dir.clone(), presentation)
+			.map_err(failed)?;
 	let cancel = CancellationToken::new();
 	let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
 	let (tx, rx) = flume::bounded(1);
@@ -291,51 +289,51 @@ pub fn cleanse(state: &ServiceState, request: CleanseRequest) -> ServiceResult<C
 	std::thread::Builder::new()
 		.name("omp-cleanse".into())
 		.spawn(move || {
-		let result = runtime
-			.block_on(omp_driver::cleanse::run(&args, &host, &cancel))
-			.map(|exit| {
-				let status = match exit.status {
-					CleanseStatus::Clean => "clean",
-					CleanseStatus::Unresolved => "unresolved",
-					CleanseStatus::Cancelled => "cancelled",
-					CleanseStatus::Unsupported => "unsupported",
-				};
-				let summary = match exit.status {
-					CleanseStatus::Clean => {
-						Str::new_static("Cleanse completed with no remaining diagnostics.")
-					},
-					CleanseStatus::Unresolved => sf!(
-						"Cleanse left {} file group(s) unresolved{}.",
-						exit.remainder.len(),
-						if exit.omitted_files == 0 {
-							String::new()
-						} else {
-							format!(" ({} more omitted)", exit.omitted_files)
-						}
-					),
-					CleanseStatus::Unsupported => {
-						Str::new_static("No supported cleanse checker was discovered.")
-					},
-					CleanseStatus::Cancelled => Str::new_static("Cleanse cancelled."),
-				};
-				CleanseOutcome {
-					status: Str::new_static(status),
-					summary,
-					remainder: exit
-						.remainder
-						.iter()
-						.map(|group| {
-							sf!(
-								"{}: {} issue(s)",
-								group.file.as_deref().unwrap_or("(project)"),
-								group.diagnostics.len()
-							)
-						})
-						.collect(),
-				}
-			})
-			.map_err(failed);
-		let _ = tx.send(result);
+			let result = runtime
+				.block_on(omp_driver::cleanse::run(&args, &host, &cancel))
+				.map(|exit| {
+					let status = match exit.status {
+						CleanseStatus::Clean => "clean",
+						CleanseStatus::Unresolved => "unresolved",
+						CleanseStatus::Cancelled => "cancelled",
+						CleanseStatus::Unsupported => "unsupported",
+					};
+					let summary = match exit.status {
+						CleanseStatus::Clean => {
+							Str::new_static("Cleanse completed with no remaining diagnostics.")
+						},
+						CleanseStatus::Unresolved => sf!(
+							"Cleanse left {} file group(s) unresolved{}.",
+							exit.remainder.len(),
+							if exit.omitted_files == 0 {
+								String::new()
+							} else {
+								format!(" ({} more omitted)", exit.omitted_files)
+							}
+						),
+						CleanseStatus::Unsupported => {
+							Str::new_static("No supported cleanse checker was discovered.")
+						},
+						CleanseStatus::Cancelled => Str::new_static("Cleanse cancelled."),
+					};
+					CleanseOutcome {
+						status: Str::new_static(status),
+						summary,
+						remainder: exit
+							.remainder
+							.iter()
+							.map(|group| {
+								sf!(
+									"{}: {} issue(s)",
+									group.file.as_deref().unwrap_or("(project)"),
+									group.diagnostics.len()
+								)
+							})
+							.collect(),
+					}
+				})
+				.map_err(failed);
+			let _ = tx.send(result);
 		})
 		.map_err(failed)?;
 	Ok(CleanseRun { done: rx, cancel: cancel_tx })

@@ -7,21 +7,24 @@
 use std::{path::PathBuf, sync::Arc};
 
 use omp_chat::overlays::services::{
-	AccountRow, AgentRow, CleanseRequest, CleanseRun, ExtensionRow, LoginFlow, MemoryOp, Mutation,
-	Mutations, Pending, PluginsReport, ServiceError, ServiceResult, Services, SessionRow,
+	AccountRow, AgentRow, AgentView, CleanseRequest, CleanseRun, ExtensionRow, LoginFlow, MemoryOp,
+	Mutation, Mutations, Pending, PluginsReport, ServiceError, ServiceResult, Services, SessionRow,
 	SessionScope, SshHostRow, SshHostSpec, ToolRow, UsageReport,
 };
 use omp_core::{Str, sf};
 use omp_driver::registry::ProductionInference as ProductionStack;
 
 mod accounts;
+pub(crate) mod agents;
 pub(crate) mod control;
+/// Production `UiControlOwner`: extension `omp.ui.*` requests as chat dialogs.
+pub mod extension_ui;
 mod extensions;
 mod mcp;
 mod misc;
 mod plugins;
 mod session_ops;
-mod sessions;
+pub(crate) mod sessions;
 mod stats;
 mod tools;
 /// Kernel notification recorder behind `/trace`.
@@ -35,7 +38,7 @@ pub struct ServiceState {
 	pub data_dir:     PathBuf,
 	/// Canonical project root.
 	pub project:      PathBuf,
-	/// Project state directory (`sessions/`, `ssh/`).
+	/// Project state directory (`sessions/`).
 	pub state_dir:    PathBuf,
 	/// Durable session directory.
 	pub sessions_dir: PathBuf,
@@ -52,6 +55,10 @@ pub struct ServiceState {
 	pub registry:     Arc<omp_tool::Registry>,
 	/// Process console.
 	pub con:          Arc<omp_con::Ctx>,
+	/// Live-session routing index (`/hub` transcripts, agent steering).
+	pub sessions:     Arc<omp_driver::sessions::SessionRegistry>,
+	/// Environment client (isolated workspaces for revived agents).
+	pub env:          omp_env::EnvClient,
 	/// MCP inspection authority.
 	pub mcp:          omp_envd::McpInspectorHandle,
 	/// Extension hot-reload authority.
@@ -70,11 +77,11 @@ pub struct ServiceState {
 #[derive(Clone)]
 pub struct StackHandles {
 	/// Authentication owner.
-	pub auth:         omp_inference::auth::AuthManager,
+	pub auth:                 omp_inference::auth::AuthManager,
 	/// Lifecycle CONTROL view of the same owner.
-	pub auth_control: omp_inference::auth::AuthControlHandle,
+	pub auth_control:         omp_inference::auth::AuthControlHandle,
 	/// Provider usage fetchers.
-	pub usage:        omp_inference::operation::usage::UsageFetcherRegistry,
+	pub usage:                omp_inference::operation::usage::UsageFetcherRegistry,
 	/// Combined credential authority (GitHub gist uploads for `/share`).
 	pub credential_authority: Arc<dyn omp_envd::github_url::CredentialAuthority>,
 }
@@ -220,6 +227,14 @@ impl Services for AppServices {
 		session_ops::list_local(&self.state, suffix)
 	}
 
+	fn write_local(&self, name: &str, content: &str) -> ServiceResult<Str> {
+		session_ops::write_local(&self.state, name, content)
+	}
+
+	fn agent_view(&self, id: &str) -> ServiceResult<Pending<AgentView>> {
+		agents::view(&self.state, id)
+	}
+
 	fn journal_tree(&self) -> ServiceResult<Vec<omp_chat::overlays::services::TreeEntry>> {
 		session_ops::journal_tree(&self.state)
 	}
@@ -272,20 +287,17 @@ impl Mutations for AppServices {
 	fn apply(&self, mutation: Mutation) -> ServiceResult<Pending<Str>> {
 		match mutation {
 			Mutation::SetExtensionEnabled { id, enabled } => Ok(ready(
-				extensions::set_enabled(&self.state, &id, enabled).map(|()| {
-					sf!("Extension {}", if enabled { "enabled" } else { "disabled" })
-				}),
+				extensions::set_enabled(&self.state, &id, enabled)
+					.map(|()| sf!("Extension {}", if enabled { "enabled" } else { "disabled" })),
 			)),
 			Mutation::ReloadExtensions => extensions::reload(&self.state),
 			Mutation::SetAgentEnabled { name, enabled } => Ok(ready(
-				sessions::set_agent_enabled(&self.state, &name, enabled).map(|()| {
-					sf!("Agent {name} {}", if enabled { "enabled" } else { "disabled" })
-				}),
+				sessions::set_agent_enabled(&self.state, &name, enabled)
+					.map(|()| sf!("Agent {name} {}", if enabled { "enabled" } else { "disabled" })),
 			)),
 			Mutation::SetPluginEnabled { id, enabled } => Ok(ready(
-				plugins::set_enabled(&self.state, &id, enabled).map(|()| {
-					sf!("{} {id}", if enabled { "Enabled" } else { "Disabled" })
-				}),
+				plugins::set_enabled(&self.state, &id, enabled)
+					.map(|()| sf!("{} {id}", if enabled { "Enabled" } else { "Disabled" })),
 			)),
 			Mutation::InstallPlugin { id } => plugins::install(&self.state, &id),
 			Mutation::UninstallPlugin { id } => plugins::uninstall(&self.state, &id),
@@ -293,22 +305,21 @@ impl Mutations for AppServices {
 			Mutation::PinAccount { account, pinned } => {
 				Ok(ready(accounts::pin(&self.state, &account, pinned)))
 			},
-			Mutation::PinSession { id, pinned } => Ok(ready(
-				sessions::pin(&self.state, &id, pinned).map(|()| {
+			Mutation::PinSession { id, pinned } => {
+				Ok(ready(sessions::pin(&self.state, &id, pinned).map(|()| {
 					Str::new_static(if pinned {
 						"Session pinned to the top of the resume list."
 					} else {
 						"Session unpinned."
 					})
-				}),
-			)),
+				})))
+			},
 			Mutation::RenameSession { id, title } => Ok(ready(
 				session_ops::rename(&self.state, &id, &title)
 					.map(|()| sf!("Session renamed to \"{title}\".")),
 			)),
 			Mutation::DeleteSession { id } => Ok(ready(
-				session_ops::delete(&self.state, &id)
-					.map(|()| Str::new_static("Session deleted")),
+				session_ops::delete(&self.state, &id).map(|()| Str::new_static("Session deleted")),
 			)),
 			Mutation::ResetUsage { target } => Ok(ready(usage::reset(&self.state, &target))),
 		}
