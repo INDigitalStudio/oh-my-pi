@@ -1583,6 +1583,21 @@ impl Terminal {
 		self.pump.set_keymap(self.keymap.clone());
 	}
 
+	/// Enables or disables inline pointer reporting without leaving raw mode.
+	///
+	/// Hosts use this while a modal or fullscreen interactive surface owns
+	/// focus, returning native terminal text selection when it closes.
+	pub fn set_mouse(&mut self, mouse: bool) -> io::Result<()> {
+		if self.mouse == mouse {
+			return Ok(());
+		}
+		let payload = if mouse { MOUSE_TRACKING_ON } else { MOUSE_TRACKING_OFF };
+		terminal_write_all(&mut self.tty, payload)?;
+		self.tty.flush()?;
+		self.mouse = mouse;
+		Ok(())
+	}
+
 	/// Returns the controlling terminal's current cell dimensions.
 	pub fn size(&self) -> io::Result<Size> {
 		platform::size(&self.tty, &self.platform)

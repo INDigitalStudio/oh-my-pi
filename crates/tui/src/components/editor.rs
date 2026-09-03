@@ -2478,8 +2478,17 @@ impl Component for EditorPane {
 			let status = &mut self.children[1];
 			let _ = status.measure(ctx);
 			let _ = status.height(ctx, rect.width);
+			// Standalone status sits on the last reserved row below the input
+			// (a `status_gap` layout leaves the row before it blank); a rule
+			// chip paints over the input's own top rule and gets the whole
+			// surface.
 			let status_rect = if layout.status_before_input {
 				Rect::new(rect.x, rect.y.saturating_add(band), rect.width, status_height)
+			} else if layout.status_attachment == ComposerStatusAttachment::Standalone {
+				let status_y = editor_y
+					.saturating_add(editor_height)
+					.saturating_add(status_height.saturating_sub(1));
+				Rect::new(rect.x, status_y, rect.width, status_height.min(1))
 			} else {
 				Rect::new(rect.x, editor_y, rect.width, editor_height.saturating_add(status_height))
 			};

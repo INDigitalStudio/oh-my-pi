@@ -94,12 +94,13 @@ pub use imagereg::register as register_image_source;
 /// Installs an application resolver for one `<img src>` URI scheme.
 pub use imagereg::{SourceResolver as ImageSourceResolver, register_scheme as register_image_scheme};
 pub use input::{
-	Chord, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton, MouseReport,
+	Chord, InputDecoder, InputEvent, Key, KeyEvent, Keymap, Mods, Mouse, MouseButton, MouseReport,
 	TerminalResponse, UiEvent, decode_keys,
 };
 pub use markup::{Border, Dim, MarkupOrigin, ParseError, parse_with_origin};
 pub use notify::{
 	Notification, NotificationAction, NotificationBuilder, NotificationSound, Urgency, notify,
+	notify_desktop,
 };
 /// Builds a component tree from declarative markup.
 pub use omp_macros::dom;

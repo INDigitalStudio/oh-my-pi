@@ -672,12 +672,7 @@ impl UiContext {
 		self.charset = caps.charset;
 		changed |= self.set_jamo_width(JamoWidth::from_caps(caps.jamo_width));
 		if let Some((red, green, blue)) = caps.background {
-			let appearance = Appearance::from_rgb16(red, green, blue);
-			if appearance != self.appearance {
-				self.appearance = appearance;
-				self.theme = Theme::for_appearance(appearance);
-				changed = true;
-			}
+			changed |= self.apply_appearance(Appearance::from_rgb16(red, green, blue));
 		}
 		if !caps.true_color {
 			let theme = self.theme.quantized_256();
@@ -685,6 +680,26 @@ impl UiContext {
 			self.theme = theme;
 		}
 		changed
+	}
+
+	/// Applies a terminal-reported dark/light appearance change.
+	///
+	/// Stock palettes follow the terminal, including their 256-color
+	/// quantized form. A caller-supplied custom theme is preserved so the
+	/// host can choose whether and how to restyle it.
+	pub fn apply_appearance(&mut self, appearance: Appearance) -> bool {
+		if self.appearance == appearance {
+			return false;
+		}
+		let stock = Theme::for_appearance(self.appearance);
+		let next = Theme::for_appearance(appearance);
+		if self.theme == stock {
+			self.theme = next;
+		} else if self.theme == stock.quantized_256() {
+			self.theme = next.quantized_256();
+		}
+		self.appearance = appearance;
+		true
 	}
 
 	/// Returns this context configured for the detected terminal.
@@ -712,7 +727,7 @@ impl Eq for UiContext {}
 mod tests {
 	use std::time::Duration;
 
-	use super::{Appearance, Charset, Theme};
+	use super::{Appearance, Charset, Theme, UiContext};
 	use crate::frame::Color;
 
 	#[test]
@@ -748,6 +763,27 @@ mod tests {
 
 		let explicit = Color::Rgb(1, 2, 3);
 		assert_eq!(theme.foreground_on(explicit, theme.panel), explicit);
+	}
+
+	#[test]
+	fn appearance_changes_follow_stock_palette_and_preserve_custom_themes() {
+		let mut stock = UiContext::default();
+		assert!(stock.apply_appearance(Appearance::Light));
+		assert_eq!(stock.appearance, Appearance::Light);
+		assert_eq!(stock.theme, Theme::for_appearance(Appearance::Light));
+		assert!(!stock.apply_appearance(Appearance::Light));
+
+		let mut quantized = UiContext {
+			theme: Theme::for_appearance(Appearance::Dark).quantized_256(),
+			..UiContext::default()
+		};
+		assert!(quantized.apply_appearance(Appearance::Light));
+		assert_eq!(quantized.theme, Theme::for_appearance(Appearance::Light).quantized_256());
+
+		let custom = Theme { accent: Color::Rgb(1, 2, 3), ..Theme::default() };
+		let mut custom_ctx = UiContext { theme: custom, ..UiContext::default() };
+		assert!(custom_ctx.apply_appearance(Appearance::Light));
+		assert_eq!(custom_ctx.theme, custom);
 	}
 
 	#[test]

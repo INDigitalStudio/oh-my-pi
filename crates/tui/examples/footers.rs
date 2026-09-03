@@ -89,6 +89,21 @@ async fn run<'a>(
 							Key::End => scroll = u16::MAX,
 							_ => {},
 						},
+						InputEvent::Chord(event) if event.pressed => {
+							if let Some(key) = event.key {
+								match key {
+									Key::Char('q') | Key::Esc | Key::Ctrl('c') => return Ok(()),
+									Key::Up | Key::Char('k') => scroll = scroll.saturating_sub(1),
+									Key::Down | Key::Char('j') => scroll = scroll.saturating_add(1),
+									Key::PageUp => scroll = scroll.saturating_sub(viewport.height),
+									Key::PageDown => scroll = scroll.saturating_add(viewport.height),
+									Key::Home => scroll = 0,
+									Key::End => scroll = u16::MAX,
+									_ => {},
+								}
+							}
+						},
+						InputEvent::Chord(_) => {},
 						InputEvent::Mouse(report) => match report.kind {
 							Mouse::WheelUp => scroll = scroll.saturating_sub(2),
 							Mouse::WheelDown => scroll = scroll.saturating_add(2),

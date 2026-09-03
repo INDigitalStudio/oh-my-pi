@@ -158,11 +158,14 @@ impl Component for Boxed {
 			let rect = self.title_rect(content);
 			let placed = self.children[0].rect;
 			if rect.y < pc.clip && rect.width > 0 {
-				// Break the rule around the title like a string title does.
+				// Break the rule under the whole title span like a string
+				// title does: the child's own layout gaps (a `<row gap>`)
+				// paint nothing, so the rule must not show through them.
 				let style = Style::new();
-				pc.frame.put(rect.x.saturating_sub(1), rect.y, " ", style);
-				pc.frame
-					.put(placed.x.saturating_add(placed.width), rect.y, " ", style);
+				let end = placed.x.saturating_add(placed.width);
+				for x in rect.x.saturating_sub(1)..=end {
+					pc.frame.put(x, rect.y, " ", style);
+				}
 				let clip = pc.clip;
 				pc.clip = rect.y.saturating_add(1).min(clip);
 				self.children[0].paint(pc);

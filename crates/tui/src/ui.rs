@@ -875,6 +875,23 @@ impl Ui {
 		}
 	}
 
+	/// Stable id of the component that currently owns keyboard focus.
+	#[must_use]
+	pub fn focused_id(&self) -> Option<Str> {
+		let slot = self.focus?;
+		find_slot_ref(&self.root, slot)
+			.and_then(|cached| cached.comp().props().id())
+			.map(Str::new)
+	}
+
+	/// Returns the laid-out document rectangle of a named component.
+	///
+	/// Pointer-driven hosts use this to map coordinates onto semantic rows
+	/// whose focus container intentionally emits no press event.
+	pub fn rect(&mut self, id: &str) -> Option<Rect> {
+		self.snapshot_id(id).map(|(_, _, rect, _)| rect)
+	}
+
 	/// Moves keyboard focus to the named component when it is visible and
 	/// focusable, activating keyboard chrome. Returns whether focus moved.
 	pub fn focus_id(&mut self, id: &str) -> bool {

@@ -504,7 +504,17 @@ impl Select {
 		let visible = self.state.visible();
 		if self.state.editing {
 			match key {
-				Key::Enter => self.state.editing = false,
+				// Enter commits the typed value: the custom row's `Changed`
+				// waited for it (see `commit`).
+				Key::Enter => {
+					self.state.editing = false;
+					if let Some(id) = self.props.id() {
+						return Flow::Event(UiEvent::Changed {
+							id:    id.clone(),
+							value: Str::new(self.state.custom_text.as_str()),
+						});
+					}
+				},
 				Key::Esc => {
 					self.state.editing = false;
 					self.state.custom_text.clear();

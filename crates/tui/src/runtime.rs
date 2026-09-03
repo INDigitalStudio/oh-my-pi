@@ -37,8 +37,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
 	AltScreenUse, Appearance, Chord, CursorStyle, Graphics, InputEvent, Key, OverlayId, PaintStats,
-	ProbeResults, Renderer, Size, Terminal, TerminalCaps, TerminalOptions, TerminalResponse, Theme,
-	TtyOut, Ui, UiContext, UiEvent,
+	ProbeResults, Renderer, Size, Terminal, TerminalCaps, TerminalOptions, TerminalResponse, TtyOut,
+	Ui, UiContext, UiEvent,
 	component::Slot,
 	components,
 	components::ImgState,
@@ -806,10 +806,7 @@ impl App {
 			return None;
 		}
 		let mut ctx = current.clone();
-		if ctx.theme == Theme::for_appearance(ctx.appearance) {
-			ctx.theme = Theme::for_appearance(appearance);
-		}
-		ctx.appearance = appearance;
+		ctx.apply_appearance(appearance);
 		self.ui.set_context(ctx);
 		Some(AppEvent::Appearance(appearance))
 	}
@@ -935,6 +932,15 @@ impl App {
 					}
 				},
 				routed => routed,
+			},
+			InputEvent::Chord(event) => {
+				if event.pressed
+					&& let Some(key) = event.key
+				{
+					self.route_key(key)
+				} else {
+					Routed::Continue
+				}
 			},
 			InputEvent::Mouse(report) => {
 				let event =

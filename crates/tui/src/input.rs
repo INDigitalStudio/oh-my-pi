@@ -246,11 +246,32 @@ pub struct MouseReport {
 	pub pressed: bool,
 }
 
+/// One physical key edge with its keymap resolution, emitted instead of
+/// [`InputEvent::Key`] once [`Keymap::set_chord_events`] is on.
+///
+/// `chord` is the terminal's exact report (key plus every modifier), so a
+/// host can look the edge up in a `bind` table by its canonical spelling
+/// ([`Chord::label`]); `key` is what the keymap would have emitted for it
+/// (`None` for chords the keymap drops). Kitty release reports arrive with
+/// `pressed == false`; repeats count as presses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct KeyEvent {
+	/// The exact physical chord.
+	pub chord:   Chord,
+	/// Keymap resolution of `chord`.
+	pub key:     Option<Key>,
+	/// `true` for press and repeat, `false` for a Kitty release report.
+	pub pressed: bool,
+}
+
 /// One framed event from the streaming terminal input decoder.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum InputEvent {
 	/// Keyboard input.
 	Key(Key),
+	/// A physical key edge (press or release) with its resolution; replaces
+	/// [`InputEvent::Key`] while the keymap emits chord events.
+	Chord(KeyEvent),
 	/// Lossless SGR mouse input.
 	Mouse(MouseReport),
 	/// Sanitized bracketed-paste text.
@@ -556,6 +577,18 @@ impl InputDecoder {
 		let (event, chords, kitty_dedup, bare) = match decoded {
 			Decoded::Event(event) => (Some(event), SmallVec::new(), None, false),
 			Decoded::Chord(chord) => (None, smallvec![chord], None, false),
+			Decoded::Release(chord) => {
+				// Releases never take part in the press dedup window and only
+				// hosts that asked for edges see them.
+				if self.keymap.chords {
+					out.push(InputEvent::Chord(KeyEvent {
+						chord,
+						key: self.keymap.resolve(chord),
+						pressed: false,
+					}));
+				}
+				return;
+			},
 			Decoded::BareChord(chord) => (None, smallvec![chord], None, true),
 			Decoded::KittyChord(chord) => {
 				let dedup = chord_printable_codepoint(chord);
@@ -642,6 +675,8 @@ fn is_string_sequence(bytes: &[u8]) -> bool {
 enum Decoded {
 	Event(InputEvent),
 	Chord(Chord),
+	/// A Kitty key-release report.
+	Release(Chord),
 	BareChord(Chord),
 	KittyChord(Chord),
 	KittyText { chords: SmallVec<Chord, 4>, dedup: Option<u32> },
@@ -917,11 +952,20 @@ fn decode_kitty_key(body: &[u8], meta: bool) -> Decoded {
 		.next()
 		.and_then(parse_decimal_u8)
 		.unwrap_or(1);
-	if event_type == 3 {
-		return Decoded::None;
-	}
 	// Caps/Num Lock describe terminal state, not application modifiers.
 	modifiers &= !(0b0100_0000 | 0b1000_0000);
+	if event_type == 3 {
+		// A release report names the same physical chord as its press; the
+		// associated text never applies to a release.
+		let codepoint = if modifiers & 0b0000_1110 != 0 {
+			base_layout.unwrap_or(primary)
+		} else if modifiers & 0b0000_0001 != 0 {
+			shifted.unwrap_or(primary)
+		} else {
+			primary
+		};
+		return chord_from_codepoint(codepoint, modifiers).map_or(Decoded::None, Decoded::Release);
+	}
 	if modifiers & 0b0000_1110 == 0
 		&& let Some(text) = associated_text
 	{
@@ -1261,7 +1305,10 @@ fn emit_raw(bytes: &[u8], keymap: &Keymap, out: &mut Vec<InputEvent>) {
 }
 
 fn emit_chord(keymap: &Keymap, chord: Chord, out: &mut Vec<InputEvent>) {
-	if let Some(key) = keymap.resolve(chord) {
+	let key = keymap.resolve(chord);
+	if keymap.chords {
+		out.push(InputEvent::Chord(KeyEvent { chord, key, pressed: true }));
+	} else if let Some(key) = key {
 		out.push(InputEvent::Key(key));
 	}
 }
@@ -1326,7 +1373,7 @@ pub fn decode_keys(bytes: &[u8], output: &mut Vec<Key>) {
 /// Nothing is folded here — lookup canonicalization happens inside
 /// [`Keymap::resolve`], where an exact binding always wins over the
 /// shift-folded spelling.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Chord {
 	/// The decoded native key.
 	pub key:  Key,
@@ -1347,7 +1394,11 @@ impl Chord {
 		source.parse()
 	}
 
-	/// Writes the canonical portable chord spelling.
+	/// Writes the canonical portable chord spelling: modifiers in
+	/// `ctrl+alt+shift+super` order, pi key names (`escape`, `pageup`),
+	/// and a letter lowercased under Ctrl/Alt/Super so `bind ctrl+shift+p`
+	/// matches both the Kitty (`p`+shift) and the modifyOtherKeys (`P`)
+	/// report of the same chord.
 	pub fn label(self) -> Str {
 		let mut label = String::new();
 		for (active, name) in [
@@ -1368,7 +1419,13 @@ impl Chord {
 		if !label.is_empty() {
 			label.push('+');
 		}
-		write_key_label(&mut label, self.key);
+		let key = match self.key {
+			Key::Char(ch) if self.mods.ctrl || self.mods.alt || self.mods.super_key => {
+				Key::Char(ch.to_ascii_lowercase())
+			},
+			key => key,
+		};
+		write_key_label(&mut label, key);
 		Str::from(label)
 	}
 
@@ -1510,7 +1567,7 @@ fn write_key_label(target: &mut String, key: Key) {
 		Key::Tab => target.push_str("tab"),
 		Key::Enter => target.push_str("enter"),
 		Key::Space => target.push_str("space"),
-		Key::Esc => target.push_str("esc"),
+		Key::Esc => target.push_str("escape"),
 		Key::Backspace => target.push_str("backspace"),
 		Key::Delete => target.push_str("delete"),
 		Key::Insert => target.push_str("insert"),
@@ -1521,6 +1578,7 @@ fn write_key_label(target: &mut String, key: Key) {
 		Key::Function(number) => {
 			let _ = write!(target, "f{number}");
 		},
+		Key::Char(' ') => target.push_str("space"),
 		Key::Char(character) => target.push(character),
 		_ => target.push_str("semantic"),
 	}
@@ -1537,6 +1595,9 @@ fn write_key_label(target: &mut String, key: Key) {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Keymap {
 	bindings: Vec<(Chord, Option<Key>)>,
+	/// Emit [`InputEvent::Chord`] edges (with releases) instead of
+	/// [`InputEvent::Key`].
+	chords:   bool,
 }
 
 /// Default chord table: word motion/delete spellings (including macOS
@@ -1601,16 +1662,15 @@ const DEFAULT_BINDINGS: &[(Key, u8, Key)] = &[
 	(Key::Char('P'), 5, Key::CyclePrevious),
 	(Key::Char('p'), 3, Key::PlanToggle),
 	(Key::Char('P'), 3, Key::PlanToggle),
-	// pi tui.input.newLine: Shift/Ctrl-Enter spelling; Alt+Enter maps to FollowUp.
-	// Rows cover each combination so the semantics stay table-owned.
+	// pi tui.input.newLine: Shift+Enter / Ctrl+J. Ctrl+Enter is deliberately
+	// absent: pi binds it to app.message.followUp, so it must stay a
+	// distinct chord for hosts (and is FollowUp here, like Alt+Enter, for
+	// hosts without a bind table).
 	(Key::Char('j'), 4, Key::ShiftEnter),
 	(Key::Enter, 1, Key::ShiftEnter),
 	(Key::Enter, 2, Key::FollowUp),
 	(Key::Enter, 3, Key::ShiftEnter),
-	(Key::Enter, 4, Key::ShiftEnter),
-	(Key::Enter, 5, Key::ShiftEnter),
-	(Key::Enter, 6, Key::ShiftEnter),
-	(Key::Enter, 7, Key::ShiftEnter),
+	(Key::Enter, 4, Key::FollowUp),
 	// legacy `CSI 13;2~` is byte-identical for Shift+Enter and Shift+F3;
 	// pi resolves the same ambiguity to newline
 	(Key::Function(3), 1, Key::ShiftEnter),
@@ -1634,11 +1694,26 @@ impl Default for Keymap {
 				.iter()
 				.map(|&(key, bits, mapped)| (Chord::new(key, mods_from_bits(bits)), Some(mapped)))
 				.collect(),
+			chords:   false,
 		}
 	}
 }
 
 impl Keymap {
+	/// Switches the decoder to physical edges: every key press arrives as
+	/// [`InputEvent::Chord`] carrying the exact chord plus this map's
+	/// resolution, and Kitty key releases are delivered instead of dropped.
+	/// Hosts with a `bind` table use this so the table sees the chord the
+	/// user pressed, not the semantic key it folded into.
+	pub const fn set_chord_events(&mut self, chords: bool) {
+		self.chords = chords;
+	}
+
+	/// Whether physical chord edges are emitted.
+	#[must_use]
+	pub const fn chord_events(&self) -> bool {
+		self.chords
+	}
 	/// Adds or replaces the binding for `chord`.
 	pub fn bind(&mut self, chord: Chord, key: Key) {
 		self.set(chord, Some(key));
@@ -2005,7 +2080,7 @@ mod tests {
 		let control = Chord::parse("Control+Shift+K").expect("control alias");
 		assert!(control.mods.ctrl && control.mods.shift);
 		assert_eq!(control.key, Key::Char('K'));
-		assert_eq!(control.label(), "ctrl+shift+K");
+		assert_eq!(control.label(), "ctrl+shift+k");
 
 		let command = Chord::parse("cmd+option+left").expect("mac aliases");
 		assert!(command.mods.super_key && command.mods.alt);
@@ -2046,7 +2121,7 @@ mod tests {
 			(Key::BackTab, 1, Key::BackTab),
 			(Key::PageDown, 0, Key::PageDown),
 			(Key::Enter, 2, Key::FollowUp),
-			(Key::Enter, 4, Key::ShiftEnter),
+			(Key::Enter, 4, Key::FollowUp),
 			(Key::Char('j'), 4, Key::ShiftEnter),
 			(Key::Function(3), 1, Key::ShiftEnter),
 			(Key::Char('d'), 2, Key::WordDelete),
@@ -2475,11 +2550,11 @@ mod tests {
 	}
 
 	#[test]
-	fn submit_remap_on_ctrl_enter_wins_over_newline_default() {
+	fn submit_remap_on_ctrl_enter_wins_over_follow_up_default() {
 		// A chord the user explicitly binds to submit must win over the hardcoded
-		// Ctrl+Enter -> newline default. OMP's newline spellings
-		// are table-owned rows, so rebinding the exact chord replaces the
-		// default `(Enter, ctrl) -> ShiftEnter` row — including under kitty
+		// Ctrl+Enter -> follow-up default (pi `app.message.followUp`). OMP's
+		// chord spellings are table-owned rows, so rebinding the exact chord
+		// replaces the default `(Enter, ctrl) -> FollowUp` row — including under kitty
 		// caps/num lock bits, which the decoder drops before lookup. Bare LF
 		// (the iTerm2 Shift+Enter mapping) stays exempt: it decodes as the
 		// Shift+Enter chord, so a Ctrl+Enter remap never captures it.
@@ -2499,10 +2574,10 @@ mod tests {
 			InputEvent::Key(Key::ShiftEnter),
 		]);
 
-		// Under the default table the same spelling still inserts a newline.
+		// Under the default table the same spelling is still the follow-up chord.
 		let mut keys = Vec::new();
 		decode_keys(b"\x1b[13;5u", &mut keys);
-		assert_eq!(keys, [Key::ShiftEnter]);
+		assert_eq!(keys, [Key::FollowUp]);
 	}
 
 	#[test]

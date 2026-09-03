@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use crate::{
+	Charset,
 	anim::{self, Gradient, Intro},
 	component::{Component, PaintCtx, Slot, next_slot},
 	context::UiContext,
@@ -16,8 +17,27 @@ use crate::{
 /// through the gradient.
 const MARK: [&str; 5] =
 	["████████████", "   ██  ██   ", "   ██  ██   ", "   ▒▒  ██   ", "       ██   "];
+/// The same mark for a terminal that cannot show block elements
+/// ([`Charset::Ascii`]): `#` for the full cell, `:` for the muted cell.
+/// Glyph presentation resolves through the charset (ADR 0032), never by
+/// hand-emitting block characters.
+const MARK_ASCII: [&str; 5] =
+	["############", "   ##  ##   ", "   ##  ##   ", "   ::  ##   ", "       ##   "];
 const ROWS: usize = MARK.len();
 const COLS: usize = 12;
+
+/// The mark rows for `charset`.
+const fn mark(charset: Charset) -> &'static [&'static str; ROWS] {
+	match charset {
+		Charset::Ascii => &MARK_ASCII,
+		Charset::Unicode | Charset::NerdFont => &MARK,
+	}
+}
+
+/// Whether a mark cell paints muted instead of through the gradient.
+const fn is_muted(glyph: char) -> bool {
+	matches!(glyph, '▒' | ':')
+}
 
 /// The brand mark: a 12×5 block grid painted through [`Gradient`].
 ///
@@ -101,7 +121,7 @@ impl Brand {
 		let truecolor = matches!(pc.ctx.theme.accent, Color::Rgb(..));
 		let muted = Style::new().fg(pc.ctx.theme.muted);
 		let mut utf8 = [0; 4];
-		for (row, line) in MARK.iter().enumerate() {
+		for (row, line) in mark(pc.ctx.charset).iter().enumerate() {
 			let y = y.saturating_add(row as u16);
 			if y >= pc.clip {
 				return;
@@ -110,7 +130,7 @@ impl Brand {
 				if glyph == ' ' {
 					continue;
 				}
-				let style = if glyph == '▒' {
+				let style = if is_muted(glyph) {
 					muted
 				} else {
 					Style::new().fg(gradient.color(self.diagonal[row][column], shine, truecolor))
@@ -201,6 +221,26 @@ mod tests {
 		assert!(!brand.settled(Duration::from_millis(99)));
 		assert!(brand.settled(Duration::from_millis(100)));
 		assert_eq!(brand.next_wake(Duration::from_millis(100)), None);
+	}
+
+	#[test]
+	fn ascii_charset_paints_an_ascii_mark_with_the_same_shape() {
+		let ctx = UiContext { charset: Charset::Ascii, ..UiContext::default() };
+		let ui = Ui::from_root(Brand::new(), 12, ctx);
+		for row in 0..ROWS as u16 {
+			let text = frame_row_text(ui.frame(), row);
+			assert!(text.is_ascii(), "row {row} is not ASCII: {text:?}");
+		}
+		assert_eq!(frame_row_text(ui.frame(), 0), "############");
+		assert_eq!(frame_row_text(ui.frame(), 3), "   ::  ##");
+		assert_eq!(fg(&ui, 0, 0), Color::Rgb(248, 79, 204), "the gradient still paints the mark");
+		assert_eq!(fg(&ui, 3, 3), UiContext::default().theme.muted, "`:` cells stay muted");
+		for (unicode, ascii) in MARK.iter().zip(MARK_ASCII.iter()) {
+			assert_eq!(unicode.chars().count(), ascii.chars().count());
+			for (a, b) in unicode.chars().zip(ascii.chars()) {
+				assert_eq!(a == ' ', b == ' ', "both marks share one silhouette");
+			}
+		}
 	}
 
 	#[test]
