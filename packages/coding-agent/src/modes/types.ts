@@ -8,10 +8,13 @@ import type { KeybindingsManager } from "../config/keybindings";
 import type { Settings } from "../config/settings";
 import type {
 	AutocompleteProviderFactory,
+	ExtensionAgentSession,
 	ExtensionCustomOptions,
+	ExtensionSidePaneOptions,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionUISelectItem,
+	ExtensionUiComponentFactory,
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
@@ -447,22 +450,21 @@ export interface InteractiveModeContext {
 	showCopySelector(): void;
 	showTreeSelector(): void;
 	showSessionSelector(source?: ForeignSessionSource): void;
+	showSessionPinSelector(): Promise<void>;
 	handleResumeSession(sessionPath: string): Promise<void>;
 	handleSessionDeleteCommand(): Promise<void>;
 	showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void>;
-	showSessionPinSelector(): Promise<void>;
 	showResetUsageSelector(): Promise<void>;
 	showProviderSetup(): Promise<void>;
 	showHookConfirm(title: string, message: string): Promise<boolean>;
 	showDebugSelector(): Promise<void>;
 	showAgentHub(options?: AgentHubOpenOptions): void;
 	resetObserverRegistry(): void;
+	/** Set or remove a right side pane on the composer. */
+	setSidePane(key: string, content: ExtensionUiComponentFactory | undefined, options?: ExtensionSidePaneOptions): void;
+	/** Subscribe to agent-session snapshots. Returns unsubscribe. */
+	onAgentSessionsChange(handler: (sessions: readonly ExtensionAgentSession[]) => void): () => void;
 
-	// Input handling
-	handleCtrlC(): void;
-	handleCtrlD(): void;
-	handleCtrlZ(): void;
-	/** Re-query terminal appearance for an explicit display reset, then immediately replay the display. */
 	resetDisplayAfterAppearanceRefresh(): void;
 	handleDequeue(): void;
 	handleImagePaste(): Promise<boolean>;

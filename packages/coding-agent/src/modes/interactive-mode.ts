@@ -71,10 +71,13 @@ import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import type {
 	AutocompleteProviderFactory,
 	ContextUsage,
+	ExtensionAgentSession,
 	ExtensionCustomOptions,
+	ExtensionSidePaneOptions,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionUISelectItem,
+	ExtensionUiComponentFactory,
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
@@ -4778,6 +4781,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#extensionUiController.clearExtensionTerminalInputListeners();
 		this.#extensionUiController.clearHookWidgets();
 		this.#extensionUiController.disposeComposerShapes();
+		this.composer.clearSidePane();
 		for (const unsubscribe of this.#eventBusUnsubscribers) {
 			unsubscribe();
 		}
@@ -5650,6 +5654,20 @@ export class InteractiveMode implements InteractiveModeContext {
 	resetObserverRegistry(): void {
 		this.#observerRegistry.resetSessions();
 		this.#observerRegistry.setMainSession(this.sessionManager.getSessionFile() ?? undefined);
+	}
+
+	setSidePane(
+		key: string,
+		content: ExtensionUiComponentFactory | undefined,
+		options?: ExtensionSidePaneOptions,
+	): void {
+		this.composer.setSidePane(key, content, options);
+	}
+
+	onAgentSessionsChange(handler: (sessions: readonly ExtensionAgentSession[]) => void): () => void {
+		const snapshot = () => this.#observerRegistry.getSessions() as readonly ExtensionAgentSession[];
+		handler(snapshot());
+		return this.#observerRegistry.onChange(_kind => handler(snapshot()));
 	}
 
 	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void> {

@@ -229,6 +229,32 @@ export type ExtensionUiComponent = Component & { dispose?(): void };
 export type ExtensionUiComponentFactory = (tui: TUI, theme: Theme) => ExtensionUiComponent;
 export type ExtensionWidgetContent = string[] | ExtensionUiComponentFactory | undefined;
 
+/** Options for {@link ExtensionUIContext.setSidePane}. */
+export interface ExtensionSidePaneOptions {
+	/** Desired side-pane width in columns. Clamped to fit between minWidth and (columns − minMainWidth). */
+	width: number;
+	/** Minimum pane width below which the pane hides entirely. Default 20. */
+	minWidth?: number;
+	/** Minimum remaining main-area width below which the pane hides entirely. Default 60. */
+	minMainWidth?: number;
+}
+
+/** Read-only session snapshot used by {@link ExtensionUIContext.onAgentSessionsChange}. */
+export interface ExtensionAgentSession {
+	readonly id: string;
+	readonly kind: "main" | "subagent";
+	readonly label: string;
+	readonly agent?: string;
+	readonly description?: string;
+	readonly status: "active" | "completed" | "failed" | "aborted";
+	readonly sessionFile?: string;
+	readonly parentToolCallId?: string;
+	readonly detached?: boolean;
+	readonly index?: number;
+	readonly lastUpdate: number;
+	readonly progress?: import("../../task/types").AgentProgress;
+}
+
 /** Options for `ExtensionUIContext.custom()` (overlay rendering of a custom component). */
 export interface ExtensionCustomOptions {
 	/** Render the component as an overlay over the transcript instead of replacing the editor area. */
@@ -368,6 +394,27 @@ export interface ExtensionUIContext {
 
 	/** Set tool output expansion state. */
 	setToolsExpanded(expanded: boolean): void;
+
+	/**
+	 * Set or replace a right side pane. Pass `undefined` as content to remove.
+	 * Reusing the active key preserves its component and updates only layout options.
+	 * The pane renders in the mutable viewport only — never in terminal history.
+	 * Hidden automatically when the terminal is too narrow to fit the requested
+	 * width alongside the minimum main area.
+	 *
+	 * Only available in interactive TUI mode; other modes silently ignore this call.
+	 */
+	setSidePane(key: string, content: ExtensionUiComponentFactory | undefined, options?: ExtensionSidePaneOptions): void;
+
+	/**
+	 * Subscribe to agent-session snapshots. The handler is invoked immediately
+	 * with the current snapshot and on every subsequent change. Returns an
+	 * unsubscribe function.
+	 *
+	 * Only available in interactive TUI mode; other modes invoke the handler
+	 * once with an empty snapshot and return a no-op unsubscribe.
+	 */
+	onAgentSessionsChange(handler: (sessions: readonly ExtensionAgentSession[]) => void): () => void;
 }
 
 /** Visual composer style and selector copy registered by an extension. */

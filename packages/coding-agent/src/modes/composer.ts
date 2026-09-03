@@ -20,8 +20,12 @@ import { CustomEditor } from "./components/custom-editor";
 import { type AnimationFrame, TranscriptContainer } from "./components/transcript-container";
 import { type LspServerInfo, type RecentSession, WelcomeComponent } from "./components/welcome";
 import { getEditorTheme, initThemeSync, theme } from "./theme/theme";
+import type { ExtensionSidePaneOptions, ExtensionUiComponentFactory } from "../extensibility/extensions/types";
 
 const DOUBLE_INTERRUPT_MS = 500;
+
+const finiteInteger = (value: number | undefined, fallback: number): number =>
+	Number.isFinite(value) ? Math.trunc(value!) : fallback;
 
 /** Live settings that affect the composer before and after session adoption. */
 export interface ComposerPreferences {
@@ -198,6 +202,14 @@ export class Composer implements TerminalFrameProvider {
 	#started = false;
 	#stopped = false;
 	#transferred = false;
+	#sidePane:
+		| {
+				key: string;
+				factory: ExtensionUiComponentFactory;
+				component?: Component & { dispose?(): void };
+				options?: ExtensionSidePaneOptions;
+		  }
+		| undefined;
 
 	constructor(options: ComposerOptions = {}) {
 		if (typeof theme === "undefined") initThemeSync();
@@ -257,36 +269,45 @@ export class Composer implements TerminalFrameProvider {
 			this.#resizeRetiredHeaderStart = undefined;
 		}
 		this.#lastNormalRows = rows;
+		const paneWidth = this.#resolveSidePaneWidth(width);
+		const mainWidth = paneWidth > 0 ? width - paneWidth - 1 : width; // -1 for border gap
+		const effectiveMainWidth = Math.max(1, mainWidth);
 		const roots = this.#runtimeMounted
 			? [...this.#runtimeChildren, this.#statusHost]
 			: [this.#header, this.#bootstrapInputGap, this.editor, this.#statusHost];
 		const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
 		if (transcriptIndex < 0) {
-			return { viewport: this.#renderRoots(roots, width).slice(-rows) };
+			const mainRows = this.#renderRoots(roots, effectiveMainWidth).slice(-rows);
+			if (paneWidth > 0) return { viewport: this.#composeWithPane(mainRows, paneWidth, rows, width) };
+			return { viewport: mainRows };
 		}
 		const transcript = roots[transcriptIndex] as TranscriptContainer;
-		const preRoots = this.#renderRoots(roots.slice(0, transcriptIndex), width);
-		const after = this.#renderRoots(roots.slice(transcriptIndex + 1), width);
+		const preRoots = this.#renderRoots(roots.slice(0, transcriptIndex), effectiveMainWidth);
+		const after = this.#renderRoots(roots.slice(transcriptIndex + 1), effectiveMainWidth);
 		// Offer history under capacity pressure only: blocks stay live (and keep
 		// reflowing to the current width) while the screen has room. A batch
 		// leaves the mutable viewport in the same frame it is appended, so its
-		// rows are never painted twice.
-		const history = this.#offerHistory(transcript, width, rows, preRoots.length + after.length);
+		// rows are never painted twice. History uses effectiveMainWidth so pane
+		// content never enters terminal scrollback.
+		const history = this.#offerHistory(transcript, effectiveMainWidth, rows, preRoots.length + after.length);
 		const headerVisible = !this.#headerRetired && this.#offeredHistory?.source !== "header";
-		const headerRows = headerVisible ? this.#header.render(width) : [];
+		const headerRows = headerVisible ? this.#header.render(effectiveMainWidth) : [];
 		const before = [...headerRows, ...preRoots];
 		const now = performance.now();
 		const frame: AnimationFrame = { now, tick: Math.floor(now / 80) };
-		const active = transcript.renderViewport(width, Math.max(0, rows - before.length - after.length), frame);
+		const active = transcript.renderViewport(
+			effectiveMainWidth,
+			Math.max(0, rows - before.length - after.length),
+			frame,
+		);
 		const composed = [...before, ...active, ...after];
 		if (history !== undefined && this.#offeredHistory?.source === "header") {
 			const visibleHeaderRows = Math.max(0, rows - composed.length);
 			this.#retiredHeaderStart = Math.max(0, history.rows.length - visibleHeaderRows);
 		}
-		return {
-			history,
-			viewport: composed.length <= rows ? composed : composed.slice(-rows),
-		};
+		const mainRows = composed.length <= rows ? composed : composed.slice(-rows);
+		if (paneWidth > 0) return { history, viewport: this.#composeWithPane(mainRows, paneWidth, rows, width) };
+		return { history, viewport: mainRows };
 	}
 
 	/** Acknowledges one accepted header, replay, or transcript batch. */
@@ -314,21 +335,25 @@ export class Composer implements TerminalFrameProvider {
 		if (!this.#started || this.#stopped) return [];
 		const width = Math.max(1, viewport.columns);
 		const rows = Math.max(0, viewport.rows);
+		const paneWidth = this.#resolveSidePaneWidth(width);
+		const effectiveMainWidth = paneWidth > 0 ? Math.max(1, width - paneWidth - 1) : width;
 		const tail = this.#runtimeMounted
-			? this.#renderResizeTail(width, rows)
-			: this.#renderRoots([this.#bootstrapInputGap, this.editor, this.#statusHost], width);
+			? this.#renderResizeTail(effectiveMainWidth, rows)
+			: this.#renderRoots([this.#bootstrapInputGap, this.editor, this.#statusHost], effectiveMainWidth);
 		let header: readonly string[];
 		if (this.#headerRetired) {
 			this.#resizeRetiredHeaderStart ??= Math.max(
 				0,
 				this.#retiredHeaderStart - Math.max(0, rows - this.#lastNormalRows),
 			);
-			header = this.#reflowRetiredHeader(width, this.#resizeRetiredHeaderStart);
+			header = this.#reflowRetiredHeader(effectiveMainWidth, this.#resizeRetiredHeaderStart);
 		} else {
-			header = this.#header.render(width);
+			header = this.#header.render(effectiveMainWidth);
 		}
 		const rendered = [...header, ...tail];
-		return rendered.length <= rows ? rendered : rendered.slice(rendered.length - rows);
+		const mainRows = rendered.length <= rows ? rendered : rendered.slice(rendered.length - rows);
+		if (paneWidth > 0) return this.#composeWithPane(mainRows, paneWidth, rows, width);
+		return mainRows;
 	}
 
 	/** Replays committed presentation without changing logical retirement state. */
@@ -466,6 +491,41 @@ export class Composer implements TerminalFrameProvider {
 		const rows: string[] = [];
 		for (const root of roots) rows.push(...root.render(width));
 		return rows;
+	}
+
+	/**
+	 * Compose main rows (bottom-aligned) with side-pane rows (top-aligned).
+	 * Each output row is ANSI-width-safe: main gets (columns - paneWidth - 1),
+	 * a vertical border, then the pane content.
+	 */
+	#composeWithPane(
+		mainRows: readonly string[],
+		paneWidth: number,
+		viewportRows: number,
+		totalWidth?: number,
+	): string[] {
+		const paneContent = this.#renderSidePane(paneWidth);
+		const mainWidth = (totalWidth ?? this.ui.terminal.columns) - paneWidth - 1;
+		const border = theme.fg("borderMuted", theme.boxSharp.vertical);
+		const result: string[] = [];
+		for (let i = 0; i < viewportRows; i++) {
+			// Main rows are bottom-aligned
+			const mainIndex = i - (viewportRows - mainRows.length);
+			// Pane rows are top-aligned
+			const paneIndex = i;
+			const mainLine = mainIndex >= 0 && mainIndex < mainRows.length ? mainRows[mainIndex]! : "";
+			const paneLine = paneIndex < paneContent.length ? paneContent[paneIndex]! : "";
+			// Pad/trim main line to exact mainWidth visible width
+			const mainVis = visibleWidth(mainLine);
+			const paddedMain =
+				mainVis < mainWidth ? mainLine + " ".repeat(mainWidth - mainVis) : truncateToWidth(mainLine, mainWidth);
+			// Pad/trim pane line to exact paneWidth visible width
+			const paneVis = visibleWidth(paneLine);
+			const paddedPane =
+				paneVis < paneWidth ? paneLine + " ".repeat(paneWidth - paneVis) : truncateToWidth(paneLine, paneWidth);
+			result.push(`${paddedMain}${border}${paddedPane}`);
+		}
+		return result;
 	}
 	/**
 	 * Mounted-runtime rows for the transient resize buffer. Only the trailing
@@ -676,10 +736,70 @@ export class Composer implements TerminalFrameProvider {
 	stop(): void {
 		if (!this.#started || this.#stopped || this.#transferred) return;
 		this.#welcome?.stopIntro();
+		this.clearSidePane();
 		this.ui.stop();
 		this.#stopped = true;
 	}
 
+	/** Dispose and remove the active side pane without stopping the composer. */
+	clearSidePane(): void {
+		this.#sidePane?.component?.dispose?.();
+		this.#sidePane = undefined;
+	}
+
+	/** Set, replace, or remove a side pane keyed by extension id. */
+	setSidePane(
+		key: string,
+		content: ExtensionUiComponentFactory | undefined,
+		options?: ExtensionSidePaneOptions,
+	): void {
+		if (this.#stopped) return;
+		if (content === undefined) {
+			// Remove: only clear if the key matches the active pane
+			if (this.#sidePane?.key === key) {
+				this.#sidePane.component?.dispose?.();
+				this.#sidePane = undefined;
+			}
+		} else {
+			if (this.#sidePane?.key === key) {
+				// Same key updates layout only; preserving the component keeps its state and subscriptions.
+				this.#sidePane.options = options;
+			} else {
+				// New key: dispose old component, create fresh slot
+				this.#sidePane?.component?.dispose?.();
+				this.#sidePane = { key, factory: content, options };
+			}
+		}
+		this.ui.requestRender();
+	}
+
+	/** Effective side-pane width given viewport columns, or 0 when hidden. */
+	#resolveSidePaneWidth(columns: number): number {
+		if (this.#sidePane === undefined) return 0;
+		const options = this.#sidePane.options;
+		const minWidth = Math.max(1, finiteInteger(options?.minWidth, 20));
+		const minMainWidth = Math.max(1, finiteInteger(options?.minMainWidth, 60));
+		const desired = Math.max(minWidth, finiteInteger(options?.width, 30));
+		if (columns < minMainWidth + minWidth + 1) return 0;
+		return Math.min(desired, columns - minMainWidth - 1);
+	}
+
+	/** Render the active side pane at the given width, lazily creating the component if needed. */
+	#renderSidePane(paneWidth: number): readonly string[] {
+		if (this.#sidePane === undefined) return [];
+		// Lazy-create the component on first render; wire invalidate→requestRender
+		if (this.#sidePane.component === undefined) {
+			const component = this.#sidePane.factory(this.ui, theme);
+			const originalInvalidate = component.invalidate?.bind(component);
+			const requestRender = this.ui.requestRender.bind(this.ui);
+			component.invalidate = () => {
+				originalInvalidate?.();
+				requestRender();
+			};
+			this.#sidePane.component = component;
+		}
+		return this.#sidePane.component.render(paneWidth);
+	}
 	#applyWelcomeUpdate(update: ComposerWelcomeUpdate): void {
 		if (update.version !== undefined) this.#version = update.version;
 		if (update.modelName !== undefined) this.#modelName = update.modelName;

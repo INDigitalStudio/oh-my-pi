@@ -602,6 +602,11 @@ export function createAcpExtensionUiContext(
 		setTheme: async () => ({ success: false, error: "Theme changes are unavailable in ACP mode" }),
 		getToolsExpanded: () => false,
 		setToolsExpanded: () => {},
+		setSidePane: () => {},
+		onAgentSessionsChange: handler => {
+			handler([]);
+			return () => {};
+		},
 	};
 }
 

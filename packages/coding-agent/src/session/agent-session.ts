@@ -412,6 +412,11 @@ const noOpUIContext: ExtensionUIContext = {
 	setEditorComponent: () => {},
 	getToolsExpanded: () => false,
 	setToolsExpanded: () => {},
+	setSidePane: () => {},
+	onAgentSessionsChange: handler => {
+		handler([]);
+		return () => {};
+	},
 };
 
 // ============================================================================

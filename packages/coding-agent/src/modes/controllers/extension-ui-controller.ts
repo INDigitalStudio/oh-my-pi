@@ -142,6 +142,8 @@ export class ExtensionUiController {
 			setEditorComponent: factory => this.ctx.setEditorComponent(factory),
 			getToolsExpanded: () => this.ctx.toolOutputExpanded,
 			setToolsExpanded: expanded => this.ctx.setToolsExpanded(expanded),
+			setSidePane: (key, content, options) => this.ctx.setSidePane(key, content, options),
+			onAgentSessionsChange: handler => this.ctx.onAgentSessionsChange(handler),
 		};
 		this.ctx.setToolUIContext(uiContext, true);
 		this.#toolUIContext = uiContext;

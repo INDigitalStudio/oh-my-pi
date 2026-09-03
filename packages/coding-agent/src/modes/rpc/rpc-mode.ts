@@ -17,6 +17,7 @@ import { $env, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
+	type ExtensionAgentSession,
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
 	type ExtensionUISelectItem,
@@ -1020,6 +1021,15 @@ export async function runRpcMode(
 
 		setEditorComponent(): void {
 			// Custom editor components not supported in RPC mode
+		}
+
+		setSidePane(): void {
+			// Side pane not supported in RPC mode - no TUI
+		}
+
+		onAgentSessionsChange(handler: (sessions: readonly ExtensionAgentSession[]) => void): () => void {
+			handler([]);
+			return () => {};
 		}
 	}
 
