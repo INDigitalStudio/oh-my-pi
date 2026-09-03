@@ -10,7 +10,7 @@
 			"python/robomp/web"
 		],
 		"catalog": {
-			"@changesets/cli": "^2.31.1",
+			"@changesets/cli": "^3.0.1",
 			"@babel/generator": "^7.29.7",
 			"@babel/parser": "^7.29.7",
 			"@babel/traverse": "^7.29.7",
