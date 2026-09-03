@@ -27,6 +27,8 @@ pub mod rewind;
 mod session;
 
 pub use component::{Component, ComponentRegistry, Draft};
-pub use projection::{ProjectionError, project_thread, project_thread_history};
+pub use projection::{
+	ProjectionError, project_thread, project_thread_history, project_thread_through,
+};
 pub use rewind::{LifecycleWork, diff};
-pub use session::{Session, SessionError, UnsettledCall};
+pub use session::{AttachmentInput, Session, SessionError, UnsettledCall};

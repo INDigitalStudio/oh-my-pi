@@ -1,11 +1,15 @@
 //! Pure inference-thread projection from the authoritative DOM.
 
-use std::{collections::BTreeMap, str, str::FromStr};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	str,
+	str::FromStr,
+};
 
 use bytes::Bytes;
 use omp_core::{Str, encoding::hex};
 use omp_dom::{Dom, Handle, KnownTag, Node, PropId, PropKey, Tag, Value};
-use omp_journal::{EntryId, blob::BlobRef};
+use omp_journal::{EntryId, data::Attachment};
 use omp_proto::{
 	inference::v1 as inference,
 	thread::v1::{self as thread, Item, item, part},
@@ -18,6 +22,18 @@ use thiserror::Error;
 
 /// Durable property carrying an explicit provider-session reset request.
 pub const PROVIDER_RESET_PROP: &str = "omp/session-provider-reset";
+
+/// Prop marking a `<user>` turn child that arrived as steering at a safe
+/// point (pi `steering: true`).
+pub const STEERING_PROP: &str = "steering";
+
+/// Notice prepended to every steering user message at projection time (pi
+/// `prompts/steering/user-interjection.md`, `wrapSteeringForModel`). The
+/// journaled text stays raw; the wrapper is a pure function of the element so
+/// the wire bytes never change once the reply buries the interjection.
+pub const STEERING_ENVELOPE: &str = "<system-notice>\nUser interjection during work: priority; \
+                                     supersedes conflicting prior instructions. Re-read; ensure \
+                                     current work reflects user intent.\n</system-notice>\n";
 
 /// Stable diagnostics for provider turns that settle without usable output.
 pub mod empty_stop {
@@ -273,6 +289,30 @@ pub fn project_thread(dom: &Dom) -> Vec<Item> {
 	if let Some(summary) = summary {
 		items.push(message_item(thread::Role::User, summary, None, true));
 	}
+	project_window(dom, Window { after: boundary, through: None }, &mut items);
+	items
+}
+
+/// Projects only the body elements journaled at or before `through` (and
+/// after the newest compaction boundary), without the synthetic summary:
+/// the material a compaction summarises, never the kept tail.
+#[must_use]
+pub fn project_thread_through(dom: &Dom, through: EntryId) -> Vec<Item> {
+	let (boundary, _) = newest_compaction(dom);
+	let mut items = Vec::new();
+	project_window(dom, Window { after: boundary, through: Some(through) }, &mut items);
+	items
+}
+
+/// Journal-entry window a projection admits: elements after `after` (the
+/// newest compaction boundary) and, when set, at or before `through`.
+#[derive(Clone, Copy)]
+struct Window {
+	after:   Option<EntryId>,
+	through: Option<EntryId>,
+}
+
+fn project_window(dom: &Dom, window: Window, items: &mut Vec<Item>) {
 	for turn in dom.children(dom.body()) {
 		if !is_tag(dom, *turn, KnownTag::Turn) {
 			continue;
@@ -284,20 +324,35 @@ pub fn project_thread(dom: &Dom) -> Vec<Item> {
 		let children = dom.children(*turn);
 		let mut receipts = BTreeMap::new();
 		let mut awaiting_receipt = None;
+		// Assistants that issued at least one tool call: they stay in the
+		// projection even without text (pi keeps `toolCall` content), whereas
+		// an assistant with nothing at all is the empty turn pi's recovery
+		// drops (`turn-recovery.ts`), together with its receipt.
+		let mut issuing = BTreeSet::new();
+		let mut last_assistant = None;
 		for child in children {
 			let Some(node) = dom.get(*child) else {
 				continue;
 			};
-			if !element_after_boundary(node, boundary) {
+			if !element_in_window(node, window) {
 				continue;
 			}
 			match &node.tag {
-				Tag::Known(KnownTag::Assistant) => awaiting_receipt = Some(*child),
+				Tag::Known(KnownTag::Assistant) => {
+					awaiting_receipt = Some(*child);
+					last_assistant = Some(*child);
+				},
+				Tag::Known(KnownTag::User | KnownTag::Developer) => last_assistant = None,
 				Tag::Known(KnownTag::Usage) => {
 					if let Some(assistant) = awaiting_receipt.take()
-						&& let Some(usage) = usage_of(node, boundary)
+						&& let Some(usage) = usage_of(node)
 					{
 						receipts.insert(assistant, usage);
+					}
+				},
+				Tag::Custom(_) => {
+					if let Some(assistant) = last_assistant {
+						issuing.insert(assistant);
 					}
 				},
 				_ => {},
@@ -313,28 +368,27 @@ pub fn project_thread(dom: &Dom) -> Vec<Item> {
 			) {
 				local = false;
 			}
-			if !element_after_boundary(node, boundary) {
+			if !element_in_window(node, window) {
 				continue;
 			}
 			match &node.tag {
-				Tag::Known(KnownTag::User) => project_message(node, thread::Role::User, &mut items),
+				Tag::Known(KnownTag::User) => project_message(node, thread::Role::User, items),
 				Tag::Known(KnownTag::Developer) => {
-					project_message(node, thread::Role::System, &mut items);
+					project_message(node, thread::Role::System, items);
 				},
 				Tag::Known(KnownTag::Assistant) => {
 					// Receipts are consumed one-for-one in ordered turn
 					// sequence; no completion can reuse another's accounting.
-					project_assistant(node, receipts.remove(child), &mut items);
+					project_assistant(node, receipts.remove(child), issuing.contains(child), items);
 				},
 				Tag::Custom(name) if local => {
-					project_local_tool(dom, *child, name.as_str(), node, &mut items);
+					project_local_tool(dom, *child, name.as_str(), node, items);
 				},
-				Tag::Custom(name) => project_tool(dom, *child, name.as_str(), node, &mut items),
+				Tag::Custom(name) => project_tool(dom, *child, name.as_str(), node, items),
 				_ => {},
 			}
 		}
 	}
-	items
 }
 
 /// Prop a local run carries when the host excluded it from the model's
@@ -411,6 +465,10 @@ fn project_local_tool(dom: &Dom, handle: Handle, name: &str, node: &Node, items:
 	items.push(message_item(thread::Role::User, &text, None, false));
 }
 
+fn is_steering(node: &Node) -> bool {
+	node.prop(&PropKey::Custom(Str::new_static(STEERING_PROP))) == Some(&Value::Bool(true))
+}
+
 fn project_message(node: &Node, role: thread::Role, items: &mut Vec<Item>) {
 	let mut parts = Vec::new();
 	if let Some(text) = node
@@ -418,18 +476,32 @@ fn project_message(node: &Node, role: thread::Role, items: &mut Vec<Item>) {
 		.as_deref()
 		.or_else(|| prop_text(node, PropId::Text))
 	{
-		parts.push(thread::Part { kind: Some(part::Kind::Text(text.to_owned())) });
+		// pi `wrapSteeringUserMessage`: an empty interjection is sent as-is.
+		let text = if is_steering(node) && !text.is_empty() {
+			let mut wrapped = String::with_capacity(STEERING_ENVELOPE.len() + text.len());
+			wrapped.push_str(STEERING_ENVELOPE);
+			wrapped.push_str(text);
+			wrapped
+		} else {
+			text.to_owned()
+		};
+		parts.push(thread::Part { kind: Some(part::Kind::Text(text)) });
 	}
-	if let Some(Value::Json(raw)) = node.prop(&PropKey::from(PropId::Data)) {
-		if let Ok(blobs) = serde_json::from_str::<Vec<BlobRef>>(raw.get()) {
-			parts.extend(blobs.into_iter().map(|blob| thread::Part {
-				kind: Some(part::Kind::Blob(thread::Blob {
-					hash: blob.hash.as_bytes().to_vec().into(),
-					size: blob.size,
-					..Default::default()
-				})),
-			}));
-		}
+	// Journaled attachments become typed media parts (pi `ImageContent`):
+	// the reference and its MIME are the projection's whole output; the
+	// kernel resolves the bytes at request time so this stays a pure
+	// function of the tree.
+	if let Some(Value::Json(raw)) = node.prop(&PropKey::from(PropId::Data))
+		&& let Ok(attachments) = serde_json::from_str::<Vec<Attachment>>(raw.get())
+	{
+		parts.extend(attachments.into_iter().map(|attachment| thread::Part {
+			kind: Some(part::Kind::Blob(thread::Blob {
+				hash: attachment.blob.hash.as_bytes().to_vec().into(),
+				mime: attachment.mime.as_str().to_owned(),
+				size: attachment.blob.size,
+				..Default::default()
+			})),
+		}));
 	}
 	items.push(Item {
 		seq:           0,
@@ -443,7 +515,12 @@ fn project_message(node: &Node, role: thread::Role, items: &mut Vec<Item>) {
 	});
 }
 
-fn project_assistant(node: &Node, usage: Option<inference::Usage>, items: &mut Vec<Item>) {
+fn project_assistant(
+	node: &Node,
+	usage: Option<inference::Usage>,
+	issued_calls: bool,
+	items: &mut Vec<Item>,
+) {
 	let mut parts = Vec::new();
 	if let Some(thinking) = prop_text(node, PropId::Thinking).filter(|text| !text.is_empty()) {
 		parts.push(thread::Part {
@@ -460,6 +537,12 @@ fn project_assistant(node: &Node, usage: Option<inference::Usage>, items: &mut V
 		.filter(|text| !text.is_empty())
 	{
 		parts.push(thread::Part { kind: Some(part::Kind::Text(text.to_owned())) });
+	}
+	// An assistant that produced neither content nor a call is the empty
+	// turn pi's recovery drops before retrying; providers reject empty
+	// assistant content and its receipt belongs to no surviving message.
+	if parts.is_empty() && !issued_calls {
+		return;
 	}
 	items.push(Item {
 		seq:           0,
@@ -618,21 +701,21 @@ fn newest_compaction(dom: &Dom) -> (Option<EntryId>, Option<&str>) {
 	result
 }
 
-fn element_after_boundary(node: &Node, boundary: Option<EntryId>) -> bool {
-	let Some(boundary) = boundary else {
+fn element_in_window(node: &Node, window: Window) -> bool {
+	if window.after.is_none() && window.through.is_none() {
 		return true;
-	};
+	}
 	prop_text(node, PropId::Order)
 		.or_else(|| prop_text(node, PropId::Id))
 		.or_else(|| prop_text(node, PropId::Cause))
 		.and_then(|id| EntryId::from_str(id).ok())
-		.is_some_and(|id| id > boundary)
+		.is_some_and(|id| {
+			window.after.is_none_or(|after| id > after)
+				&& window.through.is_none_or(|through| id <= through)
+		})
 }
 
-fn usage_of(usage: &Node, boundary: Option<EntryId>) -> Option<inference::Usage> {
-	if !element_after_boundary(usage, boundary) {
-		return None;
-	}
+fn usage_of(usage: &Node) -> Option<inference::Usage> {
 	let input_tokens = prop_u64(usage, PropId::TokensIn).unwrap_or_default();
 	let output_tokens = prop_u64(usage, PropId::TokensOut).unwrap_or_default();
 	Some(inference::Usage {

@@ -408,6 +408,7 @@ fn receipt_and_compaction_facts_materialize_and_survive_reopen() {
 			cache_write:   100,
 			ttft_ms:       Some(420),
 			duration_ms:   Some(3_100),
+			premium_requests_millionths: 330_000,
 		})
 		.expect("receipt");
 	session

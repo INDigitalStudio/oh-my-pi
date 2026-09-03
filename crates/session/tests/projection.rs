@@ -240,6 +240,40 @@ fn projection_excludes_pre_compaction_turns_and_prepends_summary() {
 }
 
 #[test]
+fn projection_through_keeps_only_entries_up_to_the_cut_and_no_summary() {
+	use omp_session::project_thread_through;
+
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let path = directory.path().join("through.oms");
+	let store = BlobStore::open(directory.path()).expect("blob store opens");
+	let bytes = b"older summary";
+	let summary = store.put(bytes).expect("summary stores");
+	let mut session = Session::create(&path, ComponentRegistry::default()).expect("session creates");
+	session.begin_turn().expect("old turn starts");
+	let boundary = session.user("old", Vec::new()).expect("old user appends");
+	session
+		.compaction(omp_journal::data::Compaction::new(summary, boundary))
+		.expect("compaction appends");
+	session.begin_turn().expect("middle turn starts");
+	let cut = session.user("middle", Vec::new()).expect("middle user appends");
+	session.begin_turn().expect("new turn starts");
+	session.user("new", Vec::new()).expect("new user appends");
+
+	let items = project_thread_through(session.dom(), cut);
+	let texts: Vec<_> = items
+		.iter()
+		.filter_map(|item| match item.kind.as_ref()? {
+			item::Kind::Message(message) => match message.parts.first()?.kind.as_ref()? {
+				part::Kind::Text(text) => Some(text.as_str()),
+				_ => None,
+			},
+			_ => None,
+		})
+		.collect();
+	assert_eq!(texts, ["middle"]);
+}
+
+#[test]
 fn compaction_uses_the_composed_session_blob_store_across_reopen() {
 	let directory = tempfile::tempdir().expect("temporary directory");
 	let session_dir = directory.path().join("sessions");
@@ -575,6 +609,17 @@ fn assistant_receipts_pair_in_turn_order() {
 	session
 		.assistant_start("model", "provider", "route")
 		.expect("second assistant starts");
+	let turn = *session
+		.dom()
+		.children(session.dom().body())
+		.last()
+		.expect("turn");
+	let second = *session.dom().children(turn).last().expect("second assistant");
+	let sid = session
+		.stream_open(second, omp_dom::PropId::Text.into())
+		.expect("stream opens");
+	session.stream_append(sid, "done").expect("stream appends");
+	session.stream_close(sid).expect("stream closes");
 	session.assistant_end("stop").expect("second assistant ends");
 	session
 		.receipt(omp_journal::data::TurnReceipt::tokens(10, 20, 30))
@@ -713,4 +758,207 @@ fn live_projection_never_emits_an_unmatched_tool_call() {
 	}
 	assert!(calls.is_empty(), "in-flight calls are not historical context");
 	assert!(results.is_empty(), "omitted calls have no orphan results");
+}
+
+fn message_texts(items: &[omp_proto::thread::v1::Item]) -> Vec<(i32, Option<String>)> {
+	items
+		.iter()
+		.filter_map(|item| match item.kind.as_ref()? {
+			item::Kind::Message(message) => Some((
+				message.role,
+				message.parts.first().and_then(|part| match part.kind.as_ref()? {
+					part::Kind::Text(text) => Some(text.clone()),
+					_ => None,
+				}),
+			)),
+			_ => None,
+		})
+		.collect()
+}
+
+#[test]
+fn steering_user_message_projects_with_interjection_envelope() {
+	use omp_dom::{NodeSpec, Op, PropKey, Txn, Value};
+	use omp_session::projection::{STEERING_ENVELOPE, STEERING_PROP};
+
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let mut session =
+		Session::create(directory.path().join("steering.oms"), ComponentRegistry::default())
+			.expect("session creates");
+	session.begin_turn().expect("turn starts");
+	session.user("question", Vec::new()).expect("user appends");
+	let turn = *session
+		.dom()
+		.children(session.dom().body())
+		.last()
+		.expect("turn");
+	let append_user = |session: &mut Session, text: &'static str, steering: bool| {
+		let mut node = NodeSpec::new(KnownTag::User).with_content(Str::new_static(text));
+		if steering {
+			node = node.with_prop(PropKey::Custom(Str::new_static(STEERING_PROP)), Value::Bool(true));
+		}
+		session
+			.patch(Txn {
+				cause: session.head().expect("head"),
+				label: Some(Str::new_static("steering.safe-point")),
+				ops:   vec![Op::Ins {
+					parent: turn,
+					after: session.dom().children(turn).last().copied(),
+					node,
+				}],
+			})
+			.expect("user inserts");
+	};
+	append_user(&mut session, "actually use <xml> & tabs", true);
+	append_user(&mut session, "", true);
+	append_user(&mut session, "plain follow-up", false);
+
+	let items = project_thread(session.dom());
+	let user = omp_proto::thread::v1::Role::User as i32;
+	assert_eq!(message_texts(&items), [
+		(user, Some("question".to_owned())),
+		(user, Some(format!("{STEERING_ENVELOPE}actually use <xml> & tabs"))),
+		(user, Some(String::new())),
+		(user, Some("plain follow-up".to_owned())),
+	]);
+	assert!(STEERING_ENVELOPE.starts_with("<system-notice>\nUser interjection during work"));
+	let journaled = session
+		.dom()
+		.children(turn)
+		.iter()
+		.filter_map(|handle| session.dom().get(*handle)?.content.clone())
+		.collect::<Vec<_>>();
+	assert!(
+		journaled.iter().all(|text| !text.contains("<system-notice>")),
+		"the envelope is a projection, never journaled"
+	);
+}
+
+#[test]
+fn empty_assistant_messages_are_omitted_from_projection() {
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let mut session =
+		Session::create(directory.path().join("empty.oms"), ComponentRegistry::default())
+			.expect("session creates");
+	session.begin_turn().expect("turn starts");
+	session.user("question", Vec::new()).expect("user appends");
+	session
+		.assistant_start("model", "provider", "route")
+		.expect("empty assistant starts");
+	session.assistant_end("stop").expect("empty assistant ends");
+	session
+		.receipt(omp_journal::data::TurnReceipt::tokens(1, 0, 0))
+		.expect("empty receipt");
+	session
+		.assistant_start("model", "provider", "route")
+		.expect("tool-only assistant starts");
+	session.assistant_end("tool_use").expect("tool-only assistant ends");
+	session
+		.receipt(omp_journal::data::TurnReceipt::tokens(5, 6, 0))
+		.expect("tool-only receipt");
+	let call = session
+		.call("read", 1, "call-1", None, Some(raw(serde_json::json!({}))), None)
+		.expect("call");
+	session
+		.settle(call, raw(serde_json::json!({"text":"ok"})))
+		.expect("call settles");
+	session
+		.assistant_start("model", "provider", "route")
+		.expect("final assistant starts");
+	let turn = *session
+		.dom()
+		.children(session.dom().body())
+		.last()
+		.expect("turn");
+	let assistant = *session.dom().children(turn).last().expect("assistant");
+	let sid = session
+		.stream_open(assistant, omp_dom::PropId::Text.into())
+		.expect("stream opens");
+	session.stream_append(sid, "answer").expect("stream appends");
+	session.stream_close(sid).expect("stream closes");
+	session.assistant_end("stop").expect("final assistant ends");
+	session
+		.receipt(omp_journal::data::TurnReceipt::tokens(10, 20, 0))
+		.expect("final receipt");
+
+	let items = project_thread(session.dom());
+	let assistants: Vec<_> = items
+		.iter()
+		.filter_map(|item| match item.kind.as_ref()? {
+			item::Kind::Message(message)
+				if message.role == omp_proto::thread::v1::Role::Assistant as i32 =>
+			{
+				Some((
+					message.parts.len(),
+					message
+						.usage
+						.as_ref()
+						.map(|usage| (usage.input_tokens, usage.output_tokens)),
+				))
+			},
+			_ => None,
+		})
+		.collect();
+	assert_eq!(
+		assistants,
+		[(0, Some((5, 6))), (1, Some((10, 20)))],
+		"the empty assistant vanishes with its receipt; the tool-issuing one and the final one stay"
+	);
+	assert_eq!(
+		items
+			.iter()
+			.filter(|item| matches!(item.kind, Some(item::Kind::ToolCall(_))))
+			.count(),
+		1
+	);
+}
+
+/// A journaled user prompt with a PNG attachment projects a typed media
+/// part (pi `ImageContent`): the blob reference plus `image/png`, the MIME
+/// persisted with the reference at journal time — and replay projects the
+/// same part, so the provider request never depends on process memory.
+#[test]
+fn user_attachment_projects_a_media_part_with_its_mime() {
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let path = directory.path().join("media.oms");
+	let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x04\0\0\0\x03";
+	let mut session = Session::create(&path, ComponentRegistry::default()).expect("session creates");
+	let attachment = session
+		.store_attachment("image/png", png)
+		.expect("attachment stores");
+	assert_eq!(attachment.blob, BlobRef { hash: Hash32::sum(png), size: png.len() as u64 });
+	assert_eq!(session.blobs().get(&attachment.blob).expect("bytes stored").as_ref(), png);
+	session.begin_turn().expect("turn starts");
+	session
+		.user("what is this? [Image #1, 4x3]", vec![attachment.clone()])
+		.expect("user appends");
+
+	let media = |session: &Session| {
+		project_thread(session.dom())
+			.into_iter()
+			.filter_map(|item| match item.kind? {
+				item::Kind::Message(message)
+					if message.role == omp_proto::thread::v1::Role::User as i32 =>
+				{
+					Some(message.parts)
+				},
+				_ => None,
+			})
+			.flatten()
+			.filter_map(|part| match part.kind? {
+				part::Kind::Blob(blob) => Some(blob),
+				_ => None,
+			})
+			.collect::<Vec<_>>()
+	};
+	let live = media(&session);
+	assert_eq!(live.len(), 1);
+	assert_eq!(live[0].mime, "image/png");
+	assert_eq!(live[0].hash.as_ref(), attachment.blob.hash.as_bytes());
+	assert_eq!(live[0].size, png.len() as u64);
+	assert!(live[0].inline.is_empty(), "the projection never inlines bytes");
+
+	drop(session);
+	let restored = Session::open(&path, ComponentRegistry::default()).expect("session restores");
+	assert_eq!(media(&restored), live);
 }

@@ -10,8 +10,8 @@ use omp_journal::{
 	Entry, EntryDraft, EntryId, Journal, JournalError, Kind, KindName,
 	blob::{BlobRef, BlobStore},
 	data::{
-		Compaction, Genesis, MsgAssistantEnd, MsgAssistantStart, MsgUser, Patch, Stream, StreamOp,
-		ToolCall, ToolResult, ToolUpdate, TurnReceipt, TurnStart,
+		Attachment, Compaction, Genesis, MsgAssistantEnd, MsgAssistantStart, MsgUser, Patch, Stream,
+		StreamOp, ToolCall, ToolResult, ToolUpdate, TurnReceipt, TurnStart,
 	},
 };
 use omp_tool::{Abort, CallOutcome, Part as ToolPart};
@@ -49,6 +49,13 @@ pub enum SessionError {
 	/// A model-facing JSON part was not valid UTF-8.
 	#[error("tool JSON projection is not UTF-8")]
 	ToolPartUtf8 {
+		/// UTF-8 validation failure.
+		#[source]
+		source: std::str::Utf8Error,
+	},
+	/// A spilled job settlement blob is not UTF-8 JSON.
+	#[error("spilled job output is not UTF-8")]
+	JobOutputUtf8 {
 		/// UTF-8 validation failure.
 		#[source]
 		source: std::str::Utf8Error,
@@ -134,6 +141,17 @@ pub struct Session {
 	/// Content-addressed store every blob this session references resolves
 	/// against: compaction summaries, spilled tool output, attachments.
 	blobs:                            BlobStore,
+}
+
+/// User media on its way into the session: what a composer image chip or an
+/// ACP image block hands the controller before
+/// [`Session::store_attachments`] content-addresses it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachmentInput {
+	/// Declared media type (`image/png`, …).
+	pub mime:  Str,
+	/// Encoded media bytes, shared without copying.
+	pub bytes: bytes::Bytes,
 }
 
 /// One tool-call element on the live chain that has no terminal result yet.
@@ -286,6 +304,12 @@ impl Session {
 			.and_then(|index| self.entries.get(*index))
 	}
 
+	/// Number of materialized journal entries (the durable event index).
+	#[must_use]
+	pub fn entry_count(&self) -> usize {
+		self.entries.len()
+	}
+
 	/// Returns the journal file path.
 	#[must_use]
 	pub fn journal_path(&self) -> &Path {
@@ -297,6 +321,36 @@ impl Session {
 	#[must_use]
 	pub const fn blobs(&self) -> &BlobStore {
 		&self.blobs
+	}
+
+	/// Content-addresses user media (a pasted image, an ACP image block) in
+	/// this session's blob store and returns the attachment a later
+	/// [`Session::user`] journals: the one seam every attachment source
+	/// takes, so the projection always finds the bytes behind the reference.
+	///
+	/// # Errors
+	/// The blob store could not stage or place the bytes.
+	pub fn store_attachment(
+		&self,
+		mime: impl Into<Str>,
+		bytes: &[u8],
+	) -> Result<Attachment, SessionError> {
+		Ok(Attachment { blob: self.blobs.put(bytes)?, mime: mime.into() })
+	}
+
+	/// Stores every [`AttachmentInput`] in order, so `[Image #N]` in the
+	/// prompt names the N-th result.
+	///
+	/// # Errors
+	/// The blob store could not stage or place one input.
+	pub fn store_attachments(
+		&self,
+		inputs: impl IntoIterator<Item = AttachmentInput>,
+	) -> Result<Vec<Attachment>, SessionError> {
+		inputs
+			.into_iter()
+			.map(|input| self.store_attachment(input.mime, &input.bytes))
+			.collect()
 	}
 
 	/// Returns every tool-call element on the live chain without a terminal
@@ -469,11 +523,13 @@ impl Session {
 		self.commit(KindName::TurnStart, Some(by), None, None, &TurnStart {})
 	}
 
-	/// Appends a user message to the active turn.
+	/// Appends a user message to the active turn. `attachments` are
+	/// positional: `[Image #N]` in `text` names `attachments[N-1]` (pi's
+	/// marker contract), and each carries the media type the provider needs.
 	pub fn user(
 		&mut self,
 		text: impl Into<Str>,
-		attachments: Vec<BlobRef>,
+		attachments: Vec<Attachment>,
 	) -> Result<EntryId, SessionError> {
 		let by = self.turn_cause()?;
 		self.commit(KindName::MsgUser, Some(by), None, None, &MsgUser {

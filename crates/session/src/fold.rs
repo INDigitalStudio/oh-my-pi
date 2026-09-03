@@ -344,6 +344,9 @@ impl Session {
 			.with_prop(PropId::CostNanoUsd, unsigned(payload.cost_nano_usd))
 			.with_prop(PropId::CacheRead, unsigned(payload.cache_read))
 			.with_prop(PropId::CacheWrite, unsigned(payload.cache_write));
+		if payload.premium_requests_millionths != 0 {
+			node = node.with_prop(PropId::PremiumRequests, unsigned(payload.premium_requests_millionths));
+		}
 		if let Some(ttft) = payload.ttft_ms {
 			node = node.with_prop(PropId::TtftMs, unsigned(ttft));
 		}
