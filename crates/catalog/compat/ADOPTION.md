@@ -2,7 +2,7 @@
 
 Every newly synced wire/thinking compatibility axis is parsed into a typed catalog policy. A `consumed` row names the inference consumer and the test reproducing pi's observable shape. A `stored-only` row is an honest gap: the fact is compiled and typed, but the named boundary cannot consume it yet. Stored-only axes are not silently treated as unsupported.
 
-Primary ledger: **69 axes — 49 consumed, 20 stored-only.**
+Primary ledger: **70 axes — 52 consumed, 18 stored-only.**
 
 | axis | set | WirePolicy field | codec file | test name | status |
 |---|---|---|---|---|---|
@@ -12,7 +12,7 @@ Primary ledger: **69 axes — 49 consumed, 20 stored-only.**
 | `antigravity-usage-label` | wire | `policy.usage.antigravity_label` | `crates/inference/src/codec/google_cca.rs` | `antigravity_usage_label_matches_pi_request_shape` | consumed |
 | `cache-control-format` | wire | `policy.cache.control_format` | `crates/inference/src/codec/openai_responses.rs` | `cache_control_format_matches_pi_request_shape` | consumed |
 | `cca-legacy-parameters-schema` | wire | `policy.tool.cca_legacy_parameters_schema` | `crates/inference/src/codec/gemini.rs` | `cca_legacy_parameters_schema_matches_pi_request_shape` | consumed |
-| `clamp-output-to-model-max` | wire | `policy.context.clamp_output_to_model_max` | `crates/inference/src/codec/openai_chat.rs` | — | stored-only: output-budget planning owns the model maximum clamp |
+| `clamp-output-to-model-max` | wire | `policy.context.clamp_output_to_model_max` | `crates/inference/src/codec/openai_chat.rs` | `clamp_output_to_model_max_matches_pi_request_shape` | consumed |
 | `claude-thinking-beta-header` | wire | `policy.headers.claude_thinking_beta` | `crates/inference/src/codec/google_cca.rs` | `claude_thinking_beta_header_matches_pi_request_shape` | consumed |
 | `disable-reasoning-on-forced-tool-choice` | wire | `policy.tool.disable_reasoning_on_forced_choice` | `crates/inference/src/codec/openai_chat.rs` | `disable_reasoning_on_forced_tool_choice_matches_pi_request_shape` | consumed |
 | `disable-strict-tools` | wire | `policy.tool.disable_strict_tools` | `crates/inference/src/codec/anthropic.rs` | `disable_strict_tools_matches_pi_request_shape` | consumed |
@@ -39,11 +39,12 @@ Primary ledger: **69 axes — 49 consumed, 20 stored-only.**
 | `requires-mistral-tool-ids` | wire | `policy.tool.requires_mistral_ids` | `crates/inference/src/codec/openai_chat.rs` | `requires_mistral_tool_ids_matches_pi_request_shape` | consumed |
 | `requires-reasoning-off-juice-instruction` | wire | `policy.reasoning.requires_off_juice_instruction` | `crates/inference/src/codec/openai_responses.rs` | `requires_reasoning_off_juice_instruction_matches_pi_request_shape` | consumed |
 | `requires-skip-thought-signature` | wire | `policy.tool.requires_skip_thought_signature` | `crates/inference/src/codec/gemini.rs` | `requires_skip_thought_signature_matches_pi_request_shape` | consumed |
+| `requires-skip-thought-signature-on-first-function-call` | wire | `policy.tool.requires_skip_thought_signature_on_first_function_call` | `crates/inference/src/codec/gemini.rs`; `crates/inference/src/codec/google_cca.rs` | `first_function_call_sentinel_applies_only_to_first_unsigned_call`; `cca_gemini_three_requires_only_the_first_call_signature_bypass` | consumed |
 | `requires-thinking-as-text` | wire | `policy.reasoning.requires_thinking_as_text` | `crates/inference/src/codec/openai_chat.rs` | `requires_thinking_as_text_matches_pi_request_shape` | consumed |
 | `requires-tool-result-name` | wire | `policy.tool.requires_result_name` | `crates/inference/src/codec/openai_chat.rs` | `requires_tool_result_name_matches_pi_request_shape` | consumed |
 | `retry-without-strict-on-grammar-error` | wire | `policy.tool.retry_without_strict_on_grammar_error` | `crates/inference/src/layer/recover.rs` | — | stored-only: requires attempt-level mutation after a typed prebody provider rejection; stream recovery cannot perform it |
 | `stream-first-event-timeout-ms` | wire | `policy.streaming.watchdog.first_event_ms` | `crates/inference/src/transport/http.rs` | `stream_first_event_timeout_ms_matches_pi_behavior` | consumed |
-| `stream-markup-healing-pattern` | wire | `policy.streaming.markup_healing_pattern` | `crates/inference/src/codec/openai_chat.rs` | — | stored-only: the shared recovery pipeline owns streamed markup healing |
+| `stream-markup-healing-pattern` | wire | `policy.streaming.markup_healing_pattern` | `crates/inference/src/recovery/projection.rs`; `crates/inference/src/layer/recover.rs` | `configured_dialect_pipeline_projects_canonical_tool_events`; `live_dialect_projection_suppresses_source_text_blocks_and_avoids_index_collisions` | consumed |
 | `strict-responses-pairing` | wire | `policy.tool.strict_responses_pairing` | `crates/inference/src/codec/openai_responses.rs` | `strict_responses_pairing_matches_pi_request_shape` | consumed |
 | `strip-deepseek-special-tokens` | wire | `policy.streaming.strip_deepseek_special_tokens` | `crates/inference/src/codec/openai_chat.rs` | `strip_deepseek_special_tokens_matches_pi_request_shape` | consumed |
 | `strip-image-input` | wire | `policy.image.strip_input` | `crates/inference/src/codec/openai_chat.rs` | `strip_image_input_matches_pi_request_shape` | consumed |

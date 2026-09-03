@@ -54,7 +54,7 @@ Internal schemes share one resolver, one selector grammar, and one byte/entry ce
 ```text
 artifact://<id>  agent://<id>  history://<id>  issue://123  pr://123/diff/2
 skill://react  rule://foo  memory://…  local://…  vault://…  security://…
-omp://…  xd://browser  ssh://host/path  mcp://…
+omp://…  ssh://host/path  mcp://…
 ```
 
 `Read` MUST also perform path recovery that would otherwise waste a turn: resolve a wrong absolute
@@ -75,7 +75,7 @@ New resource kinds are added as projections behind `Read`, NEVER as new roster t
 
 ## Status in omp
 
-**Partial.** Primary implementation: `crates/tools/src/read.rs`. Read materializes local, internal, web, archive, SQLite, notebook, image, and structural resources. Gap: `xd://` remains on the device surface rather than the Read resolver.
+**Partial.** Primary implementation: `crates/tools/src/read.rs`. Read materializes local, internal, web, archive, SQLite, notebook, image, and structural resources. Device discovery is not a Read scheme: `dyn` owns it (0025).
 
 ## References
 

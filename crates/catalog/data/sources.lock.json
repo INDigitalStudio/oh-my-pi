@@ -1,17 +1,17 @@
 {
   "schema_version": 1,
-  "source_digest": "8c9b0478365860f5f7590d8fd8caa5b2faa7bfeda344cf6b4cb8d63a86b71eab",
+  "source_digest": "c73854c442291b71039b8384390bb552cdd5a02d43a98f86b5d131a2217b7425",
   "inputs": [
     {
       "id": "catalog.models.compressed.v1",
       "path": "fixtures/llm-oracle/catalog/models.json.zst",
-      "sha256": "fedc53d731511e1be277c1882cff0cdc0c8de22edcd27d4dc184a6d3591c4e14",
+      "sha256": "c24ca3165d7e5536ebe5787954ee35caada1f0aa7d29929c42a2227311e7ca8f",
       "source": "oracle:catalog.models.compressed.v1"
     },
     {
       "id": "catalog.oauth.source.v1",
       "path": "fixtures/llm-oracle/catalog/oauth.toml",
-      "sha256": "61c7c07eeb1e1f141c5b8ffdb87a4b508cfb202b79302fabdede415cbdd25491",
+      "sha256": "3608e8a48097cfd54dfd3203938691fe12705dee8aff0d0604359ff7c2aea56f",
       "source": "oracle:catalog.oauth.source.v1"
     },
     {
@@ -35,7 +35,7 @@
     {
       "id": "catalog.policy.exact-model-overrides.v1",
       "path": "fixtures/llm-oracle/catalog-policy/exact-model-overrides.json",
-      "sha256": "6c66f6db7f683f0f9d2e67f85330980a7368c7061348a3131af515368d5855bc",
+      "sha256": "ec7bfe74ece9d4f24f841e5748017ceb58bf0b8bdfbe6c374e22ca69d44d7097",
       "source": "oracle:catalog.policy.exact-model-overrides.v1"
     },
     {
@@ -71,7 +71,7 @@
     {
       "id": "catalog.providers.source.v1",
       "path": "fixtures/llm-oracle/catalog/providers.toml",
-      "sha256": "20fad7bb26d5e31f3e6d23472abcf21d8ed2ebbcdca2f31aabaf8282111c244d",
+      "sha256": "8bd3d85b56facc7fb19cfd5c01f85bf8e9036f920b4140fe81012d2e7cc5523b",
       "source": "oracle:catalog.providers.source.v1"
     },
     {
@@ -113,7 +113,7 @@
     {
       "id": "compat.cascade.classes.gemini.v1",
       "path": "crates/catalog/compat/classes/gemini.kdl",
-      "sha256": "4033df97644c077bc7645c045b95d4e7ea3b22b14e39c5918b880488918f8e94",
+      "sha256": "501934fb4450ba062f1362ac267a9dc52e1b2c059d4e2c8ff28a7efd36214e45",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
@@ -125,7 +125,7 @@
     {
       "id": "compat.cascade.classes.glm.v1",
       "path": "crates/catalog/compat/classes/glm.kdl",
-      "sha256": "b2fa34920e6a32306a9be2c97ddc4d57c076a674812e7e8d07355fb2d0b59321",
+      "sha256": "e4cd1d67db7eca91d6c293b5fe0ae28defe73fdf109fb70e114406690a7ca25e",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
@@ -143,7 +143,7 @@
     {
       "id": "compat.cascade.classes.meta.v1",
       "path": "crates/catalog/compat/classes/meta.kdl",
-      "sha256": "745447fdee547fe255bc7643e37035f003bd314b9d90a1e35c97227f6d88a042",
+      "sha256": "fc5b36994afda3e66dec626b50831a6dfa4fc159b25ac766f0f1e024dc31af93",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
@@ -187,6 +187,12 @@
       "path": "crates/catalog/compat/classes/xai.kdl",
       "sha256": "0df22c033b627606ddfabd4b32c604d7ba015c62f259da5381a05355966dbc9f",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
+    },
+    {
+      "id": "compat.cascade.providers.abliteration.v1",
+      "path": "crates/catalog/compat/providers/abliteration.kdl",
+      "sha256": "be61169916b57c8f0b43fb4359890c803b1fe9a3b0add3b3eaf75734b8930470",
+      "source": "pi upstream compat rules 2026-09-03"
     },
     {
       "id": "compat.cascade.providers.agnes-plan.v1",
@@ -341,8 +347,14 @@
     {
       "id": "compat.cascade.providers.google-antigravity.v1",
       "path": "crates/catalog/compat/providers/google-antigravity.kdl",
-      "sha256": "481ea52c34e4e8c69911758243a7b4950a48c10d58262ae90713dce2c436f75c",
+      "sha256": "1e5c3139808bdc6ae9ccab2367bff12de0ad00b0c65089e665b5377fac23260f",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
+    },
+    {
+      "id": "compat.cascade.providers.google-gemini-cli.v1",
+      "path": "crates/catalog/compat/providers/google-gemini-cli.kdl",
+      "sha256": "260a5d2fbae4bbdeeb6106c870eeae30ba6dbefa44bfaa6706272a990d16c840",
+      "source": "pi upstream compat rules 2026-09-03"
     },
     {
       "id": "compat.cascade.providers.google-vertex.v1",
