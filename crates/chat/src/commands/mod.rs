@@ -47,6 +47,14 @@ pub mod dashboards;
 /// Collaboration, lifecycle, and capability toggles (`/export`, `/share`,
 /// `/cleanse`, `/security`, `/memory`, `/ssh`, `/browser`, …).
 pub mod misc;
+/// Model, lifecycle, and MCP commands (`/model`, `/switch`, `/fast`,
+/// `/retry`, `/clear`, `/exit`, `/quit`, `/restart`, `/dump`, `/mcp`).
+pub mod control;
+/// Workspace roots and relocation (`/add-dir`, `/remove-dir`, `/dirs`,
+/// `/move`, `/wt`).
+pub mod workspace;
+/// Settings selector (`/settings`).
+pub mod settings;
 
 pub use run::{director_active, director_frame, message_count, todo_markdown};
 
@@ -74,6 +82,9 @@ const PALETTES: &[&[PaletteEntry]] = &[
 	tools::PALETTE,
 	agents::PALETTE,
 	git::PALETTE,
+	control::PALETTE,
+	workspace::PALETTE,
+	settings::PALETTE,
 ];
 
 /// Palette icon for a registered command, when one is declared.
@@ -304,6 +315,18 @@ pub enum CommandAction {
 	Omfg {
 		/// The rule text.
 		rule: Str,
+	},
+	/// `/clear`: drop the model context in place, keeping the session.
+	Clear,
+	/// `/move <path>`: relocate the session to another directory.
+	Move {
+		/// Target directory as typed (resolved against the working directory).
+		path: Str,
+	},
+	/// `/wt [branch]`: fork the checkout into a worktree and move there.
+	Worktree {
+		/// Branch name; `None` picks pi's `wt/<yyyymmdd-hhmmss>`.
+		branch: Option<Str>,
 	},
 }
 

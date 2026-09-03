@@ -33,8 +33,13 @@ impl Card for GithubCard {
 				let output = result_value(view)
 					.and_then(|value| {
 						value
-							.get("output")
-							.and_then(Value::as_str)
+							.get("result")
+							.and_then(|result| {
+								result
+									.get("output")
+									.and_then(Value::as_str)
+									.or_else(|| result.as_str())
+							})
 							.map(str::to_owned)
 					})
 					.unwrap_or_default();

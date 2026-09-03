@@ -3,10 +3,11 @@
 //! `/context`, `/trace`, `/changelog`, `/hotkeys`, `/debug`.
 //!
 //! `/usage` opens the full-screen dashboard; the report commands open a
-//! [`ReportPanel`]; `/debug` opens the selector or one inspector. `/stats`
-//! and `/trace` opened pi's local stats web dashboard, which has no seam on
-//! this host, so they are registered for palette parity and answer with the
-//! exact missing seam.
+//! [`ReportPanel`]; `/debug` opens the selector or one inspector. pi's
+//! `/stats` and `/trace` opened its local stats web dashboard; on this host
+//! `/stats` syncs the application's usage index over every stored journal
+//! and shows pi's summary layout in a report, and `/trace` renders the last
+//! turn's timeline from the replica plus the recorded kernel notifications.
 
 use omp_con::{ConError, ConResult, Ctx};
 use omp_core::{Str, sf};
@@ -15,11 +16,14 @@ use omp_tui::Icon;
 use super::{PaletteEntry, rest};
 use crate::{
 	actions::{HostAction, post},
+	host::HostCommand,
 	overlays::{
 		PanelCall, PanelEvent, PanelOpener,
 		info::{DebugSelector, changelog_report, context_report, debug_report, hotkeys_report},
-		report::ReportPanel,
-		services::ServiceError,
+		report::{PendingReportPanel, ReportPanel},
+		reset_usage::ResetUsageSelector,
+		services::{Mutation, ServiceError},
+		stats::{stats_report, trace_report},
 		usage::UsageDashboard,
 	},
 };
@@ -36,10 +40,10 @@ pub const PALETTE: &[PaletteEntry] = &[
 ];
 
 const USAGE_USAGE: &str = "Usage: /usage [show|reset [account|active]]";
-const DEFERRED_STATS: &str = "Stats dashboard is not available: the local stats web server \
-                              (stats_cmd) was removed in d3d7c61fc4; use /usage";
-const DEFERRED_TRACE: &str = "Trace viewer is not available: it opened the stats dashboard \
-                              trace URL; the session replica does not carry the journal path";
+/// pi `stats-dashboard.ts` status while `syncAllSessions` runs.
+const STATS_SYNCING: &str = "Syncing session files...";
+/// pi `/trace` preflight (`builtin-collaboration.ts:200`).
+const NO_TRACE: &str = "No session file yet — send a message first.";
 const NO_CHANGELOG: &str = "No changelog entries found.";
 
 fn usage(message: &'static str) -> ConError {
@@ -85,18 +89,26 @@ omp_con::cmd! {
 		UsageOp::Show => open(ctx, PanelOpener::new(|cx| {
 			UsageDashboard::open(cx).map(|panel| Box::new(panel) as Box<_>)
 		})),
-		UsageOp::Reset(target) => call(ctx, PanelCall::new(move |cx| {
-			match cx.services.reset_usage(&target) {
-				Ok(line) => PanelEvent::Notice(line),
-				Err(error) => PanelEvent::Notice(Str::new(error.to_string())),
-			}
+		UsageOp::Reset(target) if target.is_empty() => open(ctx, PanelOpener::new(|cx| {
+			ResetUsageSelector::open(cx).map(|panel| Box::new(panel) as Box<_>)
+		})),
+		UsageOp::Reset(target) => call(ctx, PanelCall::new(move |_cx| {
+			PanelEvent::Command(HostCommand::Service(Mutation::ResetUsage { target: target.clone() }))
 		})),
 	};
 
-	/// Launches the local stats dashboard.
-	stats() = |ctx, _args| {
-		call(ctx, PanelCall::new(|_cx| PanelEvent::Notice(Str::new_static(DEFERRED_STATS))))
-	};
+	/// Shows historical token usage and cost across every stored session.
+	stats() = |ctx, _args| open(ctx, PanelOpener::new(|cx| {
+		let pending = cx.services.stats().map_err(|error| Str::new(error.to_string()))?;
+		Ok(Box::new(PendingReportPanel::new(
+			"stats",
+			"Stats",
+			STATS_SYNCING,
+			pending,
+			stats_report,
+			cx.ui,
+		)) as Box<_>)
+	}));
 
 	/// Shows the estimated context usage breakdown.
 	context() = |ctx, _args| open(ctx, PanelOpener::new(|cx| {
@@ -104,10 +116,15 @@ omp_con::cmd! {
 		Ok(Box::new(ReportPanel::new("context", "Context", body, cx.ui)) as Box<_>)
 	}));
 
-	/// Opens this session's trace in the stats dashboard.
-	trace() = |ctx, _args| {
-		call(ctx, PanelCall::new(|_cx| PanelEvent::Notice(Str::new_static(DEFERRED_TRACE))))
-	};
+	/// Shows the last turn's execution trace: requests, tool calls, usage,
+	/// and kernel notifications on one timeline.
+	trace() = |ctx, _args| open(ctx, PanelOpener::new(|cx| {
+		// Kernel notifications are observer-side facts; a host without the
+		// feed still traces from the replica alone.
+		let events = cx.services.trace_events().unwrap_or_default();
+		let body = trace_report(cx.dom, &events).ok_or_else(|| Str::new_static(NO_TRACE))?;
+		Ok(Box::new(ReportPanel::new("trace", "Trace", body, cx.ui)) as Box<_>)
+	}));
 
 	/// Shows changelog entries: `/changelog [full]`.
 	changelog(?full: Str) = |ctx, args| {

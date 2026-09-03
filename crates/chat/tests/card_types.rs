@@ -22,19 +22,31 @@ where
 {
 }
 
-fn renders_typed<P, T, F>(tool: &str, fixture: Value)
+fn renders_typed<P, T, F>(tool: &str, fixture: Value) -> String
 where
 	P: DeserializeOwned,
 	T: DeserializeOwned + Serialize,
 	F: DeserializeOwned,
 {
-	let payload: T =
-		serde_json::from_value(fixture).expect("typed payload fixture must deserialize");
+	let payload: T = serde_json::from_value(fixture)
+		.unwrap_or_else(|error| panic!("{tool} typed payload fixture must deserialize: {error}"));
 	let encoded = serde_json::to_value(&payload).expect("typed payload fixture must serialize");
-	let mut result = node(KnownTag::Result, String::new());
+	let mut result = node(KnownTag::Result, r#"{"results":[{"error":"projection decoy"}]}"#.to_owned());
+	result.props.push((
+		PropId::Outcome.into(),
+		DomValue::Json(
+			serde_json::value::to_raw_value(&json!({"kind": "ok", "value": encoded}))
+				.expect("outcome JSON is valid"),
+		),
+	));
 	result.props.push((
 		PropId::Data.into(),
-		DomValue::Json(serde_json::value::to_raw_value(&encoded).expect("payload JSON is valid")),
+		DomValue::Json(
+			serde_json::value::to_raw_value(&json!([
+				{"kind": "text", "text": "{\"results\":[{\"error\":\"projection decoy\"}]}"}
+			]))
+			.expect("projection JSON is valid"),
+		),
 	));
 	let input = node(KnownTag::Input, "{}".to_owned());
 	let view = CardView {
@@ -54,7 +66,9 @@ where
 	let ui = UiContext::default();
 	let component = registry.render(tool, &view, false, &ui);
 	let rendered = Ui::from_root(component, 100, ui);
-	assert!(!frame_text(rendered.frame()).trim().is_empty(), "{tool} card rendered no content");
+	let text = frame_text(rendered.frame());
+	assert!(!text.trim().is_empty(), "{tool} card rendered no content");
+	text
 }
 
 #[test]
@@ -116,7 +130,7 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 	);
 	renders_typed::<tools::computer::Params, tools::computer::Payload, tools::computer::Fault>(
 		"computer",
-		json!({"action": "capabilities", "result": {}, "artifacts": []}),
+		json!({"code": "return await desktop.capabilities()", "results": [{}], "artifacts": []}),
 	);
 	renders_typed::<tools::debug::Params, tools::debug::Payload, tools::debug::Fault>(
 		"debug",
@@ -130,9 +144,8 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 		"eval",
 		json!({
 			"session_id": [], "cell_id": [], "language": "py", "title": null, "code": "", "reset": false,
-			"frames": [], "result": null, "display_outputs": [],
-			"status": {"outcome": "complete", "exit_code": 0, "duration_ms": 0, "exception": null},
-			"truncated": false, "spilled_output": null, "total_lines": 0, "total_bytes": 0
+			"had_output": false, "result": null, "display_outputs": [],
+			"status": {"outcome": "complete", "exit_code": 0, "duration_ms": 0, "exception": null}
 		}),
 	);
 	renders_typed::<tools::github::Params, tools::github::Payload, tools::github::Fault>(
@@ -190,7 +203,7 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 	);
 	renders_typed::<tools::todo::Params, tools::todo::Payload, tools::todo::Fault>(
 		"todo",
-		json!({"phases": [], "rendered": ""}),
+		json!({"op":"view","phases": [], "completed_tasks": []}),
 	);
 	renders_typed::<tools::web_search::Params, tools::web_search::Payload, tools::web_search::Fault>(
 		"web_search",
@@ -202,4 +215,101 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 			"byte_len": 0, "reported_len": 0, "disposition": "created", "stripped_wrapper": false,
 			"made_executable": false, "snapshot_tag": null, "operation": {"kind": "plain"}}),
 	);
+	renders_typed::<
+		tools::checkpoint::CheckpointParams,
+		tools::checkpoint::CheckpointPayload,
+		tools::checkpoint::Fault,
+	>("checkpoint", json!({"token":"checkpoint-1","goal":"explore parser","started_at":1}));
+	renders_typed::<
+		tools::checkpoint::RewindParams,
+		tools::checkpoint::RewindPayload,
+		tools::checkpoint::Fault,
+	>("rewind", json!({"token":"checkpoint-1","report":"parser is sound","receipt":"r1","scheduled":true}));
+	renders_typed::<tools::yield_tool::Params, tools::yield_tool::Payload, tools::yield_tool::Fault>(
+		"yield",
+		json!({"incremental":false,"use_last_turn":false}),
+	);
+	renders_typed::<tools::learn::Params, tools::learn::LearnOutcome, tools::learn::Fault>(
+		"learn",
+		json!({"memory_id":"m1","skill":{"status":"not_requested"},"partial":false}),
+	);
+	renders_typed::<
+		tools::manage_skill::Params,
+		tools::manage_skill::MutationOutcome,
+		tools::manage_skill::Fault,
+	>("manage_skill", json!({"action":"create","name":"rust","path":"rust/SKILL.md","revision":1}));
+	let registry = CardRegistry::standard();
+	for identity in tools::builtin_tool_identities() {
+		assert!(registry.contains(identity.name), "{} must have a dedicated card", identity.name);
+	}
+}
+
+#[test]
+fn typed_outcomes_are_not_shadowed_by_projection_json() {
+	use omp_tools as tools;
+
+	let task = renders_typed::<tools::task::Params, tools::task::Payload, tools::task::Fault>(
+		"task",
+		json!({"children":[{
+			"id":"Child","agent":"task","text":"completed successfully","session_path":"child.oms",
+			"tokens_in":12,"tokens_out":3,"output":null,"workspace":null,"error":null
+		}]}),
+	);
+	assert!(task.contains("Child"), "{task}");
+	assert!(!task.contains("operation failed"), "{task}");
+
+	let ask = renders_typed::<tools::ask::Params, tools::ask::Payload, tools::ask::Fault>(
+		"ask",
+		json!({"answers":[{"id":"db","selected":["Postgres"],"timed_out":false}],"headless":false}),
+	);
+	assert!(!ask.contains("operation failed"), "{ask}");
+
+	let hub = renders_typed::<tools::hub::Params, tools::hub::Response, tools::hub::Fault>(
+		"hub",
+		json!({"text":"{\"peers\":[{\"id\":\"Worker\",\"status\":\"idle\",\"unread\":0}]}","useless":false}),
+	);
+	assert!(hub.contains("Worker"), "{hub}");
+
+	let search = renders_typed::<
+		tools::web_search::Params,
+		tools::web_search::Payload,
+		tools::web_search::Fault,
+	>(
+		"web_search",
+		json!({"response":{
+			"engine":"perplexity","answer":"production answer",
+			"sources":[{"url":"https://example.com","title":"Primary source","snippet":"proof"}]
+		}}),
+	);
+	assert!(search.contains("production answer"), "{search}");
+	assert!(search.contains("Primary source"), "{search}");
+
+	let debug = renders_typed::<tools::debug::Params, tools::debug::Payload, tools::debug::Fault>(
+		"debug",
+		json!({"action":"stack_trace","session":null,"revision":null,"output":"",
+			"data":{"session":{"path":"src/main.rs","line":7,"col":2},"frames":[{"name":"main","path":"src/main.rs","line":7,"col":2}]}}),
+	);
+	assert!(debug.contains("main"), "{debug}");
+
+	let lsp = renders_typed::<tools::lsp::Params, tools::lsp::Payload, tools::lsp::Fault>(
+		"lsp",
+		json!({"action":"references","servers":[],"output":"",
+			"data":{"references":[{"path":"src/main.rs","locations":[{"line":7,"col":2}]}]}}),
+	);
+	assert!(lsp.contains("1 found"), "{lsp}");
+
+	let goal = renders_typed::<tools::goal::Params, tools::goal::Payload, tools::goal::Fault>(
+		"goal",
+		json!({"op":"get","goal":{"id":"g1","objective":"ship","status":"active",
+			"token_budget":1000,"tokens_used":100,"time_used_secs":60},
+			"remaining_tokens":900,"completion_report":null}),
+	);
+	assert!(goal.contains("1K left"), "{goal}");
+
+	let github = renders_typed::<tools::github::Params, tools::github::Payload, tools::github::Fault>(
+		"github",
+		json!({"op":"search_prs","result":{"output":"#42 production result"},
+			"rate_limit_remaining":null,"rate_limit_reset":null}),
+	);
+	assert!(github.contains("#42 production result"), "{github}");
 }

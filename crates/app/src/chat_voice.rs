@@ -18,7 +18,13 @@ use omp_con::Ctx;
 use omp_core::Str;
 use omp_voice::audio::CaptureStream;
 
-use crate::audio_coordinator::InteractiveAudioController;
+use crate::{
+	audio_coordinator::InteractiveAudioController,
+	voice::settings::{
+		CL_STT_LANGUAGE, CL_STT_MODEL, CL_STT_SUBMIT_TRIGGER, CL_VOICE_STT_ENABLED, SttModel,
+		SttSubmitTrigger,
+	},
+};
 
 /// Mono capture rate the local recognizers consume.
 const SAMPLE_RATE: u32 = 16_000;
@@ -49,6 +55,10 @@ impl PushToTalk {
 	/// host as a notice through `ctx`'s console mailbox, never raised.
 	pub fn set_active(&mut self, active: bool, ctx: &Ctx) {
 		if active {
+			if !CL_VOICE_STT_ENABLED.get(ctx) {
+				reply(ctx, Str::new_static("Speech-to-text is disabled; set cl_voice_stt_enabled 1"));
+				return;
+			}
 			if let Err(error) = self.start() {
 				reply(ctx, error);
 			}
@@ -116,19 +126,57 @@ impl PushToTalk {
 			return;
 		};
 		let mailbox = Arc::clone(&mailbox);
-		tokio::task::spawn_blocking(move || match transcribe(&samples) {
+		let model = CL_STT_MODEL.get(ctx);
+		let language = CL_STT_LANGUAGE.get(ctx);
+		let trigger = CL_STT_SUBMIT_TRIGGER.get(ctx);
+		tokio::task::spawn_blocking(move || match transcribe(&samples, model, language) {
 			Ok(text) if text.trim().is_empty() => {
 				mailbox.post(HostAction::Reply {
 					severity: omp_con::Severity::Info,
 					text:     Str::new_static("Nothing recognized"),
 				});
 			},
-			Ok(text) => mailbox.post(HostAction::InsertText(text)),
+			Ok(text) => {
+				let (text, submit) = stt_submission(text, trigger);
+				mailbox.post(HostAction::InsertText(text));
+				if submit {
+					mailbox.post(HostAction::SubmitDraft);
+				}
+			},
 			Err(error) => mailbox.post(HostAction::Reply {
 				severity: omp_con::Severity::Warn,
 				text:     error,
 			}),
 		});
+	}
+}
+
+fn stt_submission(text: Str, trigger: SttSubmitTrigger) -> (Str, bool) {
+	let trimmed = text.trim();
+	match trigger {
+		SttSubmitTrigger::Never => (text, false),
+		SttSubmitTrigger::Release => (text, trimmed.split_whitespace().count() >= 2),
+		SttSubmitTrigger::ReleaseComplete => {
+			(text, trimmed.ends_with(['.', '?', '!', '…', '。', '？', '！']))
+		},
+		SttSubmitTrigger::SaySubmit => {
+			let without_punctuation = trimmed.trim_end_matches(|ch: char| {
+				ch.is_ascii_punctuation() || matches!(ch, '…' | '。' | '？' | '！')
+			});
+			let start = without_punctuation
+				.rfind(char::is_whitespace)
+				.map_or(0, |index| index + 1);
+			let trigger = &without_punctuation[start..];
+			if trigger
+				.as_bytes()
+				.windows("submit".len())
+				.any(|window| window.eq_ignore_ascii_case(b"submit"))
+			{
+				(Str::new(without_punctuation[..start].trim_end()), true)
+			} else {
+				(text, false)
+			}
+		},
 	}
 }
 
@@ -138,10 +186,10 @@ fn reply(ctx: &Ctx, text: Str) {
 	}
 }
 
-/// Recognizes `samples` (mono 16 kHz) with the verified local recognizer
-/// selected by `omp setup speech`.
+/// Recognizes `samples` (mono 16 kHz) with the verified configured local
+/// recognizer and language hint.
 #[cfg(feature = "local-stt")]
-fn transcribe(samples: &[f32]) -> Result<Str, Str> {
+fn transcribe(samples: &[f32], model: SttModel, language: Str) -> Result<Str, Str> {
 	use std::{fs, sync::Arc, time::Duration};
 
 	use omp_inference::local::{
@@ -163,23 +211,70 @@ fn transcribe(samples: &[f32]) -> Result<Str, Str> {
 		idle_timeout: Duration::from_secs(120),
 	};
 	let memory = Arc::new(MemoryPool::new(2 * 1024 * 1024 * 1024));
-	let adapter =
-		SpeechToTextAdapter::from_verified_artifacts(&store, &artifacts, None, options, memory, &cancel)
+	let preset = <&'static str>::from(model);
+	let adapter = SpeechToTextAdapter::from_verified_artifacts(
+		&store,
+		&artifacts,
+		Some(preset),
+		options,
+		memory,
+		&cancel,
+	)
 			.map_err(|error| {
 				Str::new(format!(
 					"Speech recognition is not set up ({error}); run `omp setup speech` first"
 				))
 			})?;
 	let transcription = adapter
-		.transcribe_mono_16khz(samples, &TranscriptionOptions::default(), &cancel)
+		.transcribe_mono_16khz(
+			samples,
+			&TranscriptionOptions {
+				language: (!language.trim().is_empty()).then_some(language),
+				..TranscriptionOptions::default()
+			},
+			&cancel,
+		)
 		.map_err(|error| fail(&error))?;
 	Ok(Str::new(transcription.text.trim()))
 }
 
 /// Feature-disabled recognizer: the build carries no local speech models.
 #[cfg(not(feature = "local-stt"))]
-fn transcribe(_samples: &[f32]) -> Result<Str, Str> {
+fn transcribe(_samples: &[f32], _model: SttModel, _language: Str) -> Result<Str, Str> {
 	Err(Str::new_static(
 		"Speech-to-text is not built; rebuild omp with `--features local-stt`",
 	))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn pi_submit_triggers_preserve_and_trim_the_dictation_contract() {
+		assert_eq!(
+			stt_submission(Str::new_static("one word"), SttSubmitTrigger::Never),
+			(Str::new_static("one word"), false)
+		);
+		assert_eq!(
+			stt_submission(Str::new_static("one"), SttSubmitTrigger::Release),
+			(Str::new_static("one"), false)
+		);
+		assert_eq!(
+			stt_submission(Str::new_static("two words"), SttSubmitTrigger::Release),
+			(Str::new_static("two words"), true)
+		);
+		assert_eq!(
+			stt_submission(Str::new_static("done。"), SttSubmitTrigger::ReleaseComplete),
+			(Str::new_static("done。"), true)
+		);
+		assert_eq!(
+			stt_submission(Str::new_static("keep this reSUBMIT!"), SttSubmitTrigger::SaySubmit),
+			(Str::new_static("keep this"), true)
+		);
+		assert_eq!(
+			stt_submission(Str::new_static("submit"), SttSubmitTrigger::SaySubmit),
+			(Str::new_static(""), true)
+		);
+	}
 }

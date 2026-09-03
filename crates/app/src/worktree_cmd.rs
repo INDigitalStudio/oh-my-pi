@@ -78,7 +78,7 @@ pub struct WorktreeRow {
 }
 
 fn configured_base(data_dir: &Path) -> io::Result<PathBuf> {
-	let settings = omp_driver::settings::current(data_dir).map_err(io::Error::other)?;
+	let settings = omp_driver::settings::current().map_err(io::Error::other)?;
 	Ok(omp_env::project_state::worktree_base(data_dir, settings.worktree.base.as_deref()))
 }
 

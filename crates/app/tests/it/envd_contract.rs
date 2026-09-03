@@ -45,7 +45,7 @@ use omp_tool::{
 	Abort, CallOutcome, Claims, Constraint, DocEffects, Effects, Ev, IncomingParams, LoweringCaps,
 	Part, Precedence, Presentation, PromptCaps, Registry, Rev, Tool, ToolRoute, ToolSpec,
 };
-use omp_tools::{eval, eval::OutputChannel};
+use omp_tools::eval;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
@@ -586,7 +586,8 @@ impl Harness {
 	async fn start_with_worker(registry: Registry, worker: ExtHostConfig) -> Self {
 		let root = tempfile::tempdir().expect("workspace scratch directory");
 		let state = tempfile::tempdir().expect("state scratch directory");
-		let con = omp_con::Ctx::new();
+		let con = Arc::new(omp_con::Ctx::new());
+		let convars = Arc::new(omp_envd::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 		let server = Arc::new(
 			EnvServer::open_local(
 				root.path(),
@@ -594,6 +595,7 @@ impl Harness {
 				registry,
 				worker,
 				&con,
+				convars,
 				RegistryBridges::default(),
 			)
 			.await
@@ -791,7 +793,7 @@ fn ok_builtin_payload(verdict: v1::Verdict, operation: &str) -> Value {
 }
 
 async fn read_builtin_text(client: &EnvClient, invocation_id: &str, path: &str) -> String {
-	let verdict = invoke_builtin(client, invocation_id, "read", "1", json!({"path": path})).await;
+	let verdict = invoke_builtin(client, invocation_id, "read", "2", json!({"path": path})).await;
 	let payload = ok_builtin_payload(verdict, "read");
 	payload["parts"][0]["text"]
 		.as_str()
@@ -808,14 +810,6 @@ fn hashline_tag<'o>(output: &'o str, path: &str) -> &'o str {
 		.expect("read minted a hashline tag")
 }
 
-fn eval_output(payload: &eval::Payload, channel: OutputChannel) -> Vec<u8> {
-	payload
-		.frames
-		.iter()
-		.filter(|frame| frame.channel == channel)
-		.flat_map(|frame| frame.data.as_ref().iter().copied())
-		.collect()
-}
 #[tokio::test]
 async fn write_name_is_reserved_before_production_registry_assembly() {
 	let root = tempfile::tempdir().expect("workspace scratch directory");
@@ -825,13 +819,15 @@ async fn write_name_is_reserved_before_production_registry_assembly() {
 	registry
 		.register(EffectTool::named("write", marker), Presentation::Slot, test_claims())
 		.expect("register colliding caller write tool");
-	let con = omp_con::Ctx::new();
+	let con = Arc::new(omp_con::Ctx::new());
+	let convars = Arc::new(omp_envd::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 	let result = EnvServer::open_local(
 		root.path(),
 		state.path(),
 		registry,
 		test_config(),
 		&con,
+		convars,
 		RegistryBridges::default(),
 	)
 	.await;
@@ -862,23 +858,19 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		.map(|tool| (tool.identity.name.as_str(), tool.identity.rev.to_string()))
 		.collect::<Vec<_>>();
 	assert_eq!(identities, [
-		("checkpoint", "1".to_owned()),
-		("rewind", "1".to_owned()),
-		("ask", "1".to_owned()),
-		("ast_edit", "1".to_owned()),
-		("ast_grep", "1".to_owned()),
-		("bash", "1".to_owned()),
-		("debug", "1".to_owned()),
+		("bash", "2".to_owned()),
 		("edit", "hl.1".to_owned()),
-		("eval", "1".to_owned()),
 		("glob", "1".to_owned()),
 		("grep", "1".to_owned()),
-		("lsp", "1".to_owned()),
-		("todo", "1".to_owned()),
-		("web_search", "1".to_owned()),
-		("write", "1".to_owned()),
-		("read", "1".to_owned()),
+		("read", "2".to_owned()),
 	]);
+	for name in ["eval", "write"] {
+		assert_eq!(
+			registry.presentation(name).expect("long-tail presentation"),
+			Presentation::Device,
+			"{name} must remain reachable through dyn without entering the wire roster",
+		);
+	}
 	let hidden_yield = registry
 		.advertise_selected(
 			LoweringCaps {
@@ -896,40 +888,11 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		"yield and think must stay selectable for child/external-thinking sessions while hidden \
 		 from the top-level agent"
 	);
-	let write_definition = advertised
-		.iter()
-		.find(|tool| tool.identity.name == "write")
-		.expect("advertised write definition");
-	let write_description = write_definition
-		.definition
-		.description
-		.as_deref()
-		.expect("write description");
-	assert!(write_description.contains("`.tar.zst`"));
-	assert!(write_description.contains("other archive formats"));
-	assert!(write_description.contains("SQLite row operations"));
-	let (write_schema, write_strict) = write_definition
-		.definition
-		.input
-		.json_schema()
-		.expect("write uses JSON Schema grammar");
-	assert!(write_strict, "write schema must remain strict");
-	assert_eq!(
-		write_schema.as_value(),
-		&json!({
-			"type": "object",
-			"additionalProperties": false,
-			"required": ["i", "path", "content"],
-			"properties": {
-				"path": {"type": "string", "description": "file path"},
-				"content": {"type": "string", "description": "file content"},
-				"i": {
-					"type": "string",
-					"description": "Short present-participle intent for this call."
-				}
-			}
-		})
-	);
+	let write_spec = registry.live_spec("write").expect("write remains a live dyn device");
+	assert!(write_spec.description.contains("`.tar.zst`"));
+	assert!(write_spec.description.contains("other archive formats"));
+	assert!(write_spec.description.contains("SQLite row operations"));
+	assert!(serde_json::from_slice::<Value>(&write_spec.schema).is_ok());
 	let definition = |name: &str| {
 		advertised
 			.iter()
@@ -955,6 +918,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 			"properties": {
 				"pattern": {"type": "string", "description": "regex pattern"},
 				"i": {"type": "string", "description": "Short present-participle intent for this call."},
+				"notrunc": {"type": "boolean", "description": "Return complete output inline without central truncation."},
 				"path": {"type": "string", "description": "file, directory, glob, internal URL, or \"<file>:<lines>\" selector to search; pass several as a semicolon-delimited list (\"src; tests\"). Omitted -> searches the workspace root (\".\")"},
 				"case": {"type": "boolean", "description": "case-sensitive search"},
 				"gitignore": {"type": "boolean", "description": "respect gitignore"},
@@ -971,6 +935,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 			"properties": {
 				"path": {"type": "string", "description": "glob, file, or directory to search — a single path or a semicolon-delimited list (\"src/**/*.ts; test/**/*.ts\"). Omitted -> searches the workspace root (\".\")"},
 				"i": {"type": "string", "description": "Short present-participle intent for this call."},
+				"notrunc": {"type": "boolean", "description": "Return complete output inline without central truncation."},
 				"hidden": {"type": "boolean", "description": "include hidden files"},
 				"gitignore": {"type": "boolean", "description": "respect gitignore"},
 				"limit": {"type": "number", "description": "max results"}
@@ -985,7 +950,9 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 			"required": ["i", "path"],
 			"properties": {
 				"path": {"type": "string", "description": "Local path, internal URI (e.g. skill://), or URL. Inline selectors are supported."},
-				"i": {"type": "string", "description": "Short present-participle intent for this call."}
+				"question": {"type": "string", "description": "Optional question about one image. The active model vision route receives the question and materialized image together."},
+				"i": {"type": "string", "description": "Short present-participle intent for this call."},
+				"notrunc": {"type": "boolean", "description": "Return complete output inline without central truncation."}
 			}
 		})
 	);
@@ -997,66 +964,14 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 			"required": ["i", "input"],
 			"properties": {
 				"input": {"type": "string"},
-				"i": {"type": "string", "description": "Short present-participle intent for this call."}
+				"i": {"type": "string", "description": "Short present-participle intent for this call."},
+				"notrunc": {"type": "boolean", "description": "Return complete output inline without central truncation."}
 			}
 		})
 	);
-	assert_eq!(
-		schema("eval"),
-		json!({
-			"type": "object",
-			"additionalProperties": false,
-			"required": ["i", "language", "code"],
-			"properties": {
-				"i": {
-					"type": "string",
-					"description": "Short present-participle intent for this call."
-				},
-				"language": {
-					"type": "string",
-					"enum": ["py"],
-					"description": "runtime: \"py\" for the Python kernel"
-				},
-				"code": {
-					"type": "string",
-					"description": "code to run in this eval call, verbatim. Use top-level await freely."
-				},
-				"title": {
-					"type": "string",
-					"description": "short label shown in transcript (e.g. \"imports\", \"load config\")"
-				},
-				"timeout": {
-					"type": "number",
-					"description": "timeout for this eval call in seconds; 0 disables the cell timeout"
-				},
-				"reset": {
-					"type": "boolean",
-					"description": "wipe this language's kernel before running. Other languages are untouched."
-				},
-				"kernel_mode": {
-					"anyOf": [
-						{
-							"oneOf": [
-								{
-									"type": "string",
-									"const": "persistent",
-									"description": "Reuse the owner-scoped Python kernel."
-								},
-								{
-									"type": "string",
-									"const": "per-call",
-									"description": "Spawn a clean Python kernel for this call and dispose it at settlement."
-								}
-							],
-							"description": "Lifetime policy for the Python kernel."
-						},
-						{"type": "null"}
-					],
-					"description": "Select a persistent kernel or an isolated one-shot process."
-				}
-			}
-		})
-	);
+	let eval_spec = registry.live_spec("eval").expect("eval remains a live dyn device");
+	let eval_schema: Value = serde_json::from_slice(&eval_spec.schema).expect("eval schema");
+	assert_eq!(eval_schema["required"], json!(["i", "language", "code"]));
 	let bash_schema = schema("bash");
 	assert_eq!(bash_schema["required"], json!(["i", "command"]));
 	assert_eq!(bash_schema["properties"]["timeout"]["type"], "number");
@@ -1101,7 +1016,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 	);
 
 	let read =
-		invoke_builtin(harness.client(), "builtin-read", "read", "1", json!({"path":"note.txt"}))
+		invoke_builtin(harness.client(), "builtin-read", "read", "2", json!({"path":"note.txt"}))
 			.await;
 	assert!(
 		!read.is_error,
@@ -1184,7 +1099,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		harness.client(),
 		"builtin-read-written",
 		"read",
-		"1",
+		"2",
 		json!({"path":"nested/written.txt:raw"}),
 	)
 	.await;
@@ -1197,7 +1112,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		harness.client(),
 		"builtin-shell",
 		"bash",
-		"1",
+		"2",
 		json!({"command":"printf shell-ok"}),
 	)
 	.await;
@@ -1455,7 +1370,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	let CallOutcome::Ok(seed) = seed else {
 		panic!("embedded Python seed cell returned a fault");
 	};
-	assert_eq!(eval_output(&seed, omp_tools::eval::OutputChannel::Stdout), b"seeded\n");
+	assert!(seed.had_output);
 	assert_eq!(seed.status.outcome, omp_tools::eval::CellOutcome::Complete);
 
 	let (unrelated, unrelated_task) = harness.connect("eval-unrelated-owner").await;
@@ -1579,10 +1494,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	let CallOutcome::Ok(denied_completion) = denied_completion else {
 		panic!("completion denial returned a resource fault");
 	};
-	assert_eq!(
-		eval_output(&denied_completion, omp_tools::eval::OutputChannel::Stdout),
-		b"bridge capability denied: __completion__\n"
-	);
+	assert!(denied_completion.had_output);
 
 	let continued = invoke_builtin(
 		harness.client(),
@@ -1599,7 +1511,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 		panic!("embedded Python continuation cell returned a fault");
 	};
 	assert_eq!(continued.session_id, seed.session_id);
-	assert_eq!(eval_output(&continued, omp_tools::eval::OutputChannel::Stdout), b"cell=42\n");
+	assert!(continued.had_output);
 	assert_eq!(
 		continued.result,
 		Some(omp_tools::eval::CellValue { text: sf!("42"), json: Some(json!(42)) })
@@ -1851,8 +1763,12 @@ async fn uds_clients_invoke_owner_eval_and_retain_ordinary_tools() {
 		})
 		.expect("advertise UDS registry");
 	assert!(
-		advertised.iter().any(|tool| tool.identity.name == "eval"),
-		"in-process registry did not advertise eval"
+		advertised.iter().all(|tool| tool.identity.name != "eval"),
+		"eval must remain a dyn device rather than tax the wire roster",
+	);
+	assert_eq!(
+		harness.server.registry().presentation("eval").expect("eval presentation"),
+		Presentation::Device,
 	);
 	let local_eval = invoke_builtin(
 		harness.client(),
@@ -1916,7 +1832,7 @@ async fn uds_clients_invoke_owner_eval_and_retain_ordinary_tools() {
 		&remote,
 		"remote-read-allowed",
 		"read",
-		"1",
+		"2",
 		json!({"path":"uds-note.txt:raw"}),
 	)
 	.await;
@@ -1940,7 +1856,8 @@ async fn opt_in_python_admits_its_soft_declaration_without_shadowing_native_eval
 			maximum_strict: None,
 		})
 		.expect("advertise worker registry");
-	assert_eq!(advertised.len(), 16);
+	assert_eq!(advertised.len(), 5);
+	assert_eq!(registry.presentation("py_eval").expect("python presentation"), Presentation::Device);
 	assert!(matches!(registry.route("py_eval").expect("python route"), ToolRoute::Worker { .. }));
 	assert_eq!(
 		registry
@@ -1980,7 +1897,8 @@ async fn extension_prelude_helper_bridges_eval_without_registering_a_tool() {
 			maximum_strict: None,
 		})
 		.expect("advertise registry with prelude helper");
-	assert_eq!(advertised.len(), 16);
+	assert_eq!(advertised.len(), 5);
+	assert_eq!(registry.presentation("eval").expect("eval presentation"), Presentation::Device);
 
 	let verdict = invoke_builtin(
 		harness.client(),

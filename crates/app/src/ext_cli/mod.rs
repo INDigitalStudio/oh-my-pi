@@ -625,7 +625,7 @@ pub async fn run(args: ExtArgs) -> miette::Result<()> {
 	let data_dir = omp_core::dirs::data_dir(data_dir).into_diagnostic()?;
 	let state = StatePaths::new(&data_dir, &project);
 	let scoped_state = state.scoped(scope);
-	let settings = omp_driver::settings::current(&data_dir).map_err(|error| miette!("{error}"))?;
+	let settings = omp_driver::settings::current().map_err(|error| miette!("{error}"))?;
 	let _environment = ExtensionEnvironment::from_environment();
 	let extension_scopes = settings
 		.extension_scopes(

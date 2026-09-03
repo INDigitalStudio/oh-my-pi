@@ -41,8 +41,9 @@ impl Card for DebugCard {
 			}
 			.into_component();
 		};
-		let session = result.get("session").unwrap_or(&Value::Null);
-		let frames = result
+		let data = result.get("data").unwrap_or(&Value::Null);
+		let session = data.get("session").unwrap_or(&Value::Null);
+		let frames = data
 			.get("frames")
 			.and_then(Value::as_array)
 			.cloned()

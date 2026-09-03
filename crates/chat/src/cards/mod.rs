@@ -27,6 +27,7 @@ pub mod resolve;
 pub mod task;
 pub mod think;
 pub mod todo;
+pub mod utility;
 pub mod vibe;
 pub mod web_search;
 pub mod write;
@@ -36,6 +37,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 pub use generic::GenericCard;
 use omp_core::{Str, sf};
 use omp_dom::{Node, PropId};
+use omp_tool::{ArgPath, CallOutcome};
 use omp_tui::{Graphics, IntoComponent as _, UiContext, dom};
 use serde::de::DeserializeOwned;
 
@@ -186,25 +188,55 @@ impl CardView<'_> {
 	}
 
 	/// Deserializes the successful result into the tool's canonical payload
-	/// type.
+	/// type: the journaled `CallOutcome::Ok` truth (ADR 0008: the element
+	/// carries the payload). The bounded projection (`data` / text — the
+	/// once-bounded prompt parts, ADR 0009) is only consulted when the
+	/// element carries no typed outcome (a foreign or extension tool whose
+	/// result is its projection), never as an override of one.
 	#[must_use]
 	pub fn result<T: DeserializeOwned>(&self) -> Option<T> {
 		let node = self.result?;
-		serde_json::from_str(node_data(node).or_else(|| node_text(node))?).ok()
+		match node_outcome(node, PropId::Outcome) {
+			Some(raw) => outcome_value::<T>(raw, "ok"),
+			None => parse_either::<T>(node),
+		}
 	}
 
-	/// Parses the successful result as JSON.
+	/// The successful result's raw journaled payload as untyped JSON.
+	///
+	/// Dedicated cards should prefer [`Self::result`] with their concrete
+	/// payload. This seam is for extension and dynamic-device cards whose
+	/// payload type is not linked into `omp-chat`.
+	#[must_use]
+	pub fn outcome_json(&self) -> Option<serde_json::Value> {
+		let node = self.result?;
+		outcome_value(node_outcome(node, PropId::Outcome)?, "ok")
+	}
+
+	/// The successful result's model-facing projection parsed as JSON: the
+	/// bounded text when it is JSON, else the settled payload. Wrapper
+	/// tools whose payload embeds the JSON their cards read (`hub`
+	/// `Response::text`) decode the typed payload and unwrap it themselves;
+	/// this is the untyped fallback for tools without a card contract.
 	#[must_use]
 	pub fn result_json(&self) -> Option<serde_json::Value> {
-		serde_json::from_str(self.result_text()?).ok()
+		let node = self.result?;
+		self
+			.result_text()
+			.and_then(|text| serde_json::from_str(text).ok())
+			.or_else(|| outcome_value(node_outcome(node, PropId::Outcome)?, "ok"))
 	}
 
 	/// Deserializes the terminal diagnostic into the tool's canonical fault
-	/// type.
+	/// type: the settled `CallOutcome::Faulted` truth, else a bare fault in
+	/// `data` or the text for elements without a journaled outcome.
 	#[must_use]
 	pub fn fault<F: DeserializeOwned>(&self) -> Option<F> {
 		let node = self.diag?;
-		serde_json::from_str(node_data(node).or_else(|| node_text(node))?).ok()
+		match node_outcome(node, PropId::Fault) {
+			Some(raw) => outcome_value::<F>(raw, "faulted"),
+			None => parse_either::<F>(node),
+		}
 	}
 }
 
@@ -234,6 +266,11 @@ where
 		.or_else(|| view.args_json())
 }
 
+/// The typed payload re-encoded as JSON for cards that read it by field.
+///
+/// This intentionally never falls back to projection JSON. Typed cards consume
+/// the journaled outcome; wrapper cards that deliberately consume a textual
+/// projection call [`CardView::result_json`] themselves.
 pub(crate) fn typed_result<T>(view: &CardView<'_>) -> Option<serde_json::Value>
 where
 	T: DeserializeOwned + serde::Serialize,
@@ -241,20 +278,97 @@ where
 	view
 		.result::<T>()
 		.and_then(|value| serde_json::to_value(value).ok())
-		.or_else(|| view.result_json())
 }
 
-pub(crate) fn typed_fault<F>(view: &CardView<'_>) -> Option<omp_core::Str>
+/// Parses `data`, then the text, independently: live `data` is the
+/// prompt-part array, which is never a payload, while the text may be one.
+fn parse_either<T: DeserializeOwned>(node: &Node) -> Option<T> {
+	node_data(node)
+		.and_then(|raw| serde_json::from_str(raw).ok())
+		.or_else(|| node_text(node).and_then(|raw| serde_json::from_str(raw).ok()))
+}
+
+/// Human-readable text for a failed call: the tool fault's `message` (else
+/// its JSON), or the harness-owned prose for an abort / rejected argument
+/// (`Abort::render`), read from the journaled `CallOutcome` envelope.
+pub(crate) fn typed_fault<F>(view: &CardView<'_>) -> Option<Str>
 where
 	F: DeserializeOwned + serde::Serialize,
 {
+	if let Some(raw) = view.diag.and_then(|node| node_outcome(node, PropId::Fault)) {
+		if let Ok(outcome) = serde_json::from_str::<CallOutcome<serde_json::Value, F>>(raw) {
+			return Some(match outcome {
+				// A tool fault: its `message`, else the fold's bounded human
+				// text (the prompt-parts projection), never the raw fault JSON
+				// when a bounded rendering exists.
+				CallOutcome::Faulted(fault) => {
+					let value = serde_json::to_value(fault).ok()?;
+					match value.get("message").and_then(serde_json::Value::as_str) {
+						Some(message) => Str::new(message),
+						None => view
+							.diag
+							.and_then(node_text)
+							.filter(|text| !text.is_empty())
+							.map_or_else(|| fault_message(&value), Str::new),
+					}
+				},
+				CallOutcome::Aborted { abort, .. } => abort.render(),
+				CallOutcome::ArgsRejected(issue) => sf!(
+					"invalid argument{}: expected {}",
+					issue
+						.path
+						.iter()
+						.map(|segment| match segment {
+							ArgPath::Key(key) => format!(".{key}"),
+							ArgPath::Index(index) => format!("[{index}]"),
+						})
+						.collect::<String>(),
+					issue.expected
+				),
+				CallOutcome::Ok(_) => return None,
+			});
+		}
+	}
 	let value = serde_json::to_value(view.fault::<F>()?).ok()?;
+	Some(fault_message(&value))
+}
+
+fn fault_message(value: &serde_json::Value) -> Str {
 	let text = value
 		.get("message")
 		.and_then(serde_json::Value::as_str)
 		.map(str::to_owned)
-		.unwrap_or_else(|| serde_json::to_string(&value).unwrap_or_default());
-	Some(omp_core::Str::new(text))
+		.unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default());
+	Str::new(text)
+}
+
+/// The journaled `CallOutcome` envelope (`{"kind":…,"value":…}`) the fold
+/// stores on a settled `<result>` (`outcome`) or `<diag>` (`fault`).
+fn node_outcome(node: &Node, prop: PropId) -> Option<&str> {
+	match node.prop(&prop.into())? {
+		omp_dom::Value::Json(value) => Some(value.get()),
+		_ => None,
+	}
+}
+
+/// Unwraps the `value` of a `CallOutcome` envelope whose `kind` is `kind`.
+///
+/// Cards apply no size limit of their own (ADR 0009: output is bounded once,
+/// by dispatch, which spills over-limit outcomes to the CAS as
+/// `CallOutcomeDetails` and journals the `<diag kind=truncated>` address);
+/// whatever the element carries inline is what the card renders.
+fn outcome_value<T: DeserializeOwned>(raw: &str, kind: &str) -> Option<T> {
+	#[derive(serde::Deserialize)]
+	struct Envelope<'a> {
+		kind:  &'a str,
+		#[serde(default)]
+		value: Option<Box<serde_json::value::RawValue>>,
+	}
+	let envelope: Envelope<'_> = serde_json::from_str(raw).ok()?;
+	if envelope.kind != kind {
+		return None;
+	}
+	serde_json::from_str(envelope.value?.get()).ok()
 }
 
 fn node_data(node: &Node) -> Option<&str> {
@@ -321,6 +435,15 @@ impl CardRegistry {
 		registry.register(task::TaskCard);
 		registry.register(think::ThinkCard);
 		registry.register(todo::TodoCard);
+		registry.register(utility::CheckpointCard);
+		registry.register(utility::ImageGenCard);
+		registry.register(utility::LearnCard);
+		registry.register(utility::ManageSkillCard);
+		registry.register(utility::MemoryEditCard);
+		registry.register(utility::RewindCard);
+		registry.register(utility::SecurityScanCard);
+		registry.register(utility::TtsCard);
+		registry.register(utility::YieldCard);
 		registry.register(vibe::VibeCard);
 		registry.register(web_search::WebSearchCard);
 		registry.register(write::WriteCard);

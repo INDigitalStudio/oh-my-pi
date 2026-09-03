@@ -18,7 +18,11 @@ use omp_agent::{ApprovalDecision, ApprovalScope, ApprovalSource};
 use omp_con::Ctx;
 use omp_core::{Str, StrMut, sf};
 use omp_dom::{Dom, KnownTag, PropId, PropKey, Tag, Value};
-use omp_tui::{Frame, Key, Prop, Size, Ui, UiContext, UiEvent, assets::provider_logo, dom};
+use omp_tui::{
+	Frame, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent, assets::provider_logo, dom,
+};
+
+use crate::host::HostCommand;
 
 /// Codex quota-reset fireworks celebration.
 pub mod fireworks;
@@ -46,6 +50,12 @@ pub mod login;
 pub mod info;
 /// Full-screen `/usage` dashboard.
 pub mod usage;
+/// Confirmation selector for spending a saved usage reset.
+pub mod reset_usage;
+/// `/stats` and `/trace` report builders.
+pub mod stats;
+/// `ask@1` dialog projected from the running tool element.
+pub mod ask;
 /// Loader-then-result panel over one asynchronous service request.
 pub mod tasks;
 /// `/branch` rewind selector.
@@ -56,6 +66,8 @@ pub mod sessions;
 pub mod side;
 /// `/tree` branch explorer.
 pub mod tree;
+/// `/settings` selector over the console variable registry.
+pub mod settings;
 /// Application-supplied data feeds for dashboards and account commands.
 pub mod services;
 
@@ -94,6 +106,43 @@ pub enum PanelEvent {
 	Notice(Str),
 	/// Write text to the clipboard; the panel stays open.
 	Copy(Str),
+	/// Close the panel and answer (or dismiss, `None`) the `ask` call `id`.
+	Ask {
+		/// `<ask id>` the dialog was projected from.
+		id:      Str,
+		/// Answers in question order; `None` cancels the tool.
+		answers: Option<Vec<omp_tools::ask::Answer>>,
+	},
+	/// Ask the controller for a mutation (ADR 0005: actor input travels back
+	/// as commands; views never own mutations). The panel stays open and
+	/// learns the result through [`Panel::notify`] with
+	/// [`PanelNote::Outcome`].
+	Command(HostCommand),
+}
+
+/// Settled result of a controller-run mutation a panel asked for through
+/// [`PanelEvent::Command`]. The controller posts it back through the console
+/// mailbox as `HostAction::Outcome`; the host hands it to every open panel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Outcome {
+	/// A Git workbench mutation settled.
+	Git(git::GitOutcome),
+	/// An application-state mutation (extension, agent, plugin, account,
+	/// session index, usage reset) settled.
+	Service(services::ServiceOutcome),
+	/// An agent supervision request (revive, kill, send) settled.
+	Agent(hub::AgentOutcome),
+	/// A project/global session-index read settled.
+	SessionIndex(sessions::SessionIndexOutcome),
+}
+
+/// A fact delivered to an open panel after it opened.
+#[derive(Clone, Copy)]
+pub enum PanelNote<'a> {
+	/// The replica applied a DOM event; `dom` is the updated replica.
+	Dom(&'a Dom),
+	/// A controller-run mutation settled.
+	Outcome(&'a Outcome),
 }
 
 /// pi panel chords the host lowers before handing a panel the raw key
@@ -170,6 +219,22 @@ pub trait Panel {
 	fn key(&mut self, key: Key) -> PanelEvent;
 	/// Applies pasted text.
 	fn paste(&mut self, _text: &str) -> PanelEvent {
+		PanelEvent::Ignored
+	}
+	/// Records that real input (a key or a paste) reached the panel at
+	/// `now` on the host clock; called before [`Panel::key`] / [`Panel::paste`]
+	/// so inactivity deadlines (pi `ask.timeout`) restart from the actual
+	/// input time, never from the last periodic tick.
+	fn touch(&mut self, _now: Duration) {}
+	/// Applies one mouse report in panel-frame coordinates (the host
+	/// subtracts the composited frame's origin). `Ignored` leaves the
+	/// pointer to the document.
+	fn mouse(&mut self, _report: MouseReport) -> PanelEvent {
+		PanelEvent::Ignored
+	}
+	/// Delivers a fact that arrived while the panel was open: a DOM patch on
+	/// the replica or the outcome of a mutation the panel requested.
+	fn notify(&mut self, _note: PanelNote<'_>) -> PanelEvent {
 		PanelEvent::Ignored
 	}
 	/// Reflows for a viewport and returns the frame to composite.
@@ -260,7 +325,9 @@ impl PartialEq for PanelCall {
 impl Eq for PanelCall {}
 
 const MODEL_HINT: &str =
-	"↑/↓ models · Enter switch · type to search · Alt+P task model · Esc close";
+	"↑/↓ models · Enter switch · type to search · @ quick roles · Alt+P task model · Esc close";
+const MODEL_ROLE_HINT: &str =
+	"↑/↓ roles · Enter apply role model · type to search · Esc close";
 const MODEL_TASK_HINT: &str =
 	"↑/↓ models · Enter use for task subagents · type to search · Alt+P session model · Esc close";
 const HISTORY_HINT: &str = "↑/↓ prompts · Enter edit · type to search · Esc close";
@@ -328,6 +395,17 @@ pub struct ModelRow {
 	pub efforts:     Vec<Str>,
 }
 
+/// One configured Ctrl+P role exposed as a virtual `@role` picker row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuickRoleRow {
+	/// Role name without the leading `@`.
+	pub role:     Str,
+	/// Index of the role's resolved model in [`ModelPicker::rows`].
+	pub model:    usize,
+	/// Role-specific thinking level, when configured.
+	pub thinking: Option<Str>,
+}
+
 /// What a routed picker key did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PickerEvent {
@@ -339,6 +417,8 @@ pub enum PickerEvent {
 	Pick(usize),
 	/// Choose the model at this row index for task subagents.
 	PickTask(usize),
+	/// Apply the configured quick role at this role-row index.
+	PickRole(usize),
 	/// Put this prompt text back into the composer.
 	Recall(Str),
 }
@@ -349,6 +429,9 @@ pub struct ModelPicker {
 	rows:         Vec<ModelRow>,
 	current:      usize,
 	task_current: usize,
+	quick_roles:  Vec<QuickRoleRow>,
+	current_role: Option<usize>,
+	role_mode:    bool,
 	task_mode:    bool,
 	session_only: bool,
 	ctx:          UiContext,
@@ -367,17 +450,23 @@ impl ModelPicker {
 		rows: Vec<ModelRow>,
 		current: usize,
 		task_current: usize,
+		quick_roles: Vec<QuickRoleRow>,
+		current_role: Option<usize>,
 		session_only: bool,
 		width: u16,
 		ctx: &UiContext,
 	) -> Self {
 		let current = current.min(rows.len().saturating_sub(1));
 		let task_current = task_current.min(rows.len().saturating_sub(1));
+		let current_role = current_role.filter(|&index| index < quick_roles.len());
 		let mut picker = Self {
 			ui: Ui::from_root(dom! { <col/> }, width, ctx.clone()),
 			rows,
 			current,
 			task_current,
+			quick_roles,
+			current_role,
+			role_mode: false,
 			task_mode: false,
 			session_only,
 			ctx: ctx.clone(),
@@ -401,10 +490,17 @@ impl ModelPicker {
 		&self.rows
 	}
 
+	/// Configured quick roles in cycle order.
+	#[must_use]
+	pub fn quick_roles(&self) -> &[QuickRoleRow] {
+		&self.quick_roles
+	}
+
 	/// Routes a key into the filter and list.
 	pub fn key(&mut self, key: Key) -> PickerEvent {
 		if key == Key::Alt('p') {
 			self.task_mode = !self.task_mode;
+			self.role_mode = self.query.starts_with('@') && !self.task_mode;
 			self.rebuild();
 			return PickerEvent::Consumed;
 		}
@@ -415,6 +511,13 @@ impl ModelPicker {
 	/// Routes pasted text into the filter.
 	pub fn paste(&mut self, text: &str) -> PickerEvent {
 		let event = self.ui.handle_paste(text);
+		self.route(event)
+	}
+
+	/// Routes pointer input through the picker hit map.
+	pub fn mouse(&mut self, report: MouseReport) -> PickerEvent {
+		let event =
+			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		self.route(event)
 	}
 
@@ -439,7 +542,9 @@ impl ModelPicker {
 				.as_str()
 				.parse()
 				.map_or(PickerEvent::Consumed, |index| {
-					if self.task_mode {
+					if self.role_mode {
+						PickerEvent::PickRole(index)
+					} else if self.task_mode {
 						PickerEvent::PickTask(index)
 					} else {
 						PickerEvent::Pick(index)
@@ -450,8 +555,14 @@ impl ModelPicker {
 				PickerEvent::Consumed
 			},
 			UiEvent::Filtered { id, query, value } if id.as_str() == "models" => {
+				let role_mode = query.starts_with('@') && !self.task_mode;
 				self.query = query;
-				self.show_detail(value.and_then(|value| value.as_str().parse().ok()));
+				if role_mode != self.role_mode {
+					self.role_mode = role_mode;
+					self.rebuild();
+				} else {
+					self.show_detail(value.and_then(|value| value.as_str().parse().ok()));
+				}
 				PickerEvent::Consumed
 			},
 			_ => PickerEvent::Consumed,
@@ -459,27 +570,51 @@ impl ModelPicker {
 	}
 
 	fn rebuild(&mut self) {
-		let selected = if self.task_mode {
+		let selected = if self.role_mode {
+			self.current_role.unwrap_or(0)
+		} else if self.task_mode {
 			self.task_current
 		} else {
 			self.current
 		};
-		self.ui = build_models(
-			&self.rows,
-			selected,
-			&self.query,
-			self.list_rows,
-			self.width,
-			self.task_mode,
-			&self.ctx,
-		);
-		self.show_detail((!self.rows.is_empty()).then_some(selected));
+		self.ui = if self.role_mode {
+			build_roles(
+				&self.rows,
+				&self.quick_roles,
+				selected,
+				&self.query,
+				self.list_rows,
+				self.width,
+				&self.ctx,
+			)
+		} else {
+			build_models(
+				&self.rows,
+				selected,
+				&self.query,
+				self.list_rows,
+				self.width,
+				self.task_mode,
+				&self.ctx,
+			)
+		};
+		let has_rows = if self.role_mode {
+			!self.quick_roles.is_empty()
+		} else {
+			!self.rows.is_empty()
+		};
+		self.show_detail(has_rows.then_some(selected));
 	}
 
-	fn show_detail(&mut self, model: Option<usize>) {
-		let text = model
-			.and_then(|index| self.rows.get(index))
-			.map_or_else(|| sf!(" "), model_facts);
+	fn show_detail(&mut self, selected: Option<usize>) {
+		let model = if self.role_mode {
+			selected
+				.and_then(|index| self.quick_roles.get(index))
+				.and_then(|role| self.rows.get(role.model))
+		} else {
+			selected.and_then(|index| self.rows.get(index))
+		};
+		let text = model.map_or_else(|| sf!(" "), model_facts);
 		self.ui.set_text("model-facts", text);
 	}
 }
@@ -588,6 +723,73 @@ fn build_models(
 	Ui::from_root(tree, width, ctx.clone())
 }
 
+fn build_roles(
+	models: &[ModelRow],
+	roles: &[QuickRoleRow],
+	current: usize,
+	query: &str,
+	list_rows: u16,
+	width: u16,
+	ctx: &UiContext,
+) -> Ui {
+	struct RoleDisplay {
+		value:   Str,
+		label:   Str,
+		role:    Str,
+		model:   Str,
+		current: bool,
+		thinking: Option<Str>,
+	}
+	let display = roles
+		.iter()
+		.enumerate()
+		.filter_map(|(index, role)| {
+			let model = models.get(role.model)?;
+			let name = if model.name.is_empty() {
+				model.key.clone()
+			} else {
+				model.name.clone()
+			};
+			Some(RoleDisplay {
+				value: sf!("{index}"),
+				label: sf!("@{} {} {} {}", role.role, model.provider, name, model.key),
+				role: sf!("@{}", role.role),
+				model: name,
+				current: index == current,
+				thinking: role.thinking.clone(),
+			})
+		})
+		.collect::<Vec<_>>();
+	let seed = Str::new(query);
+	let height = list_rows.saturating_add(1);
+	let tree = dom! {
+		<box border=round title="Switch Quick Role" pad-x=1>
+			<col>
+				<select id="models" filter={seed} h={height}>
+					for row in display {
+						<option value={row.value} label={row.label} recommended={row.current}>
+							<td truncate>
+								<pre fg=accent>{row.role}</pre>
+							</td>
+							<td truncate=start grow>
+								<pre>{row.model}</pre>
+								if row.current { <pre fg=ok>{" current"}</pre> }
+							</td>
+							if let Some(thinking) = row.thinking {
+								<td align=end><pre fg=muted>{thinking}</pre></td>
+							}
+						</option>
+					}
+				</select>
+				<hr border=round/>
+				<text id="model-facts" fg=muted truncate>{" "}</text>
+				<text fg=muted truncate>{MODEL_ROLE_HINT}</text>
+			</col>
+		</box>
+	};
+	Ui::from_root(tree, width, ctx.clone())
+}
+
 fn model_facts(row: &ModelRow) -> Str {
 	let mut line = StrMut::with_capacity(96);
 	let name = if row.name.is_empty() {
@@ -679,6 +881,13 @@ impl HistoryPicker {
 	/// Routes pasted text into the filter.
 	pub fn paste(&mut self, text: &str) -> PickerEvent {
 		let event = self.ui.handle_paste(text);
+		self.route(event)
+	}
+
+	/// Routes pointer input through the picker hit map.
+	pub fn mouse(&mut self, report: MouseReport) -> PickerEvent {
+		let event =
+			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		self.route(event)
 	}
 
@@ -804,6 +1013,22 @@ impl Overlays {
 		self.notice = Some(text.into());
 	}
 
+	/// Delivers a controller or DOM fact to open panels from newest to
+	/// oldest. Exactly one panel owns any request, so the first consumed
+	/// event wins while unrelated panels remain observers.
+	pub fn notify_panels(&mut self, note: PanelNote<'_>) -> PanelEvent {
+		for overlay in self.stack.iter_mut().rev() {
+			let Overlay::Panel(panel) = overlay else {
+				continue;
+			};
+			let event = panel.notify(note);
+			if event != PanelEvent::Ignored {
+				return event;
+			}
+		}
+		PanelEvent::Ignored
+	}
+
 	/// Number of stacked overlays.
 	#[must_use]
 	pub const fn depth(&self) -> usize {
@@ -876,6 +1101,24 @@ impl Overlays {
 	/// Pops the topmost observer-local overlay.
 	pub fn dismiss(&mut self) -> Option<Overlay> {
 		self.stack.pop()
+	}
+
+	/// Removes the overlay with stable identity `id` wherever it sits in
+	/// the stack; returns whether one was open.
+	pub fn close_id(&mut self, id: &str) -> bool {
+		match self.stack.iter().rposition(|overlay| overlay.id() == id) {
+			Some(at) => {
+				self.stack.remove(at);
+				true
+			},
+			None => false,
+		}
+	}
+
+	/// Whether an overlay with stable identity `id` is open.
+	#[must_use]
+	pub fn is_open(&self, id: &str) -> bool {
+		self.stack.iter().any(|overlay| overlay.id() == id)
 	}
 
 	/// Drops the transient notice, keeping every interactive overlay.
@@ -967,7 +1210,16 @@ mod tests {
 	}
 
 	fn picker(rows: Vec<ModelRow>, current: usize, task_current: usize) -> ModelPicker {
-		ModelPicker::open(rows, current, task_current, true, 100, &UiContext::default())
+		ModelPicker::open(
+			rows,
+			current,
+			task_current,
+			Vec::new(),
+			None,
+			true,
+			100,
+			&UiContext::default(),
+		)
 	}
 
 	#[test]
@@ -1003,6 +1255,42 @@ mod tests {
 		let mut picker = picker(vec![row("alpha", "first"), row("beta", "second")], 0, 1);
 		assert_eq!(picker.key(Key::Alt('p')), PickerEvent::Consumed);
 		assert_eq!(picker.key(Key::Enter), PickerEvent::PickTask(1));
+	}
+
+	#[test]
+	fn leading_at_switches_to_quick_roles_and_returns_the_role() {
+		let rows = vec![row("alpha", "first"), row("beta", "second")];
+		let roles = vec![
+			QuickRoleRow {
+				role: Str::new_static("default"),
+				model: 0,
+				thinking: Some(Str::new_static("medium")),
+			},
+			QuickRoleRow {
+				role: Str::new_static("slow"),
+				model: 1,
+				thinking: Some(Str::new_static("high")),
+			},
+		];
+		let mut picker = ModelPicker::open(
+			rows,
+			0,
+			0,
+			roles,
+			Some(0),
+			true,
+			100,
+			&UiContext::default(),
+		);
+		for ch in "@slow".chars() {
+			assert_eq!(picker.key(Key::Char(ch)), PickerEvent::Consumed);
+		}
+		let shown = omp_tui::frame_text(picker.frame(Size::new(100, 40)));
+		assert!(shown.contains("Switch Quick Role"), "{shown}");
+		assert!(shown.contains("@slow"), "{shown}");
+		assert!(!shown.contains("@default"), "{shown}");
+		assert_eq!(picker.key(Key::Enter), PickerEvent::PickRole(1));
+		assert_eq!(picker.quick_roles()[1].thinking.as_deref(), Some("high"));
 	}
 
 	#[test]

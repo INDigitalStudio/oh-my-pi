@@ -13,7 +13,8 @@ use std::{
 
 use omp_catalog::{ProviderId, snapshot::Catalog};
 use omp_chat::overlays::services::{
-	Pending, ServiceError, ServiceResult, UsageAccount, UsageReport, UsageStatus, UsageWindow,
+	Pending, ResetAccountRow, ServiceError, ServiceResult, UsageAccount, UsageReport, UsageStatus,
+	UsageWindow,
 };
 use omp_core::Str;
 use serde_json::Value;
@@ -38,6 +39,52 @@ pub fn fetch(state: &ServiceState) -> ServiceResult<Pending<UsageReport>> {
 	let catalog = state.catalog.clone();
 	state.runtime.spawn(async move {
 		let result = build(&data_dir, catalog.as_deref()).await;
+		let _ = tx.send(result);
+	});
+	Ok(rx)
+}
+
+/// Fetches selectable saved Codex-reset accounts for the retained modal.
+pub fn reset_accounts(state: &ServiceState) -> ServiceResult<Pending<Vec<ResetAccountRow>>> {
+	let (tx, rx) = flume::bounded(1);
+	let data_dir = state.data_dir.clone();
+	state.runtime.spawn(async move {
+		let result = usage_cmd::collect_quota(
+			&data_dir,
+			Some(&ProviderId::from("openai-codex")),
+			None,
+		)
+		.await
+		.map(|snapshot| {
+			snapshot
+				.reports
+				.into_iter()
+				.enumerate()
+				.map(|(index, report)| {
+					let label = report
+						.account_meta
+						.email
+						.as_ref()
+						.or(report.account_meta.provider_account_id.as_ref())
+						.map_or_else(
+							|| usage_cmd::mask(report.account.as_str()),
+							ToString::to_string,
+						);
+					ResetAccountRow {
+						target: report.account.to_string().into(),
+						label: label.into(),
+						available: report
+							.reset_credits
+							.as_ref()
+							.map_or(0, |credits| {
+								u32::try_from(credits.available).unwrap_or(u32::MAX)
+							}),
+						active: index == 0,
+					}
+				})
+				.collect()
+		})
+		.map_err(ServiceError::failed);
 		let _ = tx.send(result);
 	});
 	Ok(rx)

@@ -59,6 +59,7 @@ fn chat_request() -> ChatRequest {
 		top_logprobs:      None,
 		safety:            Arc::from([]),
 		negotiation:       NegotiationPolicy::default(),
+		forced_call:       None,
 	}
 }
 

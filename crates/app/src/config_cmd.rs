@@ -326,7 +326,7 @@ fn load_cfg(path: &Path) -> miette::Result<Ctx> {
 	.into_diagnostic()?;
 	ctx.seal_bind_defaults();
 	if path.is_file() {
-		let script = crate::keybindings::migrate_generated_preamble(
+		let script = omp_driver::cfg::migrate_generated_preamble(
 			&fs::read_to_string(path).into_diagnostic()?,
 		);
 		let outcome =
@@ -418,7 +418,6 @@ fn flag_names(flags: VarFlags) -> Vec<&'static str> {
 	[
 		(VarFlags::ARCHIVE, "ARCHIVE"),
 		(VarFlags::SESSION, "SESSION"),
-		(VarFlags::INHERIT, "INHERIT"),
 		(VarFlags::REPLICATED, "REPLICATED"),
 		(VarFlags::READONLY, "READONLY"),
 		(VarFlags::NOTIFY, "NOTIFY"),
@@ -439,30 +438,57 @@ fn value_at<'a>(document: &'a toml::Table, path: &str) -> Option<&'a toml::Value
 }
 
 /// Migrates legacy TOML settings and keybindings to the archived command
-/// stream.
+/// stream, scope for scope (ADR 0012): the user `config.toml` (plus
+/// `OMP_CONFIG_FILES` overlays) and legacy keybindings become the user
+/// `config.cfg`; `<project>/.omp/config.toml` becomes
+/// `<project>/.omp/config.cfg`, never a global setting. Returns the user
+/// cfg path.
 ///
 /// Re-running migration over unchanged inputs writes identical bytes.
 pub fn migrate_settings(data_dir: &Path, project: &Path) -> miette::Result<PathBuf> {
-	let mut document = toml::Table::new();
-	let mut sources = vec![data_dir.join("config.toml"), project.join(".omp/config.toml")];
+	let mut user_sources = vec![data_dir.join("config.toml")];
 	if let Some(overlays) = env::var_os("OMP_CONFIG_FILES") {
-		sources.extend(env::split_paths(&overlays));
+		user_sources.extend(env::split_paths(&overlays));
 	}
+	let user = migrate_toml_sources(&user_sources)?;
+	migrate_keybindings(data_dir, &user)?;
+	let destination = crate::config_path().into_diagnostic()?;
+	persist_cfg(&destination, &user)?;
+
+	let project_source = project.join(".omp/config.toml");
+	if project_source.is_file() {
+		let scoped = migrate_toml_sources(std::slice::from_ref(&project_source))?;
+		persist_cfg(&project.join(".omp/config.cfg"), &scoped)?;
+	}
+	Ok(destination)
+}
+
+/// Folds legacy TOML documents (later sources override earlier) into one
+/// archive-layer context through the per-crate legacy mappings.
+fn migrate_toml_sources(sources: &[PathBuf]) -> miette::Result<Ctx> {
+	let mut document = toml::Table::new();
 	for source in sources {
 		if !source.is_file() {
 			continue;
 		}
-		let text = fs::read_to_string(&source).into_diagnostic()?;
+		let text = fs::read_to_string(source).into_diagnostic()?;
 		let incoming = text.parse::<toml::Table>().into_diagnostic()?;
 		merge_toml(&mut document, incoming);
 	}
 	let ctx = Ctx::new();
 	for mappings in [
 		omp_catalog::settings::LEGACY_CONVAR_MAPPINGS,
+		omp_catalog::pi_settings::LEGACY_CONVAR_MAPPINGS,
 		omp_inference::settings::LEGACY_CONVAR_MAPPINGS,
+		omp_inference::pi_settings::LEGACY_CONVAR_MAPPINGS,
 		omp_tools::settings::LEGACY_CONVAR_MAPPINGS,
+		omp_tools::pi_settings::LEGACY_CONVAR_MAPPINGS,
 		omp_envd::LEGACY_CONVAR_MAPPINGS,
+		omp_envd::pi_settings::LEGACY_CONVAR_MAPPINGS,
 		omp_driver::settings::LEGACY_CONVAR_MAPPINGS,
+		omp_driver::pi_settings::LEGACY_CONVAR_MAPPINGS,
+		crate::settings::LEGACY_CONVAR_MAPPINGS,
+		omp_chat::settings::LEGACY_CONVAR_MAPPINGS,
 		crate::voice::settings::LEGACY_CONVAR_MAPPINGS,
 	] {
 		for &(legacy_path, name) in mappings {
@@ -479,10 +505,7 @@ pub fn migrate_settings(data_dir: &Path, project: &Path) -> miette::Result<PathB
 				.into_diagnostic()?;
 		}
 	}
-	migrate_keybindings(data_dir, &ctx)?;
-	let destination = crate::config_path().into_diagnostic()?;
-	persist_cfg(&destination, &ctx)?;
-	Ok(destination)
+	Ok(ctx)
 }
 
 fn merge_toml(target: &mut toml::Table, incoming: toml::Table) {

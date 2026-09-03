@@ -100,6 +100,8 @@ async fn typed_client_uses_shared_varint_codec_and_disconnects_cleanly() {
 async fn unknown_frame_receives_the_same_protocol_error_as_stream_dispatch() {
 	let root = tempfile::tempdir().expect("workspace");
 	let state = tempfile::tempdir().expect("state");
+	let con = Arc::new(omp_con::Ctx::new());
+	let convars = Arc::new(omp_envd::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 	let server = Arc::new(
 		EnvServer::open_local(
 			root.path(),
@@ -107,7 +109,8 @@ async fn unknown_frame_receives_the_same_protocol_error_as_stream_dispatch() {
 			Registry::new(),
 			ExtHostConfig::current(Principal::new(sf!("test"), sf!("Test")), sf!("test-session"), 1)
 				.expect("host config"),
-			omp_app::SETTINGS_CATALOG,
+			&con,
+			convars,
 			RegistryBridges::default(),
 		)
 		.await

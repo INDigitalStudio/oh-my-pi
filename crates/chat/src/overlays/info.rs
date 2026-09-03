@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use omp_con::{AI_COMPACT_THRESHOLD, AI_MODEL, CL_CHARSET, CL_THEME, Ctx, DumpOptions};
 use omp_core::{Str, sf};
 use omp_dom::{Dom, PropKey, Value};
-use omp_tui::{Frame, Key, Prop, Size, Ui, UiContext, UiEvent, dom};
+use omp_tui::{Frame, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent, dom};
 
 use super::{Panel, PanelAnchor, PanelCx, PanelEvent};
 use crate::status_line::StatusLine;
@@ -78,6 +78,16 @@ impl DebugSelector {
 		};
 		self.ui = Ui::from_root(tree, width, self.ctx.clone());
 	}
+
+	fn route(&mut self, event: UiEvent) -> PanelEvent {
+		match event {
+			UiEvent::Cancel => PanelEvent::Close,
+			UiEvent::Changed { id, value } if id.as_str() == "actions" => {
+				PanelEvent::Finish(sf!("debug {}", value.as_str()))
+			},
+			_ => PanelEvent::Consumed,
+		}
+	}
 }
 
 impl Panel for DebugSelector {
@@ -93,13 +103,14 @@ impl Panel for DebugSelector {
 		if key == Key::Esc {
 			return PanelEvent::Close;
 		}
-		match self.ui.handle_key(key) {
-			UiEvent::Cancel => PanelEvent::Close,
-			UiEvent::Changed { id, value } if id.as_str() == "actions" => {
-				PanelEvent::Finish(sf!("debug {}", value.as_str()))
-			},
-			_ => PanelEvent::Consumed,
-		}
+		let event = self.ui.handle_key(key);
+		self.route(event)
+	}
+
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		let event =
+			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		self.route(event)
 	}
 
 	fn frame(&mut self, viewport: Size) -> &Frame {
@@ -306,7 +317,23 @@ fn system_report(cx: &PanelCx<'_>) -> Str {
 
 #[cfg(test)]
 mod tests {
+	use omp_tui::{Mods, Mouse, MouseButton};
+
 	use super::*;
+
+	fn mouse(kind: Mouse, col: u16, row: u16, button: MouseButton) -> MouseReport {
+		MouseReport { kind, col, row, button, mods: Mods::default(), pressed: true }
+	}
+
+	fn point(text: &str, needle: &str) -> (u16, u16) {
+		text.lines()
+			.enumerate()
+			.find_map(|(row, line)| {
+				let byte = line.find(needle)?;
+				Some((omp_tui::cell_width(&line[..byte]), u16::try_from(row).unwrap()))
+			})
+			.expect("text point")
+	}
 
 	#[test]
 	fn debug_selector_enter_finishes_with_the_chosen_key() {
@@ -320,6 +347,18 @@ mod tests {
 		assert_eq!(panel.key(Key::Down), PanelEvent::Consumed);
 		assert_eq!(panel.key(Key::Enter), PanelEvent::Finish(sf!("debug system")));
 		assert_eq!(panel.key(Key::Esc), PanelEvent::Close);
+	}
+
+	#[test]
+	fn debug_selector_click_commits_the_hit_row() {
+		let ctx = UiContext::default();
+		let mut panel = DebugSelector::open(&ctx, 60);
+		let text = omp_tui::frame_text(panel.frame(Size { width: 60, height: 12 }));
+		let (col, row) = point(&text, "system");
+		assert_eq!(
+			panel.mouse(mouse(Mouse::Click, col, row, MouseButton::Left)),
+			PanelEvent::Finish(sf!("debug system"))
+		);
 	}
 
 	#[test]

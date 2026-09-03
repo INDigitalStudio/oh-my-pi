@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use flume::Receiver;
 use omp_core::{Str, StrMut};
-use omp_tui::{Frame, Key, Prop, Size, Ui, UiContext, UiEvent, dom};
+use omp_tui::{Frame, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent, dom};
 
 use super::{Panel, PanelAnchor, PanelCx, PanelEvent, services::SideEvent};
 
@@ -112,6 +112,13 @@ impl SidePanel {
 		changed
 	}
 
+	fn route(&mut self, event: UiEvent) -> PanelEvent {
+		match event {
+			UiEvent::Cancel => PanelEvent::Close,
+			_ => PanelEvent::Consumed,
+		}
+	}
+
 	fn rebuild(&mut self) {
 		let question = self.question.clone();
 		let status = self.status.label();
@@ -174,12 +181,18 @@ impl Panel for SidePanel {
 					PanelEvent::Copy(Str::new(self.answer.as_str()))
 				}
 			},
-			Key::Up | Key::Down | Key::PageUp | Key::PageDown => match self.ui.handle_key(key) {
-				UiEvent::Cancel => PanelEvent::Close,
-				_ => PanelEvent::Consumed,
+			Key::Up | Key::Down | Key::PageUp | Key::PageDown => {
+				let event = self.ui.handle_key(key);
+				self.route(event)
 			},
 			_ => PanelEvent::Ignored,
 		}
+	}
+
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		let event =
+			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		self.route(event)
 	}
 
 	fn frame(&mut self, viewport: Size) -> &Frame {
@@ -214,6 +227,7 @@ impl Panel for SidePanel {
 mod tests {
 	use omp_con::Ctx;
 	use omp_dom::Dom;
+	use omp_tui::{Mods, Mouse, MouseButton};
 
 	use super::*;
 	use std::sync::Arc;
@@ -222,6 +236,27 @@ mod tests {
 
 	fn cx<'a>(dom: &'a Dom, con: &'a Ctx, ui: &'a UiContext, services: &'a Arc<dyn Services>) -> PanelCx<'a> {
 		PanelCx { dom, con, ui, viewport: Size { width: 60, height: 24 }, services }
+	}
+
+	fn wheel_down(col: u16, row: u16) -> MouseReport {
+		MouseReport {
+			kind: Mouse::WheelDown,
+			col,
+			row,
+			button: MouseButton::WheelDown,
+			mods: Mods::default(),
+			pressed: true,
+		}
+	}
+
+	fn point(text: &str, needle: &str) -> (u16, u16) {
+		text.lines()
+			.enumerate()
+			.find_map(|(row, line)| {
+				let byte = line.find(needle)?;
+				Some((omp_tui::cell_width(&line[..byte]), u16::try_from(row).unwrap()))
+			})
+			.expect("text point")
 	}
 
 	#[test]
@@ -250,6 +285,28 @@ mod tests {
 			PanelEvent::Copy(Str::new_static("Rayleigh scattering."))
 		);
 		assert_eq!(panel.key(Key::Esc), PanelEvent::Close);
+	}
+
+	#[test]
+	fn wheel_scrolls_the_streamed_answer() {
+		let dom = Dom::new();
+		let con = Ctx::new();
+		let ui = UiContext::default();
+		let services: Arc<dyn Services> = Arc::new(NoServices);
+		let (tx, rx) = flume::unbounded();
+		let mut panel = SidePanel::btw(Str::new_static("q"), rx, &cx(&dom, &con, &ui, &services));
+		tx.send(SideEvent::Delta(Str::new_static(
+			"line 1  \nline 2  \nline 3  \nline 4  \nline 5  \nline 6",
+		)))
+		.unwrap();
+		assert!(panel.tick(Duration::from_millis(40)));
+		let size = Size { width: 60, height: 15 };
+		let before = omp_tui::frame_text(panel.frame(size));
+		let (col, row) = point(&before, "line 1");
+		assert_eq!(panel.mouse(wheel_down(col, row)), PanelEvent::Consumed);
+		let after = omp_tui::frame_text(panel.frame(size));
+		assert_ne!(after, before, "wheel must move the answer viewport");
+		assert!(after.contains("line 4"), "next answer row did not enter the viewport:\n{after}");
 	}
 
 	#[test]

@@ -4,9 +4,7 @@ use omp_journal::{Entry, Journal, kind};
 
 /// Opens a journal and returns every recovered entry.
 pub fn journal_entries(path: &std::path::Path) -> Vec<Entry> {
-	let (journal, entries) = Journal::open(path).expect("journal opens");
-	drop(journal);
-	entries
+	Journal::scan(path).expect("journal scans")
 }
 
 /// Asserts that every non-genesis entry carries its journal cause.

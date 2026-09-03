@@ -29,7 +29,6 @@ gui = ["dep:omp-gui"]
 local-all = [
 	"local-applefm",
 	"local-embedding",
-	"local-text",
 	"local-stt",
 	"local-tts",
 ]
@@ -40,7 +39,6 @@ local-embedding = [
 	"omp-inference/local-embedding",
 	"omp-memory/local-embedding",
 ]
-local-text = ["local", "omp-driver/local-text", "omp-inference/local-text"]
 local-stt = ["local", "omp-driver/local-stt", "omp-inference/local-stt"]
 local-tts = ["local", "omp-driver/local-tts", "omp-inference/local-tts"]
 

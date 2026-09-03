@@ -113,13 +113,16 @@ impl ChildEnvironment {
 		extension.python_site = Some(root.clone());
 		config.extensions.push(extension);
 
+		let con = Arc::new(omp_con::Ctx::new());
+		let convars = Arc::new(omp_envd::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 		let server = Arc::new(
 			EnvServer::open_local(
 				&root,
 				state.path(),
 				Registry::new(),
 				config,
-				&omp_con::Ctx::new(),
+				&con,
+				convars,
 				RegistryBridges::default(),
 			)
 			.await

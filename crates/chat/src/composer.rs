@@ -59,6 +59,145 @@ pub enum PrefixMode {
 	Eval,
 }
 
+/// One submitted prefix-mode line: what to run locally and whether the
+/// model may see it (pi `!!` / `$$` `excludeFromContext`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalInput {
+	/// Which executor the sigil selects.
+	pub mode:    PrefixMode,
+	/// The command or code after the sigil, trimmed.
+	pub code:    Str,
+	/// Keep the run out of the model's context.
+	pub exclude: bool,
+}
+
+/// pi `pythonCommandPrefixLength`: `$` / `$$` starts eval mode only when
+/// followed by whitespace or the end of input, so `$HOME is set` and `${x}`
+/// stay prose.
+fn eval_prefix_len(trimmed: &str) -> usize {
+	let bytes = trimmed.as_bytes();
+	if bytes.first() != Some(&b'$') || bytes.get(1) == Some(&b'{') {
+		return 0;
+	}
+	let prefix = if bytes.get(1) == Some(&b'$') { 2 } else { 1 };
+	match bytes.get(prefix) {
+		None => prefix,
+		Some(b' ' | b'\t' | b'\n' | b'\r') => prefix,
+		Some(_) => 0,
+	}
+}
+
+/// Commands a pasted shell prompt typically starts with (pi
+/// `SHELL_PROMPT_COMMAND_RE`, minus the path forms handled inline).
+const SHELL_PROMPT_COMMANDS: &[&str] = &[
+	"cd", "sudo", "git", "bun", "npm", "pnpm", "yarn", "node", "cargo", "go", "make", "docker",
+	"kubectl",
+];
+
+/// Whether `word` is a shell-prompt command: one of [`SHELL_PROMPT_COMMANDS`]
+/// or `python` with an optional version suffix (`python`, `python3`,
+/// `python3.12` is not: pi's `python\d*` stops at the digits).
+fn is_shell_prompt_command(word: &str) -> bool {
+	SHELL_PROMPT_COMMANDS.contains(&word)
+		|| word
+			.strip_prefix("python")
+			.is_some_and(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Whether `token` is a shell operator standing alone between whitespace
+/// (pi `SHELL_PROMPT_OPERATOR_RE`: `&&`, `||`, `|`, `2>&1`, and one or two
+/// redirection chevrons).
+fn is_shell_operator(token: &str) -> bool {
+	matches!(token, "&&" | "||" | "|" | "2>&1")
+		|| ((1..=2).contains(&token.len()) && token.bytes().all(|byte| matches!(byte, b'<' | b'>')))
+}
+
+/// Whether `line` is omp's own status line (`in: 12 out: 34 [cache …] t: …
+/// tok/s: …`, pi `OMP_STATUS_LINE_RE`), the tell of a pasted transcript.
+fn is_status_line(line: &str) -> bool {
+	fn number(word: &str) -> bool {
+		!word.is_empty() && word.bytes().all(|byte| byte.is_ascii_digit())
+	}
+	let mut words = line.split_ascii_whitespace();
+	if words.next() != Some("in:") || !words.next().is_some_and(number) {
+		return false;
+	}
+	if words.next() != Some("out:") || !words.next().is_some_and(number) {
+		return false;
+	}
+	let mut next = words.next();
+	if next == Some("cache") {
+		if words.next().is_none() {
+			return false;
+		}
+		next = words.next();
+	}
+	next == Some("t:")
+		&& words.next().is_some()
+		&& words.next() == Some("tok/s:")
+		&& words.next().is_some()
+}
+
+/// pi `looksLikePastedShellPrompt`: a single-`$` body shaped like a copied
+/// terminal line (`$ cd ~/project && cargo test`, `$ git status`) stays an
+/// ordinary prompt instead of being run as Python.
+#[must_use]
+pub fn looks_like_pasted_shell_prompt(code: &str) -> bool {
+	let first = code.split('\n').next().unwrap_or_default().trim_start();
+	let starts_like_path = first.starts_with('/')
+		|| first.starts_with("./")
+		|| first.starts_with("../")
+		|| first.starts_with("~/");
+	let head = first
+		.split(|c: char| c.is_whitespace())
+		.next()
+		.unwrap_or_default();
+	starts_like_path
+		|| is_shell_prompt_command(head)
+		|| first.split_whitespace().any(is_shell_operator)
+		|| code.lines().any(is_status_line)
+}
+
+/// Splits a draft into its sigil and body (pi `parsePythonCommandInput`
+/// plus the `!` branch of `handleSubmit`): the mode, the prefix length, and
+/// the trimmed code. `None` is prose.
+fn split_local(text: &str) -> Option<(PrefixMode, usize, &str)> {
+	let trimmed = text.trim_start();
+	let (mode, prefix) = if trimmed.starts_with('!') {
+		(PrefixMode::Bash, if trimmed.starts_with("!!") { 2 } else { 1 })
+	} else {
+		match eval_prefix_len(trimmed) {
+			0 => return None,
+			len => (PrefixMode::Eval, len),
+		}
+	};
+	let code = trimmed[prefix..].trim();
+	if mode == PrefixMode::Eval && prefix == 1 && looks_like_pasted_shell_prompt(code) {
+		return None;
+	}
+	Some((mode, prefix, code))
+}
+
+/// Classifies a draft's leading sigil (pi `isBashMode` / `isPythonMode`);
+/// a pasted shell prompt behind a single `$` is prose.
+#[must_use]
+pub fn prefix_mode_of(text: &str) -> Option<PrefixMode> {
+	split_local(text).map(|(mode, _, _)| mode)
+}
+
+/// Parses a submitted line into a local run (pi `input-controller.ts`
+/// `handleSubmit`: `!cmd`, `!!cmd`, `$ code`, `$$ code`). `None` is an
+/// ordinary prompt, including a bare sigil with nothing to run and a
+/// single-`$` line that [`looks_like_pasted_shell_prompt`].
+#[must_use]
+pub fn parse_local_input(text: &str) -> Option<LocalInput> {
+	let (mode, prefix, code) = split_local(text)?;
+	if code.is_empty() {
+		return None;
+	}
+	Some(LocalInput { mode, code: Str::new(code), exclude: prefix == 2 })
+}
+
 /// Max gap between two spaces for the later one to count as OS auto-repeat
 /// (pi `SPACE_REPEAT_MAX_GAP_MS`).
 pub const SPACE_REPEAT_MAX_GAP: Duration = Duration::from_millis(120);
@@ -393,11 +532,7 @@ impl Composer {
 	/// `isBashMode` / `isPythonMode`).
 	#[must_use]
 	pub fn prefix_mode(&self) -> Option<PrefixMode> {
-		match self.text().trim_start().as_bytes().first() {
-			Some(b'!') => Some(PrefixMode::Bash),
-			Some(b'$') => Some(PrefixMode::Eval),
-			_ => None,
-		}
+		prefix_mode_of(&self.text())
 	}
 
 	/// Current composer line, for `cl_copy_line`.
@@ -778,28 +913,81 @@ mod tests {
 		assert!(!displayed.contains("line0"), "the chip stays collapsed on screen");
 		let expanded = composer.text();
 		assert_eq!(expanded, format!("{paste} tail"), "the editor draft carries the paste");
-		let tall = composer.height();
+		assert!(rows(&composer).iter().any(|row| row.contains("#1 ───")), "card band shown");
 
 		let edited = format!("{expanded}\nedited");
 		composer.replace_edited(&edited);
 		assert_eq!(composer.text(), edited, "verbatim replacement, nothing re-collapsed");
 		assert_eq!(composer.text_displayed(), edited);
-		assert!(composer.height() < tall, "the attachment card band is gone");
+		let after = rows(&composer);
+		assert!(!after.iter().any(|row| row.contains("#1 ───")), "the attachment card band is gone");
+		assert!(after.iter().any(|row| row.contains("line0")), "the expanded lines are editable");
 	}
-}
-#[cfg(test)]
-mod dbg_tests {
-	use super::*;
+
 	#[test]
-	fn dbg_gap() {
-		let mut composer = Composer::new(60, UiContext::default(), StatusFacts::default(), vec![], None);
-		for c in "hi".chars() { composer.key(Key::Char(c)); }
-		eprintln!("A {:?} h={}", omp_tui::frame_text(composer.frame()).lines().collect::<Vec<_>>(), composer.height());
-		composer.set_status_row_occupied(true);
-		eprintln!("B {:?} h={}", omp_tui::frame_text(composer.frame()).lines().collect::<Vec<_>>(), composer.height());
-		composer.set_status_row_occupied(false);
-		eprintln!("C {:?} h={}", omp_tui::frame_text(composer.frame()).lines().collect::<Vec<_>>(), composer.height());
-		composer.set_plan_mode(true);
-		eprintln!("D {:?} h={}", omp_tui::frame_text(composer.frame()).lines().collect::<Vec<_>>(), composer.height());
+	fn prefix_lines_parse_like_pi_and_prose_stays_prose() {
+		let bash = parse_local_input("  !echo hi").expect("bash");
+		assert_eq!(bash, LocalInput { mode: PrefixMode::Bash, code: "echo hi".into(), exclude: false });
+		let hidden = parse_local_input("!! ls -la ").expect("excluded bash");
+		assert_eq!(hidden.code, "ls -la");
+		assert!(hidden.exclude);
+		let eval = parse_local_input("$ 1+1").expect("eval");
+		assert_eq!(eval, LocalInput { mode: PrefixMode::Eval, code: "1+1".into(), exclude: false });
+		let hidden_eval = parse_local_input("$$\tprint(2)").expect("excluded eval");
+		assert!(hidden_eval.exclude && hidden_eval.mode == PrefixMode::Eval);
+		// A bare sigil runs nothing; shell-style variables and `${…}` are prose.
+		assert_eq!(parse_local_input("!"), None);
+		assert_eq!(parse_local_input("$ "), None);
+		assert_eq!(parse_local_input("$HOME is set"), None);
+		assert_eq!(parse_local_input("${x} costs $5"), None);
+		assert_eq!(prefix_mode_of("$HOME"), None);
+		assert_eq!(prefix_mode_of("$"), Some(PrefixMode::Eval));
+		assert_eq!(prefix_mode_of("!"), Some(PrefixMode::Bash));
+	}
+
+	/// pi `looksLikePastedShellPrompt`: every branch of the three regexes.
+	#[test]
+	fn pasted_shell_prompts_behind_a_single_dollar_stay_prose() {
+		// SHELL_PROMPT_COMMAND_RE: path forms and the command roster.
+		for line in [
+			"$ cd ~/project && cargo test",
+			"$ git status",
+			"$ ./run.sh",
+			"$ ../scripts/build",
+			"$ /usr/bin/env",
+			"$ ~/bin/tool --flag",
+			"$ sudo make install",
+			"$ python3 -m venv .venv",
+			"$ python",
+			"$ kubectl get pods",
+			"$ cd",
+			// SHELL_PROMPT_OPERATOR_RE: standalone operators anywhere on the first line.
+			"$ cat a | sort",
+			"$ a || b",
+			"$ run 2>&1",
+			"$ echo hi > out.txt",
+			"$ prog << EOF",
+			"$ cmd < input",
+			// OMP_STATUS_LINE_RE: a pasted omp status line on any line.
+			"$ first\nin: 12 out: 34 t: 1.2s tok/s: 40",
+			"$ first\n  in: 12 out: 34 cache 5% t: 1.2s tok/s: 40",
+		] {
+			assert_eq!(parse_local_input(line), None, "{line:?} must stay a prompt");
+			assert_eq!(prefix_mode_of(line), None, "{line:?} must not paint eval mode");
+		}
+		// The guard is about shell shapes, not tokens inside Python.
+		for line in ["$ print('cd')", "$ gitlab = 1", "$ python_version()", "$ x|y", "$ 1<2"] {
+			let parsed = parse_local_input(line).unwrap_or_else(|| panic!("{line:?} is Python"));
+			assert_eq!(parsed.mode, PrefixMode::Eval);
+			assert_eq!(prefix_mode_of(line), Some(PrefixMode::Eval));
+		}
+		// `$$` is explicit: pi skips the guard for the excluded form.
+		let forced = parse_local_input("$$ git status").expect("explicit eval");
+		assert!(forced.exclude);
+		assert_eq!(forced.code, "git status");
+		assert_eq!(prefix_mode_of("$$ git status"), Some(PrefixMode::Eval));
+		// Only the first line decides the command/operator shape.
+		assert!(parse_local_input("$ x = 1\ncd home").is_some());
+		assert!(looks_like_pasted_shell_prompt("cd home\nx = 1"));
 	}
 }

@@ -39,9 +39,9 @@ impl Card for AskCard {
 		let selected: BTreeMap<String, Vec<String>> = answers
 			.iter()
 			.filter_map(|answer| {
-				let id = answer.get("question")?.as_str()?.to_owned();
+				let id = answer.get("id")?.as_str()?.to_owned();
 				let values = answer
-					.get("options")?
+					.get("selected")?
 					.as_array()?
 					.iter()
 					.filter_map(Value::as_str)

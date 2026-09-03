@@ -2,12 +2,11 @@
 
 use omp_core::{Str, sf};
 use omp_dom::{Node, PropId};
+use omp_tools::todo::Status;
 use omp_tui::{IntoComponent as _, UiContext, components::STRIKE_TOTAL_FRAMES, dom};
 use serde_json::Value;
 
-use super::{
-	Card, CardStatus, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result,
-};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_fault, typed_input};
 
 /// Session todo/checklist card.
 pub struct TodoCard;
@@ -54,7 +53,7 @@ fn newly_completed(view: &CardView<'_>) -> Option<(Option<Str>, Str)> {
 	if args.get("op").and_then(Value::as_str) != Some("done") {
 		return None;
 	}
-	let item = args.get("item").and_then(Value::as_str).map(Str::new)?;
+	let item = args.get("task").and_then(Value::as_str).map(Str::new)?;
 	let phase = args.get("phase").and_then(Value::as_str).map(Str::new);
 	Some((phase, item))
 }
@@ -62,31 +61,18 @@ fn newly_completed(view: &CardView<'_>) -> Option<(Option<Str>, Str)> {
 fn render_checklist(view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Component {
 	let completed_now = newly_completed(view);
 	let sweep = sf!("{}ms", TODO_STRIKE_FRAME_MS * u64::from(STRIKE_TOTAL_FRAMES));
-	let result = typed_result::<omp_tools::todo::Payload>(view).unwrap_or(Value::Null);
-	let phases = result
-		.get("phases")
-		.and_then(Value::as_array)
-		.map(Vec::as_slice)
+	let phases = view
+		.result::<omp_tools::todo::Payload>()
+		.map(|payload| payload.phases)
 		.unwrap_or_default();
-	let total: usize = phases
-		.iter()
-		.filter_map(|phase| phase.get("tasks").and_then(Value::as_array))
-		.map(Vec::len)
-		.sum();
+	let total: usize = phases.iter().map(|phase| phase.tasks.len()).sum();
 	let mut phase_rows = Vec::new();
 	for (phase_index, phase) in phases.iter().enumerate() {
-		let title = phase
-			.get("title")
-			.and_then(Value::as_str)
-			.unwrap_or_default();
-		let tasks = phase
-			.get("tasks")
-			.and_then(Value::as_array)
-			.map(Vec::as_slice)
-			.unwrap_or_default();
+		let title = phase.name.as_str();
+		let tasks = phase.tasks.as_slice();
 		let done = tasks
 			.iter()
-			.filter(|task| task.get("status").and_then(Value::as_str) == Some("completed"))
+			.filter(|task| task.status == Status::Completed)
 			.count();
 		let heading = sf!("{}. {title}", roman_numeral(phase_index + 1));
 		phase_rows.push(
@@ -94,13 +80,12 @@ fn render_checklist(view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Com
 				.into_component(),
 		);
 		for (task_index, task) in tasks.iter().enumerate() {
-			let text = Str::new(task.get("text").and_then(Value::as_str).unwrap_or_default());
-			let completed = task.get("status").and_then(Value::as_str) == Some("completed");
+			let text = task.content.clone();
+			let completed = task.status == Status::Completed;
 			let blocker = task
-				.get("blocker")
-				.and_then(Value::as_str)
-				.filter(|text| !text.is_empty())
-				.map(Str::new);
+				.blocker
+				.clone()
+				.filter(|text| !text.is_empty());
 			let last = task_index + 1 == tasks.len();
 			let sweeping = completed
 				&& completed_now.as_ref().is_some_and(|(phase, item)| {
@@ -198,12 +183,18 @@ mod tests {
 	use super::TodoCard;
 	use crate::cards::{Card as _, CardStatus, CardView};
 
-	const RESULT: &str = r#"{"phases":[{"title":"Foundation","tasks":[{"text":"Scaffold crate","status":"completed"},{"text":"Wire workspace","status":"completed"}]}]}"#;
+	const RESULT: &str = r#"{"op":"view","phases":[{"name":"Foundation","tasks":[{"content":"Scaffold crate","status":"completed"},{"content":"Wire workspace","status":"completed"}]}],"completed_tasks":[]}"#;
 
 	fn text_node(tag: KnownTag, text: &'static str) -> Node {
 		let mut props = smallvec::SmallVec::new();
 		props.push((PropId::Text.into(), Value::Str(Str::new_static(text))));
 		Node { tag: tag.into(), props, kids: Vec::new(), content: None }
+	}
+
+	/// Cell column of `needle` in a single-width row (`str::find` is bytes).
+	fn column_of(row: &str, needle: &str) -> u16 {
+		let at = row.find(needle).expect("task row");
+		u16::try_from(row[..at].chars().count()).unwrap()
 	}
 
 	fn struck(ui: &Ui, row: u16, from: u16, len: u16) -> Vec<bool> {
@@ -217,7 +208,7 @@ mod tests {
 	fn todo_strike_reveals_progressively_then_settles() {
 		let input = text_node(
 			KnownTag::Input,
-			r#"{"op":"done","phase":"Foundation","item":"Scaffold crate"}"#,
+			r#"{"op":"done","phase":"Foundation","task":"Scaffold crate"}"#,
 		);
 		let result = text_node(KnownTag::Result, RESULT);
 		let view = CardView {
@@ -231,7 +222,7 @@ mod tests {
 		};
 		let mut ui = Ui::from_root(TodoCard.render(&view, false, &UiContext::default()), 40, UiContext::default());
 		let row = frame_row_text(ui.frame(), 2);
-		let at = u16::try_from(row.find("Scaffold").expect("task row")).unwrap();
+		let at = column_of(&row, "Scaffold");
 		let len = u16::try_from("Scaffold crate".len()).unwrap();
 		// The task the op just completed starts plain and sweeps; the other
 		// completed task was struck already and stays struck throughout.
@@ -263,7 +254,7 @@ mod tests {
 			started: None,
 		};
 		let ui = Ui::from_root(TodoCard.render(&view, false, &UiContext::default()), 40, UiContext::default());
-		let at = u16::try_from(frame_row_text(ui.frame(), 2).find("Scaffold").unwrap()).unwrap();
+		let at = column_of(&frame_row_text(ui.frame(), 2), "Scaffold");
 		assert!(struck(&ui, 2, at, 14).iter().all(|s| *s));
 		assert_eq!(ui.next_wake(), None);
 	}

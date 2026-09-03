@@ -7,7 +7,7 @@ use omp_dom::{Node, PropId};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_input, typed_result};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_input};
 
 /// Unified hub card; the `op` argument selects the compact presentation.
 pub struct HubCard;
@@ -44,10 +44,25 @@ impl Card for HubCard {
 	}
 }
 
+/// Decodes the typed hub envelope first, then its model-facing JSON text.
+/// Hub is intentionally a wrapper tool: unlike ordinary typed cards, its
+/// operation-specific projection is nested in `Response::text`.
+fn result_value(view: &CardView<'_>) -> Option<Value> {
+	let response = view.result::<omp_tools::hub::Response>()?;
+	serde_json::from_str(response.text.as_str())
+		.ok()
+		.or_else(|| Some(serde_json::json!({ "text": response.text })))
+}
+
 fn render_generic(view: &CardView<'_>) -> Component {
-	let detail = typed_result::<omp_tools::hub::Response>(view)
+	let result = result_value(view);
+	let detail = result
 		.as_ref()
-		.and_then(|value| string_at(value, "detail"))
+		.and_then(|value| {
+			string_at(value, "detail")
+				.or_else(|| string_at(value, "text"))
+				.or_else(|| value.get("peers")?.as_array()?.first()?.get("id")?.as_str())
+		})
 		.map(Str::new);
 	let fault = diag_text(view.diag);
 	let icon = match view.status {
@@ -73,7 +88,7 @@ fn render_process(
 	raw: &str,
 	fallback_op: &str,
 ) -> Component {
-	let result = typed_result::<omp_tools::hub::Response>(view);
+	let result = result_value(view);
 	let op = args
 		.and_then(|value| string_at(value, "op"))
 		.or_else(|| partial_string(raw, "op"))
@@ -131,7 +146,7 @@ fn render_process(
 }
 
 fn render_logs(view: &CardView<'_>, args: Option<&Value>, ui: &UiContext) -> Component {
-	let result = typed_result::<omp_tools::hub::Response>(view);
+	let result = result_value(view);
 	let logs = result.as_ref().and_then(|value| value.get("logs"));
 	let name = logs
 		.and_then(|value| string_at(value, "name"))
@@ -188,7 +203,7 @@ fn render_logs(view: &CardView<'_>, args: Option<&Value>, ui: &UiContext) -> Com
 }
 
 fn render_send(view: &CardView<'_>, args: Option<&Value>, raw: &str) -> Component {
-	let result = typed_result::<omp_tools::hub::Response>(view);
+	let result = result_value(view);
 	let sent = result.as_ref().and_then(|value| value.get("sent"));
 	let mut to = Str::new(
 		sent
@@ -255,7 +270,7 @@ fn render_send(view: &CardView<'_>, args: Option<&Value>, raw: &str) -> Componen
 }
 
 fn render_inbox(view: &CardView<'_>, args: Option<&Value>, raw: &str, waiting: bool) -> Component {
-	let result = typed_result::<omp_tools::hub::Response>(view);
+	let result = result_value(view);
 	let messages = result
 		.as_ref()
 		.and_then(|value| value.get("inbox"))
@@ -342,7 +357,7 @@ fn render_inbox(view: &CardView<'_>, args: Option<&Value>, raw: &str, waiting: b
 }
 
 fn render_roster(view: &CardView<'_>) -> Component {
-	let result = typed_result::<omp_tools::hub::Response>(view);
+	let result = result_value(view);
 	let peers = result
 		.as_ref()
 		.and_then(|value| value.get("peers"))
@@ -405,7 +420,7 @@ fn render_roster(view: &CardView<'_>) -> Component {
 }
 
 fn render_jobs(view: &CardView<'_>, args: Option<&Value>, raw: &str) -> Component {
-	let result = typed_result::<omp_tools::hub::Response>(view);
+	let result = result_value(view);
 	let jobs = result
 		.as_ref()
 		.and_then(|value| value.get("jobs"))

@@ -384,6 +384,9 @@ pub fn aborted_tool_tail(dom: &Dom) -> bool {
 				let status = status.as_deref().unwrap_or("running");
 				return match status {
 					"cancelled" | "aborted" => true,
+					// The kernel journals an abort as a fault whose `<diag>`
+					// carries `omp_tool::Abort::render` text.
+					"error" => diag_is_abort(dom, *handle),
 					"running" | "arguments" => interrupted,
 					_ => false,
 				};
@@ -392,6 +395,29 @@ pub fn aborted_tool_tail(dom: &Dom) -> bool {
 		}
 	}
 	false
+}
+
+/// Whether a faulted tool's `<diag>` is an abort rather than a tool fault:
+/// the `CallOutcome::aborted` JSON the dispatcher journals for a tool that
+/// yielded `Ev::Aborted` (`{"kind":"aborted",…}`), or the `Abort::render`
+/// text (`interrupted: …`, `aborted…`, `skipped: …`) of a harness-owned
+/// cancellation.
+fn diag_is_abort(dom: &Dom, tool: Handle) -> bool {
+	dom.children(tool)
+		.iter()
+		.filter_map(|handle| dom.get(*handle))
+		.find(|node| node.tag == Tag::Known(KnownTag::Diag))
+		.and_then(|diag| diag.content.clone().or_else(|| prop_text(diag, PropId::Text)))
+		.is_some_and(|text| {
+			let text = text.as_str().trim_start();
+			if text.starts_with('{') {
+				return serde_json::from_str::<serde_json::Value>(text)
+					.ok()
+					.and_then(|value| value.get("kind")?.as_str().map(|kind| kind == "aborted"))
+					.unwrap_or(false);
+			}
+			text.starts_with("interrupted:") || text.starts_with("aborted") || text.starts_with("skipped:")
+		})
 }
 
 /// The idle `<loop> <key> to Retry` status row (pi

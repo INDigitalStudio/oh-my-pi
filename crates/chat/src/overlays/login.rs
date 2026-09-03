@@ -4,20 +4,21 @@
 //! `/logout` without a provider (pi `OAuthSelectorComponent`).
 //!
 //! Every panel is observer-local (ADR 0005): the login dialog only relays
-//! [`LoginFlow`] channel traffic, the logout selector polls its
-//! [`Pending`] deletion from `tick`, and a chosen provider becomes a console
-//! line (`login <id>`) so the dialog opens through the one command stream
+//! [`LoginFlow`] channel traffic, the logout selector posts a typed mutation
+//! to the controller, and a chosen provider becomes a console line
+//! (`login <id>`) so the dialog opens through the one command stream
 //! (ADR 0014).
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use omp_core::{Str, StrMut, sf};
-use omp_tui::{Frame, Key, Prop, Size, Ui, UiContext, UiEvent, dom};
+use omp_tui::{Frame, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent, dom};
 
 use super::{
-	Panel, PanelAnchor, PanelEvent, Services,
-	services::{AccountRow, LoginEvent, LoginFlow, Pending, ProviderRow},
+	Outcome, Panel, PanelAnchor, PanelEvent, PanelNote,
+	services::{AccountRow, LoginEvent, LoginFlow, Mutation, ProviderRow},
 };
+use crate::host::HostCommand;
 
 /// Poll cadence while a flow or deletion is pending.
 const POLL: Duration = Duration::from_millis(100);
@@ -253,6 +254,23 @@ impl Panel for LoginDialog {
 		}
 	}
 
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		if self.prompt.is_none() || self.outcome.is_some() {
+			return PanelEvent::Consumed;
+		}
+		match self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods)
+		{
+			UiEvent::Cancel => self.cancel(),
+			UiEvent::Submit => self.submit(),
+			_ => {
+				self.sync_value();
+				PanelEvent::Consumed
+			},
+		}
+	}
+
 	fn frame(&mut self, viewport: Size) -> &Frame {
 		if viewport.width != self.width {
 			self.sync_value();
@@ -322,16 +340,13 @@ fn escape_quoted(text: &str) -> Str {
 
 /// Account picker for `/logout` once the provider is known (pi
 /// `LogoutAccountSelectorComponent`): circular ↑/↓, PgUp/PgDn by a page,
-/// Enter deletes the highlighted account through [`Services::logout`].
+/// Enter asks the controller to delete the highlighted account.
 pub struct LogoutSelector {
-	services:  Arc<dyn Services>,
 	provider:  Str,
 	accounts:  Vec<AccountRow>,
 	selected:  usize,
 	status:    Option<Str>,
-	pending:   Option<(usize, Pending<()>)>,
-	settled:   Option<PanelEvent>,
-	next_wake: Option<Duration>,
+	pending:   Option<(usize, Mutation)>,
 	ui:        Ui,
 	ctx:       UiContext,
 	width:     u16,
@@ -344,7 +359,6 @@ impl LogoutSelector {
 	pub fn open(
 		provider_name: impl Into<Str>,
 		accounts: Vec<AccountRow>,
-		services: Arc<dyn Services>,
 		ctx: &UiContext,
 	) -> Self {
 		let selected = accounts
@@ -352,14 +366,11 @@ impl LogoutSelector {
 			.position(|account| account.active)
 			.unwrap_or(0);
 		let mut selector = Self {
-			services,
 			provider: provider_name.into(),
 			accounts,
 			selected,
 			status: None,
 			pending: None,
-			settled: None,
-			next_wake: None,
 			ui: Ui::from_root(dom! { <col/> }, 80, ctx.clone()),
 			ctx: ctx.clone(),
 			width: 0,
@@ -395,16 +406,11 @@ impl LogoutSelector {
 		let Some(account) = self.accounts.get(self.selected) else {
 			return PanelEvent::Consumed;
 		};
-		match self.services.logout(account) {
-			Ok(pending) => {
-				self.status = Some(sf!("Logging out {}…", account.label));
-				self.pending = Some((self.selected, pending));
-				self.next_wake = Some(Duration::ZERO);
-			},
-			Err(error) => self.status = Some(sf!("Logout failed: {error}")),
-		}
+		let mutation = Mutation::Logout { account: account.clone() };
+		self.status = Some(sf!("Logging out {}…", account.label));
+		self.pending = Some((self.selected, mutation.clone()));
 		self.rebuild(self.width);
-		PanelEvent::Consumed
+		PanelEvent::Command(HostCommand::Service(mutation))
 	}
 
 	fn rebuild(&mut self, width: u16) {
@@ -493,6 +499,16 @@ impl Panel for LogoutSelector {
 		}
 	}
 
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		match self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods)
+		{
+			UiEvent::Cancel => PanelEvent::Close,
+			_ => PanelEvent::Consumed,
+		}
+	}
+
 	fn frame(&mut self, viewport: Size) -> &Frame {
 		if viewport.width != self.width {
 			self.rebuild(viewport.width);
@@ -500,43 +516,32 @@ impl Panel for LogoutSelector {
 		self.ui.frame()
 	}
 
-	fn tick(&mut self, now: Duration) -> bool {
-		let Some((index, pending)) = &self.pending else {
-			self.next_wake = None;
-			return false;
+	fn notify(&mut self, note: PanelNote<'_>) -> PanelEvent {
+		let PanelNote::Outcome(Outcome::Service(outcome)) = note else {
+			return PanelEvent::Ignored;
 		};
+		let Some((index, mutation)) = &self.pending else {
+			return PanelEvent::Ignored;
+		};
+		if *mutation != outcome.mutation {
+			return PanelEvent::Ignored;
+		}
 		let index = *index;
-		match pending.try_recv() {
-			Ok(Ok(())) => {
+		self.pending = None;
+		match &outcome.result {
+			Ok(_) => {
 				let account = self.accounts.remove(index);
 				self.selected = self.selected.min(self.accounts.len().saturating_sub(1));
 				self.status = None;
-				self.settled = Some(PanelEvent::Finish(sf!(
-					"echo \"Logged out {}\"",
-					escape_quoted(&account.label)
-				)));
+				self.rebuild(self.width);
+				PanelEvent::Finish(sf!("echo \"Logged out {}\"", escape_quoted(&account.label)))
 			},
-			Ok(Err(error)) => self.status = Some(sf!("Logout failed: {error}")),
-			Err(flume::TryRecvError::Disconnected) => {
-				self.status = Some(Str::new_static("Logout failed: the request was dropped before settling"));
-			},
-			Err(flume::TryRecvError::Empty) => {
-				self.next_wake = Some(now + POLL);
-				return false;
+			Err(error) => {
+				self.status = Some(sf!("Logout failed: {error}"));
+				self.rebuild(self.width);
+				PanelEvent::Consumed
 			},
 		}
-		self.pending = None;
-		self.next_wake = None;
-		self.rebuild(self.width);
-		true
-	}
-
-	fn next_wake(&self) -> Option<Duration> {
-		self.next_wake
-	}
-
-	fn settled(&mut self) -> Option<PanelEvent> {
-		self.settled.take()
 	}
 }
 
@@ -686,6 +691,12 @@ impl Panel for ProviderPicker {
 		self.route(event)
 	}
 
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		let event =
+			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		self.route(event)
+	}
+
 	fn frame(&mut self, viewport: Size) -> &Frame {
 		let rows = viewport
 			.height
@@ -706,10 +717,9 @@ impl Panel for ProviderPicker {
 mod tests {
 	use flume::{Receiver, Sender};
 	use omp_core::sf;
-	use parking_lot::Mutex;
 
 	use super::*;
-	use crate::overlays::services::ServiceResult;
+	use crate::overlays::services::{ServiceOutcome, ServiceResult};
 
 	struct Channels {
 		events: Sender<LoginEvent>,
@@ -829,20 +839,6 @@ mod tests {
 		assert_eq!(dialog.outcome(), Some(Err("Login to Anthropic ended without a result")));
 	}
 
-	struct Recorder {
-		logged_out: Mutex<Vec<Str>>,
-		reply:      Mutex<Option<Sender<ServiceResult<()>>>>,
-	}
-
-	impl Services for Recorder {
-		fn logout(&self, account: &AccountRow) -> ServiceResult<Pending<()>> {
-			self.logged_out.lock().push(account.id.clone());
-			let (tx, rx) = flume::bounded(1);
-			*self.reply.lock() = Some(tx);
-			Ok(rx)
-		}
-	}
-
 	fn account(id: &'static str, active: bool) -> AccountRow {
 		AccountRow {
 			id:            Str::new_static(id),
@@ -858,12 +854,9 @@ mod tests {
 	#[test]
 	fn logout_selector_wraps_and_enter_logs_out_the_highlighted_account() {
 		let ctx = UiContext::default();
-		let recorder = Arc::new(Recorder { logged_out: Mutex::new(Vec::new()), reply: Mutex::new(None) });
-		let services: Arc<dyn Services> = recorder.clone();
 		let mut selector = LogoutSelector::open(
 			"Anthropic",
 			vec![account("alice", false), account("bob", true), account("carol", false)],
-			services,
 			&ctx,
 		);
 		assert_eq!(selector.selected(), 1, "the active account is preselected");
@@ -885,28 +878,27 @@ mod tests {
 		assert_eq!(selector.key(Key::PageDown), PanelEvent::Consumed);
 		assert_eq!(selector.selected(), 2, "page down clamps");
 
-		assert_eq!(selector.key(Key::Enter), PanelEvent::Consumed);
-		assert_eq!(recorder.logged_out.lock().as_slice(), &[Str::new_static("carol")]);
-		assert!(text(&mut selector).contains("Logging out carol@example.com"));
-		assert_eq!(selector.next_wake(), Some(Duration::ZERO));
-		assert!(!selector.tick(Duration::ZERO), "still pending");
-		assert_eq!(selector.next_wake(), Some(POLL));
-		recorder.reply.lock().take().unwrap().send(Ok(())).unwrap();
-		assert!(selector.tick(POLL));
+		let mutation = Mutation::Logout { account: account("carol", false) };
 		assert_eq!(
-			selector.settled(),
-			Some(PanelEvent::Finish(sf!("echo \"Logged out carol@example.com\"")))
+			selector.key(Key::Enter),
+			PanelEvent::Command(HostCommand::Service(mutation.clone()))
 		);
-		assert_eq!(selector.settled(), None);
+		assert!(text(&mut selector).contains("Logging out carol@example.com"));
+		let outcome = Outcome::Service(ServiceOutcome {
+			mutation,
+			result: Ok(Str::new_static("Logged out carol@example.com")),
+		});
+		assert_eq!(
+			selector.notify(PanelNote::Outcome(&outcome)),
+			PanelEvent::Finish(sf!("echo \"Logged out carol@example.com\""))
+		);
 		assert_eq!(selector.key(Key::Esc), PanelEvent::Close);
 	}
 
 	#[test]
 	fn logout_selector_without_accounts_says_so() {
 		let ctx = UiContext::default();
-		let services: Arc<dyn Services> =
-			Arc::new(Recorder { logged_out: Mutex::new(Vec::new()), reply: Mutex::new(None) });
-		let mut selector = LogoutSelector::open("Anthropic", Vec::new(), services, &ctx);
+		let mut selector = LogoutSelector::open("Anthropic", Vec::new(), &ctx);
 		assert!(text(&mut selector).contains(LOGOUT_EMPTY));
 		assert_eq!(selector.key(Key::Enter), PanelEvent::Consumed);
 		assert_eq!(selector.key(Key::Esc), PanelEvent::Close);

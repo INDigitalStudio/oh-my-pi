@@ -138,7 +138,7 @@ pub(super) fn list_local(state: &ServiceState, suffix: &str) -> ServiceResult<Ve
 /// text previews, and live-chain membership.
 pub(super) fn journal_tree(state: &ServiceState) -> ServiceResult<Vec<TreeEntry>> {
 	let path = state.live_journal.read().clone();
-	let (_, entries) = Journal::open(&path).map_err(|error| ServiceError::Failed(Str::new(error.to_string())))?;
+	let entries = Journal::scan(&path).map_err(|error| ServiceError::Failed(Str::new(error.to_string())))?;
 	let live = omp_journal::live_chain(&entries)
 		.map(|entry| entry.id)
 		.collect::<std::collections::HashSet<_>>();

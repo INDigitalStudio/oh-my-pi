@@ -23,7 +23,10 @@ use omp_session::project_thread_history;
 use omp_tool::{
 	CallOutcome, CapsBase, Claims, ModelClass, Precedence, Presentation, Registry, Rev, ToolIdentity,
 };
-use omp_tools::edit::{self, Fault, FormatPolicy, Payload, RejectionReason, ReplaceParams};
+use omp_tools::edit::{
+	self, Fault, FormatPolicy, LegacyReplaceParams, Payload, RejectionReason,
+	observer::EditObserver,
+};
 
 const CAPS: CapsBase = CapsBase {
 	maximum_parts:      8,
@@ -146,7 +149,14 @@ async fn p10_edit_lift_is_idempotent_and_dispatches_at_the_live_revision() -> Re
 	};
 	let mut registry = Registry::new();
 	registry.register(
-		edit::replace_tool(documents.clone(), FormatPolicy::BestEffort),
+		edit::legacy_replace_tool_with_observer(
+			documents.clone(),
+			FormatPolicy::BestEffort,
+			EditObserver::default(),
+			true,
+			true,
+			false,
+		),
 		Presentation::Slot,
 		claims.clone(),
 	)?;
@@ -161,7 +171,7 @@ async fn p10_edit_lift_is_idempotent_and_dispatches_at_the_live_revision() -> Re
 		name: Str::new_static("edit"),
 		rev:  Rev { family: Str::new_static("rep"), n: 1 },
 	};
-	let args = Bytes::from(serde_json::to_vec(&ReplaceParams { edits: Vec::new() })?);
+	let args = Bytes::from(serde_json::to_vec(&LegacyReplaceParams { edits: Vec::new() })?);
 	let verdict = serde_json::to_value(CallOutcome::<Payload, Fault>::Faulted(Fault {
 		reason:    RejectionReason::InvalidPatch { message: Str::new_static("no match") },
 		conflicts: Vec::new(),

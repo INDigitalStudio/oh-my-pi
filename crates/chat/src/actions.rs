@@ -108,12 +108,20 @@ pub enum HostAction {
 		/// Only this session: skip archiving the choice to `config.cfg`.
 		session_only: bool,
 	},
+	/// `/model <selector>` (pi `/model` with an argument): set `ai_model`
+	/// to the roster entry matching `selector` by key or display name and
+	/// archive it, or notice `Unknown model`.
+	ModelSet(Str),
 	/// `cl_followup` (pi `app.message.followUp`, Ctrl+Q / Alt+Enter):
 	/// submit the draft as steering while a turn runs, else as a turn.
 	FollowUp,
 	/// `cl_retry` (pi `app.retry`, F5 / Alt+R): resend the last user prompt
 	/// when its turn ended in an error notice.
 	Retry,
+	/// `cl_tools_expand` (pi `app.tools.expand`, Ctrl+O): toggle the
+	/// transcript's default tool-card expansion after an active panel has
+	/// had first refusal.
+	ToolsExpand,
 	/// `cl_plan_toggle` (pi `app.plan.toggle`, Alt+Shift+P): flip the
 	/// plan-mode Director engagement.
 	PlanToggle,
@@ -158,6 +166,9 @@ pub enum HostAction {
 	},
 	/// Text recognized by speech-to-text, inserted at the caret.
 	InsertText(Str),
+	/// Submit the complete composer draft after a speech transcript was
+	/// inserted; mailbox order keeps insertion and submission atomic to input.
+	SubmitDraft,
 	/// Register (or replace) an observer-local Esc hook.
 	EscapeHook(EscapeHook),
 	/// Remove an Esc hook by id.
@@ -168,6 +179,27 @@ pub enum HostAction {
 	Call(PanelCall),
 	/// A typed slash-command request (`crate::commands`).
 	Command(CommandAction),
+	/// The controller could not run a submitted `!` / `$` line (for example
+	/// while paused): the draft returns to the composer and the optimistic
+	/// activity edge rolls back.
+	LocalRefused {
+		/// The submitted line verbatim.
+		draft:  Str,
+		/// Why it did not run.
+		reason: Str,
+	},
+	/// A controller-run mutation settled (posted by the application after a
+	/// `HostCommand::Git` / `Service` / `Agent`); delivered to every open
+	/// panel through `Panel::notify`.
+	Outcome(crate::overlays::Outcome),
+	/// An editor command (`ed_*`, pi `tui.editor.*` / `tui.input.*`): the
+	/// composer applies the named semantic key. Bound chords reach the
+	/// composer only through these, so `bind`/`unbind` decide every editor
+	/// key (ADR 0014).
+	Editor(omp_tui::Key),
+	/// A panel command (`panel_*`, pi `app.session.*` / `app.tree.*`):
+	/// lowered onto the topmost open panel.
+	Panel(crate::overlays::PanelAction),
 	/// A console reply line (the sink installed by [`HostMailbox::attach`]).
 	Reply {
 		/// Reply severity.
@@ -252,13 +284,13 @@ omp_con::var! {
 	/// Expands tool cards in the transcript (pi `app.tools.expand`, Ctrl+O).
 	pub static CL_TOOLS_EXPANDED = cl_tools_expanded: bool {
 		default: false,
-		flags: session | inherit,
+		flags: session,
 	};
 	/// Shows tool activity in the transcript (pi `app.tools.toggleVisibility`,
 	/// Ctrl+Shift+O).
 	pub static CL_SHOWTOOLS = cl_showtools: bool {
 		default: true,
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 }
 
@@ -302,6 +334,9 @@ omp_con::cmd! {
 
 	/// Resends the last prompt after a failed turn.
 	cl_retry() = |ctx, _args| post(ctx, HostAction::Retry);
+
+	/// Toggles the default expansion of transcript tool cards.
+	cl_tools_expand() = |ctx, _args| post(ctx, HostAction::ToolsExpand);
 
 	/// Toggles plan mode.
 	cl_plan_toggle() = |ctx, _args| post(ctx, HostAction::PlanToggle);
@@ -350,6 +385,78 @@ omp_con::cmd! {
 		let id = args.get::<Str>(0)?;
 		post(ctx, HostAction::DropEscapeHook(id))
 	};
+}
+
+omp_con::cmd! {
+	/// Moves the focused editor or selector one row up.
+	ed_up() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Up));
+	/// Moves the focused editor or selector one row down.
+	ed_down() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Down));
+	/// Moves the editor caret one grapheme left.
+	ed_left() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Left));
+	/// Moves the editor caret one grapheme right.
+	ed_right() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Right));
+	/// Moves the editor caret one word left.
+	ed_word_left() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::WordLeft));
+	/// Moves the editor caret one word right.
+	ed_word_right() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::WordRight));
+	/// Moves the editor caret to the line start.
+	ed_home() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Home));
+	/// Moves the editor caret to the line end.
+	ed_end() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::End));
+	/// Starts a forward character jump.
+	ed_jump_forward() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Ctrl(']')));
+	/// Starts a backward character jump.
+	ed_jump_backward() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::CtrlAlt(']')));
+	/// Scrolls the focused editor or selector one page up.
+	ed_page_up() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::PageUp));
+	/// Scrolls the focused editor or selector one page down.
+	ed_page_down() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::PageDown));
+	/// Deletes one grapheme before the editor caret.
+	ed_backspace() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Backspace));
+	/// Deletes one grapheme under the editor caret.
+	ed_delete() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Delete));
+	/// Deletes one word before the editor caret.
+	ed_delete_word_backward() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Ctrl('w')));
+	/// Deletes one word after the editor caret.
+	ed_delete_word_forward() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::WordDelete));
+	/// Deletes from the editor caret to the line start.
+	ed_delete_to_start() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Ctrl('u')));
+	/// Deletes from the editor caret to the line end.
+	ed_delete_to_end() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Ctrl('k')));
+	/// Yanks the latest editor kill.
+	ed_yank() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Ctrl('y')));
+	/// Rotates the editor yank ring.
+	ed_yank_pop() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Alt('y')));
+	/// Undoes the latest editor change.
+	ed_undo() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Ctrl('-')));
+	/// Opens spelling suggestions at the editor caret.
+	ed_spelling() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Ctrl('.')));
+	/// Inserts a newline into the editor.
+	ed_newline() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::ShiftEnter));
+	/// Activates the focused control or submits the editor.
+	ed_enter() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Enter));
+	/// Advances autocomplete or focus.
+	ed_tab() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Tab));
+	/// Copies the editor selection.
+	ed_copy() = |ctx, _args| post(ctx, HostAction::Editor(omp_tui::Key::Copy));
+
+	/// Toggles full versus relative paths in the session picker.
+	panel_toggle_path() = |ctx, _args| post(ctx, HostAction::Panel(crate::overlays::PanelAction::TogglePath));
+	/// Toggles modified versus created sorting in the session picker.
+	panel_toggle_sort() = |ctx, _args| post(ctx, HostAction::Panel(crate::overlays::PanelAction::ToggleSort));
+	/// Starts renaming the selected session.
+	panel_rename() = |ctx, _args| post(ctx, HostAction::Panel(crate::overlays::PanelAction::Rename));
+	/// Deletes the selected session after confirmation.
+	panel_delete() = |ctx, _args| post(ctx, HostAction::Panel(crate::overlays::PanelAction::Delete));
+	/// Deletes the selected session without an invasive prompt.
+	panel_delete_fast() = |ctx, _args| post(ctx, HostAction::Panel(crate::overlays::PanelAction::DeleteFast));
+	/// Folds the selected tree node or moves to its parent.
+	panel_fold_up() = |ctx, _args| post(ctx, HostAction::Panel(crate::overlays::PanelAction::FoldUp));
+	/// Unfolds the selected tree node or moves to its first child.
+	panel_unfold_down() = |ctx, _args| post(ctx, HostAction::Panel(crate::overlays::PanelAction::UnfoldDown));
+	/// Expands the selected panel entry.
+	panel_expand() = |ctx, _args| post(ctx, HostAction::Panel(crate::overlays::PanelAction::Expand));
 }
 
 omp_con::var! {

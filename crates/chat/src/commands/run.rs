@@ -17,7 +17,7 @@ use crate::{
 	host::{HostCommand, HostError, Presenter, Routed, SpawnKind},
 	overlays::{
 		PanelOpener, plan_review::PlanReviewPanel, report::ReportPanel, rewind::RewindPanel,
-		sessions::SessionPicker, side::SidePanel, tree::TreePanel,
+		services::Mutation, sessions::SessionPicker, side::SidePanel, tree::TreePanel,
 	},
 	status_line::StatusLine,
 };
@@ -32,6 +32,11 @@ const WAIT_BEFORE_HANDOFF: &str =
 const WAIT_BEFORE_FORK: &str = "Wait for the current response to finish or abort it before forking.";
 const WAIT_BEFORE_FRESH: &str =
 	"Wait for the current response to finish or abort it before refreshing provider state.";
+const WAIT_BEFORE_RESET: &str =
+	"Wait for the current response to finish or abort it before resetting the context.";
+const WAIT_BEFORE_MOVE: &str = "Wait for the current response to finish or abort it before moving.";
+const WAIT_BEFORE_WORKTREE: &str =
+	"Wait for the current response to finish or abort it before creating a worktree.";
 /// pi `/jobs` empty notice.
 const NO_JOBS: &str = "No background jobs running. (Background jobs run async tools — e.g. \
                        long-running bash, debug, or task subagents that would otherwise tie up \
@@ -191,14 +196,16 @@ impl Presenter {
 				Routed::Repaint
 			},
 			CommandAction::SessionRename { id, title } => {
-				match self.services.rename_session(id.as_str(), title.as_str()) {
-					Ok(()) => self.notice(format!("Session renamed to \"{title}\".")),
-					Err(error) => self.notice(format!("Rename failed: {error}")),
-				}
+				let _ = self
+					.commands
+					.send(HostCommand::Service(Mutation::RenameSession { id, title }));
+				Routed::Repaint
 			},
-			CommandAction::SessionDelete { id } => match self.services.delete_session(id.as_str()) {
-				Ok(()) => self.notice("Session deleted"),
-				Err(error) => self.notice(format!("Delete failed: {error}")),
+			CommandAction::SessionDelete { id } => {
+				let _ = self
+					.commands
+					.send(HostCommand::Service(Mutation::DeleteSession { id }));
+				Routed::Repaint
 			},
 			CommandAction::Rename { title } => {
 				let _ = self.commands.send(HostCommand::Rename { title: title.clone() });
@@ -228,6 +235,51 @@ impl Presenter {
 				let text = Str::new(OMFG_RULE.replace("{{complaint}}", rule.as_str()));
 				let _ = self.commands.send(HostCommand::Steer(text));
 				self.notice("Rule steered into the session; it applies from the next safe point.")
+			},
+			CommandAction::Clear => {
+				if self.turn_active {
+					return Ok(self.notice(WAIT_BEFORE_RESET));
+				}
+				let _ = self.commands.send(HostCommand::ContextReset);
+				Routed::Repaint
+			},
+			CommandAction::Move { path } => {
+				if self.turn_active {
+					return Ok(self.notice(WAIT_BEFORE_MOVE));
+				}
+				let cwd = self
+					.services
+					.project_dir()
+					.or_else(|_| std::env::current_dir())
+					.unwrap_or_else(|_| PathBuf::from("."));
+				let resolved = super::workspace::resolve_to_cwd(path.as_str(), &cwd);
+				if !resolved.is_dir() {
+					return Ok(self.notice(if resolved.exists() {
+						format!("Not a directory: {}", resolved.display())
+					} else {
+						format!("Directory does not exist: {}", resolved.display())
+					}));
+				}
+				let _ = self.commands.send(HostCommand::Move { path: resolved });
+				Routed::Repaint
+			},
+			CommandAction::Worktree { branch } => {
+				if self.turn_active {
+					return Ok(self.notice(WAIT_BEFORE_WORKTREE));
+				}
+				let branch = branch.unwrap_or_else(super::workspace::default_worktree_branch);
+				match self.services.create_worktree(branch.as_str()) {
+					Ok(worktree) => {
+						let _ = self.commands.send(HostCommand::Move { path: worktree.path.clone() });
+						self.notice(format!(
+							"Moved to worktree {} on branch {} (checked out, uncommitted changes carried \
+							 over).",
+							worktree.path.display(),
+							worktree.branch
+						))
+					},
+					Err(error) => self.notice(format!("Worktree creation failed: {error}")),
+				}
 			},
 		})
 	}
@@ -260,7 +312,11 @@ impl Presenter {
 		if !self.plan_engaged() {
 			return Ok(self.notice("Plan mode is not active."));
 		}
-		let cycle = self.cycle.clone();
+		let cycle = self
+			.cycle
+			.iter()
+			.map(|(role, model, _)| (role.clone(), model.clone()))
+			.collect::<Vec<_>>();
 		self.act(HostAction::Open(PanelOpener::new(move |cx| {
 			PlanReviewPanel::open(cx, &cycle).map(|panel| Box::new(panel) as Box<_>)
 		})))
@@ -275,7 +331,7 @@ impl Presenter {
 		}
 		let _ = self.commands.send(HostCommand::PlanMode { engage: false });
 		if let Some(role) = role
-			&& let Some((_, model)) = self.cycle.iter().find(|(name, _)| *name == role)
+			&& let Some((_, model, _)) = self.cycle.iter().find(|(name, _, _)| *name == role)
 			&& let Err(error) = omp_con::AI_MODEL.set(&self.con, model.clone())
 		{
 			return self.notice(format!("Could not switch to the {role} model: {error}"));
@@ -507,7 +563,7 @@ impl Presenter {
 		} else {
 			self
 				.services
-				.sessions()
+				.sessions(crate::overlays::services::SessionScope::Project)
 				.ok()
 				.into_iter()
 				.flatten()
@@ -682,7 +738,7 @@ fn session_info(dom: &Dom, services: &dyn crate::overlays::Services) -> Str {
 		let _ = writeln!(out, "\n### Cost");
 		let _ = writeln!(out, "- Total: ${:.4}", status.cost_nano_usd as f64 / 1e9);
 	}
-	if let Ok(rows) = services.sessions() {
+	if let Ok(rows) = services.sessions(crate::overlays::services::SessionScope::Project) {
 		let _ = writeln!(out, "\n### Stored sessions\n- {} on disk", rows.len());
 	}
 	out.freeze()

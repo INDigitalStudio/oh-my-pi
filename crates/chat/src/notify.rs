@@ -28,9 +28,9 @@ omp_con::var! {
 		flags: archive,
 	};
 	/// Toasts when a turn stops with a terminal provider error (pi
-	/// `error.notify`, `on|off`).
+	/// `error.notify`, default `off`: opt-in, unlike completion and ask).
 	pub static CL_NOTIFY_ERROR = cl_notify_error: bool {
-		default: true,
+		default: false,
 		flags: archive,
 	};
 	/// Toasts when a tool waits for interactive input (pi `ask.notify`,
@@ -252,6 +252,7 @@ mod tests {
 		assert_eq!(toast.actions, Some(NotificationAction::Focus));
 
 		con.exec("cl_notify_completion 0", Source::Console).expect("set");
+		con.exec("cl_notify_error 1", Source::Console).expect("opt in");
 		assert_eq!(notifier.turn_ended(&con, TurnEnd::Completed), None);
 		assert!(
 			notifier.turn_ended(&con, TurnEnd::Errored).is_some(),
@@ -260,12 +261,27 @@ mod tests {
 	}
 
 	#[test]
+	fn error_toast_is_opt_in_like_pi_error_notify() {
+		let con = ctx();
+		let notifier = Notifier::new(None);
+		assert_eq!(
+			notifier.turn_ended(&con, TurnEnd::Errored),
+			None,
+			"pi `error.notify` defaults to off"
+		);
+		assert!(notifier.turn_ended(&con, TurnEnd::Completed).is_some());
+		con.exec("cl_notify_error 1", Source::Console).expect("set");
+		assert!(notifier.turn_ended(&con, TurnEnd::Errored).is_some());
+	}
+
+	#[test]
 	fn error_toast_suppressed_while_retry_pending() {
 		let con = ctx();
+		con.exec("cl_notify_error 1", Source::Console).expect("opt in");
 		let mut notifier = Notifier::new(None);
 		let toast = notifier
 			.turn_ended(&con, TurnEnd::Errored)
-			.expect("enabled by default");
+			.expect("enabled");
 		assert_eq!(toast.title.as_deref(), Some("omp"), "app name when the session is unnamed");
 		assert_eq!(toast.body.as_deref(), Some("Stopped with error"));
 

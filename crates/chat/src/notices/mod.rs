@@ -1,6 +1,7 @@
 //! Transcript notices and maintenance surfaces: provider errors, retry
 //! countdowns, compaction dividers, cache-miss markers, per-turn usage rows,
-//! observer-local message boxes, desktop notifications, and the vocalizer.
+//! extension and hook message boxes, desktop notifications, and the
+//! vocalizer.
 //!
 //! Every renderer here is a pure function of session-DOM element state (ADR
 //! 0005: the actor projects, never authors). The DOM contract the renderers
@@ -11,7 +12,9 @@
 //!   `name` = server), `tangent` (background `/tan` dispatch, `id` = job id,
 //!   `label` = work summary), `advisor` (`severity` = `blocker | concern`,
 //!   `label` = summary header, body = paragraphs), `hook` (`name` = hook
-//!   name, body = Markdown).
+//!   name, body = Markdown, folded to five lines unless expanded), `custom`
+//!   (`name` = the extension's message type, body = Markdown). The kernel
+//!   journals the last two from `EnvEvent::Notice`.
 //! - `<user author=guest>` renders as the collaboration guest bubble;
 //!   `<user synthetic=true>` collapses to pi's `Synthetic input · size ·
 //!   lines · ctrl+o` row.
@@ -23,9 +26,9 @@
 //!   divider lands after the turn containing that entry.
 
 pub mod cache;
+pub mod custom;
 pub mod divider;
 pub mod error;
-pub mod local;
 pub mod misc;
 pub mod retry;
 pub mod usage;

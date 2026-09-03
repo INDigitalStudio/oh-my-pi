@@ -13,12 +13,13 @@ use omp_tui::Icon;
 use super::PaletteEntry;
 use crate::{
 	actions::{HostAction, post},
+	host::HostCommand,
 	overlays::{
 		Panel, PanelAnchor, PanelCall, PanelCx, PanelEvent, PanelOpener,
 		extensions::ExtensionsDashboard,
 		plugins::{PluginMode, PluginSelector},
 		report::ReportPanel,
-		services::{PluginsReport, ToolRow},
+		services::{Mutation, PluginsReport, ToolRow},
 		tasks::{PendingPanel, Settle},
 	},
 };
@@ -342,23 +343,8 @@ fn open_marketplace(op: &MarketplaceOp, cx: &PanelCx<'_>) -> Opened {
 			let text = installed_text(&marketplace_report(cx)?);
 			report("marketplace", "Installed plugins", preformatted(&text), cx)
 		},
-		MarketplaceOp::Install(Some(spec)) => {
-			return pending(
-				"marketplace",
-				"Marketplace",
-				sf!("Installing {spec}…"),
-				cx.services.install_plugin(spec),
-				cx,
-			);
-		},
-		MarketplaceOp::Uninstall(Some(spec)) => {
-			return pending(
-				"marketplace",
-				"Marketplace",
-				sf!("Uninstalling {spec}…"),
-				cx.services.uninstall_plugin(spec),
-				cx,
-			);
+		MarketplaceOp::Install(Some(_)) | MarketplaceOp::Uninstall(Some(_)) => {
+			return Err(Str::new_static("Plugin mutation must travel through the controller"));
 		},
 		MarketplaceOp::Update(name) => {
 			let message = name
@@ -426,12 +412,11 @@ omp_con::cmd! {
 					.ok_or_else(|| Str::new_static("No plugins installed"))?;
 				Ok(report("plugins", "Plugins", preformatted(&body), cx))
 			}))),
-			PluginsOp::SetEnabled { id, enabled } => post(ctx, HostAction::Call(PanelCall::new(move |cx| {
-				match cx.services.set_plugin_enabled(&id, enabled) {
-					Ok(()) if enabled => PanelEvent::Notice(sf!("Enabled {id}")),
-					Ok(()) => PanelEvent::Notice(sf!("Disabled {id}")),
-					Err(error) => PanelEvent::Notice(sf!("Plugin error: {error}")),
-				}
+			PluginsOp::SetEnabled { id, enabled } => post(ctx, HostAction::Call(PanelCall::new(move |_cx| {
+				PanelEvent::Command(HostCommand::Service(Mutation::SetPluginEnabled {
+					id: id.clone(),
+					enabled,
+				}))
 			}))),
 		}
 	};
@@ -451,20 +436,20 @@ omp_con::cmd! {
 					Err(error) => PanelEvent::Notice(services_error(error)),
 				}
 			}))),
+			MarketplaceOp::Install(Some(id)) => post(ctx, HostAction::Call(PanelCall::new(move |_cx| {
+				PanelEvent::Command(HostCommand::Service(Mutation::InstallPlugin { id: id.clone() }))
+			}))),
+			MarketplaceOp::Uninstall(Some(id)) => post(ctx, HostAction::Call(PanelCall::new(move |_cx| {
+				PanelEvent::Command(HostCommand::Service(Mutation::UninstallPlugin { id: id.clone() }))
+			}))),
 			op => post(ctx, HostAction::Open(PanelOpener::new(move |cx| open_marketplace(&op, cx)))),
 		}
 	};
 
 	/// Reloads all plugins (skills, commands, hooks, tools, agents, MCP).
 	"reload-plugins"() = |ctx, _args| {
-		post(ctx, HostAction::Open(PanelOpener::new(|cx| {
-			pending(
-				"reload",
-				"Reload plugins",
-				Str::new_static("Reloading plugins…"),
-				cx.services.reload_extensions(),
-				cx,
-			)
+		post(ctx, HostAction::Call(PanelCall::new(|_cx| {
+			PanelEvent::Command(HostCommand::Service(Mutation::ReloadExtensions))
 		})))
 	};
 }

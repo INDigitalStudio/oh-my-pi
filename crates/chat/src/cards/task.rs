@@ -36,11 +36,7 @@ impl Card for TaskCard {
 }
 
 fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
-	let result = view
-		.result_json()
-		.filter(|value| value.get("results").is_some())
-		.or_else(|| typed_result::<omp_tools::task::Payload>(view))
-		.unwrap_or(Value::Null);
+	let result = typed_result::<omp_tools::task::Payload>(view).unwrap_or(Value::Null);
 	let rows = result
 		.get("results")
 		.or_else(|| result.get("children"))
@@ -125,27 +121,16 @@ fn render_settled(view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Compon
 			.into_component(),
 		);
 	}
-	let requests = result
-		.get("requests")
-		.and_then(Value::as_u64)
-		.unwrap_or_else(|| {
-			rows
-				.iter()
-				.filter_map(|row| row.get("requests")?.as_u64())
-				.sum()
-		});
-	let duration = result
-		.get("total_duration_ms")
-		.and_then(Value::as_u64)
-		.unwrap_or_else(|| {
-			rows
-				.iter()
-				.filter_map(|row| row.get("wall_ms")?.as_u64())
-				.max()
-				.unwrap_or(0)
-		});
+	let tokens_in: u64 = rows
+		.iter()
+		.filter_map(|row| row.get("tokens_in")?.as_u64())
+		.sum();
+	let tokens_out: u64 = rows
+		.iter()
+		.filter_map(|row| row.get("tokens_out")?.as_u64())
+		.sum();
 	let status = if failed { "failed" } else { "succeeded" };
-	let summary = sf!("⟨{count} {status} · {requests} req · {:.1}s⟩", duration as f64 / 1_000.0);
+	let summary = sf!("⟨{count} {status} · ↓{tokens_in} · ↑{tokens_out}⟩");
 	dom! {
 		<box border=round title={title} title_pad=3 pad="0 1">
 			{rendered_rows}
@@ -164,21 +149,9 @@ fn row_failed(row: &Value) -> bool {
 }
 
 fn task_detail(row: &Value) -> Option<Str> {
-	let requests = row.get("requests").and_then(Value::as_u64)?;
-	let mut parts = vec![sf!("{requests} req")];
-	if let (Some(tokens), Some(window)) = (
-		row.get("context_tokens").and_then(Value::as_u64),
-		row.get("context_window").and_then(Value::as_u64),
-	) {
-		parts.push(sf!("{:.1}%/{}K", tokens as f64 * 100.0 / window as f64, window / 1_000));
-	}
-	if let Some(cost) = row.get("cost").and_then(Value::as_f64) {
-		parts.push(sf!("${cost:.2}"));
-	}
-	if let Some(wall) = row.get("wall_ms").and_then(Value::as_u64) {
-		parts.push(sf!("{:.1}s", wall as f64 / 1_000.0));
-	}
-	Some(Str::new(parts.join(" · ")))
+	let tokens_in = row.get("tokens_in").and_then(Value::as_u64)?;
+	let tokens_out = row.get("tokens_out").and_then(Value::as_u64).unwrap_or_default();
+	Some(sf!("↓{tokens_in} · ↑{tokens_out}"))
 }
 
 fn preview(text: &str, max_chars: usize) -> Str {

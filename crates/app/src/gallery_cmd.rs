@@ -56,8 +56,11 @@ pub struct GalleryArgs {
 	#[arg(short = 'e', long)]
 	pub expanded:   bool,
 	/// Emit text without terminal styling.
-	#[arg(long)]
+	#[arg(long, conflicts_with = "ansi")]
 	pub plain:      bool,
+	/// Emit terminal styling even when stdout is redirected (gallery QA).
+	#[arg(long, conflicts_with = "plain")]
+	pub ansi:       bool,
 	/// Capture one native PNG per card and lifecycle state.
 	#[arg(long)]
 	pub screenshot: bool,
@@ -109,7 +112,7 @@ fn run_tool(args: &GalleryArgs) -> miette::Result<()> {
 		println!("  · {}", section.state.label());
 		println!(
 			"{}",
-			if args.plain || !io::stdout().is_terminal() {
+			if args.plain || (!args.ansi && !io::stdout().is_terminal()) {
 				omp_tui::frame_text(&section.frame)
 			} else {
 				omp_tui::frame_ansi(&section.frame)

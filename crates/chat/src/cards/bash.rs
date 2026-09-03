@@ -29,16 +29,18 @@ fn output_tail(output: &str, expanded: bool) -> Option<(Option<String>, String)>
 		return Some((None, output.to_owned()));
 	}
 	let skipped = total - BASH_DEFAULT_PREVIEW_LINES;
-	let start = output
-		.lines()
-		.take(skipped)
-		.map(|line| line.len() + 1)
-		.sum::<usize>();
 	let marker = format!(
 		"… ({skipped} earlier lines, showing {BASH_DEFAULT_PREVIEW_LINES} of {total}) (ctrl+o to \
 		 expand)"
 	);
-	Some((Some(marker), output[start..].to_owned()))
+	// `lines()` strips `\n` and `\r\n` alike, so the window is rejoined from
+	// the logical lines rather than sliced at a computed byte offset.
+	let tail = output
+		.lines()
+		.skip(skipped)
+		.collect::<Vec<_>>()
+		.join("\n");
+	Some((Some(marker), tail))
 }
 
 impl Card for BashCard {
@@ -61,15 +63,28 @@ impl Card for BashCard {
 			.and_then(Value::as_str);
 		let shown_command =
 			cwd.map_or_else(|| command.clone(), |cwd| format!("cd {cwd} && {command}"));
-		let result = typed_result::<omp_tools::shell::Payload>(view);
+		// A non-zero exit is `Fault::CommandFailed { payload }`: pi paints it
+		// as the ordinary output box with `Exit: N`, so the failed payload is
+		// the result and the fault line is dropped.
+		let failed = view
+			.fault::<omp_tools::shell::Fault>()
+			.and_then(|fault| match fault {
+				omp_tools::shell::Fault::CommandFailed { payload } => serde_json::to_value(payload).ok(),
+				_ => None,
+			});
+		let result = failed.or_else(|| typed_result::<omp_tools::shell::Payload>(view));
 		let output = result.as_ref().map(output_text).unwrap_or_default();
-		let fault = diag_text(view).or_else(|| {
-			result
-				.as_ref()
-				.and_then(|value| value.get("text").or_else(|| value.get("error")))
-				.and_then(Value::as_str)
-				.map(str::to_owned)
-		});
+		let fault = if result.is_some() && view.status == CardStatus::Failed {
+			None
+		} else {
+			diag_text(view).or_else(|| {
+				result
+					.as_ref()
+					.and_then(|value| value.get("text").or_else(|| value.get("error")))
+					.and_then(Value::as_str)
+					.map(str::to_owned)
+			})
+		};
 		let wall_ms = result.as_ref().and_then(|value| {
 			value
 				.get("wall_ms")
@@ -101,6 +116,9 @@ impl Card for BashCard {
 		let tail = (view.status == CardStatus::InProgress)
 			.then(|| view.output.and_then(|output| output_tail(output, expanded)))
 			.flatten();
+		// pi bash.ts: the collapsed window applies after completion too, so the
+		// block never jumps when the call settles; only ctrl+o uncaps.
+		let settled = output_tail(&output, expanded);
 		dom! {
 			<box border=round>
 				<row pad-x=1 gap=1><text>{"$"}</text><text>{shown_command}</text>
@@ -109,15 +127,16 @@ impl Card for BashCard {
 				if let Some((marker, lines)) = tail {
 					<hr title="Output" title_pad=3/>
 					<col pad-x=1>
-						if let Some(marker) = marker { <text fg=muted>{marker}</text> }
+						if let Some(marker) = marker { <text fg=muted truncate>{marker}</text> }
 						<pre>{lines}</pre>
 					</col>
 				}
-				if matches!(view.status, CardStatus::Done | CardStatus::Failed) && (!output.is_empty() || fault.is_some()) {
+				if matches!(view.status, CardStatus::Done | CardStatus::Failed) && (settled.is_some() || fault.is_some()) {
 					<hr title="Output" title_pad=3/>
 					<col pad-x=1>
-						if !output.is_empty() {
-							<pre>{output}</pre>
+						if let Some((marker, lines)) = settled {
+							if let Some(marker) = marker { <text fg=muted truncate>{marker}</text> }
+							<pre>{lines}</pre>
 						}
 						if let Some(message) = fault {
 							<pre>{message}</pre>
@@ -218,7 +237,7 @@ mod tests {
 	}
 
 	fn rows(view: &CardView<'_>, expanded: bool) -> Vec<String> {
-		let ui = Ui::from_root(BashCard.render(view, expanded, &UiContext::default()), 60, UiContext::default());
+		let ui = Ui::from_root(BashCard.render(view, expanded, &UiContext::default()), 100, UiContext::default());
 		(0..ui.frame().size().height)
 			.map(|y| frame_row_text(ui.frame(), y))
 			.collect()
@@ -264,6 +283,84 @@ mod tests {
 		rows(view, expanded).join("\n")
 	}
 
+	/// A settled call carries the journaled `CallOutcome` envelope on its
+	/// `<result>`; the collapsed card windows the output exactly like the
+	/// streaming tail (pi bash.ts) so the block never jumps on settle.
+	#[test]
+	fn settled_bash_card_reads_the_outcome_envelope_and_keeps_the_tail_window() {
+		let input = text_node(KnownTag::Input, r#"{"command":"cargo build"}"#);
+		let transcript = (1..=25)
+			.map(|n| {
+				let bytes = format!("line {n}\n").into_bytes();
+				serde_json::json!({"channel": "stdout", "data": bytes, "sequence": n})
+			})
+			.collect::<Vec<_>>();
+		let envelope = serde_json::json!({
+			"kind": "ok",
+			"value": {
+				"session_id": [], "exec_id": [], "command": "cargo build",
+				"transcript": transcript, "attachments": [], "adjustments": [],
+				"status": {"outcome": "exited", "exit_code": 0, "signal": null,
+					"wall_clock_ms": 180, "spilled_output": null, "aborted": false,
+					"effects_unknown": false, "final_cwd_uri": null, "final_cwd_revision": 0}
+			}
+		});
+		let mut result = text_node(KnownTag::Result, "");
+		result.props.push((
+			PropId::Outcome.into(),
+			Value::Json(serde_json::value::to_raw_value(&envelope).unwrap()),
+		));
+		let view = CardView {
+			input:   &input,
+			result:  Some(&result),
+			diag:    None,
+			usage:   None,
+			status:  CardStatus::Done,
+			output:  None,
+			started: None,
+		};
+		let collapsed = rows_join(&view, false);
+		assert!(collapsed.contains("… (15 earlier lines, showing 10 of 25) (ctrl+o to expand)"), "{collapsed}");
+		assert!(collapsed.contains("line 25") && !collapsed.contains("line 15 "), "{collapsed}");
+		assert!(collapsed.contains("Wall: 0.18s"), "{collapsed}");
+		let expanded = rows_join(&view, true);
+		assert!(expanded.contains("line 1 ") && !expanded.contains("earlier lines"), "{expanded}");
+	}
+
+	/// pi bash.ts: a non-zero exit is still the ordinary output box, with
+	/// `Exit: N` in the meta row and no raw fault JSON.
+	#[test]
+	fn failed_bash_card_renders_the_command_failed_payload_as_output() {
+		let input = text_node(KnownTag::Input, r#"{"command":"false"}"#);
+		let envelope = serde_json::json!({
+			"kind": "faulted",
+			"value": {"kind": "command_failed", "payload": {
+				"session_id": [], "exec_id": [], "command": "false", "attachments": [], "adjustments": [],
+				"transcript": [{"channel": "stderr", "data": b"boom\n".to_vec(), "sequence": 1}],
+				"status": {"outcome": "exited", "exit_code": 2, "signal": null, "wall_clock_ms": 20,
+					"spilled_output": null, "aborted": false, "effects_unknown": false,
+					"final_cwd_uri": null, "final_cwd_revision": 0}}}
+		});
+		let mut diag = text_node(KnownTag::Diag, "");
+		diag.props.push((
+			PropId::Fault.into(),
+			Value::Json(serde_json::value::to_raw_value(&envelope).unwrap()),
+		));
+		let view = CardView {
+			input:   &input,
+			result:  None,
+			diag:    Some(&diag),
+			usage:   None,
+			status:  CardStatus::Failed,
+			output:  None,
+			started: None,
+		};
+		let rendered = rows_join(&view, false);
+		assert!(rendered.contains("boom"), "{rendered}");
+		assert!(rendered.contains("Exit: 2"), "{rendered}");
+		assert!(!rendered.contains("command_failed") && !rendered.contains("{\""), "{rendered}");
+	}
+
 	#[test]
 	fn output_tail_windows_logical_lines() {
 		assert_eq!(output_tail("", false), None);
@@ -279,6 +376,22 @@ mod tests {
 			output_tail("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n", true),
 			Some((None, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11".to_owned()))
 		);
+	}
+
+	/// CRLF line ends and multi-byte text never shift or split the window.
+	#[test]
+	fn output_tail_survives_crlf_and_unicode_lines() {
+		let output = (1..=12)
+			.map(|n| format!("ライン {n} — ✓\r\n"))
+			.collect::<String>();
+		let (marker, lines) = output_tail(&output, false).unwrap();
+		assert_eq!(
+			marker.as_deref(),
+			Some("… (2 earlier lines, showing 10 of 12) (ctrl+o to expand)")
+		);
+		assert!(lines.starts_with("ライン 3 — ✓"), "{lines}");
+		assert!(lines.ends_with("ライン 12 — ✓"), "{lines}");
+		assert_eq!(lines.lines().count(), 10);
 	}
 
 	#[test]

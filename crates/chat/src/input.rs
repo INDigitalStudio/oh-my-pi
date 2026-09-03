@@ -36,6 +36,19 @@ impl Bindings {
 	pub fn binds(&self, command: &str) -> bool {
 		self.commands.values().any(|bound| bound == command)
 	}
+
+	/// The chord to show in a hint for `command`: the shortest one bound to
+	/// it (`f5` over `alt+r`, as pi lists its primary key first), ties by
+	/// chord order. Bind lines carry no declaration order into the table.
+	#[must_use]
+	pub fn chord_for(&self, command: &str) -> Option<&str> {
+		self
+			.commands
+			.iter()
+			.filter(|(_, bound)| bound.as_str() == command)
+			.map(|(chord, _)| chord.as_str())
+			.min_by_key(|chord| chord.len())
+	}
 }
 
 /// Invalid `bind` key chord.

@@ -1,10 +1,11 @@
 //! `/resume` session picker: pi `session-selector.ts` as an observer-local
 //! [`Panel`] (ADR 0005).
 //!
-//! The picker reads the on-disk session index once through
-//! [`Services::sessions`](super::Services::sessions), keeps its own row
-//! list, and asks for every effect through a console line (ADR 0014):
-//! `resume`, `session_rename`, `session_delete`.
+//! The picker opens on the project session index, then asks the controller
+//! for project/global replacements when Tab toggles scope. It keeps only the
+//! detached rows and sends every effect outward on the command stream (ADR
+//! 0005/0014): typed index requests plus `resume`, `session_rename`, and
+//! `session_delete` console lines.
 //!
 //! pi's picker (`SessionSelectorComponent`, `session-selector.ts:809`)
 //! stacks a search input over a multi-line session list; here the list is
@@ -18,14 +19,17 @@ use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
 use omp_core::{Str, StrMut, sf};
 use omp_tui::{Frame, Key, Prop, Size, Ui, UiContext, UiEvent, dom};
 
-use super::{Panel, PanelAction, PanelAnchor, PanelCx, PanelEvent, services::SessionRow};
+use super::{
+	Outcome, Panel, PanelAction, PanelAnchor, PanelCx, PanelEvent, PanelNote,
+	services::{SessionRow, SessionScope},
+};
+use crate::host::HostCommand;
 
 /// pi `session-selector.ts:833` default heading.
 const TITLE: &str = "Resume Session";
-/// pi `session-selector.ts:1021` footer, with the `app.session.*` chords
-/// in place of the all-projects scope toggle (one listing, no scope).
+/// pi `session-selector.ts:1021` footer plus omp's session chords.
 const LIST_HINT: &str =
-	"[Del/⌫ delete · Enter select · Ctrl+P path · Ctrl+S sort · Ctrl+R rename · Esc cancel]";
+	"[Tab scope · Del · Enter · Ctrl+P path · Ctrl+S sort · Ctrl+R rename · Esc]";
 const RENAME_HINT: &str = "[Enter save · Esc cancel]";
 const CONFIRM_HINT: &str = "[y delete · n/Esc keep]";
 /// pi `session-selector.ts:559` empty-state wording.
@@ -79,6 +83,15 @@ struct Shown {
 	child: bool,
 }
 
+/// Result of a controller-owned project/global session-index read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionIndexOutcome {
+	/// Scope that was requested.
+	pub scope:  SessionScope,
+	/// Detached rows or the controller's failure.
+	pub result: Result<Vec<SessionRow>, Str>,
+}
+
 /// Retained `/resume` picker.
 pub struct SessionPicker {
 	ui:        Ui,
@@ -92,6 +105,8 @@ pub struct SessionPicker {
 	mode:      Mode,
 	full_path: bool,
 	sort:      Sort,
+	scope:     SessionScope,
+	requested: Option<SessionScope>,
 	width:     u16,
 	list_rows: u16,
 }
@@ -103,7 +118,7 @@ impl SessionPicker {
 	pub fn open(cx: &PanelCx<'_>) -> Result<Self, Str> {
 		let rows = cx
 			.services
-			.sessions()
+			.sessions(SessionScope::Project)
 			.map_err(|error| Str::new(error.to_string()))?;
 		Self::from_rows(rows, TimeZone::system(), cx.viewport, cx.ui)
 	}
@@ -129,6 +144,8 @@ impl SessionPicker {
 			mode: Mode::List,
 			full_path: false,
 			sort: Sort::Modified,
+			scope: SessionScope::Project,
+			requested: None,
 			width: viewport.width,
 			list_rows: Self::list_rows_for(viewport),
 		};
@@ -302,12 +319,17 @@ impl SessionPicker {
 	}
 
 	/// pi suffixes the heading with the listing scope
-	/// (`session-selector.ts:889`); here the suffix names the sort key.
+	/// (`session-selector.ts:889`).
 	fn list_title(&self) -> Str {
-		match self.sort {
-			Sort::Modified => sf!("{TITLE} (by modified)"),
-			Sort::Created => sf!("{TITLE} (by created)"),
-		}
+		let sort = match self.sort {
+			Sort::Modified => "modified",
+			Sort::Created => "created",
+		};
+		let scope = match self.requested.unwrap_or(self.scope) {
+			SessionScope::Project => "project",
+			SessionScope::All => "all projects",
+		};
+		sf!("{TITLE} (by {sort} · {scope})")
 	}
 
 	fn build_rename(&self, index: usize, text: Str) -> Ui {
@@ -405,6 +427,18 @@ impl SessionPicker {
 	}
 
 	fn list_key(&mut self, key: Key) -> PanelEvent {
+		if key == Key::Tab {
+			if self.requested.is_some() {
+				return PanelEvent::Consumed;
+			}
+			let scope = match self.scope {
+				SessionScope::Project => SessionScope::All,
+				SessionScope::All => SessionScope::Project,
+			};
+			self.requested = Some(scope);
+			self.rebuild();
+			return PanelEvent::Command(HostCommand::SessionIndex { scope });
+		}
 		// pi `session-selector.ts:670-683`: Delete, or Backspace on an empty
 		// query, asks to delete the highlighted session.
 		if key == Key::Delete || (key == Key::Backspace && self.query.is_empty()) {
@@ -530,6 +564,39 @@ impl Panel for SessionPicker {
 			Mode::Rename { .. } => self.rename_key(key),
 			Mode::Confirm { .. } => self.confirm_key(key),
 		}
+	}
+
+	fn notify(&mut self, note: PanelNote<'_>) -> PanelEvent {
+		let PanelNote::Outcome(Outcome::SessionIndex(outcome)) = note else {
+			return PanelEvent::Ignored;
+		};
+		if self.requested != Some(outcome.scope) {
+			return PanelEvent::Ignored;
+		}
+		self.requested = None;
+		let rows = match &outcome.result {
+			Ok(rows) => rows.clone(),
+			Err(error) => {
+				self.rebuild();
+				return PanelEvent::Notice(error.clone());
+			},
+		};
+		let selected = self.current().map(|index| self.rows[index].id.clone());
+		self.scope = outcome.scope;
+		self.rows = rows;
+		self.reorder();
+		self.cursor = selected
+			.as_ref()
+			.and_then(|id| {
+				self
+					.shown
+					.iter()
+					.position(|shown| self.rows[shown.row].id == *id)
+			})
+			.or_else(|| (!self.shown.is_empty()).then_some(0));
+		self.mode = Mode::List;
+		self.rebuild();
+		PanelEvent::Consumed
 	}
 
 	fn paste(&mut self, text: &str) -> PanelEvent {
@@ -661,7 +728,10 @@ mod tests {
 		let shown = text(&mut picker);
 		assert!(shown.contains("2024-12-31 23:59"), "created stamp missing:\n{shown}");
 		assert!(!shown.contains("2025-01-15 10:30"), "modified stamp still shown:\n{shown}");
-		assert!(shown.contains("Resume Session (by created)"), "title suffix missing:\n{shown}");
+		assert!(
+			shown.contains("Resume Session (by created · project)"),
+			"title suffix missing:\n{shown}"
+		);
 		// B was created last, so it now leads and Enter resumes it.
 		assert_eq!(
 			picker.key(Key::Enter),
@@ -740,6 +810,36 @@ mod tests {
 	fn esc_closes_the_list() {
 		let mut picker = picker(vec![row("01HABC", Some("Old"), MODIFIED, CREATED)]);
 		assert_eq!(picker.key(Key::Esc), PanelEvent::Close);
+	}
+
+	#[test]
+	fn tab_requests_global_index_and_applies_the_typed_outcome() {
+		let mut picker = picker(vec![row("project", Some("Project"), MODIFIED, CREATED)]);
+		assert!(matches!(
+			picker.key(Key::Tab),
+			PanelEvent::Command(HostCommand::SessionIndex {
+				scope: SessionScope::All
+			})
+		));
+		assert_eq!(picker.rows()[0].id.as_str(), "project", "old projection stays visible while loading");
+		assert!(text(&mut picker).contains("all projects"));
+
+		let outcome = Outcome::SessionIndex(SessionIndexOutcome {
+			scope: SessionScope::All,
+			result: Ok(vec![row("global", Some("Global"), MODIFIED + 1, CREATED)]),
+		});
+		assert_eq!(picker.notify(PanelNote::Outcome(&outcome)), PanelEvent::Consumed);
+		assert_eq!(picker.rows()[0].id.as_str(), "global");
+		let shown = text(&mut picker);
+		assert!(shown.contains("Global"), "{shown}");
+		assert!(shown.contains("all projects"), "{shown}");
+
+		assert!(matches!(
+			picker.key(Key::Tab),
+			PanelEvent::Command(HostCommand::SessionIndex {
+				scope: SessionScope::Project
+			})
+		));
 	}
 
 	#[test]

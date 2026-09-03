@@ -16,17 +16,25 @@ use std::{
 };
 
 use miette::{IntoDiagnostic as _, miette};
-use omp_agent::{Kernel, TurnInput, Up};
+use omp_agent::{Kernel, LifecycleHooks, TurnInput, Up};
 use omp_chat::{
 	HostAction, HostCommand, HostMailbox,
 	commands::{CompactionMethod, ShakeMode, TodoOp},
 	host::SpawnKind,
+	overlays::{
+		Outcome,
+		git::GitOutcome,
+		hub::AgentOutcome,
+		services::{Mutation, Mutations, ServiceError, ServiceOutcome},
+		sessions::SessionIndexOutcome,
+	},
 };
 use omp_con::{Ctx, Severity};
 use omp_core::{Str, Ulid};
 use omp_dom::{Event, Handle, KnownTag, NodeSpec, Op, PropId, PropKey, Tag, Txn, Value};
 use omp_driver::headless::kernel::{ComposedInference, KernelOptions, SessionHome};
 use omp_journal::EntryId;
+use omp_proto::toolhost::v1::HookEventId;
 use omp_session::{Session, SessionError, components::jobs};
 use parking_lot::RwLock;
 
@@ -37,14 +45,48 @@ const TAN_CONTEXT: &str = include_str!("../../chat/prompts/tan-context-switch.md
 /// `<prompt kind>` of a `/queue` entry under `<queues><prompts>`.
 const QUEUED: &str = "queued";
 
+/// A lifecycle transform requested behavior the controller cannot perform.
+#[derive(Debug, thiserror::Error)]
+enum SessionHookError {
+	/// The hook transformed a field without a corresponding runtime operation.
+	#[error("hook {event:?} transformed unsupported field {field}")]
+	UnsupportedTransform {
+		/// Lifecycle event whose output requested the operation.
+		event: HookEventId,
+		/// Mutable field without an implementation.
+		field: &'static str,
+	},
+}
+
 /// What the idle loop does next after one command.
 enum Flow {
 	/// Keep waiting for commands.
 	Idle,
 	/// Run this turn.
 	Turn(TurnInput),
+	/// Run one tool without inference (`!` / `$` prefix modes).
+	Local(omp_agent::LocalRun),
 	/// Leave the controller.
 	Quit,
+}
+
+/// Builds the tool call behind a `!` / `$` composer line (pi `handleBashCommand`
+/// → `bash`, `handlePythonCommand` → `eval` with the Python kernel).
+fn local_run(input: omp_chat::composer::LocalInput) -> omp_agent::LocalRun {
+	let (name, args) = match input.mode {
+		omp_chat::composer::PrefixMode::Bash => {
+			("bash", serde_json::json!({ "command": input.code.as_str() }))
+		},
+		omp_chat::composer::PrefixMode::Eval => {
+			("eval", serde_json::json!({ "language": "py", "code": input.code.as_str() }))
+		},
+	};
+	omp_agent::LocalRun {
+		name:    Str::new_static(name),
+		args:    serde_json::value::to_raw_value(&args).expect("literal JSON serializes"),
+		intent:  None,
+		exclude: input.exclude,
+	}
 }
 
 /// A background `/tan` child finished.
@@ -55,13 +97,15 @@ struct TanDone {
 }
 
 /// The chat controller: session owner, kernel driver, command applier.
-pub(crate) struct Controller {
-	kernel:       Kernel<ComposedInference>,
+pub(crate) struct Controller<C = ComposedInference> {
+	kernel:       Kernel<C>,
+	lifecycle:    Option<LifecycleHooks>,
 	session:      Session,
 	home:         SessionHome,
 	relay:        flume::Sender<Event>,
 	forwarder:    Option<tokio::task::JoinHandle<()>>,
 	ctx:          Arc<Ctx>,
+	mutations:    Arc<dyn Mutations>,
 	up:           flume::Sender<Up>,
 	live_journal: Arc<RwLock<PathBuf>>,
 	data_dir:     PathBuf,
@@ -73,32 +117,39 @@ pub(crate) struct Controller {
 	tan_rx:       flume::Receiver<TanDone>,
 	/// Journal deleted by `/drop` once the replacement session is live.
 	ephemeral:    Option<PathBuf>,
+	/// Pairs waiting `ask` calls with the host's answers.
+	ask:          omp_driver::headless::AskRoute,
 }
 
-impl Controller {
+impl<C: omp_agent::Inference> Controller<C> {
 	/// Takes ownership of the composed kernel and session and starts
 	/// relaying the session's DOM events onto `relay`.
 	pub(crate) fn new(
-		kernel: Kernel<ComposedInference>,
+		kernel: Kernel<C>,
 		mut session: Session,
 		home: SessionHome,
 		relay: flume::Sender<Event>,
 		ctx: Arc<Ctx>,
+		mutations: Arc<dyn Mutations>,
 		live_journal: Arc<RwLock<PathBuf>>,
 		data_dir: PathBuf,
 		ephemeral: Option<PathBuf>,
+		ask: omp_driver::headless::AskRoute,
 	) -> (Self, omp_dom::Snapshot) {
 		let up = kernel.mailbox();
+		let lifecycle = kernel.lifecycle_hooks();
 		let (snapshot, events) = session.subscribe();
 		let forwarder = Some(forward(events, relay.clone()));
 		let (tan_tx, tan_rx) = flume::unbounded();
 		let controller = Self {
 			kernel,
+			lifecycle,
 			session,
 			home,
 			relay,
 			forwarder,
 			ctx,
+			mutations,
 			up,
 			live_journal,
 			data_dir,
@@ -110,6 +161,7 @@ impl Controller {
 			tan_tx,
 			tan_rx,
 			ephemeral,
+			ask,
 		};
 		(controller, snapshot)
 	}
@@ -119,6 +171,24 @@ impl Controller {
 		mut self,
 		command_rx: flume::Receiver<HostCommand>,
 	) -> miette::Result<()> {
+		let _ = Self::gate_lifecycle(
+			self.lifecycle.clone(),
+			HookEventId::HookEventSessionStart,
+				serde_json::json!({
+					"session_id": display_name(&self.session),
+					"root": &self.home.project_root,
+					"cwd": &self.home.project_root,
+					"dirs": [],
+					"resumed": !self.session.dom().children(self.session.dom().body()).is_empty(),
+					"forked_from": serde_json::Value::Null,
+					"agent": serde_json::Value::Null,
+					"trust": "trusted",
+					"head_event": self.head()?,
+					"prompt_rev": "1",
+					"previous_session": serde_json::Value::Null,
+				}),
+			)
+			.await?;
 		loop {
 			let flow = tokio::select! {
 				command = command_rx.recv_async() => match command {
@@ -135,15 +205,21 @@ impl Controller {
 			match flow {
 				Flow::Idle => {},
 				Flow::Turn(input) => {
-					let quit = self.run_turn(input, &command_rx).await?;
+					let quit = self.run_turn(input, &command_rx).await? || self.after_turn(&command_rx).await?;
 					if quit {
-						self.session.process_exit().into_diagnostic()?;
+						self.shutdown()?;
 						return Ok(());
 					}
-					self.after_turn().await?;
+				},
+				Flow::Local(run) => {
+					let quit = self.run_local(run, &command_rx).await? || self.after_turn(&command_rx).await?;
+					if quit {
+						self.shutdown()?;
+						return Ok(());
+					}
 				},
 				Flow::Quit => {
-					self.session.process_exit().into_diagnostic()?;
+					self.shutdown()?;
 					return Ok(());
 				},
 			}
@@ -152,18 +228,79 @@ impl Controller {
 			if !self.paused && let Some(prompt) = self.pop_queued()? {
 				let quit = self
 					.run_turn(TurnInput { text: prompt, attachments: Vec::new() }, &command_rx)
-					.await?;
+					.await?
+					|| self.after_turn(&command_rx).await?;
 				if quit {
-					self.session.process_exit().into_diagnostic()?;
+					self.shutdown()?;
 					return Ok(());
 				}
-				self.after_turn().await?;
 			}
 		}
 	}
 
+	/// Runs a lifecycle admission gate when extensions subscribed to it.
+	async fn gate_lifecycle(
+		lifecycle: Option<LifecycleHooks>,
+		event: HookEventId,
+		payload: serde_json::Value,
+	) -> miette::Result<serde_json::Value> {
+		match lifecycle {
+			Some(lifecycle) => lifecycle.gate(event, payload).await.into_diagnostic(),
+			None => Ok(payload),
+		}
+	}
+
+	/// Notifies lifecycle observers when extensions subscribed to the event.
+	fn notify_lifecycle(
+		&self,
+		event: HookEventId,
+		payload: serde_json::Value,
+	) -> miette::Result<()> {
+		if let Some(lifecycle) = &self.lifecycle {
+			lifecycle.notify(event, payload).into_diagnostic()?;
+		}
+		Ok(())
+	}
+
+	/// Commits process exit before observers see the bounded shutdown edge.
+	fn shutdown(&mut self) -> miette::Result<()> {
+		let session = display_name(&self.session);
+		self
+			.kernel
+			.flush_session_state(&mut self.session)
+			.into_diagnostic()?;
+		self.session.process_exit().into_diagnostic()?;
+		self.notify_lifecycle(
+			HookEventId::HookEventSessionShutdown,
+			serde_json::json!({
+				"session_id": session,
+				"reason": "user_exit",
+				"budget": "1s",
+				"target_session": serde_json::Value::Null,
+			}),
+		)
+	}
+
 	/// Applies one command while no turn is running.
 	async fn apply_idle(&mut self, command: HostCommand) -> miette::Result<Flow> {
+		// Console writes happen in the host's `Ctx`. Persist them at the next
+		// controller boundary; transition commands flush after their before
+		// hook so admission observes the pre-transition state.
+		if !matches!(
+			&command,
+			HostCommand::SessionOpen { .. }
+				| HostCommand::SessionNew { .. }
+				| HostCommand::SessionDrop
+				| HostCommand::Fork { .. }
+				| HostCommand::Rewind { .. }
+				| HostCommand::Quit
+		) {
+			self
+				.kernel
+				.flush_session_state(&mut self.session)
+				.into_diagnostic()?;
+			self.kernel.resync_session_state(&self.session);
+		}
 		Ok(match command {
 			HostCommand::Submit(text) => {
 				if self.paused {
@@ -193,6 +330,17 @@ impl Controller {
 				let _ = self.up.send(Up::Approve { id, decision });
 				Flow::Idle
 			},
+			HostCommand::RunLocal { input, draft } => {
+				if self.paused {
+					self.refuse_local(draft);
+					return Ok(Flow::Idle);
+				}
+				Flow::Local(local_run(input))
+			},
+			HostCommand::AskAnswer { id, answers } => {
+				self.answer_ask(&id, answers);
+				Flow::Idle
+			},
 			HostCommand::Overlay { .. } => Flow::Idle,
 			HostCommand::PushToTalk { active } => {
 				self.voice.set_active(active, &self.ctx);
@@ -220,6 +368,7 @@ impl Controller {
 		command_rx: &flume::Receiver<HostCommand>,
 	) -> miette::Result<bool> {
 		let mut quit = false;
+		let ask = self.ask.clone();
 		let failure = {
 			let mut failure = None;
 			let turn =
@@ -246,6 +395,7 @@ impl Controller {
 						Ok(HostCommand::Approve { id, decision }) => {
 							let _ = self.up.send(Up::Approve { id, decision });
 						},
+						Ok(HostCommand::AskAnswer { id, answers }) => answer_ask(&ask, &id, answers),
 						Ok(HostCommand::Quit) | Err(_) => {
 							let _ = self.up.send(Up::Cancel);
 							quit = true;
@@ -288,13 +438,38 @@ impl Controller {
 		Ok(quit)
 	}
 
-	/// Applies every command deferred during the turn.
-	async fn after_turn(&mut self) -> miette::Result<()> {
-		let pending = std::mem::take(&mut self.pending);
-		for command in pending {
-			self.apply_session_command(command).await?;
+	/// Applies every command deferred during the turn, in arrival order. A
+	/// deferred `!` / `$` run (pi `pendingBashComponents`) executes here with
+	/// the live command receiver, so Esc and quit still reach it; anything
+	/// it defers in turn is drained too. Returns whether the host asked to
+	/// quit.
+	async fn after_turn(&mut self, command_rx: &flume::Receiver<HostCommand>) -> miette::Result<bool> {
+		while !self.pending.is_empty() {
+			for command in std::mem::take(&mut self.pending) {
+				match command {
+					HostCommand::RunLocal { input, draft } => {
+						if self.paused {
+							self.refuse_local(draft);
+						} else if self.run_local(local_run(input), command_rx).await? {
+							return Ok(true);
+						}
+					},
+					other => self.apply_session_command(other).await?,
+				}
+			}
 		}
-		Ok(())
+		Ok(false)
+	}
+
+	/// Hands a `!` / `$` line back to the composer: the controller is paused
+	/// and will not run tools until resumed.
+	fn refuse_local(&self, draft: Str) {
+		if let Some(mailbox) = self.ctx.user::<HostMailbox>() {
+			mailbox.post(HostAction::LocalRefused {
+				draft,
+				reason: Str::new_static("Paused: resume before running local commands"),
+			});
+		}
 	}
 
 	/// Applies one session-mutating command between turns.
@@ -306,18 +481,18 @@ impl Controller {
 			HostCommand::SessionOpen { path } => {
 				let next = self.home.open(&path).map_err(|error| miette!(error))?;
 				let name = display_name(&next);
-				self.switch_to(next).await?;
+				self.switch_to(next, "resume").await?;
 				self.reply(Severity::Info, format!("Resumed session {name}"));
 			},
 			HostCommand::SessionNew { model: _ } => {
 				let next = self.home.create(None).map_err(|error| miette!(error))?;
-				self.switch_to(next).await?;
+				self.switch_to(next, "new").await?;
 				self.reply(Severity::Info, "✓ New session started");
 			},
 			HostCommand::SessionDrop => {
 				let dropped = self.session.journal_path().to_path_buf();
 				let next = self.home.create(None).map_err(|error| miette!(error))?;
-				self.switch_to(next).await?;
+				self.switch_to(next, "new").await?;
 				let _ = fs::remove_file(&dropped);
 				if self.ephemeral.as_ref() == Some(&dropped) {
 					self.ephemeral = None;
@@ -326,28 +501,117 @@ impl Controller {
 			},
 			HostCommand::Fork { target } => {
 				let source = self.session.journal_path().to_path_buf();
+				let at_event = self.head()?;
+				let effective = Self::gate_lifecycle(
+					self.lifecycle.clone(),
+					HookEventId::HookEventSessionBranch,
+						serde_json::json!({
+							"at_event": at_event,
+							"keep_event": target,
+							"reason": "user",
+							"summarize": false,
+						}),
+					)
+					.await?;
+				if effective.get("summarize").and_then(serde_json::Value::as_bool) != Some(false) {
+					return Err(SessionHookError::UnsupportedTransform {
+						event: HookEventId::HookEventSessionBranch,
+						field: "summarize",
+					})
+					.into_diagnostic();
+				}
+				self
+					.kernel
+					.flush_session_state(&mut self.session)
+					.into_diagnostic()?;
 				let mut next = self.home.fork(&source).map_err(|error| miette!(error))?;
 				if let Some(target) = target {
 					next.rewind(target).map_err(|error| miette!(error))?;
 				}
 				let name = display_name(&next);
-				self.switch_to(next).await?;
+				self.switch_to(next, "fork").await?;
+				self.notify_lifecycle(
+					HookEventId::HookEventSessionBranched,
+					serde_json::json!({
+						"at_event": at_event,
+						"new_head": self.head()?,
+						"summary_event": serde_json::Value::Null,
+					}),
+				)?;
 				self.reply(Severity::Info, format!("✓ Session forked to {name}"));
 			},
-			HostCommand::Rewind { target } => match self.session.rewind(target) {
-				Ok(work) => {
-					self.home.register(&self.session);
-					if !work.terminate.is_empty() {
-						self.reply(
-							Severity::Warn,
-							format!(
-								"Rewound; {} background job(s) fell off the live chain",
-								work.terminate.len()
-							),
-						);
-					}
-				},
-				Err(error) => self.reply(Severity::Warn, format!("Rewind failed: {error}")),
+			HostCommand::Rewind { target } => {
+				let effective = Self::gate_lifecycle(
+					self.lifecycle.clone(),
+					HookEventId::HookEventSessionRewind,
+						serde_json::json!({
+							"to_event": target,
+							"restore_workspace": false,
+							"targets": [],
+							"dropped_items": 0,
+						}),
+					)
+					.await?;
+				if effective
+					.get("restore_workspace")
+					.and_then(serde_json::Value::as_bool)
+					!= Some(false)
+				{
+					return Err(SessionHookError::UnsupportedTransform {
+						event: HookEventId::HookEventSessionRewind,
+						field: "restore_workspace",
+					})
+					.into_diagnostic();
+				}
+				self
+					.kernel
+					.flush_session_state(&mut self.session)
+					.into_diagnostic()?;
+				let before = self.session.dom().snapshot();
+				match self.session.rewind(target) {
+					Ok(work) => {
+						self.kernel.apply_lifecycle(&self.session, &work).await;
+						self.home.register(&self.session);
+						self.kernel.resync_session_state(&self.session);
+						let new_head = self.head()?;
+						let cancelled_jobs = work
+							.terminate
+							.iter()
+							.filter_map(|handle| before.get(*handle))
+							.filter_map(|node| node.prop(&PropId::Id.into()))
+							.filter_map(Value::as_str)
+							.map(Str::new)
+							.collect::<Vec<_>>();
+						let running_jobs = work
+							.spawn
+							.iter()
+							.filter_map(|handle| self.session.dom().get(*handle))
+							.filter_map(|node| node.prop(&PropId::Id.into()))
+							.filter_map(Value::as_str)
+							.map(Str::new)
+							.collect::<Vec<_>>();
+						self.notify_lifecycle(
+							HookEventId::HookEventSessionRewound,
+							serde_json::json!({
+								"to_event": target,
+								"new_head": new_head,
+								"restored_workspace": false,
+								"running_jobs": running_jobs,
+								"cancelled_jobs": cancelled_jobs,
+							}),
+						)?;
+						if !work.terminate.is_empty() {
+							self.reply(
+								Severity::Warn,
+								format!(
+									"Rewound; {} background job(s) fell off the live chain",
+									work.terminate.len()
+								),
+							);
+						}
+					},
+					Err(error) => self.reply(Severity::Warn, format!("Rewind failed: {error}")),
+				}
 			},
 			HostCommand::Rename { title } => {
 				let cause = self.head()?;
@@ -359,10 +623,17 @@ impl Controller {
 						ops: vec![Op::Set {
 							h:     self.session.dom().meta(),
 							prop:  PropId::Name.into(),
-							value: Value::Str(title),
+							value: Value::Str(title.clone()),
 						}],
 					})
 					.into_diagnostic()?;
+				self.notify_lifecycle(
+					HookEventId::HookEventSessionRenamed,
+					serde_json::json!({
+						"session": display_name(&self.session),
+						"name": title,
+					}),
+				)?;
 			},
 			HostCommand::Compact { method, hint } => self.compact(method, hint).await?,
 			HostCommand::Queue { prompt } => self.queue_prompt(prompt)?,
@@ -404,7 +675,55 @@ impl Controller {
 					self.reply(Severity::Warn, format!("todo: {error}"));
 				}
 			},
-			HostCommand::Submit(_)
+			HostCommand::ContextReset => match self.reset_context() {
+				Ok(dropped) => {
+					if dropped > 0 {
+						self.notify_lifecycle(
+							HookEventId::HookEventSessionReset,
+							serde_json::json!({
+								"at_event": self.head()?,
+								"kept_events": 0,
+							}),
+						)?;
+					}
+					self.reply(
+						Severity::Info,
+						format!(
+							"✓ Context reset — {dropped} {} dropped; session continues.",
+							if dropped == 1 { "message" } else { "messages" }
+						),
+					);
+				},
+				Err(error) => self.reply(Severity::Warn, format!("Context reset failed: {error}")),
+			},
+			HostCommand::Move { path } => match self.relocate(&path).await {
+				Ok(()) => self.reply(Severity::Info, format!("✓ Moved to {}", path.display())),
+				Err(error) => self.reply(Severity::Warn, format!("Move failed: {error}")),
+			},
+			HostCommand::AskAnswer { id, answers } => self.answer_ask(&id, answers),
+			HostCommand::Service(mutation) => self.apply_mutation(mutation),
+			HostCommand::SessionIndex { scope } => {
+				self.post_outcome(Outcome::SessionIndex(SessionIndexOutcome {
+					scope,
+					result: Err(Str::new_static("session index authority unavailable")),
+				}));
+			},
+			HostCommand::Git(op) => self.post_outcome(Outcome::Git(GitOutcome {
+				op,
+				result: Err(ServiceError::Unavailable("controller-owned git operations")),
+			})),
+			HostCommand::Agent { id, op } => {
+				self.post_outcome(Outcome::Agent(AgentOutcome {
+					id,
+					op,
+					result: Err(ServiceError::Unavailable("agent supervision")),
+				}));
+			},
+			// Deferred local runs are drained by `after_turn`, never applied
+			// as a plain session command.
+			HostCommand::RunLocal { .. }
+			| HostCommand::Retry
+			| HostCommand::Submit(_)
 			| HostCommand::SubmitWithAttachments { .. }
 			| HostCommand::Steer(_)
 			| HostCommand::Interrupt
@@ -417,9 +736,121 @@ impl Controller {
 		Ok(())
 	}
 
+	fn answer_ask(&self, id: &str, answers: Option<Vec<omp_tools::ask::Answer>>) {
+		answer_ask(&self.ask, id, answers);
+	}
+
+	fn apply_mutation(&self, mutation: Mutation) {
+		let pending = match self.mutations.apply(mutation.clone()) {
+			Ok(pending) => pending,
+			Err(error) => {
+				self.post_outcome(Outcome::Service(ServiceOutcome {
+					mutation,
+					result: Err(error),
+				}));
+				return;
+			},
+		};
+		let ctx = Arc::clone(&self.ctx);
+		tokio::spawn(async move {
+			let result = pending
+				.recv_async()
+				.await
+				.unwrap_or_else(|_| Err(ServiceError::Unavailable("mutation result")));
+			if let Some(mailbox) = ctx.user::<HostMailbox>() {
+				mailbox.post(HostAction::Outcome(Outcome::Service(ServiceOutcome {
+					mutation,
+					result,
+				})));
+			}
+		});
+	}
+
+	fn post_outcome(&self, outcome: Outcome) {
+		if let Some(mailbox) = self.ctx.user::<HostMailbox>() {
+			mailbox.post(HostAction::Outcome(outcome));
+		}
+	}
+
+	/// Runs one tool outside a model turn (`!` / `$`), routing interrupts,
+	/// approvals, and quit from the host meanwhile. Returns whether the host
+	/// asked to quit.
+	async fn run_local(
+		&mut self,
+		run: omp_agent::LocalRun,
+		command_rx: &flume::Receiver<HostCommand>,
+	) -> miette::Result<bool> {
+		let mut quit = false;
+		let ask = self.ask.clone();
+		let failure = {
+			let local =
+				self
+					.kernel
+					.run_local(&mut self.session, run, omp_agent::RunControl::default());
+			tokio::pin!(local);
+			let mut failure = None;
+			loop {
+				tokio::select! {
+					result = &mut local => {
+						failure = result.err();
+						break;
+					},
+					command = command_rx.recv_async() => match command {
+						Ok(HostCommand::Interrupt) => {
+							let _ = self.up.send(Up::Interrupt);
+						},
+						Ok(HostCommand::Approve { id, decision }) => {
+							let _ = self.up.send(Up::Approve { id, decision });
+						},
+						Ok(HostCommand::Quit) | Err(_) => {
+							let _ = self.up.send(Up::Cancel);
+							quit = true;
+						},
+						Ok(HostCommand::Submit(text) | HostCommand::Steer(text)) => {
+							let _ = self.up.send(Up::Steer(text));
+						},
+						Ok(HostCommand::AskAnswer { id, answers }) => answer_ask(&ask, &id, answers),
+						Ok(HostCommand::Overlay { .. }) => {},
+						Ok(other) => self.pending.push(other),
+					},
+				}
+				if quit {
+					failure = local.await.err();
+					break;
+				}
+			}
+			failure
+		};
+		if let Some(error) = failure {
+			crate::chat_cmd::record_turn_failure(&mut self.session, &error).into_diagnostic()?;
+		}
+		Ok(quit)
+	}
+
 	/// Replaces the live session: the old one records a switch, the new
 	/// one's subscription is relayed after exactly one `Reset`.
-	async fn switch_to(&mut self, mut next: Session) -> miette::Result<()> {
+	async fn switch_to(
+		&mut self,
+		mut next: Session,
+		reason: &'static str,
+	) -> miette::Result<()> {
+		let from = display_name(&self.session);
+		let to = display_name(&next);
+		let _ = Self::gate_lifecycle(
+			self.lifecycle.clone(),
+			HookEventId::HookEventSessionSwitch,
+				serde_json::json!({
+					"reason": reason,
+					"from_session": from,
+					"to_session": to,
+					"target_cwd": next.journal_path().parent(),
+				}),
+			)
+			.await?;
+		self
+			.kernel
+			.flush_session_state(&mut self.session)
+			.into_diagnostic()?;
 		// Subscribe before the swap: nothing writes `next` until it is live,
 		// so its receiver holds no events when the reset goes out.
 		let (snapshot, events) = next.subscribe();
@@ -436,6 +867,107 @@ impl Controller {
 		*self.live_journal.write() = self.session.journal_path().to_path_buf();
 		let _ = self.relay.send(Event::Reset { snapshot });
 		self.forwarder = Some(forward(events, self.relay.clone()));
+		self.kernel.resync_session_state(&self.session);
+		self.notify_lifecycle(
+			HookEventId::HookEventSessionSwitched,
+			serde_json::json!({
+				"reason": reason,
+				"from_session": from,
+				"to_session": to,
+				"head_event": self.head()?,
+			}),
+		)?;
+		Ok(())
+	}
+
+	/// pi `resetSessionContext`: journals a `compaction@1` at the head whose
+	/// summary is empty, so the provider projection starts over while the
+	/// session id, title, and journal survive. Returns the message count
+	/// the boundary hides.
+	fn reset_context(&mut self) -> miette::Result<usize> {
+		let dropped = omp_chat::commands::message_count(self.session.dom());
+		if dropped == 0 {
+			return Ok(0);
+		}
+		let root = self
+			.session
+			.journal_path()
+			.parent()
+			.map(PathBuf::from)
+			.unwrap_or_else(|| PathBuf::from("."));
+		let summary = omp_journal::blob::BlobStore::open(root)
+			.into_diagnostic()?
+			.put(b"")
+			.into_diagnostic()?;
+		let boundary = self.head()?;
+		self
+			.session
+			.compaction(omp_journal::data::Compaction {
+				summary,
+				boundary,
+				method: Some(Str::new_static("clear")),
+				tokens_before: None,
+				tokens_after: None,
+				warning: None,
+			})
+			.into_diagnostic()?;
+		Ok(dropped)
+	}
+
+	/// pi `moveSession` + `setProjectDir`: copies the journal (and its blob
+	/// store) into `target`'s session bucket, opens the copy as the live
+	/// session, removes the old file, and moves the process working
+	/// directory. A failure before the switch leaves everything in place.
+	async fn relocate(&mut self, target: &std::path::Path) -> miette::Result<()> {
+		let target = fs::canonicalize(target).into_diagnostic()?;
+		if !target.is_dir() {
+			return Err(miette!("not a directory: {}", target.display()));
+		}
+		let state_dir =
+			omp_env::project_state::directory(&self.data_dir, &target).into_diagnostic()?;
+		let sessions_dir = state_dir.join("sessions");
+		fs::create_dir_all(&sessions_dir).into_diagnostic()?;
+		let source = self.session.journal_path().to_path_buf();
+		let file = source
+			.file_name()
+			.ok_or_else(|| miette!("journal has no file name"))?;
+		let destination = sessions_dir.join(file);
+		if destination == source {
+			return Err(miette!("the session already lives in {}", target.display()));
+		}
+		if let Some(blobs) = source.parent().map(|dir| dir.join("blobs"))
+			&& blobs.is_dir()
+		{
+			copy_tree(&blobs, &sessions_dir.join("blobs")).into_diagnostic()?;
+		}
+		fs::copy(&source, &destination).into_diagnostic()?;
+		let home = SessionHome {
+			sessions_dir,
+			project_root: target.clone(),
+			model: self.home.model.clone(),
+			prompt: self.home.prompt.clone(),
+			live: Arc::clone(&self.home.live),
+			up: self.home.up.clone(),
+		};
+		let next = match home.open(&destination) {
+			Ok(next) => next,
+			Err(error) => {
+				let _ = fs::remove_file(&destination);
+				return Err(miette!(error));
+			},
+		};
+		self.switch_to(next, "handoff").await?;
+		self.home = home;
+		let _ = fs::remove_file(&source);
+		if self.ephemeral.as_ref() == Some(&source) {
+			self.ephemeral = Some(destination);
+		}
+		if let Err(error) = std::env::set_current_dir(&target) {
+			self.reply(
+				Severity::Warn,
+				format!("Session moved, but the working directory could not change: {error}"),
+			);
+		}
 		Ok(())
 	}
 
@@ -1007,6 +1539,22 @@ impl Controller {
 	}
 }
 
+/// Resolves the `ask` dialog reply for call `id`; a stale reply (the call
+/// already settled or the turn was interrupted) is dropped.
+fn answer_ask(
+	route: &omp_driver::headless::AskRoute,
+	id: &str,
+	answers: Option<Vec<omp_tools::ask::Answer>>,
+) {
+	let reply = match answers {
+		Some(answers) => omp_driver::headless::AskReply::Answers(answers),
+		None => omp_driver::headless::AskReply::Cancelled,
+	};
+	if !route.answer(id, reply) {
+		tracing::debug!(id, "ask reply had no waiting call");
+	}
+}
+
 /// Forwards one session's DOM events onto the host's relay until the
 /// session is dropped.
 fn forward(events: flume::Receiver<Event>, relay: flume::Sender<Event>) -> tokio::task::JoinHandle<()> {
@@ -1017,6 +1565,22 @@ fn forward(events: flume::Receiver<Event>, relay: flume::Sender<Event>) -> tokio
 			}
 		}
 	})
+}
+
+/// Copies every file under `from` into `to` (blob stores are flat,
+/// content-addressed, and idempotent to merge).
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+	fs::create_dir_all(to)?;
+	for entry in fs::read_dir(from)? {
+		let entry = entry?;
+		let target = to.join(entry.file_name());
+		if entry.file_type()?.is_dir() {
+			copy_tree(&entry.path(), &target)?;
+		} else if !target.exists() {
+			fs::copy(entry.path(), target)?;
+		}
+	}
+	Ok(())
 }
 
 fn display_name(session: &Session) -> Str {
@@ -1081,4 +1645,431 @@ enum TodoFailure {
 	Io(String),
 	#[error("{0}")]
 	Session(String),
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{future::Future, sync::Arc, time::Duration};
+
+	use async_stream::stream;
+	use futures::Stream;
+	use omp_agent::{
+		DispatchPolicy, KernelEvent, SessionStateBridge, StaticPrompt, TurnStop,
+		hooks::{
+			GateDecision, HookGate, HookPhase, OnFailure, SourceRef, Subscription, When,
+		},
+	};
+	use omp_chat::composer::{LocalInput, PrefixMode};
+	use omp_inference::{
+		BlockKind, ChatEvent, ChatRequest, ChatStream, Completion, ExecutionReceipt, FinishReason,
+		ProviderId, RequestId, ResponseMeta, RouteId, Usage,
+	};
+	use omp_tool::{
+		Claims, Constraint, Effects, Ev, IncomingParams, Part, Precedence, Presentation, PromptCaps,
+		Registry, Rev, Tool, ToolSpec, ToolTerminal,
+	};
+	use serde::{Deserialize, Serialize};
+
+	use super::*;
+
+	/// One text answer per request, delivered after `delay` so a command sent
+	/// right behind the prompt is provably received mid-turn.
+	struct SlowInference {
+		delay: Duration,
+	}
+
+	impl omp_agent::Inference for SlowInference {
+		fn chat(
+			&mut self,
+			_request: ChatRequest,
+		) -> impl Future<Output = Result<ChatStream, omp_inference::Error>> + Send {
+			let delay = self.delay;
+			async move {
+				tokio::time::sleep(delay).await;
+				let events = vec![
+					ChatEvent::Started(ResponseMeta {
+						request_id:          RequestId::from("scripted-request"),
+						provider:            ProviderId::from("scripted"),
+						route:               RouteId::from("scripted/test"),
+						model:               None,
+						provider_request_id: None,
+						created_at:          SystemTime::UNIX_EPOCH,
+					}),
+					ChatEvent::BlockStarted { index: 0, kind: BlockKind::Text },
+					ChatEvent::TextDelta { index: 0, text: Str::new_static("pong") },
+					ChatEvent::Completed(Completion {
+						reason:  FinishReason::Stop,
+						blocks:  1,
+						usage:   Usage::default(),
+						receipt: ExecutionReceipt::default().into(),
+					}),
+				];
+				Ok(ChatStream::ordinary(Box::pin(futures::stream::iter(events.into_iter().map(Ok)))))
+			}
+		}
+	}
+
+	#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+	struct Payload {
+		text: Str,
+	}
+
+	#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+	struct Fault {
+		message: Str,
+	}
+
+	/// A `bash` stand-in that runs far longer than the test is willing to
+	/// wait; only an interrupt reaching the kernel ends it.
+	struct SleepingBash {
+		spec: ToolSpec,
+	}
+
+	impl SleepingBash {
+		fn registry() -> Arc<Registry> {
+			let tool = Self {
+				spec: ToolSpec {
+					name:            Str::new_static("bash"),
+					rev:             Rev { family: Str::new_static("test"), n: 1 },
+					description:     Str::new_static("sleeping bash"),
+					schema:          bytes::Bytes::from_static(br#"{"type":"object"}"#),
+					constraint:      Constraint::None,
+					effects:         Effects::empty(),
+					projection_code: [1; 32],
+				},
+			};
+			let mut registry = Registry::new();
+			registry
+				.register(tool, Presentation::Slot, Claims {
+					precedence: Precedence::CORE,
+					claimant:   Str::new_static("omp-app/tests"),
+					replaces:   None,
+				})
+				.expect("tool registers");
+			Arc::new(registry)
+		}
+	}
+
+	impl Tool for SleepingBash {
+		type Fault = Fault;
+		type Params = serde_json::Value;
+		type Payload = Payload;
+		type Update = Str;
+
+		fn spec(&self) -> &ToolSpec {
+			&self.spec
+		}
+
+		fn call<'c>(
+			&'c self,
+			mut params: IncomingParams<'c>,
+		) -> impl Stream<Item = Ev<Self::Update, Self::Payload, Self::Fault>> + Send + 'c {
+			stream! {
+				let _ = params.committed().await;
+				tokio::time::sleep(Duration::from_secs(20)).await;
+				yield Ev::Done(ToolTerminal::Done {
+					result: Ok(Payload { text: Str::new_static("slept") }),
+					useless: false,
+				});
+			}
+		}
+
+		fn prompt(&self, view: Result<&Self::Payload, &Self::Fault>, _caps: &PromptCaps) -> Vec<Part> {
+			let text = match view {
+				Ok(payload) => payload.text.clone(),
+				Err(fault) => fault.message.clone(),
+			};
+			vec![Part::Text { text }]
+		}
+	}
+
+	struct OrderBridge {
+		order: flume::Sender<&'static str>,
+	}
+
+	impl SessionStateBridge for OrderBridge {
+		fn flush(&self, _session: &mut Session) -> Result<(), SessionError> {
+			let _ = self.order.send("flush");
+			Ok(())
+		}
+
+		fn resync(&self, _dom: &omp_dom::Dom) {
+			let _ = self.order.send("resync");
+		}
+	}
+
+	fn subscription(event: HookEventId, phase: HookPhase, id: u32) -> Subscription {
+		Subscription {
+			host: Str::new_static("controller-test"),
+			source: SourceRef {
+				layer: 0,
+				publisher: Str::new_static("omp-app"),
+				extension_id: Str::new_static("controller-test"),
+			},
+			id,
+			event,
+			phase,
+			order: 0,
+			on_failure: OnFailure::Defer,
+			when: When::default(),
+		}
+	}
+
+	struct Harness {
+		commands: flume::Sender<HostCommand>,
+		events:   flume::Receiver<KernelEvent>,
+		ctx:      Arc<Ctx>,
+		run:      tokio::task::JoinHandle<miette::Result<()>>,
+		_dir:     tempfile::TempDir,
+	}
+
+	fn harness(inference_delay: Duration) -> Harness {
+		let dir = tempfile::tempdir().expect("temp dir");
+		let mut kernel = Kernel::new(
+			SlowInference { delay: inference_delay },
+			SleepingBash::registry(),
+			DispatchPolicy::new(
+				omp_journal::blob::BlobStore::open(dir.path().join("blobs")).expect("blob store"),
+			),
+			StaticPrompt(Str::new_static("test system")),
+		);
+		let events = kernel.subscribe();
+		let home = SessionHome {
+			sessions_dir: dir.path().join("sessions"),
+			project_root: dir.path().to_path_buf(),
+			model:        Str::new_static("test/model"),
+			prompt:       omp_driver::headless::kernel::PromptOverrides::default(),
+			live:         Arc::new(omp_driver::sessions::SessionRegistry::new()),
+			up:           kernel.mailbox(),
+		};
+		fs::create_dir_all(&home.sessions_dir).expect("sessions dir");
+		let session = home.create(None).expect("session");
+		let (relay, _dom_events) = flume::unbounded();
+		let ctx = Arc::new(HostMailbox::new().attach(Ctx::builder()).build());
+		let live_journal = Arc::new(RwLock::new(session.journal_path().to_path_buf()));
+		let (controller, _snapshot) = Controller::new(
+			kernel,
+			session,
+			home,
+			relay,
+			Arc::clone(&ctx),
+			Arc::new(omp_chat::overlays::services::NoMutations),
+			live_journal,
+			dir.path().to_path_buf(),
+			None,
+			omp_driver::headless::AskRoute::new(),
+		);
+		let (commands, command_rx) = flume::unbounded();
+		let run = tokio::spawn(controller.run(command_rx));
+		Harness { commands, events, ctx, run, _dir: dir }
+	}
+
+	fn sleep_command() -> HostCommand {
+		HostCommand::RunLocal {
+			input: LocalInput {
+				mode:    PrefixMode::Bash,
+				code:    Str::new_static("sleep 20"),
+				exclude: false,
+			},
+			draft: Str::new_static("!sleep 20"),
+		}
+	}
+
+	async fn next_event(
+		events: &flume::Receiver<KernelEvent>,
+		accept: impl Fn(&KernelEvent) -> bool,
+	) -> KernelEvent {
+		tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				let event = events.recv_async().await.expect("kernel event");
+				if accept(&event) {
+					return event;
+				}
+			}
+		})
+		.await
+		.expect("event arrives in time")
+	}
+
+	#[tokio::test]
+	async fn session_switch_orders_gate_flush_transition_resync_then_observation() {
+		let dir = tempfile::tempdir().expect("temp dir");
+		let (gate, hook_rx) = HookGate::channel();
+		let gate = Arc::new(gate);
+		gate
+			.subscribe("controller-test", [
+				subscription(HookEventId::HookEventSessionSwitch, HookPhase::Precheck, 1),
+				subscription(HookEventId::HookEventSessionSwitched, HookPhase::Observe, 2),
+			])
+			.expect("subscriptions");
+		let (order_tx, order_rx) = flume::unbounded();
+		let kernel = Kernel::new(
+			SlowInference { delay: Duration::ZERO },
+			SleepingBash::registry(),
+			DispatchPolicy::new(
+				omp_journal::blob::BlobStore::open(dir.path().join("blobs")).expect("blob store"),
+			),
+			StaticPrompt(Str::new_static("test system")),
+		)
+		.with_hook_gate(Arc::clone(&gate))
+		.with_session_state_bridge(Arc::new(OrderBridge { order: order_tx.clone() }));
+		let home = SessionHome {
+			sessions_dir: dir.path().join("sessions"),
+			project_root: dir.path().to_path_buf(),
+			model: Str::new_static("test/model"),
+			prompt: omp_driver::headless::kernel::PromptOverrides::default(),
+			live: Arc::new(omp_driver::sessions::SessionRegistry::new()),
+			up: kernel.mailbox(),
+		};
+		fs::create_dir_all(&home.sessions_dir).expect("sessions dir");
+		let session = home.create(None).expect("session");
+		let next = home.create(None).expect("next session");
+		let (relay, _dom_events) = flume::unbounded();
+		let ctx = Arc::new(HostMailbox::new().attach(Ctx::builder()).build());
+		let live_journal = Arc::new(RwLock::new(session.journal_path().to_path_buf()));
+		let (mut controller, _snapshot) = Controller::new(
+			kernel,
+			session,
+			home,
+			relay,
+			ctx,
+			Arc::new(omp_chat::overlays::services::NoMutations),
+			live_journal,
+			dir.path().to_path_buf(),
+			None,
+			omp_driver::headless::AskRoute::new(),
+		);
+		let responder_gate = Arc::clone(&gate);
+		let responder_order = order_tx;
+		let responder = tokio::spawn(async move {
+			while let Ok(dispatch) = hook_rx.recv_async().await {
+				let payload: serde_json::Value =
+					serde_json::from_slice(&dispatch.payload).expect("JSON lifecycle payload");
+				match dispatch.event {
+					HookEventId::HookEventSessionSwitch => {
+						assert!(payload.get("reason").is_some());
+						assert!(payload.get("from_session").is_some());
+						assert!(payload.get("to_session").is_some());
+						assert!(payload.get("target_cwd").is_some());
+						let _ = responder_order.send("before");
+						let decisions = dispatch
+							.subscriptions
+							.iter()
+							.map(|subscription| (subscription.id, GateDecision::Defer))
+							.collect();
+						responder_gate
+							.answer(dispatch.dispatch_id, decisions)
+							.expect("answer switch gate");
+					},
+					HookEventId::HookEventSessionSwitched => {
+						assert!(payload.get("reason").is_some());
+						assert!(payload.get("from_session").is_some());
+						assert!(payload.get("to_session").is_some());
+						assert!(payload.get("head_event").is_some());
+						let _ = responder_order.send("after");
+						break;
+					},
+					other => panic!("unexpected hook dispatch {other:?}"),
+				}
+			}
+		});
+		controller.switch_to(next, "new").await.expect("switch");
+		responder.await.expect("responder");
+		assert_eq!(
+			order_rx.try_iter().collect::<Vec<_>>(),
+			["before", "flush", "resync", "after"],
+		);
+	}
+
+	/// A `!` command typed during a model turn runs after it (pi
+	/// `pendingBashComponents`) and still hears Esc: the interrupt from the
+	/// host reaches the deferred run instead of waiting for it to finish.
+	#[tokio::test]
+	async fn deferred_local_run_is_interrupted_by_the_host() {
+		let harness = harness(Duration::from_millis(300));
+		harness
+			.commands
+			.send(HostCommand::Submit(Str::new_static("hello")))
+			.expect("submit");
+		harness.commands.send(sleep_command()).expect("local command");
+		next_event(&harness.events, |event| {
+			matches!(event, KernelEvent::TurnEnded { stop: TurnStop::Completed })
+		})
+		.await;
+		next_event(&harness.events, |event| {
+			matches!(event, KernelEvent::ToolReady { name, .. } if name == "bash")
+		})
+		.await;
+		harness.commands.send(HostCommand::Interrupt).expect("interrupt");
+		let ended = next_event(&harness.events, |event| matches!(event, KernelEvent::TurnEnded { .. })).await;
+		assert!(
+			matches!(ended, KernelEvent::TurnEnded { stop: TurnStop::Cancelled }),
+			"the deferred run ends on the interrupt: {ended:?}"
+		);
+		harness.commands.send(HostCommand::Quit).expect("quit");
+		tokio::time::timeout(Duration::from_secs(5), harness.run)
+			.await
+			.expect("controller exits")
+			.expect("controller task")
+			.expect("controller run");
+	}
+
+	/// A paused controller hands the `!` line back instead of dropping it,
+	/// both when idle and when the run was deferred behind a turn.
+	#[tokio::test]
+	async fn paused_controller_refuses_local_runs_with_the_draft() {
+		let harness = harness(Duration::from_millis(300));
+		let mailbox = harness.ctx.user::<HostMailbox>().expect("mailbox");
+		harness
+			.commands
+			.send(HostCommand::Pause { active: true })
+			.expect("pause");
+		harness.commands.send(sleep_command()).expect("local command");
+		let refused = tokio::time::timeout(Duration::from_secs(5), mailbox.next())
+			.await
+			.expect("refusal arrives")
+			.expect("mailbox open");
+		assert_eq!(refused, HostAction::LocalRefused {
+			draft:  Str::new_static("!sleep 20"),
+			reason: Str::new_static("Paused: resume before running local commands"),
+		});
+		assert!(
+			harness.events.try_iter().all(|event| !matches!(event, KernelEvent::ToolReady { .. })),
+			"nothing ran"
+		);
+		// Deferred behind a turn: pausing during the turn wins over the
+		// queued run.
+		harness
+			.commands
+			.send(HostCommand::Pause { active: false })
+			.expect("resume");
+		harness
+			.commands
+			.send(HostCommand::Submit(Str::new_static("hello")))
+			.expect("submit");
+		harness
+			.commands
+			.send(HostCommand::Pause { active: true })
+			.expect("pause mid-turn");
+		harness.commands.send(sleep_command()).expect("deferred local command");
+		next_event(&harness.events, |event| {
+			matches!(event, KernelEvent::TurnEnded { stop: TurnStop::Completed })
+		})
+		.await;
+		let refused = tokio::time::timeout(Duration::from_secs(5), mailbox.next())
+			.await
+			.expect("refusal arrives")
+			.expect("mailbox open");
+		assert!(matches!(refused, HostAction::LocalRefused { ref draft, .. } if draft == "!sleep 20"));
+		assert!(
+			harness.events.try_iter().all(|event| !matches!(event, KernelEvent::ToolReady { .. })),
+			"the deferred run never started"
+		);
+		harness.commands.send(HostCommand::Quit).expect("quit");
+		tokio::time::timeout(Duration::from_secs(5), harness.run)
+			.await
+			.expect("controller exits")
+			.expect("controller task")
+			.expect("controller run");
+	}
 }

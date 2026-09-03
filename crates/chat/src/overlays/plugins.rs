@@ -2,25 +2,24 @@
 //! `PluginSelectorComponent` — a centered `Plugins` list of every catalog
 //! plugin with `@version`, `[installed]`, and `[scope]` tags plus the
 //! marketplace as the hint. Enter installs (or, for an installed row,
-//! uninstalls) through [`Services`]; the request settles asynchronously
-//! and the panel polls it from [`Panel::tick`].
+//! uninstalls) through the controller's typed mutation stream; settled
+//! outcomes return through [`Panel::notify`].
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use omp_core::{Str, sf};
-use omp_tui::{Frame, Key, Prop, Size, Ui, UiContext, UiEvent, dom};
+use omp_tui::{Frame, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent, dom};
 
 use super::{
-	Panel, PanelAnchor, PanelEvent,
-	services::{Pending, PluginRow, PluginsReport, Services},
+	Outcome, Panel, PanelAnchor, PanelEvent, PanelNote,
+	services::{Mutation, PluginRow, PluginsReport, Services},
 };
+use crate::host::HostCommand;
 
 /// pi `SelectList` cap: `Math.min(items.length, 20)`.
 const MAX_VISIBLE: usize = 20;
 /// Border rows, divider, status row, and hint.
 const CHROME_ROWS: u16 = 5;
-/// Poll cadence while a request is in flight.
-const POLL: Duration = Duration::from_millis(100);
 const EMPTY_VALUE: &str = "__empty__";
 const HINT_INSTALL: &str = "↑/↓ plugins · Enter install (uninstall when installed) · type to search · Esc close";
 const HINT_UNINSTALL: &str = "↑/↓ plugins · Enter uninstall · type to search · Esc close";
@@ -38,7 +37,7 @@ pub enum PluginMode {
 struct InFlight {
 	id:         Str,
 	installing: bool,
-	pending:    Pending<Str>,
+	mutation:   Mutation,
 }
 
 /// Retained marketplace plugin selector.
@@ -47,10 +46,7 @@ pub struct PluginSelector {
 	report:    PluginsReport,
 	mode:      PluginMode,
 	in_flight: Option<InFlight>,
-	/// Settled line not yet handed to the host.
-	notice:    Option<Str>,
 	query:     Str,
-	next_wake: Option<Duration>,
 	ui:        Ui,
 	ctx:       UiContext,
 	width:     u16,
@@ -70,9 +66,7 @@ impl PluginSelector {
 			report,
 			mode,
 			in_flight: None,
-			notice: None,
 			query: Str::default(),
-			next_wake: None,
 			ui: Ui::from_root(dom! { <col/> }, 80, ctx.clone()),
 			ctx: ctx.clone(),
 			width: 80,
@@ -228,19 +222,31 @@ impl PluginSelector {
 			return PanelEvent::Consumed;
 		};
 		let installing = !plugin.installed;
-		let started = if installing {
-			self.services.install_plugin(id)
+		let mutation = if installing {
+			Mutation::InstallPlugin { id: Str::new(id) }
 		} else {
-			self.services.uninstall_plugin(id)
+			Mutation::UninstallPlugin { id: Str::new(id) }
 		};
-		match started {
-			Ok(pending) => {
-				self.in_flight = Some(InFlight { id: Str::new(id), installing, pending });
-				self.next_wake = Some(Duration::ZERO);
-				self.rebuild();
+		self.in_flight = Some(InFlight {
+			id: Str::new(id),
+			installing,
+			mutation: mutation.clone(),
+		});
+		self.rebuild();
+		PanelEvent::Command(HostCommand::Service(mutation))
+	}
+
+	fn route(&mut self, event: UiEvent) -> PanelEvent {
+		match event {
+			UiEvent::Cancel => PanelEvent::Close,
+			UiEvent::Changed { id, value } if id.as_str() == "plugins" => {
+				self.choose(value.as_str())
+			},
+			UiEvent::Filtered { id, query, .. } if id.as_str() == "plugins" => {
+				self.query = query;
 				PanelEvent::Consumed
 			},
-			Err(error) => PanelEvent::Notice(sf!("Marketplace error: {error}")),
+			_ => PanelEvent::Consumed,
 		}
 	}
 }
@@ -255,26 +261,19 @@ impl Panel for PluginSelector {
 	}
 
 	fn key(&mut self, key: Key) -> PanelEvent {
-		match self.ui.handle_key(key) {
-			UiEvent::Cancel => PanelEvent::Close,
-			UiEvent::Changed { id, value } if id.as_str() == "plugins" => self.choose(value.as_str()),
-			UiEvent::Filtered { id, query, .. } if id.as_str() == "plugins" => {
-				self.query = query;
-				PanelEvent::Consumed
-			},
-			_ => PanelEvent::Consumed,
-		}
+		let event = self.ui.handle_key(key);
+		self.route(event)
 	}
 
 	fn paste(&mut self, text: &str) -> PanelEvent {
-		match self.ui.handle_paste(text) {
-			UiEvent::Cancel => PanelEvent::Close,
-			UiEvent::Filtered { id, query, .. } if id.as_str() == "plugins" => {
-				self.query = query;
-				PanelEvent::Consumed
-			},
-			_ => PanelEvent::Consumed,
-		}
+		let event = self.ui.handle_paste(text);
+		self.route(event)
+	}
+
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		let event =
+			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		self.route(event)
 	}
 
 	fn frame(&mut self, viewport: Size) -> &Frame {
@@ -290,63 +289,43 @@ impl Panel for PluginSelector {
 		self.ui.frame()
 	}
 
-	fn tick(&mut self, now: Duration) -> bool {
+	fn notify(&mut self, note: PanelNote<'_>) -> PanelEvent {
+		let PanelNote::Outcome(Outcome::Service(outcome)) = note else {
+			return PanelEvent::Ignored;
+		};
 		let Some(request) = &self.in_flight else {
-			return false;
+			return PanelEvent::Ignored;
 		};
-		let line = match request.pending.try_recv() {
-			Ok(Ok(line)) => line,
-			Ok(Err(error)) => sf!("Marketplace error: {error}"),
-			Err(flume::TryRecvError::Disconnected) => {
-				Str::new_static("Marketplace error: the request was dropped before settling")
-			},
-			Err(flume::TryRecvError::Empty) => {
-				self.next_wake = Some(now + POLL);
-				return false;
-			},
-		};
+		if request.mutation != outcome.mutation {
+			return PanelEvent::Ignored;
+		}
 		self.in_flight = None;
-		self.next_wake = None;
-		self.notice = Some(line);
-		if let Ok(report) = self.services.plugins() {
+		if outcome.result.is_ok() && let Ok(report) = self.services.plugins() {
 			self.report = report;
 		}
 		self.rebuild();
-		true
-	}
-
-	fn next_wake(&self) -> Option<Duration> {
-		self.next_wake
-	}
-
-	fn settled(&mut self) -> Option<PanelEvent> {
-		self.notice.take().map(PanelEvent::Notice)
+		match &outcome.result {
+			Ok(line) => PanelEvent::Notice(line.clone()),
+			Err(error) => PanelEvent::Notice(sf!("Marketplace error: {error}")),
+		}
 	}
 }
 
 #[cfg(test)]
 mod tests {
+	use omp_tui::{Mods, Mouse, MouseButton};
 	use parking_lot::Mutex;
 
 	use super::*;
-	use crate::overlays::services::{MarketplaceSource, ServiceResult};
+	use crate::overlays::services::{MarketplaceSource, ServiceOutcome, ServiceResult};
 
 	struct Feed {
-		report:   Mutex<PluginsReport>,
-		installs: Mutex<Vec<Str>>,
-		tx:       Mutex<Option<flume::Sender<ServiceResult<Str>>>>,
+		report: Mutex<PluginsReport>,
 	}
 
 	impl Services for Feed {
 		fn plugins(&self) -> ServiceResult<PluginsReport> {
 			Ok(self.report.lock().clone())
-		}
-
-		fn install_plugin(&self, id: &str) -> ServiceResult<Pending<Str>> {
-			self.installs.lock().push(Str::new(id));
-			let (tx, rx) = flume::bounded(1);
-			*self.tx.lock() = Some(tx);
-			Ok(rx)
 		}
 	}
 
@@ -368,18 +347,37 @@ mod tests {
 		}
 	}
 
+	fn point(text: &str, needle: &str) -> (u16, u16) {
+		text.lines()
+			.enumerate()
+			.find_map(|(row, line)| {
+				let byte = line.find(needle)?;
+				Some((omp_tui::cell_width(&line[..byte]), u16::try_from(row).ok()?))
+			})
+			.expect("text point")
+	}
+
+	fn click(col: u16, row: u16) -> MouseReport {
+		MouseReport {
+			kind: Mouse::Click,
+			col,
+			row,
+			button: MouseButton::Left,
+			mods: Mods::default(),
+			pressed: true,
+		}
+	}
+
 	fn feed(plugins: Vec<PluginRow>, marketplaces: usize) -> Arc<Feed> {
 		let sources = (0..marketplaces)
 			.map(|index| MarketplaceSource { name: sf!("market{index}"), uri: sf!("org/repo{index}") })
 			.collect::<Vec<_>>();
 		Arc::new(Feed {
-			report:   Mutex::new(PluginsReport {
+			report: Mutex::new(PluginsReport {
 				marketplaces: sources.iter().map(|source| source.name.clone()).collect(),
 				plugins,
 				sources,
 			}),
-			installs: Mutex::new(Vec::new()),
-			tx:       Mutex::new(None),
 		})
 	}
 
@@ -392,7 +390,7 @@ mod tests {
 	fn selector_lists_plugins_with_pi_tags_and_marketplace_hint() {
 		let feed = feed(vec![plugin("linter", true), plugin("docs", false)], 1);
 		let mut panel = open(&feed, PluginMode::Install);
-		let text = omp_tui::frame_text(panel.frame(Size { width: 70, height: 20 }));
+		let text = omp_tui::frame_text(panel.frame(Size { width: 110, height: 20 }));
 		assert!(text.contains("Plugins"), "title missing:\n{text}");
 		assert!(text.contains("linter@1.0.0 [installed] [user]"), "installed row missing:\n{text}");
 		assert!(text.contains("docs@1.0.0"), "available row missing:\n{text}");
@@ -402,33 +400,47 @@ mod tests {
 	}
 
 	#[test]
-	fn enter_installs_then_settles_through_tick_and_settled() {
+	fn clicking_a_plugin_emits_the_same_typed_mutation_as_enter() {
+		let feed = feed(vec![plugin("docs", false)], 1);
+		let mut panel = open(&feed, PluginMode::Install);
+		let painted = omp_tui::frame_text(panel.frame(Size { width: 110, height: 20 }));
+		let (col, row) = point(&painted, "docs@1.0.0");
+		assert_eq!(
+			panel.mouse(click(col, row)),
+			PanelEvent::Command(HostCommand::Service(Mutation::InstallPlugin {
+				id: Str::new_static("docs@official"),
+			}))
+		);
+	}
+
+	#[test]
+	fn enter_installs_then_settles_from_the_controller_outcome() {
 		let feed = feed(vec![plugin("docs", false), plugin("linter", true)], 1);
 		let mut panel = open(&feed, PluginMode::Install);
-		panel.frame(Size { width: 70, height: 20 });
-		assert_eq!(panel.key(Key::Enter), PanelEvent::Consumed);
-		assert_eq!(feed.installs.lock().as_slice(), &[Str::new_static("docs@official")]);
+		panel.frame(Size { width: 110, height: 20 });
+		let mutation = Mutation::InstallPlugin { id: Str::new_static("docs@official") };
+		assert_eq!(
+			panel.key(Key::Enter),
+			PanelEvent::Command(HostCommand::Service(mutation.clone()))
+		);
 		assert_eq!(panel.in_flight(), Some(("docs@official", true)));
-		let text = omp_tui::frame_text(panel.frame(Size { width: 70, height: 20 }));
+		let text = omp_tui::frame_text(panel.frame(Size { width: 110, height: 20 }));
 		assert!(text.contains("Installing docs@official…"), "pending row missing:\n{text}");
-		assert!(!panel.tick(Duration::ZERO), "nothing settled yet");
-		assert_eq!(panel.next_wake(), Some(POLL));
 		assert!(
 			matches!(panel.key(Key::Enter), PanelEvent::Notice(text) if text.contains("Installing")),
 			"a second Enter waits for the request"
 		);
 		feed.report.lock().plugins[0].installed = true;
-		let tx = feed.tx.lock().take().expect("install started");
-		tx.send(Ok(Str::new_static("Installed docs from official"))).unwrap();
-		assert!(panel.tick(POLL), "settling repaints");
+		let outcome = Outcome::Service(ServiceOutcome {
+			mutation,
+			result: Ok(Str::new_static("Installed docs from official")),
+		});
 		assert_eq!(
-			panel.settled(),
-			Some(PanelEvent::Notice(Str::new_static("Installed docs from official")))
+			panel.notify(PanelNote::Outcome(&outcome)),
+			PanelEvent::Notice(Str::new_static("Installed docs from official"))
 		);
-		assert_eq!(panel.settled(), None, "notice delivered once");
 		assert_eq!(panel.in_flight(), None);
-		assert_eq!(panel.next_wake(), None);
-		let text = omp_tui::frame_text(panel.frame(Size { width: 70, height: 20 }));
+		let text = omp_tui::frame_text(panel.frame(Size { width: 110, height: 20 }));
 		assert!(text.contains("docs@1.0.0 [installed]"), "list refreshed from services:\n{text}");
 	}
 
@@ -436,17 +448,16 @@ mod tests {
 	fn empty_catalog_explains_the_missing_marketplace() {
 		let feed = feed(Vec::new(), 0);
 		let mut panel = open(&feed, PluginMode::Install);
-		let text = omp_tui::frame_text(panel.frame(Size { width: 70, height: 20 }));
+		let text = omp_tui::frame_text(panel.frame(Size { width: 110, height: 20 }));
 		assert!(text.contains("No plugins available"), "empty row missing:\n{text}");
 		assert!(
 			text.contains("Add a marketplace first: /marketplace add <source>"),
 			"empty reason missing:\n{text}"
 		);
 		assert_eq!(panel.key(Key::Enter), PanelEvent::Consumed);
-		assert!(feed.installs.lock().is_empty());
 		let feed = feed_with_market();
 		let mut panel = open(&feed, PluginMode::Install);
-		let text = omp_tui::frame_text(panel.frame(Size { width: 70, height: 20 }));
+		let text = omp_tui::frame_text(panel.frame(Size { width: 110, height: 20 }));
 		assert!(text.contains("Configured marketplaces have no plugins"), "reason missing:\n{text}");
 	}
 
@@ -459,7 +470,7 @@ mod tests {
 		let feed = feed(vec![plugin("docs", false), plugin("linter", true)], 1);
 		let mut panel = open(&feed, PluginMode::Uninstall);
 		assert_eq!(panel.plugins().len(), 1);
-		let text = omp_tui::frame_text(panel.frame(Size { width: 70, height: 20 }));
+		let text = omp_tui::frame_text(panel.frame(Size { width: 110, height: 20 }));
 		assert!(text.contains("linter@1.0.0 [installed]"), "installed row missing:\n{text}");
 		assert!(!text.contains("docs@"), "available rows hidden:\n{text}");
 		assert!(text.contains("Enter uninstall"), "hint missing:\n{text}");

@@ -23,6 +23,7 @@ omp-inference.workspace = true
 omp-journal.workspace = true
 omp-session.workspace = true
 omp-tui.workspace = true
+omp-tool.workspace = true
 omp-tools.workspace = true
 omp-vcs.workspace = true
 omp-voice.workspace = true

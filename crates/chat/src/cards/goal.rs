@@ -72,10 +72,10 @@ fn render_done(view: &CardView<'_>, ui: &UiContext) -> Component {
 		.and_then(|value| string_at(value, "status"))
 		.map(Str::new);
 	let detail = goal.and_then(|goal| {
-		let budget = goal.get("tokenBudget")?.as_u64()?;
-		let used = goal.get("tokensUsed").and_then(Value::as_u64).unwrap_or(0);
+		let budget = goal.get("token_budget")?.as_u64()?;
+		let used = goal.get("tokens_used").and_then(Value::as_u64).unwrap_or(0);
 		let left = result
-			.get("remainingTokens")
+			.get("remaining_tokens")
 			.and_then(Value::as_u64)
 			.unwrap_or_else(|| budget.saturating_sub(used));
 		let mut detail = sf!(
@@ -84,7 +84,7 @@ fn render_done(view: &CardView<'_>, ui: &UiContext) -> Component {
 			compact_tokens(budget),
 			compact_tokens(left)
 		);
-		if let Some(seconds) = goal.get("timeUsedSeconds").and_then(Value::as_u64)
+		if let Some(seconds) = goal.get("time_used_secs").and_then(Value::as_u64)
 			&& seconds > 0
 		{
 			detail = sf!("{detail} · {}m elapsed", seconds / 60);
@@ -92,7 +92,7 @@ fn render_done(view: &CardView<'_>, ui: &UiContext) -> Component {
 		Some(detail)
 	});
 	let report = result
-		.get("completionBudgetReport")
+		.get("completion_report")
 		.and_then(Value::as_str)
 		.filter(|text| !text.is_empty())
 		.map(Str::new);

@@ -433,16 +433,18 @@ impl DaemonHandle {
 		Client::new(self.service(), Router::new(self.registry.clone(), Duration::from_secs(30)), meta)
 	}
 
-	/// Waits for process shutdown and then signals daemon-owned tasks.
+	/// Waits for process shutdown, cleans up daemon-owned tasks, then preserves
+	/// the identity of the signal that requested shutdown.
 	pub async fn wait(mut self) -> Result<(), DaemonError> {
-		tokio::select! {
+		let signal = tokio::select! {
 			signal = shutdown_signal() => signal.map_err(DaemonError::Signal)?,
 			result = &mut self.rpc_task => {
 				result.map_err(DaemonError::RpcTask)?.map_err(DaemonError::RpcServe)?;
 				return Err(DaemonError::RpcStopped);
 			},
-		}
-		self.finish_shutdown().await
+		};
+		self.finish_shutdown().await?;
+		signal.finish().map_err(DaemonError::Signal)
 	}
 
 	/// Initiates graceful shutdown.
@@ -511,18 +513,78 @@ mod gateway_bearer_tests {
 			.expect("rotated bearer");
 	}
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownSignal {
+	Interrupt,
+	#[cfg(unix)]
+	Terminate,
+	#[cfg(unix)]
+	Hangup,
+}
+
+impl ShutdownSignal {
+	#[cfg(unix)]
+	const fn number(self) -> i32 {
+		match self {
+			Self::Interrupt => libc::SIGINT,
+			Self::Terminate => libc::SIGTERM,
+			Self::Hangup => libc::SIGHUP,
+		}
+	}
+
+	#[cfg(unix)]
+	fn finish(self) -> Result<(), io::Error> {
+		let number = self.number();
+		// Safety: restoring the default disposition before re-raising is the
+		// only way to retain both graceful cleanup and the original signal
+		// identity after Tokio's process-wide signal handler observed it.
+		unsafe {
+			libc::signal(number, libc::SIG_DFL);
+			if libc::raise(number) != 0 {
+				return Err(io::Error::last_os_error());
+			}
+		}
+		Err(io::Error::other("shutdown signal did not terminate the process"))
+	}
+
+	#[cfg(windows)]
+	const fn finish(self) -> Result<(), io::Error> {
+		Ok(())
+	}
+}
+
 #[cfg(unix)]
-async fn shutdown_signal() -> Result<(), io::Error> {
-	use tokio::signal::{
-		ctrl_c,
-		unix::{SignalKind, signal},
-	};
+async fn shutdown_signal() -> Result<ShutdownSignal, io::Error> {
+	use tokio::signal::unix::{SignalKind, signal};
+
+	let mut interrupt = signal(SignalKind::interrupt())?;
 	let mut terminate = signal(SignalKind::terminate())?;
-	tokio::select! { result = ctrl_c() => result, _ = terminate.recv() => Ok(()) }
+	let mut hangup = signal(SignalKind::hangup())?;
+	tokio::select! {
+		_ = interrupt.recv() => Ok(ShutdownSignal::Interrupt),
+		_ = terminate.recv() => Ok(ShutdownSignal::Terminate),
+		_ = hangup.recv() => Ok(ShutdownSignal::Hangup),
+	}
 }
 
 #[cfg(windows)]
-async fn shutdown_signal() -> Result<(), io::Error> {
+async fn shutdown_signal() -> Result<ShutdownSignal, io::Error> {
 	use tokio::signal::ctrl_c;
-	ctrl_c().await
+	ctrl_c().await?;
+	Ok(ShutdownSignal::Interrupt)
+}
+
+#[cfg(all(test, unix))]
+mod shutdown_tests {
+	use super::ShutdownSignal;
+
+	#[test]
+	fn shutdown_signals_retain_conventional_identity() {
+		assert_eq!(ShutdownSignal::Interrupt.number(), libc::SIGINT);
+		assert_eq!(ShutdownSignal::Terminate.number(), libc::SIGTERM);
+		assert_eq!(ShutdownSignal::Hangup.number(), libc::SIGHUP);
+		assert_eq!(128 + ShutdownSignal::Interrupt.number(), 130);
+		assert_eq!(128 + ShutdownSignal::Terminate.number(), 143);
+		assert_eq!(128 + ShutdownSignal::Hangup.number(), 129);
+	}
 }

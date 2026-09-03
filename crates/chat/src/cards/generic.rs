@@ -5,7 +5,7 @@ use omp_dom::{Node, PropId};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, elapsed_badge};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge, result_image};
 
 /// Fallback renderer that presents every standard child of a tool element.
 pub struct GenericCard;
@@ -21,7 +21,17 @@ impl GenericCard {
 		let title = Str::new(tool);
 		let args = parsed_args(view.args_text().unwrap_or_default());
 		let detail = compact_args(args.as_ref());
-		let result = display_result(view.result_text());
+		let result = display_result(view.output.or_else(|| view.result_text()), expanded);
+		let images = view
+			.outcome_json()
+			.as_ref()
+			.and_then(|value| value.get("artifacts").or_else(|| value.get("images")))
+			.and_then(Value::as_array)
+			.into_iter()
+			.flatten()
+			.filter_map(Value::as_str)
+			.map(|artifact| result_image(&Str::new(artifact), "image/*", None, _ui))
+			.collect::<Vec<_>>();
 		let fault = view
 			.diag
 			.and_then(node_text)
@@ -50,7 +60,8 @@ impl GenericCard {
 				} else if let Some(detail) = detail {
 					<row pad-x=2 gap=1><text>{"└─"}</text><text>{detail}</text></row>
 				}
-				if let Some(result) = result { <text pad-x=1>{result}</text> }
+				if let Some(result) = result { <pre pad-x=1>{result}</pre> }
+				if expanded { {images} }
 				if let Some(fault) = fault { <text pad-x=1>{fault}</text> }
 				if !expanded && matches!(view.status, CardStatus::Done | CardStatus::Failed) {
 					<text pad-x=1>{"⟨Ctrl+O: Expand⟩"}</text>
@@ -101,7 +112,7 @@ fn compact_args(args: Option<&Value>) -> Option<Str> {
 	(!text.is_empty()).then(|| Str::new(text))
 }
 
-fn display_result(text: Option<&str>) -> Option<Str> {
+fn display_result(text: Option<&str>, expanded: bool) -> Option<Str> {
 	let text = text?.trim();
 	if text.is_empty() {
 		return None;
@@ -118,7 +129,14 @@ fn display_result(text: Option<&str>) -> Option<Str> {
 			other => other.to_string(),
 		},
 	);
-	Some(Str::new(display))
+	let lines = display.lines().collect::<Vec<_>>();
+	let limit = if expanded { 12 } else { 4 };
+	let shown = lines.len().min(limit);
+	let mut bounded = lines[..shown].join("\n");
+	if shown < lines.len() {
+		bounded.push_str(&format!("\n… {} more lines", lines.len() - shown));
+	}
+	Some(Str::new(bounded))
 }
 
 fn json_text(value: &Value) -> String {

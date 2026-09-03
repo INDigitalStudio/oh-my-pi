@@ -68,6 +68,19 @@ pub enum UsageStatus {
 	Unknown,
 }
 
+/// One account eligible for `/usage reset` confirmation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResetAccountRow {
+	/// Selector sent back to the controller (`provider:account`).
+	pub target:    Str,
+	/// Human-readable account label.
+	pub label:     Str,
+	/// Saved resets available to spend.
+	pub available: u32,
+	/// Whether this account currently serves the provider.
+	pub active:    bool,
+}
+
 /// One provider account's quota card (pi `UsageReport`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageAccount {
@@ -81,6 +94,86 @@ pub struct UsageAccount {
 	pub windows:  Vec<UsageWindow>,
 	/// Query failure, when the provider could not be reached.
 	pub error:    Option<Str>,
+}
+
+/// One `/stats` grouping row (by model or by folder).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StatsGroup {
+	/// Model route or project folder.
+	pub key:           Str,
+	/// Provider requests.
+	pub requests:      u64,
+	/// Cost in nano-dollars over priced requests.
+	pub cost_nano_usd: u64,
+	/// Requests without a price.
+	pub unpriced:      u64,
+	/// Input tokens.
+	pub input_tokens:  u64,
+	/// Output tokens.
+	pub output_tokens: u64,
+	/// Cache-read tokens.
+	pub cache_read:    u64,
+	/// Cache-write tokens.
+	pub cache_write:   u64,
+}
+
+/// One `/stats` tool row.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StatsTool {
+	/// Tool name.
+	pub tool:   Str,
+	/// Calls.
+	pub calls:  u64,
+	/// Faulted calls.
+	pub errors: u64,
+}
+
+/// Historical usage over every stored session (pi `/stats`, the
+/// `stats.db` overall summary plus by-model and by-folder breakdowns).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StatsReport {
+	/// Journal files that were re-read by this sync.
+	pub synced:            u64,
+	/// Journal files indexed in total.
+	pub files:             u64,
+	/// Provider requests.
+	pub requests:          u64,
+	/// Requests that ended with an error.
+	pub errors:            u64,
+	/// Input tokens.
+	pub input_tokens:      u64,
+	/// Output tokens.
+	pub output_tokens:     u64,
+	/// Cache-read tokens.
+	pub cache_read:        u64,
+	/// Cache-write tokens.
+	pub cache_write:       u64,
+	/// Cost in nano-dollars over priced requests.
+	pub cost_nano_usd:     u64,
+	/// Requests without a price.
+	pub unpriced:          u64,
+	/// Mean inference duration.
+	pub avg_duration_ms:   Option<u64>,
+	/// Mean time to first token.
+	pub avg_ttft_ms:       Option<u64>,
+	/// Output tokens per second.
+	pub tokens_per_second: Option<f64>,
+	/// Top models by requests.
+	pub by_model:          Vec<StatsGroup>,
+	/// Top folders by requests.
+	pub by_folder:         Vec<StatsGroup>,
+	/// Tool calls by tool.
+	pub tools:             Vec<StatsTool>,
+}
+
+/// One ephemeral kernel notification recorded for `/trace`: what the
+/// journal does not carry (retries, inference starts, tool readiness).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceEvent {
+	/// Unix milliseconds when the kernel published it.
+	pub at_ms: u64,
+	/// Short event label.
+	pub label: Str,
 }
 
 /// One day of local cost activity for the heatmap.
@@ -468,8 +561,231 @@ pub struct SshHostSpec {
 	pub project:  bool,
 }
 
-/// Application-supplied feeds for commands and dashboards. Every method
-/// defaults to [`ServiceError::Unavailable`].
+/// `/mcp` subcommands (pi `mcp-command-controller.ts`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpOp {
+	/// `list`: every configured and discovered server with its state.
+	List,
+	/// `test <name>`: connect, list tools, report.
+	Test(Str),
+	/// `reload`: re-read the native configs and respawn the runtime tools.
+	Reload,
+	/// `reconnect <name>`: manual reconnect clearing the circuit breaker.
+	Reconnect(Str),
+	/// `enable <name>` / `disable <name>`: flip the persisted switch.
+	SetEnabled(Str, bool),
+	/// `remove <name> [--scope project|user]`.
+	Remove(Str, McpScope),
+	/// `add <name> [--scope project|user] [--url <url>] [-- <command…>]`.
+	Add(McpAdd),
+	/// `reauth <name>`: run a fresh OAuth grant.
+	Reauth(Str),
+	/// `unauth <name>`: drop the stored OAuth grant.
+	Unauth(Str),
+	/// `resources`: resources offered by connected servers.
+	Resources,
+	/// `prompts`: prompts offered by connected servers.
+	Prompts,
+	/// `notifications`: notification capabilities and subscriptions.
+	Notifications,
+}
+
+/// Which MCP config file a mutation targets.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, strum::Display, strum::EnumString)]
+#[strum(serialize_all = "lowercase")]
+pub enum McpScope {
+	/// `.omp/mcp.json` in the project.
+	#[default]
+	Project,
+	/// The user data directory's `mcp.json`.
+	User,
+}
+
+/// One `/mcp add` declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpAdd {
+	/// Server name.
+	pub name:    Str,
+	/// Target config.
+	pub scope:   McpScope,
+	/// Remote endpoint (`--url`); exclusive with `command`.
+	pub url:     Option<Str>,
+	/// Stdio command line (after `--`).
+	pub command: Vec<Str>,
+}
+
+/// An in-flight `/mcp` operation.
+pub struct McpRun {
+	/// Report text once settled.
+	pub done:   Pending<Str>,
+	/// Cancels the operation (Esc while `/mcp test` connects).
+	pub cancel: Option<Sender<()>>,
+}
+
+/// A worktree `/wt` moved the session into.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorktreeInfo {
+	/// Checkout path.
+	pub path:   PathBuf,
+	/// Branch checked out there.
+	pub branch: Str,
+}
+
+/// Which stored sessions the session picker lists (pi session picker Tab
+/// toggle: current project vs every project).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, strum::Display, strum::EnumString)]
+#[strum(serialize_all = "lowercase")]
+pub enum SessionScope {
+	/// Sessions started in the current project directory.
+	#[default]
+	Project,
+	/// Sessions from every project directory.
+	All,
+}
+
+/// A live or parked agent's transcript as the controller hands it to the
+/// hub viewer: a detached snapshot plus, for a running kernel, the ordered
+/// event stream following it (ADR 0005: the actor never reads a journal).
+pub struct AgentView {
+	/// Detached DOM snapshot of the child session.
+	pub snapshot: omp_dom::Snapshot,
+	/// Ordered events following `snapshot`; `None` for a parked agent whose
+	/// journal is closed.
+	pub events:   Option<Receiver<omp_dom::Event>>,
+}
+
+/// One application-state mutation a dashboard asks the controller for
+/// (`HostCommand::Service`). Panels never call the mutating owner directly
+/// (ADR 0005; ADR 0014: one control stream).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Mutation {
+	/// Enable or disable one extension by id.
+	SetExtensionEnabled {
+		/// Extension id.
+		id:      Str,
+		/// Desired state.
+		enabled: bool,
+	},
+	/// `/reload-plugins`: reload every extension runtime from disk.
+	ReloadExtensions,
+	/// Enable or disable one agent definition.
+	SetAgentEnabled {
+		/// Agent definition name.
+		name:    Str,
+		/// Desired state.
+		enabled: bool,
+	},
+	/// Enable or disable an installed plugin.
+	SetPluginEnabled {
+		/// Plugin id.
+		id:      Str,
+		/// Desired state.
+		enabled: bool,
+	},
+	/// Install a marketplace plugin.
+	InstallPlugin {
+		/// Plugin id.
+		id: Str,
+	},
+	/// Uninstall a plugin.
+	UninstallPlugin {
+		/// Plugin id.
+		id: Str,
+	},
+	/// Delete one stored account.
+	Logout {
+		/// Stored account.
+		account: AccountRow,
+	},
+	/// Pin or unpin a stored account as the one the session uses for its
+	/// provider.
+	PinAccount {
+		/// Stored account.
+		account: AccountRow,
+		/// Desired state.
+		pinned:  bool,
+	},
+	/// Pin or unpin a stored session in the resume list.
+	PinSession {
+		/// Session id.
+		id:     Str,
+		/// Desired state.
+		pinned: bool,
+	},
+	/// Rename a stored session in the index (session picker Ctrl+R).
+	RenameSession {
+		/// Session id.
+		id:    Str,
+		/// New title.
+		title: Str,
+	},
+	/// Delete a stored session file (session picker Ctrl+D).
+	DeleteSession {
+		/// Session id.
+		id: Str,
+	},
+	/// `/usage reset`: spend one saved rate-limit reset on `account`.
+	ResetUsage {
+		/// Account selector (`provider:account` or `active`).
+		target: Str,
+	},
+}
+
+impl Mutation {
+	/// Short verb for status lines (`enabled`, `installed`, …).
+	#[must_use]
+	pub const fn verb(&self) -> &'static str {
+		match self {
+			Self::SetExtensionEnabled { enabled: true, .. }
+			| Self::SetAgentEnabled { enabled: true, .. }
+			| Self::SetPluginEnabled { enabled: true, .. } => "enabled",
+			Self::SetExtensionEnabled { enabled: false, .. }
+			| Self::SetAgentEnabled { enabled: false, .. }
+			| Self::SetPluginEnabled { enabled: false, .. } => "disabled",
+			Self::ReloadExtensions => "reloaded",
+			Self::InstallPlugin { .. } => "installed",
+			Self::UninstallPlugin { .. } => "uninstalled",
+			Self::Logout { .. } => "logged out",
+			Self::PinAccount { pinned: true, .. } | Self::PinSession { pinned: true, .. } => "pinned",
+			Self::PinAccount { pinned: false, .. } | Self::PinSession { pinned: false, .. } => {
+				"unpinned"
+			},
+			Self::RenameSession { .. } => "renamed",
+			Self::DeleteSession { .. } => "deleted",
+			Self::ResetUsage { .. } => "reset",
+		}
+	}
+}
+
+/// Settled [`Mutation`], posted back by the controller (`Outcome::Service`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceOutcome {
+	/// The request that settled.
+	pub mutation: Mutation,
+	/// Status line on success, else why it failed.
+	pub result:   ServiceResult<Str>,
+}
+
+/// The application's mutating owner. Held by the controller only; the
+/// actor reaches it exclusively through `HostCommand::Service`.
+pub trait Mutations: Send + Sync {
+	/// Runs one mutation; the receiver settles with a status line.
+	fn apply(&self, mutation: Mutation) -> ServiceResult<Pending<Str>>;
+}
+
+/// A controller with no mutating owner (tests, `omp render`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoMutations;
+
+impl Mutations for NoMutations {
+	fn apply(&self, _mutation: Mutation) -> ServiceResult<Pending<Str>> {
+		Err(ServiceError::Unavailable("mutations"))
+	}
+}
+
+/// Application-supplied read feeds for commands and dashboards. Every
+/// method defaults to [`ServiceError::Unavailable`]. Mutations live on
+/// [`Mutations`], which only the controller holds.
 pub trait Services: Send + Sync {
 	/// Provider quotas and local cost activity. Quota refreshes contact
 	/// every provider, so the report settles asynchronously.
@@ -477,9 +793,10 @@ pub trait Services: Send + Sync {
 		Err(ServiceError::Unavailable("usage"))
 	}
 
-	/// `/usage reset [account|active]`: spend a saved rate-limit reset.
-	fn reset_usage(&self, _target: &str) -> ServiceResult<Str> {
-		Err(ServiceError::Unavailable("usage reset"))
+	/// Accounts with saved Codex reset credits. The controller performs the
+	/// network refresh; the actor only receives immutable selector rows.
+	fn reset_accounts(&self) -> ServiceResult<Pending<Vec<ResetAccountRow>>> {
+		Err(ServiceError::Unavailable("saved reset accounts"))
 	}
 
 	/// The kernel's registered tools.
@@ -490,16 +807,6 @@ pub trait Services: Send + Sync {
 	/// Extension and MCP server status.
 	fn extensions(&self) -> ServiceResult<Vec<ExtensionRow>> {
 		Err(ServiceError::Unavailable("extensions"))
-	}
-
-	/// Enables or disables one extension by id.
-	fn set_extension_enabled(&self, _id: &str, _enabled: bool) -> ServiceResult<()> {
-		Err(ServiceError::Unavailable("extension toggling"))
-	}
-
-	/// `/reload-plugins`: reload every extension runtime from disk.
-	fn reload_extensions(&self) -> ServiceResult<Pending<Str>> {
-		Err(ServiceError::Unavailable("extension reload"))
 	}
 
 	/// Stored provider accounts.
@@ -517,47 +824,29 @@ pub trait Services: Send + Sync {
 		Err(ServiceError::Unavailable("login"))
 	}
 
-	/// Deletes one stored account.
-	fn logout(&self, _account: &AccountRow) -> ServiceResult<Pending<()>> {
-		Err(ServiceError::Unavailable("logout"))
-	}
-
-	/// Pins (or unpins, when `pinned` is false) the account that serves
-	/// `provider` in this session.
-	fn pin_account(&self, _account: &AccountRow, _pinned: bool) -> ServiceResult<Str> {
-		Err(ServiceError::Unavailable("account pinning"))
-	}
-
 	/// Exports the live session; `None` picks the default path beside the
 	/// journal. Returns the written path.
 	fn export(&self, _path: Option<&std::path::Path>) -> ServiceResult<PathBuf> {
 		Err(ServiceError::Unavailable("export"))
 	}
 
-	/// On-disk sessions, newest first.
-	fn sessions(&self) -> ServiceResult<Vec<SessionRow>> {
+	/// On-disk sessions in `scope`, newest first.
+	fn sessions(&self, _scope: SessionScope) -> ServiceResult<Vec<SessionRow>> {
 		Err(ServiceError::Unavailable("session index"))
 	}
 
-	/// Pins or unpins a stored session in the resume list.
-	fn pin_session(&self, _id: &str, _pinned: bool) -> ServiceResult<()> {
-		Err(ServiceError::Unavailable("session pinning"))
+	/// The transcript of agent `id` (a `<meta><jobs>` child): a live
+	/// kernel's snapshot plus its patch stream, or a parked agent's
+	/// journal-derived snapshot. Settles asynchronously because a live
+	/// kernel services the subscription at its next safe point.
+	fn agent_view(&self, _id: &str) -> ServiceResult<Pending<AgentView>> {
+		Err(ServiceError::Unavailable("agent transcripts"))
 	}
 
 	/// Id (journal stem) of the live session, for `/pin` without an
 	/// argument. `Failed` when the session is in-memory only.
 	fn live_session_id(&self) -> ServiceResult<Str> {
 		Err(ServiceError::Unavailable("live session id"))
-	}
-
-	/// Renames a stored session in the index (session picker Ctrl+R).
-	fn rename_session(&self, _id: &str, _title: &str) -> ServiceResult<()> {
-		Err(ServiceError::Unavailable("session rename"))
-	}
-
-	/// Deletes a stored session file (session picker Ctrl+D).
-	fn delete_session(&self, _id: &str) -> ServiceResult<()> {
-		Err(ServiceError::Unavailable("session delete"))
 	}
 
 	/// Reads a session-local artifact (`local://PLAN.md`) as text.
@@ -588,29 +877,9 @@ pub trait Services: Send + Sync {
 		Err(ServiceError::Unavailable("agent definitions"))
 	}
 
-	/// Enables or disables one agent definition.
-	fn set_agent_enabled(&self, _name: &str, _enabled: bool) -> ServiceResult<()> {
-		Err(ServiceError::Unavailable("agent toggling"))
-	}
-
 	/// Marketplace sources and plugins.
 	fn plugins(&self) -> ServiceResult<PluginsReport> {
 		Err(ServiceError::Unavailable("marketplace"))
-	}
-
-	/// Installs a plugin; the receiver settles with a status line.
-	fn install_plugin(&self, _id: &str) -> ServiceResult<Pending<Str>> {
-		Err(ServiceError::Unavailable("plugin install"))
-	}
-
-	/// Uninstalls a plugin; the receiver settles with a status line.
-	fn uninstall_plugin(&self, _id: &str) -> ServiceResult<Pending<Str>> {
-		Err(ServiceError::Unavailable("plugin uninstall"))
-	}
-
-	/// Enables or disables an installed plugin.
-	fn set_plugin_enabled(&self, _id: &str, _enabled: bool) -> ServiceResult<()> {
-		Err(ServiceError::Unavailable("plugin toggling"))
 	}
 
 	/// Adds a marketplace source.
@@ -668,6 +937,49 @@ pub trait Services: Send + Sync {
 	/// Starts a cleanse run over the project.
 	fn cleanse(&self, _request: CleanseRequest) -> ServiceResult<CleanseRun> {
 		Err(ServiceError::Unavailable("cleanse"))
+	}
+
+	/// The session's working directory (`/dirs`, `/add-dir`, `/move`
+	/// resolve relative paths against it).
+	fn project_dir(&self) -> ServiceResult<PathBuf> {
+		Err(ServiceError::Unavailable("project directory"))
+	}
+
+	/// `/wt [branch]`: forks the checkout into a new linked worktree on
+	/// `branch`, carrying uncommitted changes along (pi
+	/// `createSessionWorktree`).
+	fn create_worktree(&self, _branch: &str) -> ServiceResult<WorktreeInfo> {
+		Err(ServiceError::Unavailable("worktrees"))
+	}
+
+	/// `/dump`: writes the next LLM request as JSON to a temp file and
+	/// returns its path (pi `dumpLlmRequestToTmpDir`).
+	fn dump_request(&self) -> ServiceResult<PathBuf> {
+		Err(ServiceError::Unavailable("request dump"))
+	}
+
+	/// `/restart`: marks the process for re-exec with its launch flags once
+	/// the host hands the terminal back.
+	fn request_restart(&self) -> ServiceResult<()> {
+		Err(ServiceError::Unavailable("restart"))
+	}
+
+	/// `/mcp …`: runs one MCP management operation; the run settles with
+	/// the report text.
+	fn mcp(&self, _op: McpOp) -> ServiceResult<McpRun> {
+		Err(ServiceError::Unavailable("mcp"))
+	}
+
+	/// `/stats`: syncs the usage index from every stored journal and
+	/// settles with the aggregate report.
+	fn stats(&self) -> ServiceResult<Pending<StatsReport>> {
+		Err(ServiceError::Unavailable("usage statistics"))
+	}
+
+	/// `/trace`: the kernel notifications recorded since launch, oldest
+	/// first (bounded by the application).
+	fn trace_events(&self) -> ServiceResult<Vec<TraceEvent>> {
+		Err(ServiceError::Unavailable("kernel trace"))
 	}
 }
 

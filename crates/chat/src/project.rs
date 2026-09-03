@@ -7,7 +7,7 @@ use omp_tui::{IntoComponent, UiContext, dom, slots::Mode};
 
 use crate::{
 	cards::{CardRegistry, CardStatus, CardView, Component},
-	notices::{cache, divider, error, misc, usage},
+	notices::{cache, custom, divider, error, misc, usage},
 	thinking,
 	transcript::{Local, REVEAL_HORIZON},
 };
@@ -144,8 +144,16 @@ pub(crate) fn project(
 					assistant_blocks(dom, *handle, node, options, &mut blocks);
 				},
 				Tag::Known(KnownTag::Notice) => {
-					let text = node.content.clone().unwrap_or_default();
 					let kind = prop_text(node, PropId::Kind).unwrap_or_else(|| Str::new_static("info"));
+					// pi `custom_message` / `hookMessage` entries: framed
+					// Markdown boxes journaled by the kernel (`EnvEvent::Notice`).
+					if let Ok(framed) = kind.as_str().parse::<custom::CustomKind>() {
+						let component = custom::custom_message_card(framed, node, options.expanded);
+						let text = custom::framed_text(node);
+						blocks.push(rendered(*handle, BlockKind::Notice, text, Mode::Mutable, true, component));
+						continue;
+					}
+					let text = node.content.clone().unwrap_or_default();
 					// ERR-06: while the identical error is pinned above the editor the
 					// inline copy is suppressed; ctrl+o draws it in full anyway.
 					if !options.expanded && error::suppressed_inline(dom, *handle) {
@@ -327,6 +335,12 @@ fn displace_cards(dom: &Dom, blocks: &mut Vec<RenderedBlock>, start: usize, last
 		let Tag::Custom(tool) = &node.tag else {
 			return None;
 		};
+		if matches!(
+			node.prop(&PropId::Status.into()).and_then(Value::as_str),
+			Some("error" | "cancelled" | "aborted")
+		) {
+			return None;
+		}
 		match tool.as_str() {
 			"todo" => Some("todo"),
 			"hub" if hub_is_wait(dom, handle, node) => Some("hub"),
@@ -385,8 +399,7 @@ fn group_reads(
 	let is_read = |block: &RenderedBlock| {
 		block.view.kind == BlockKind::Tool
 			&& Handle::new(block.view.key / 8)
-				.and_then(|handle| dom.get(handle))
-				.is_some_and(|node| matches!(&node.tag, Tag::Custom(tool) if tool.as_str() == "read"))
+				.is_some_and(|handle| read_is_groupable(dom, handle))
 	};
 	let reads_only = blocks[start..]
 		.iter()
@@ -438,6 +451,36 @@ fn group_reads(
 		blocks.splice(index..end, [RenderedBlock { view, component: group, stream: None }]);
 		index += 1;
 	}
+}
+
+/// Only ordinary local-file reads collapse into a compact group. Internal
+/// resources (`artifact://`, `skill://`, `agent://`, URLs, and other schemes)
+/// keep their full card because their result body is the useful surface.
+fn read_is_groupable(dom: &Dom, handle: Handle) -> bool {
+	let Some(node) = dom.get(handle) else {
+		return false;
+	};
+	if !matches!(&node.tag, Tag::Custom(tool) if tool.as_str() == "read") {
+		return false;
+	}
+	let Some(input) = child(dom, handle, KnownTag::Input) else {
+		return false;
+	};
+	let raw = match input.prop(&PropId::Data.into()) {
+		Some(Value::Json(value)) => value.get(),
+		_ => input
+			.prop(&PropId::Text.into())
+			.and_then(Value::as_str)
+			.or(input.content.as_deref())
+			.unwrap_or_default(),
+	};
+	let Ok(args) = serde_json::from_str::<serde_json::Value>(raw) else {
+		return true;
+	};
+	args
+		.get("path")
+		.and_then(serde_json::Value::as_str)
+		.is_some_and(|path| !path.contains("://"))
 }
 
 fn read_group_block(

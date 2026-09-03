@@ -19,7 +19,7 @@ const fn states(
 	]
 }
 
-const TASK_ARGS: &str = r#"{"agent":"task","id":"AuthLoader","description":"Load auth middleware","assignment":"Read packages/server/src/auth/session.ts and middleware.ts, then document the session-cookie validation flow and any TODOs."}"#;
+const TASK_ARGS: &str = r#"{"agent":"task","name":"AuthLoader","task":"Read packages/server/src/auth/session.ts and middleware.ts, then document the session-cookie validation flow and any TODOs."}"#;
 const TASK_RESULT: &str = r#"{"total_duration_ms":48200,"requests":6,"results":[{"job":"AuthLoader","description":"Load auth middleware","assignment":"Read packages/server/src/auth/session.ts and middleware.ts, then document the session-cookie validation flow and any TODOs.","exit":0,"wall_ms":41900,"requests":6,"context_tokens":23100,"context_window":200000,"cost":0.12,"output":"Session validation runs in middleware.ts:42 via verifySessionCookie().\nCookies are HMAC-signed (SHA-256) and checked against the session store.\nTODO at session.ts:88 — sliding-expiration refresh is stubbed."}]}"#;
 const TASK_FAILED: &str = r#"{"total_duration_ms":9800,"requests":3,"results":[{"job":"RateLimiter","description":"Audit rate limiter","assignment":"Inspect packages/server/src/auth/rate-limit.ts. Confirm the 429 path sets Retry-After and report gaps.","exit":1,"wall_ms":9800,"requests":3,"context_tokens":6400,"context_window":200000,"cost":0.10,"error":"Subagent exited 1: target file packages/server/src/auth/rate-limit.ts does not exist."}]}"#;
 const HUB_START_ARGS: &str = r#"{"op":"start","name":"web","application":"bun","args":["run","dev"],"ready":{"log":"Local:.*http","port":5173,"timeout":30}}"#;
@@ -29,7 +29,7 @@ const HUB_SEND_ARGS: &str = r#"{"op":"send","to":"AuthLoader","message":"Are you
 const HUB_WAIT_ARGS: &str = r#"{"op":"wait","from":"AuthLoader","timeoutMs":60000}"#;
 const HUB_JOBS_ARGS: &str = r#"{"op":"wait","ids":["job_a1","job_b2","job_c3"]}"#;
 const TODO_ARGS: &str = r#"{"op":"init","list":[{"phase":"Foundation","items":["Scaffold crate","Wire workspace"]},{"phase":"Auth","items":["Port credential store","Wire OAuth providers"]}]}"#;
-const TODO_RESULT: &str = r#"{"phases":[{"title":"Foundation","tasks":[{"text":"Scaffold crate","status":"pending"},{"text":"Wire workspace","status":"pending"}]},{"title":"Auth","tasks":[{"text":"Port credential store","status":"pending"},{"text":"Wire OAuth providers","status":"pending"}]}]}"#;
+const TODO_RESULT: &str = r#"{"phases":[{"phase":"Foundation","items":[{"text":"Scaffold crate","status":"pending"},{"text":"Wire workspace","status":"pending"}]},{"phase":"Auth","items":[{"text":"Port credential store","status":"pending"},{"text":"Wire OAuth providers","status":"pending"}]}],"rendered":""}"#;
 const GOAL_ARGS: &str = r#"{"op":"create","objective":"Ship the auth hardening pass: per-account rate limits and sliding session expiry.","token_budget":500000}"#;
 
 pub(super) const FIXTURES: &[CardFixture] = &[
@@ -37,7 +37,7 @@ pub(super) const FIXTURES: &[CardFixture] = &[
 		tool:   "task",
 		title:  "Task",
 		states: states(
-			r#"{"agent":"task","id":"AuthLoader","description":"Load auth middleware","assignment":"Read packages/server/src/auth/*.ts and summarize the session-cookie"#,
+			r#"{"agent":"task","name":"AuthLoader","task":"Read packages/server/src/auth/*.ts and summarize the session-cookie"#,
 			TASK_ARGS,
 			Some(
 				r#"{"job":"AuthLoader","seq":2,"status":"running","intent":"Documenting session-cookie flow"}"#,

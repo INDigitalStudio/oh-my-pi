@@ -14,13 +14,15 @@ use omp_chat::{
 	HostAction, HostCommand, HostOptions, NativeEffect, NativeHost,
 	actions::{EscapeHook, EscapeRung},
 	composer::{SPACE_HOLD_RELEASE, SpaceHold, SpaceHoldEvent},
-	input::{Bindings, normalize_chord},
 	overlays::{NoServices, Panel, PanelAction, PanelAnchor, PanelCall, PanelEvent, PanelOpener},
 };
 use omp_core::Str;
 use omp_dom::{KnownTag, NodeSpec, Op, PropId, Tag, Txn, Value};
 use omp_session::{ComponentRegistry, Session};
-use omp_tui::{Frame, Key, Size, UiContext, paste::ClipboardRead, slots::ResizePolicy};
+use omp_tui::{
+	Chord, Frame, Key, KeyEvent, Mods, Mouse, MouseButton, MouseReport, Size, UiContext,
+	paste::ClipboardRead, slots::ResizePolicy,
+};
 use tempfile::tempdir;
 
 const BINDS: &str = r#"
@@ -31,6 +33,14 @@ bind alt+shift+l cl_copy_line
 bind alt+shift+c cl_copy_prompt
 bind ctrl+v cl_paste_image
 bind ctrl+shift+v cl_paste_raw
+bind ctrl+p panel_toggle_path
+bind ctrl+s panel_toggle_sort
+bind ctrl+r panel_rename
+bind ctrl+d panel_delete
+bind ctrl+w panel_delete_fast
+bind ctrl+left panel_fold_up
+bind ctrl+right panel_unfold_down
+bind ctrl+o panel_expand
 "#;
 
 struct Harness {
@@ -68,11 +78,6 @@ fn harness(mut session: Session) -> Harness {
 			.build(),
 	);
 	con.run(BINDS).expect("binds");
-	let bindings = Bindings::new(
-		con.binds()
-			.into_iter()
-			.map(|(chord, command)| (normalize_chord(&chord).unwrap(), command)),
-	);
 	let host = NativeHost::new(
 		HostOptions {
 			model: omp_chat::ModelBadge::from_identifier("test/model"),
@@ -82,7 +87,6 @@ fn harness(mut session: Session) -> Harness {
 			commands,
 			up,
 			con: Arc::clone(&con),
-			bindings,
 			models: Vec::new(),
 			cycle: Vec::new(),
 			resize_policy: ResizePolicy::Rebuild,
@@ -90,6 +94,9 @@ fn harness(mut session: Session) -> Harness {
 			welcome: omp_chat::welcome::WelcomeFacts::default(),
 			ui: UiContext::default(),
 			services: Arc::new(NoServices),
+			speech: None,
+			resuming: false,
+			initial_panel: None,
 		},
 		Size::new(100, 30),
 	);
@@ -481,6 +488,51 @@ fn copy_line_and_copy_prompt_hand_text_to_the_clipboard() {
 }
 
 #[test]
+fn live_bind_changes_apply_to_the_next_physical_edge() {
+	let mut h = harness(idle_session());
+	let f6 = Chord::parse("f6").expect("chord");
+	h.con.run("bind f6 cl_paste_image").expect("bind smart paste");
+	h.host
+		.chord(KeyEvent { chord: f6, key: Some(Key::Function(6)), pressed: true })
+		.expect("smart paste chord");
+	assert_eq!(h.host.take_clipboard_read(), Some(ClipboardRead::Smart));
+
+	h.con.run("bind f6 cl_paste_raw").expect("replace bind");
+	h.host
+		.chord(KeyEvent { chord: f6, key: Some(Key::Function(6)), pressed: true })
+		.expect("raw paste chord");
+	assert_eq!(h.host.take_clipboard_read(), Some(ClipboardRead::Text));
+
+	h.con.run("unbind f6").expect("unbind");
+	assert_eq!(
+		h.host
+			.chord(KeyEvent { chord: f6, key: Some(Key::Function(6)), pressed: true })
+			.expect("unbound chord"),
+		NativeEffect::Ignored
+	);
+	assert_eq!(h.host.take_clipboard_read(), None);
+}
+
+#[test]
+fn physical_release_runs_the_minus_action_from_the_live_bind() {
+	let mut h = harness(idle_session());
+	h.con
+		.run(
+			r#"alias +peek "cl_showthinking 1"; alias -peek "cl_showthinking 0"; bind ctrl+h +peek"#,
+		)
+		.expect("hold action");
+	let chord = Chord::parse("ctrl+h").expect("chord");
+	h.host
+		.chord(KeyEvent { chord, key: Some(Key::Ctrl('h')), pressed: true })
+		.expect("press");
+	assert!(omp_con::CL_SHOWTHINKING.get(&h.con));
+	h.host
+		.chord(KeyEvent { chord, key: Some(Key::Ctrl('h')), pressed: false })
+		.expect("release");
+	assert!(!omp_con::CL_SHOWTHINKING.get(&h.con));
+}
+
+#[test]
 fn paste_chords_request_the_matching_clipboard_read_and_deliver_it() {
 	let mut h = harness(idle_session());
 	h.host.key(Key::Paste).expect("ctrl+v");
@@ -540,6 +592,14 @@ impl Panel for Probe {
 			Key::Char('r') => PanelEvent::Recall(Str::new_static("recalled")),
 			Key::Char('c') => PanelEvent::Copy(Str::new_static("copied")),
 			_ => PanelEvent::Ignored,
+		}
+	}
+
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		if report.kind == Mouse::Click {
+			PanelEvent::Copy(Str::new_static("clicked"))
+		} else {
+			PanelEvent::Ignored
 		}
 	}
 
@@ -609,6 +669,23 @@ fn panels_receive_lowered_session_and_tree_chords_before_raw_keys() {
 }
 
 #[test]
+fn pointer_reports_reach_the_active_panel() {
+	let mut h = harness(idle_session());
+	open_probe(&mut h.host, "probe", PanelAnchor::Center);
+	h.host
+		.mouse(MouseReport {
+			kind: Mouse::Click,
+			col: 2,
+			row: 1,
+			button: MouseButton::Left,
+			mods: Mods::default(),
+			pressed: true,
+		})
+		.expect("mouse");
+	assert_eq!(h.host.take_clipboard().as_deref(), Some("clicked"));
+}
+
+#[test]
 fn panel_events_run_console_lines_recall_text_and_copy() {
 	let mut h = harness(idle_session());
 	open_probe(&mut h.host, "probe", PanelAnchor::Center);
@@ -631,6 +708,12 @@ fn side_panels_leave_the_composer_live_and_close_at_escape_rung_two() {
 	let mut h = harness(session);
 	open_probe(&mut h.host, "btw", PanelAnchor::Side);
 	assert!(!h.host.overlay_open(), "a side panel is not modal");
+	h.host.key(Key::Char('c')).expect("side-panel copy");
+	assert_eq!(
+		h.host.take_clipboard().as_deref(),
+		Some("copied"),
+		"reserved side-panel keys win while the composer is empty"
+	);
 	type_text(&mut h.host, "typed");
 	assert_eq!(h.host.composer_text(), "typed");
 	h.host.key(Key::Esc).expect("esc");

@@ -15,8 +15,8 @@ use std::{
 use jiff::{ToSpan as _, Timestamp, Zoned, civil::Date, tz::TimeZone};
 use omp_core::Str;
 use omp_tui::{
-	Component, Frame, Icon, IntoComponent as _, Key, PaintCtx, Props, Rect, Size, Slot, Style,
-	Ui, UiContext, UiEvent, cell_width, components::hr::truncate_to_width, dom, next_slot,
+	Component, Frame, Icon, IntoComponent as _, Key, MouseReport, PaintCtx, Props, Rect, Size, Slot,
+	Style, Ui, UiContext, UiEvent, cell_width, components::hr::truncate_to_width, dom, next_slot,
 };
 
 use super::{
@@ -116,6 +116,13 @@ impl UsageDashboard {
 		}
 	}
 
+	fn route(&mut self, event: UiEvent) -> PanelEvent {
+		match event {
+			UiEvent::Cancel => PanelEvent::Close,
+			_ => PanelEvent::Consumed,
+		}
+	}
+
 	fn checked_text(&self) -> Str {
 		let State::Ready(report) = &self.state else {
 			return Str::default();
@@ -210,13 +217,17 @@ impl Panel for UsageDashboard {
 				PanelEvent::Consumed
 			},
 			Key::Up | Key::Down | Key::PageUp | Key::PageDown | Key::Home | Key::End => {
-				match self.ui.handle_key(key) {
-					UiEvent::Cancel => PanelEvent::Close,
-					_ => PanelEvent::Consumed,
-				}
+				let event = self.ui.handle_key(key);
+				self.route(event)
 			},
 			_ => PanelEvent::Ignored,
 		}
+	}
+
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		let event =
+			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		self.route(event)
 	}
 
 	fn frame(&mut self, viewport: Size) -> &Frame {
@@ -886,6 +897,7 @@ mod tests {
 	use std::time::Duration;
 
 	use omp_core::sf;
+	use omp_tui::{Mods, Mouse, MouseButton};
 
 	use super::*;
 	use crate::overlays::services::{ServiceResult, UsageWindow};
@@ -901,6 +913,27 @@ mod tests {
 			.timestamp()
 			.as_millisecond();
 		u64::try_from(ts).unwrap()
+	}
+
+	fn wheel_down(col: u16, row: u16) -> MouseReport {
+		MouseReport {
+			kind: Mouse::WheelDown,
+			col,
+			row,
+			button: MouseButton::WheelDown,
+			mods: Mods::default(),
+			pressed: true,
+		}
+	}
+
+	fn point(text: &str, needle: &str) -> (u16, u16) {
+		text.lines()
+			.enumerate()
+			.find_map(|(row, line)| {
+				let byte = line.find(needle)?;
+				Some((omp_tui::cell_width(&line[..byte]), u16::try_from(row).unwrap()))
+			})
+			.expect("text point")
 	}
 
 	fn report() -> UsageReport {
@@ -983,6 +1016,24 @@ mod tests {
 		assert!(text.contains("↵ details · Esc close"), "overview footer missing:\n{text}");
 		assert_eq!(panel.key(Key::Char('q')), PanelEvent::Close);
 		assert_eq!(panel.key(Key::Down), PanelEvent::Consumed);
+	}
+
+	#[test]
+	fn wheel_scrolls_the_detail_report() {
+		let ctx = UiContext::default();
+		let mut report = report();
+		report.detail = sf!(
+			"line 1  \nline 2  \nline 3  \nline 4  \nline 5  \nline 6  \nline 7  \nline 8"
+		);
+		let mut panel = UsageDashboard::from_report(report, &ctx, 60, NOW_MS);
+		assert_eq!(panel.key(Key::Enter), PanelEvent::Consumed);
+		let size = Size { width: 60, height: 10 };
+		let before = omp_tui::frame_text(panel.frame(size));
+		let (col, row) = point(&before, "line 1");
+		assert_eq!(panel.mouse(wheel_down(col, row)), PanelEvent::Consumed);
+		let after = omp_tui::frame_text(panel.frame(size));
+		assert_ne!(after, before, "wheel must move the details viewport");
+		assert!(after.contains("line 6"), "next detail row did not enter the viewport:\n{after}");
 	}
 
 	#[test]

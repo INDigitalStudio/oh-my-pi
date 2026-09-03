@@ -39,13 +39,13 @@ omp_con::var! {
 	/// painting each chunk at once (pi `display.smoothStreaming`).
 	pub static CL_SMOOTH_STREAMING = cl_smooth_streaming: bool {
 		default: true,
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 	/// Shows reasoning as prose only: fenced code in the trace collapses to
 	/// an ellipsis (pi `proseOnlyThinking`).
 	pub static CL_THINKING_PROSE_ONLY = cl_thinking_prose_only: bool {
 		default: true,
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 }
 
@@ -312,7 +312,11 @@ impl Projection {
 	/// extended in place so its reveal cursor and animation phase survive;
 	/// a live block that vanished (a displaced card) is discarded from the
 	/// ledger without touching history; blocks may materialize anywhere; a
-	/// reorder returns `false` and the caller rebuilds.
+	/// live block that moved behind a newer one reopens the live set in the
+	/// new order (`false`). The slot ledger is never replaced: rows already
+	/// retired into native scrollback stay retired (ADR 0034 exactly-once),
+	/// so a new tail block — a journaled notice, a toggled projection — is
+	/// admitted beside them, never re-emitted with them.
 	pub(crate) fn reconcile(
 		&mut self,
 		blocks: Vec<RenderedBlock>,
@@ -335,7 +339,29 @@ impl Projection {
 			.filter(|mounted| present(mounted.view.key))
 			.all(|mounted| next_keys.any(|key| key == mounted.view.key));
 		if !ordered {
-			self.blocks = survivors;
+			// Retired rows stay in scrollback; every live block reopens in
+			// the new order, and a block already retired is refreshed in
+			// place rather than mounted a second time.
+			let mut kept = Vec::with_capacity(survivors.len() + blocks.len());
+			for mounted in survivors {
+				if mounted.retired {
+					kept.push(mounted);
+				} else {
+					self.slots.discard(mounted.id);
+				}
+			}
+			for (block, twin) in blocks.into_iter().zip(mirror) {
+				if let Some(retired) = kept
+					.iter_mut()
+					.find(|mounted| mounted.view.key == block.view.key)
+				{
+					retired.view = block.view;
+					continue;
+				}
+				let mounted = self.open(block, twin, now);
+				kept.push(mounted);
+			}
+			self.blocks = kept;
 			return false;
 		}
 		let mut old = survivors.into_iter().peekable();
@@ -470,6 +496,15 @@ impl Projection {
 			self.blocks[index].retired = true;
 			live_rows = live_rows.saturating_sub(u32::from(rows));
 		}
+	}
+
+	/// First row of the composer inside the document [`Self::document`]
+	/// composes: the end of the live content while it fits, else the tail
+	/// anchor. Rows above it are where pi's status/notice row lives.
+	pub(crate) fn composer_top(&self, chrome_rows: u16, size: Size) -> u16 {
+		let chrome_rows = chrome_rows.min(size.height);
+		let available = u32::from(size.height.saturating_sub(chrome_rows));
+		u16::try_from(self.live_rows().min(available)).unwrap_or(u16::MAX)
 	}
 
 	/// Composes the on-screen document: live blocks then the composer,
@@ -755,7 +790,88 @@ mod tests {
 		};
 		assert!(
 			!live.reconcile(swapped(), swapped(), Duration::ZERO),
-			"a live block cannot move behind a newer one"
+			"a live block moving behind a newer one reopens the live set"
+		);
+		assert_eq!(
+			live.blocks.iter().map(|mounted| mounted.view.key).collect::<Vec<_>>(),
+			[1, 3, 2]
+		);
+		assert_eq!(live.slots.logical_history().count(), 0, "a reorder writes no history");
+	}
+
+	/// ADR 0034 exactly-once: admitting a new tail block (a journaled hook
+	/// notice, a toggled projection) after rows have retired into native
+	/// scrollback must never stage those rows again — the ledger is
+	/// reconciled, not rebuilt.
+	#[test]
+	fn admitting_a_new_tail_never_re_emits_retired_rows() {
+		// Two two-row blocks and a three-row chrome in six rows: exactly the
+		// oldest block retires.
+		let mut projection = fixture(6, &[true, true]);
+		projection.retire_under_pressure(3, 6);
+		assert!(projection.blocks[0].retired && !projection.blocks[1].retired);
+		let first = projection.blocks[0].id;
+		let plan = projection.slots.plan();
+		assert_eq!(plan.rows().len(), 2, "the first block's text row and spacer");
+		projection.slots.commit(plan, Delivered::All);
+		assert_eq!(projection.slots.logical_history().count(), 2);
+
+		let next = || {
+			vec![
+				block(1, BlockKind::User, "row", true),
+				block(2, BlockKind::User, "row", true),
+				block(9, BlockKind::Notice, "[pre-commit]\nlint ok", true),
+			]
+		};
+		assert!(projection.reconcile(next(), next(), Duration::ZERO));
+		assert_eq!(
+			projection.blocks.iter().map(|mounted| mounted.view.key).collect::<Vec<_>>(),
+			[1, 2, 9]
+		);
+		assert!(projection.blocks[0].retired, "the retired block stays retired");
+		// The new tail pushes the second block out under the same pressure;
+		// the staged rows are exactly that block's, never the first's again.
+		projection.retire_under_pressure(3, 6);
+		let plan = projection.slots.plan();
+		assert!(!plan.rows().is_empty());
+		assert!(
+			plan.rows().iter().all(|row| row.logical().block() != first),
+			"retired rows must not be staged twice"
+		);
+		projection.slots.commit(plan, Delivered::All);
+		assert_eq!(projection.slots.logical_history().count(), 4);
+		assert_eq!(
+			projection
+				.slots
+				.logical_history()
+				.filter(|row| row.block() == first)
+				.count(),
+			2
+		);
+		// A reorder of live blocks is admitted the same way.
+		let reordered = || {
+			vec![
+				block(1, BlockKind::User, "row", true),
+				block(2, BlockKind::User, "row", true),
+				block(11, BlockKind::Thinking, "late", false),
+				block(9, BlockKind::Notice, "[pre-commit]\nlint ok", true),
+			]
+		};
+		projection.reconcile(reordered(), reordered(), Duration::ZERO);
+		let swapped = || {
+			vec![
+				block(1, BlockKind::User, "row", true),
+				block(2, BlockKind::User, "row", true),
+				block(9, BlockKind::Notice, "[pre-commit]\nlint ok", true),
+				block(11, BlockKind::Thinking, "late", false),
+			]
+		};
+		assert!(!projection.reconcile(swapped(), swapped(), Duration::ZERO));
+		assert_eq!(projection.slots.logical_history().count(), 4, "reopening writes no history");
+		assert_eq!(
+			projection.blocks.iter().filter(|mounted| mounted.retired).count(),
+			2,
+			"both retired blocks survive the reorder exactly once"
 		);
 	}
 
@@ -895,11 +1011,14 @@ mod tests {
 		let emitted = projection.slots.emitted(projection.blocks[0].id);
 		assert!(emitted > 0, "a long append-only head streams its stable prefix mid-stream");
 		let chrome = Frame::new(Size::new(20, 1));
-		let document = projection.document(&chrome, Size::new(20, 6));
+		// Tall enough to hold every live row, so the document is top-anchored
+		// and its first row is the first row not yet in scrollback.
+		let document = projection.document(&chrome, Size::new(20, 20));
 		let first = omp_tui::frame_text(&document).lines().next().unwrap_or_default().to_owned();
-		assert!(
-			!first.starts_with("line 1"),
-			"rows already in scrollback leave the live document: {first:?}"
+		assert_eq!(
+			first,
+			format!("line {}", emitted + 1),
+			"rows already in scrollback leave the live document ({emitted} emitted)"
 		);
 		let sealed = || vec![streamed(3, &lines(12), Mode::AppendOnly, true)];
 		assert!(projection.reconcile(sealed(), sealed(), now));

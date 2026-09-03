@@ -16,7 +16,7 @@ impl Card for InspectImageCard {
 
 	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
 		let args = view.args_json();
-		let result = view.result_json();
+		let result = view.outcome_json().or_else(|| view.result_json());
 		let path = result
 			.as_ref()
 			.and_then(|value| value.get("image_path"))

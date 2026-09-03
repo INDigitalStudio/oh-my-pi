@@ -127,8 +127,8 @@ async fn p3_dispatcher_detaches_work_after_the_central_blocking_limit() {
 	assert!(journal.contains("\"kind\":\"detached\""));
 }
 
-#[test]
-fn p3_job_board_rebuilds_from_meta_jobs_and_rewind_terminates_runtime() {
+#[tokio::test]
+async fn p3_job_board_rebuilds_from_meta_jobs_and_rewind_terminates_runtime() {
 	let temp = tempfile::tempdir().expect("P3 scratch");
 	let mut session = Session::create(temp.path().join("jobs.oms"), ComponentRegistry::standard())
 		.expect("session");
@@ -153,7 +153,7 @@ fn p3_job_board_rebuilds_from_meta_jobs_and_rewind_terminates_runtime() {
 	assert!(board.attach(session.dom(), handle, cancel.clone()));
 	assert_eq!(board.list().len(), 1);
 	let work = session.rewind(before).expect("rewind");
-	board.apply_lifecycle(&work);
+	board.apply_lifecycle(&session, &work).await;
 	assert!(cancel.is_cancelled());
 	assert!(board.list().is_empty());
 }

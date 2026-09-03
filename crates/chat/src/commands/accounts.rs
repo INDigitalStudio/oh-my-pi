@@ -9,8 +9,6 @@
 //!
 //! [`Services`]: crate::overlays::services::Services
 
-use std::sync::Arc;
-
 use omp_con::ConError;
 use omp_core::{Str, sf};
 use omp_tui::Icon;
@@ -18,10 +16,11 @@ use omp_tui::Icon;
 use super::{PaletteEntry, rest};
 use crate::{
 	actions::{HostAction, post},
+	host::HostCommand,
 	overlays::{
 		Panel, PanelCall, PanelCx, PanelEvent, PanelOpener,
 		login::{LoginDialog, LogoutSelector, ProviderMode, ProviderPicker},
-		services::{AccountRow, ProviderRow},
+		services::{AccountRow, Mutation, ProviderRow, SessionScope},
 	},
 };
 
@@ -92,12 +91,7 @@ fn logout_panel(cx: &PanelCx<'_>, provider: Option<&str>) -> Result<Box<dyn Pane
 		let providers = logout_providers(cx)?;
 		return match providers.as_slice() {
 			[] => Err(Str::new_static(NOTHING_TO_LOG_OUT)),
-			[only] => Ok(boxed(LogoutSelector::open(
-				only.name.clone(),
-				accounts,
-				Arc::clone(cx.services),
-				cx.ui,
-			))),
+			[only] => Ok(boxed(LogoutSelector::open(only.name.clone(), accounts, cx.ui))),
 			_ => Ok(boxed(ProviderPicker::open(providers, ProviderMode::Logout, cx.ui))),
 		};
 	};
@@ -118,7 +112,7 @@ fn logout_panel(cx: &PanelCx<'_>, provider: Option<&str>) -> Result<Box<dyn Pane
 		});
 	};
 	let name = first.provider_name.clone();
-	Ok(boxed(LogoutSelector::open(name, rows, Arc::clone(cx.services), cx.ui)))
+	Ok(boxed(LogoutSelector::open(name, rows, cx.ui)))
 }
 
 /// `/pin` target: a session (pi) or a provider account.
@@ -137,9 +131,7 @@ pub enum PinTarget {
 	},
 }
 
-/// Toggles a session pin through [`Services::pin_session`].
-///
-/// [`Services::pin_session`]: crate::overlays::services::Services::pin_session
+/// Toggles a session pin through the controller-owned mutation stream.
 fn pin_session(cx: &PanelCx<'_>, id: Option<&str>) -> PanelEvent {
 	let id = match id {
 		Some(id) => Str::new(id),
@@ -148,7 +140,7 @@ fn pin_session(cx: &PanelCx<'_>, id: Option<&str>) -> PanelEvent {
 			Err(error) => return PanelEvent::Notice(sf!("{error}")),
 		},
 	};
-	let rows = match cx.services.sessions() {
+	let rows = match cx.services.sessions(SessionScope::Project) {
 		Ok(rows) => rows,
 		Err(error) => return PanelEvent::Notice(sf!("{error}")),
 	};
@@ -159,19 +151,13 @@ fn pin_session(cx: &PanelCx<'_>, id: Option<&str>) -> PanelEvent {
 	}) else {
 		return PanelEvent::Notice(sf!("Session \"{id}\" not found."));
 	};
-	match cx.services.pin_session(&row.id, !row.pinned) {
-		Ok(()) => PanelEvent::Notice(Str::new_static(if row.pinned {
-			"Session unpinned."
-		} else {
-			"Session pinned to the top of the resume list."
-		})),
-		Err(error) => PanelEvent::Notice(sf!("{error}")),
-	}
+	PanelEvent::Command(HostCommand::Service(Mutation::PinSession {
+		id: row.id.clone(),
+		pinned: !row.pinned,
+	}))
 }
 
-/// Pins one provider account through [`Services::pin_account`].
-///
-/// [`Services::pin_account`]: crate::overlays::services::Services::pin_account
+/// Pins one provider account through the controller-owned mutation stream.
 fn pin_account(cx: &PanelCx<'_>, provider: &str, account: Option<&str>) -> PanelEvent {
 	let accounts = match cx.services.accounts() {
 		Ok(accounts) => accounts,
@@ -199,10 +185,10 @@ fn pin_account(cx: &PanelCx<'_>, provider: &str, account: Option<&str>) -> Panel
 			),
 		});
 	};
-	match cx.services.pin_account(row, true) {
-		Ok(line) => PanelEvent::Notice(line),
-		Err(error) => PanelEvent::Notice(sf!("{error}")),
-	}
+	PanelEvent::Command(HostCommand::Service(Mutation::PinAccount {
+		account: row.clone(),
+		pinned: true,
+	}))
 }
 
 /// Parses `/pin [session id | <provider> [account]]`: a first word naming
@@ -278,6 +264,8 @@ omp_con::cmd! {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
 	use super::*;
 
 	fn provider(id: &'static str) -> ProviderRow {

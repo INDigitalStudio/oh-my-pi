@@ -6,7 +6,7 @@ use miette::{IntoDiagnostic as _, miette};
 use omp_core::Str;
 use omp_driver::discovery::roles;
 
-use crate::cli::ChatArgs;
+use crate::cli::{ChatArgs, InvocationExtensionMode, LaunchExtensions, PromptArgs};
 
 /// Initial surface selected by the command boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +29,56 @@ pub enum ChatPresentation {
 	Gui,
 }
 
+/// Lowers application launch-extension controls into the driver composition
+/// contract shared by chat, print, RPC, and ACP.
+pub(crate) fn driver_extension_policy(
+	launch: &LaunchExtensions,
+) -> omp_driver::headless::kernel::LaunchExtensionPolicy {
+	omp_driver::headless::kernel::LaunchExtensionPolicy {
+		native_roots: launch.native_roots.clone(),
+		native_mode: match launch.mode {
+			InvocationExtensionMode::Merge => {
+				omp_driver::headless::kernel::NativeExtensionMode::Merge
+			},
+			InvocationExtensionMode::ExplicitOnly => {
+				omp_driver::headless::kernel::NativeExtensionMode::ExplicitOnly
+			},
+			InvocationExtensionMode::Disabled => {
+				omp_driver::headless::kernel::NativeExtensionMode::Disabled
+			},
+		},
+		include_workspace: !launch.no_workspace,
+		trusted: launch.trusted.clone(),
+		contributed: launch.contributed.clone(),
+		setting_overrides: launch.settings.clone(),
+	}
+}
+
+/// Resolves the prompt flags once at the command boundary.
+pub(crate) fn prompt_overrides(
+	project: &std::path::Path,
+	home: &std::path::Path,
+	args: &PromptArgs,
+) -> miette::Result<omp_driver::headless::kernel::PromptOverrides> {
+	let slots = crate::spec::resolve_prompt_slots(
+		project,
+		home,
+		args.custom_prompt.as_deref(),
+		args.append_prompt.as_deref(),
+	)?;
+	Ok(omp_driver::headless::kernel::PromptOverrides {
+		custom_prompt: slots.system,
+		append_prompt: slots.append,
+		personality: args.personality.clone(),
+		include_model: args.include_model_in_prompt,
+		include_workstation: args.include_workstation,
+		include_workspace_tree: args.include_workspace_tree,
+		render_mermaid: args.render_mermaid,
+		include_skills: args.skills_enabled,
+		null_prompt: args.null_prompt,
+	})
+}
+
 /// Runs one interactive durable project-chat session.
 #[cfg(any(unix, windows))]
 #[expect(
@@ -37,12 +87,14 @@ pub enum ChatPresentation {
 )]
 pub(crate) async fn run(
 	mut args: ChatArgs,
-	_start: ChatStart,
+	start: ChatStart,
 	presentation: ChatPresentation,
 ) -> miette::Result<()> {
-	if args.fork.is_some() {
-		return Err(miette!("forking a session requires an explicit journal branch target"));
-	}
+	let resuming = args.continue_session
+		|| args.resume.is_some()
+		|| args.fork.is_some()
+		|| args.from_claude
+		|| args.from_codex;
 	if args.from_claude || args.from_codex {
 		crate::session_import::prepare(&mut args)?;
 	}
@@ -67,6 +119,8 @@ pub(crate) async fn run(
 	}
 
 	let home = env::var_os("HOME").map_or_else(|| project.clone(), PathBuf::from);
+	let prompt = prompt_overrides(&project, &home, &args.prompt_settings)?;
+	let extensions = driver_extension_policy(&args.extension_launch);
 	let model_settings =
 		omp_catalog::settings::ModelSettings::from_con(&ctx).resolve_path_scopes(&project, &home);
 	let catalog = if args.gateway.is_some() {
@@ -110,12 +164,21 @@ pub(crate) async fn run(
 				.resume
 				.as_ref()
 				.map(|value| PathBuf::from(value.as_str())),
+			fork: args
+				.fork
+				.as_ref()
+				.map(|value| PathBuf::from(value.as_str())),
 			sessions_dir: args.session_dir.clone(),
 			ephemeral: args.no_session,
 			no_tools: args.no_tools,
+			tools: args.tools.as_ref().map(|tools| tools.0.clone()),
 			py_eval: args.py_eval,
 			spawn_idle_timeout: args.envd_idle_timeout,
 			api_key: args.api_key.clone(),
+			approval_mode: args.effective_approval().map(Into::into),
+			model_override: args.model.is_some(),
+			prompt,
+			extensions,
 			provider: args
 				.provider
 				.as_ref()
@@ -131,10 +194,14 @@ pub(crate) async fn run(
 			sessions: Some(Arc::clone(&live_sessions)),
 			session_name: None,
 			tool_registry: None,
+			output_schema: None,
+			schema_mode: None,
 		},
 	)
 	.await
 	.into_diagnostic()?;
+	apply_launch_thinking(&ctx, args.thinking).into_diagnostic()?;
+	apply_launch_plan(&mut session, args.plan_mode, args.plan_yolo).into_diagnostic()?;
 	let ephemeral_path = args
 		.no_session
 		.then(|| session.journal_path().to_path_buf());
@@ -142,19 +209,38 @@ pub(crate) async fn run(
 	// subscription onto it and publishes one `Reset` per session switch.
 	let (relay_tx, dom_events) = flume::unbounded();
 	let kernel_events = kernel.subscribe();
+	// The interactive `ask` presenter: the tool waits on the host, which
+	// answers the call identity through the controller.
+	let ask_route = omp_driver::headless::AskRoute::new();
+	kernel
+		.inference()
+		.environment()
+		.bind_ask_presenter(Arc::new(ask_route.clone()));
+	// `/trace` reads the notifications the journal never carries.
+	let trace = crate::chat_services::trace::TraceLog::record(
+		kernel.subscribe(),
+		&tokio::runtime::Handle::current(),
+	);
 	let up = kernel.mailbox();
 	let (commands, command_rx) = flume::unbounded();
-	let console_bindings = crate::keybindings::config::ConsoleKeybindings::from_ctx(&ctx)
-		.map_err(|source| miette!(source))?;
-	let bindings = omp_chat::input::Bindings::new(console_bindings.bindings);
 	let resize_policy = match omp_con::CL_RESIZE_POLICY.get(&ctx) {
 		omp_con::ResizePolicy::Preserve => omp_tui::slots::ResizePolicy::Preserve,
 		omp_con::ResizePolicy::Append => omp_tui::slots::ResizePolicy::Append,
 		omp_con::ResizePolicy::Rebuild => omp_tui::slots::ResizePolicy::Rebuild,
 	};
 	let model_badge = {
-		let mut badge = omp_chat::ModelBadge::from_identifier(model.as_str());
-		if let Some(spec) = catalog.model(&omp_catalog::ModelKey::from(model.as_str())) {
+		// A resumed session restores its journaled `ai_model` route; the
+		// badge follows it rather than the launch default.
+		let route = Some(omp_con::AI_MODEL.get(&ctx))
+			.filter(|route| !route.is_empty())
+			.unwrap_or_else(|| model.clone());
+		let spec = catalog
+			.model(&omp_catalog::ModelKey::from(route.as_str()))
+			.or_else(|| catalog.resolve_alias(route.as_str()));
+		let mut badge = omp_chat::ModelBadge::from_identifier(
+			spec.map_or(route.as_str(), |spec| spec.key.as_str()),
+		);
+		if let Some(spec) = spec {
 			badge.name = spec.display_name.clone();
 			badge.context_window = spec.limits.context_window;
 			badge.reasoning = spec.thinking.is_some();
@@ -168,10 +254,10 @@ pub(crate) async fn run(
 		let key_of =
 			|key: &Option<omp_catalog::ModelKey>| key.as_ref().map(|key| Str::new(key.as_str()));
 		let by_role = [
-			("smol", key_of(&launch_roles.smol)),
-			("default", Some(model.clone())),
-			("slow", key_of(&launch_roles.slow)),
-			("plan", key_of(&launch_roles.plan)),
+			("smol", key_of(&launch_roles.smol), launch_roles.smol_thinking.clone()),
+			("default", Some(model.clone()), launch_roles.primary_thinking.clone()),
+			("slow", key_of(&launch_roles.slow), launch_roles.slow_thinking.clone()),
+			("plan", key_of(&launch_roles.plan), launch_roles.plan_thinking.clone()),
 		];
 		model_settings
 			.cycle_order
@@ -179,8 +265,10 @@ pub(crate) async fn run(
 			.filter_map(|role| {
 				by_role
 					.iter()
-					.find(|(name, _)| *name == role.as_str())
-					.and_then(|(name, key)| key.clone().map(|key| (Str::new_static(name), key)))
+					.find(|(name, _, _)| *name == role.as_str())
+					.and_then(|(name, key, thinking)| {
+						key.clone().map(|key| (Str::new_static(name), key, thinking.clone()))
+					})
 			})
 			.collect::<Vec<_>>()
 	};
@@ -224,11 +312,15 @@ pub(crate) async fn run(
 	// stay here, the actor only reads rows (ADR 0005).
 	let live_journal =
 		Arc::new(parking_lot::RwLock::new(session.journal_path().to_path_buf()));
-	let services: Arc<dyn omp_chat::overlays::Services> = {
+	let (services, mutations): (
+		Arc<dyn omp_chat::overlays::Services>,
+		Arc<dyn omp_chat::overlays::services::Mutations>,
+	) = {
 		let composed = kernel.inference();
 		let environment = composed.environment();
 		let state_dir = omp_env::project_state::directory(&data_dir, &project).into_diagnostic()?;
-		Arc::new(crate::chat_services::AppServices::new(crate::chat_services::ServiceState {
+		let services = Arc::new(crate::chat_services::AppServices::new(
+			crate::chat_services::ServiceState {
 			data_dir: data_dir.clone(),
 			project: project.clone(),
 			sessions_dir: args
@@ -248,9 +340,22 @@ pub(crate) async fn run(
 			stack: composed
 				.production_stack()
 				.map(crate::chat_services::StackHandles::from_stack),
-			runtime: tokio::runtime::Handle::current(),
-		}))
+			trace,
+				runtime: tokio::runtime::Handle::current(),
+			},
+		));
+		(
+			Arc::clone(&services) as Arc<dyn omp_chat::overlays::Services>,
+			services as Arc<dyn omp_chat::overlays::services::Mutations>,
+		)
 	};
+	// The vocalizer synthesizes through the Environment's media bridge; the
+	// mode itself (`cl_speech_mode`) is read by the host per event.
+	let speech: Option<Arc<dyn omp_chat::notices::voice::SpeechSynth>> =
+		Some(Arc::new(crate::voice::synth::EnvSpeechSynth::new(
+			kernel.inference().environment().search_bridge(),
+			Arc::clone(&ctx),
+		)));
 	let home = omp_driver::headless::kernel::SessionHome::new(
 		&data_dir,
 		&project,
@@ -269,9 +374,11 @@ pub(crate) async fn run(
 		home,
 		relay_tx,
 		Arc::clone(&ctx),
+		mutations,
 		Arc::clone(&live_journal),
 		data_dir.clone(),
 		ephemeral_path.clone(),
+		ask_route,
 	);
 	let options = omp_chat::HostOptions {
 		snapshot,
@@ -280,15 +387,17 @@ pub(crate) async fn run(
 		commands: commands.clone(),
 		up: up.clone(),
 		con: Arc::clone(&ctx),
-		bindings,
 		models,
 		cycle,
 		resize_policy,
 		model: model_badge,
+		resuming,
+		initial_panel: (start == ChatStart::SessionIndex).then_some(omp_chat::InitialPanel::Sessions),
 		project: project.clone(),
 		welcome,
 		services,
 		ui: omp_tui::UiContext::default(),
+		speech,
 	};
 	if !args.prompt.is_empty() {
 		let mut text = String::new();
@@ -337,6 +446,81 @@ pub(crate) async fn run(
 	}
 	if let Some(path) = ephemeral_path {
 		let _ = fs::remove_file(path);
+	}
+	// `/restart` (pi `interactive-mode.ts` `restart()`): the terminal is
+	// restored and the session journaled its exit, so replace the process
+	// image with the launch argv resuming this session. Returns only on
+	// exec failure.
+	if crate::chat_services::control::take_restart_request() {
+		let prompts = args.prompt.iter().map(Str::as_str).collect::<Vec<_>>();
+		let journal = live_journal.read().clone();
+		let resume = (!args.no_session).then_some(journal.as_path());
+		let error = crate::chat_services::control::exec_restart(&prompts, resume);
+		return Err(miette!("Restart exec failed: {error}"));
+	}
+	Ok(())
+}
+
+/// `--thinking` is the launch's reasoning level: it lands on `ai_thinking`
+/// after the session opened, so an explicit flag outranks a resumed
+/// session's journaled value; the kernel and the status band both read the
+/// convar (ADR 0012: the convar is the live setting).
+pub(crate) fn apply_launch_thinking(
+	ctx: &omp_con::Ctx,
+	level: Option<crate::cli::ThinkingLevel>,
+) -> omp_con::ConResult<()> {
+	match level {
+		Some(level) => omp_con::AI_THINKING.set(ctx, Str::new_static(<&'static str>::from(level))),
+		None => Ok(()),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn launch_thinking_outranks_a_resumed_session_value() {
+		let ctx = omp_con::Ctx::new();
+		ctx.run("ai_thinking low").expect("resumed session value");
+		apply_launch_thinking(&ctx, Some(crate::cli::ThinkingLevel::High)).expect("applies");
+		assert_eq!(omp_con::AI_THINKING.get(&ctx), "high");
+		apply_launch_thinking(&ctx, None).expect("no flag");
+		assert_eq!(omp_con::AI_THINKING.get(&ctx), "high", "no flag leaves the session value");
+		apply_launch_thinking(&ctx, Some(crate::cli::ThinkingLevel::Off)).expect("applies");
+		assert_eq!(omp_con::AI_THINKING.get(&ctx), "off");
+	}
+
+	#[cfg(any(unix, windows))]
+	#[test]
+	fn both_launch_plan_flags_engage_the_plan_director_before_the_first_turn() {
+		for (plan_mode, plan_yolo) in [(true, false), (false, true)] {
+			let directory = tempfile::tempdir().unwrap();
+			let path = directory.path().join("session.oms");
+			let mut session =
+				omp_session::Session::create(&path, omp_session::ComponentRegistry::standard())
+					.unwrap();
+			apply_launch_plan(&mut session, plan_mode, plan_yolo).unwrap();
+			assert_eq!(
+				session
+					.dom()
+					.select("directors director[family=plan]")
+					.unwrap()
+					.count(),
+				1
+			);
+		}
+	}
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) fn apply_launch_plan(
+	session: &mut omp_session::Session,
+	plan_mode: bool,
+	plan_yolo: bool,
+) -> Result<(), omp_agent::DirectorError> {
+	if plan_mode || plan_yolo {
+		set_plan_mode(session, true)?;
 	}
 	Ok(())
 }

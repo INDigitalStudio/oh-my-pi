@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use omp_core::{Str, StrMut, sf};
 use omp_dom::{Dom, KnownTag, Node, PropId, Tag, Value};
-use omp_tui::{Frame, Icon, IntoComponent as _, Key, Prop, Size, Ui, UiContext, dom};
+use omp_tui::{
+	Frame, Icon, IntoComponent as _, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent, dom,
+};
 
 use super::{Panel, PanelAction, PanelAnchor, PanelEvent};
 use crate::cards::Component;
@@ -63,6 +65,8 @@ enum Segment {
 	Thinking(Str),
 	Assistant(Str),
 	Tool { name: Str, status: Str, output: Str },
+	/// A journaled extension or hook message (`<notice kind=custom|hook>`).
+	Message { name: Option<Str>, body: Str },
 }
 
 /// One selectable transcript message (pi `OutlineTarget`): a user prompt,
@@ -200,6 +204,27 @@ impl CopySelector {
 		PanelEvent::Copy(content)
 	}
 
+	fn route(&mut self, event: UiEvent) -> PanelEvent {
+		match event {
+			UiEvent::Cancel => PanelEvent::Close,
+			UiEvent::Pressed(id) => {
+				if let Some(index) = id
+					.as_str()
+					.strip_prefix("turn-")
+					.and_then(|index| index.parse::<usize>().ok())
+					.filter(|index| *index < self.targets.len())
+					&& index != self.selected
+				{
+					self.selected = index;
+					self.block_selected = None;
+					self.rebuild(self.width, self.rows);
+				}
+				PanelEvent::Consumed
+			},
+			_ => PanelEvent::Consumed,
+		}
+	}
+
 	fn rebuild(&mut self, width: u16, rows: u16) {
 		self.width = width;
 		self.rows = rows;
@@ -255,7 +280,7 @@ impl CopySelector {
 					<scroll id="copy" h={rows}>
 						for (id, descended, outlined, caption, cards, segments) in entries {
 							if descended {
-								<col id={id} focus>
+								<col id={id} focus hover=muted>
 									for card in cards { {card} }
 								</col>
 							} else if outlined {
@@ -265,7 +290,7 @@ impl CopySelector {
 									</col>
 								</box>
 							} else {
-								<col id={id} focus pad-x=1>
+								<col id={id} focus hover=muted pad-x=1>
 									for segment in segments { {segment} }
 								</col>
 							}
@@ -305,6 +330,17 @@ fn segment_view(segment: &Segment, expanded: bool) -> Component {
 				<col pad-x=1>
 					<text fg=muted>{header}</text>
 					if !shown.is_empty() { <pre fg=muted>{shown}</pre> }
+				</col>
+			}
+			.into_component()
+		},
+		Segment::Message { name, body } => {
+			let name = name.clone();
+			let body = body.clone();
+			dom! {
+				<col pad-x=1>
+					if let Some(name) = name { <text bold fg=accent>{name}</text> }
+					<md>{body}</md>
 				</col>
 			}
 			.into_component()
@@ -395,11 +431,30 @@ impl Panel for CopySelector {
 			Key::Left => self.ascend(),
 			Key::Enter => self.pick(),
 			Key::PageUp | Key::PageDown | Key::Home | Key::End | Key::SelectUp | Key::SelectDown => {
-				let _ = self.ui.handle_key(key);
-				PanelEvent::Consumed
+				let event = self.ui.handle_key(key);
+				self.route(event)
 			},
 			_ => PanelEvent::Consumed,
 		}
+	}
+
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		let event =
+			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		if report.kind == omp_tui::Mouse::Click
+			&& let Some(index) = self
+				.ui
+				.focused_id()
+				.and_then(|id| id.strip_prefix("turn-").and_then(|index| index.parse().ok()))
+			&& index < self.targets.len()
+			&& index != self.selected
+		{
+			self.selected = index;
+			self.block_selected = None;
+			self.rebuild(self.width, self.rows);
+			return PanelEvent::Consumed;
+		}
+		self.route(event)
 	}
 
 	fn frame(&mut self, viewport: Size) -> &Frame {
@@ -474,6 +529,26 @@ pub fn collect_targets(dom: &Dom, show_thinking: bool) -> Vec<CopyTarget> {
 						content: trimmed,
 						blocks,
 						segments,
+					});
+				},
+				// pi `targetCopy` `custom | hookMessage`: the framed message is
+				// its own outline target labeled `message`.
+				Tag::Known(KnownTag::Notice)
+					if prop_text(node, PropId::Kind)
+						.is_some_and(|kind| matches!(kind.as_str(), "custom" | "hook")) =>
+				{
+					targets.extend(open.take());
+					let body = node.content.clone().unwrap_or_default();
+					if body.trim().is_empty() {
+						continue;
+					}
+					let mut blocks = Vec::new();
+					push_markdown_blocks(&mut blocks, body.as_str());
+					targets.push(CopyTarget {
+						label: Str::new_static("message"),
+						content: body.clone(),
+						blocks,
+						segments: vec![Segment::Message { name: prop_text(node, PropId::Name), body }],
 					});
 				},
 				Tag::Custom(tool) => {
@@ -600,13 +675,24 @@ fn command_of(tool: &str, input: &Node) -> Option<(CommandKind, Str, Option<Str>
 	}
 }
 
-/// Model-facing text of a tool result: a JSON `text`/`output` field when
-/// the outcome is an object carrying one, else the raw outcome.
+/// Model-facing text of a tool result: the settled `<result>` text (the
+/// fold's prompt-parts projection) when there is one, else a JSON
+/// `text`/`output` field of the journaled outcome, else the raw outcome.
 fn result_text(node: &Node) -> Option<Str> {
-	let raw = node_json(node)?;
+	let projected = node
+		.prop(&PropId::Text.into())
+		.and_then(Value::as_str)
+		.map(str::trim)
+		.filter(|text| !text.is_empty());
+	let raw = match (projected, node.prop(&PropId::Outcome.into())) {
+		(Some(text), _) => text,
+		(None, Some(Value::Json(value))) => value.get(),
+		(None, _) => node_json(node)?,
+	};
 	let text = serde_json::from_str::<serde_json::Value>(raw)
 		.ok()
 		.and_then(|value| {
+			let value = value.get("value").unwrap_or(&value);
 			value
 				.get("text")
 				.or_else(|| value.get("output"))
@@ -724,11 +810,25 @@ fn prop_text(node: &Node, prop: PropId) -> Option<Str> {
 #[cfg(test)]
 mod tests {
 	use omp_session::{ComponentRegistry, Session};
-	use omp_tui::frame_text;
+	use omp_tui::{Mods, Mouse, MouseButton, frame_text};
 
 	use super::*;
 
 	const FENCE: &str = "fn main() {\n    println!(\"hi\");\n}";
+
+	fn mouse(kind: Mouse, col: u16, row: u16, button: MouseButton) -> MouseReport {
+		MouseReport { kind, col, row, button, mods: Mods::default(), pressed: true }
+	}
+
+	fn point(text: &str, needle: &str) -> (u16, u16) {
+		text.lines()
+			.enumerate()
+			.find_map(|(row, line)| {
+				let byte = line.find(needle)?;
+				Some((omp_tui::cell_width(&line[..byte]), u16::try_from(row).unwrap()))
+			})
+			.unwrap_or_else(|| panic!("text point `{needle}` missing from:\n{text}"))
+	}
 
 	fn session(with_bash: bool) -> Session {
 		let directory = tempfile::tempdir().expect("temp directory");
@@ -796,6 +896,32 @@ mod tests {
 		assert_eq!(panel.next_wake(), Some(Duration::ZERO));
 		assert!(panel.tick(Duration::from_millis(1)));
 		assert_eq!(panel.settled(), Some(PanelEvent::Close));
+	}
+
+	#[test]
+	fn click_selects_a_message_and_wheel_scrolls_the_copy_viewport() {
+		let session = session(false);
+		let mut panel = CopySelector::open(session.dom(), true, &UiContext::default());
+		let full = Size { width: 80, height: 24 };
+		let text = frame_text(panel.frame(full));
+		let (col, row) = point(&text, "show me main");
+		assert_eq!(
+			panel.mouse(mouse(Mouse::Click, col, row, MouseButton::Left)),
+			PanelEvent::Consumed
+		);
+		assert_eq!(panel.selected, 0);
+		assert!(panel.hint().starts_with("1/2"), "clicked message must become the selection");
+
+		let mut panel = CopySelector::open(session.dom(), true, &UiContext::default());
+		let size = Size { width: 80, height: 8 };
+		let before = frame_text(panel.frame(size));
+		let (col, row) = point(&before, "show me main");
+		assert_eq!(
+			panel.mouse(mouse(Mouse::WheelDown, col, row, MouseButton::WheelDown)),
+			PanelEvent::Consumed
+		);
+		let after = frame_text(panel.frame(size));
+		assert_ne!(after, before, "wheel must move the transcript viewport");
 	}
 
 	#[test]

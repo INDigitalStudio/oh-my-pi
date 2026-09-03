@@ -32,7 +32,7 @@ impl Card for WriteCard {
 	}
 }
 
-fn render_streaming(path: &str, content: &str, expanded: bool, ui: &UiContext) -> Component {
+fn render_streaming(path: &str, content: &str, _expanded: bool, ui: &UiContext) -> Component {
 	let body = sf!("{}\n  3", number_lines(content.trim_end_matches('\n'), 1));
 	let title = sf!("Write: {} {path}", icon(ui, "typescript"));
 	dom! {
@@ -56,7 +56,9 @@ fn render_progress(
 ) -> Component {
 	let lines: Vec<&str> = content.lines().collect();
 	let full = number_lines(&lines.join("\n"), 1);
-	let middle = number_lines(&lines.iter().skip(4).copied().collect::<Vec<_>>().join("\n"), 5);
+	let skipped = lines.len().saturating_sub(12);
+	let middle = number_lines(&lines.iter().skip(skipped).copied().collect::<Vec<_>>().join("\n"), skipped + 1);
+	let line_count = lines.len();
 	let title = sf!("Write: {} {path}", icon(ui, "typescript"));
 	dom! {
 		<box border=round title_pad=3>
@@ -66,11 +68,11 @@ fn render_progress(
 			</row>
 			if expanded {
 				<pre pad-x=1>{full}</pre>
-				<row pad-x=2><text fg=muted>{"16"}</text></row>
+				<row pad-x=2><text fg=muted>{sf!("{line_count}")}</text></row>
 			} else {
-				<row pad-x=1><text fg=muted>{"… (4 earlier lines)"}</text></row>
+				if skipped > 0 { <row pad-x=1><text fg=muted>{sf!("… ({skipped} earlier lines)")}</text></row> }
 				<pre pad-x=1>{middle}</pre>
-				<row pad-x=2><text fg=muted>{"16"}</text></row>
+				<row pad-x=2><text fg=muted>{sf!("{line_count}")}</text></row>
 			}
 			<row pad-x=1><text fg=muted>{"… (streaming)"}</text></row>
 		</box>
@@ -85,13 +87,9 @@ fn render_done(
 	expanded: bool,
 	ui: &UiContext,
 ) -> Component {
-	let result = typed_result::<omp_tools::write::Payload>(view).unwrap_or(Value::Null);
-	let line_count = result
-		.get("line_count")
-		.or_else(|| result.get("lines"))
-		.and_then(Value::as_u64)
-		.unwrap_or(16);
+	let _result = typed_result::<omp_tools::write::Payload>(view).unwrap_or(Value::Null);
 	let lines: Vec<&str> = content.lines().collect();
+	let line_count = lines.len();
 	let full = number_lines(&lines.join("\n"), 1);
 	let head = number_lines(&lines.iter().take(6).copied().collect::<Vec<_>>().join("\n"), 1);
 	let title =
@@ -100,10 +98,12 @@ fn render_done(
 		<box border=round title={title} title_pad=3>
 			if expanded {
 				<pre pad-x=1>{full}</pre>
-				<row pad-x=2><text fg=muted>{"16"}</text></row>
+				<row pad-x=2><text fg=muted>{sf!("{line_count}")}</text></row>
 			} else {
 				<pre pad-x=1>{head}</pre>
-				<row pad-x=1><text fg=muted>{"… 10 more lines ⟨Ctrl+O: Expand⟩"}</text></row>
+				if line_count > 6 {
+					<row pad-x=1><text fg=muted>{sf!("… {} more lines ⟨Ctrl+O: Expand⟩", line_count - 6)}</text></row>
+				}
 			}
 		</box>
 	}

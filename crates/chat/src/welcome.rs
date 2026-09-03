@@ -184,7 +184,8 @@ pub fn tip_for(cwd: &str, charset: Charset) -> Str {
 pub struct Welcome {
 	props:    Props,
 	slot:     Slot,
-	version:  Str,
+	/// Top-border title ` omp v<version> `, built once.
+	title:    Str,
 	model:    Str,
 	provider: Str,
 	/// Tip body with any `[NEW]` marker stripped.
@@ -193,6 +194,25 @@ pub struct Welcome {
 	new_tag:  bool,
 	facts:    WelcomeFacts,
 	brand:    Brand,
+	/// Wrapped tip lines for the last box width (ADR 0030: the cache owns
+	/// the memory; the intro repaints every frame at one width).
+	tip_wrap: TipWrap,
+}
+
+/// Width-keyed wrap of the startup tip: rebuilt only when the box width
+/// changes.
+struct TipWrap {
+	box_width: u16,
+	lines:     Vec<Str>,
+	/// Whether the `NEW!` tag rides the last line (`false` puts it on its
+	/// own indented line), pi `renderWelcomeTip`.
+	inline:    bool,
+}
+
+impl TipWrap {
+	const fn empty() -> Self {
+		Self { box_width: 0, lines: Vec::new(), inline: false }
+	}
 }
 
 struct WelcomeGeometry {
@@ -220,13 +240,14 @@ impl Welcome {
 		Self {
 			props: Props::new(),
 			slot: next_slot(),
-			version,
+			title: Str::new(format!(" omp v{version} ")),
 			model: badge.name.clone(),
 			provider: badge.provider.clone(),
 			tip,
 			new_tag,
 			facts,
 			brand,
+			tip_wrap: TipWrap::empty(),
 		}
 	}
 
@@ -262,29 +283,33 @@ impl Welcome {
 		u16::try_from(rows).unwrap_or(u16::MAX)
 	}
 
-	/// Wrapped tip body lines plus whether the `NEW!` tag rides the last one
-	/// (`false` puts it on its own indented line), pi `renderWelcomeTip`.
-	fn tip_lines(&self, box_width: u16) -> (Vec<Str>, bool) {
-		let indent = cell_width(TIP_LABEL);
-		let budget = box_width.saturating_sub(1 + indent);
-		if budget < 8 {
-			return (Vec::new(), false);
+	/// Wrapped tip body lines for `box_width`, rewrapped only when the width
+	/// differs from the cached one; the returned lines are owned by the
+	/// component.
+	fn tip_lines(&mut self, box_width: u16) -> &TipWrap {
+		if self.tip_wrap.box_width != box_width || self.tip_wrap.box_width == 0 {
+			let indent = cell_width(TIP_LABEL);
+			let budget = box_width.saturating_sub(1 + indent);
+			self.tip_wrap.box_width = box_width;
+			self.tip_wrap.lines.clear();
+			self.tip_wrap.inline = false;
+			if budget >= 8 {
+				wrap_words(self.tip.as_str(), budget, &mut self.tip_wrap.lines);
+				if let Some(last) = self.tip_wrap.lines.last() {
+					let tag_width = 1 + cell_width(NEW_TAG_TEXT);
+					self.tip_wrap.inline = 1 + indent + cell_width(last) + tag_width <= box_width;
+				}
+			}
 		}
-		let lines = wrap_words(self.tip.as_str(), budget);
-		if lines.is_empty() {
-			return (lines, false);
-		}
-		let tag_width = 1 + cell_width(NEW_TAG_TEXT);
-		let last = lines.last().map_or(0, |line| cell_width(line));
-		let inline = 1 + indent + last + tag_width <= box_width;
-		(lines, inline)
+		&self.tip_wrap
 	}
 
 	/// Rows the tip occupies under the box.
-	fn tip_rows(&self, box_width: u16) -> u16 {
-		let (lines, inline) = self.tip_lines(box_width);
-		let extra = u16::from(self.new_tag && !inline && !lines.is_empty());
-		u16::try_from(lines.len())
+	fn tip_rows(&mut self, box_width: u16) -> u16 {
+		let new_tag = self.new_tag;
+		let wrap = self.tip_lines(box_width);
+		let extra = u16::from(new_tag && !wrap.inline && !wrap.lines.is_empty());
+		u16::try_from(wrap.lines.len())
 			.unwrap_or(u16::MAX)
 			.saturating_add(extra)
 	}
@@ -307,7 +332,7 @@ impl Welcome {
 		let muted = Style::new().fg(theme.muted);
 		if self.facts.recent.is_empty() {
 			if index == 0 {
-				pc.frame.put(x, y, "No recent sessions", dim);
+				pc.frame.put(x.saturating_add(1), y, "No recent sessions", dim);
 			}
 			return;
 		}
@@ -342,7 +367,7 @@ impl Welcome {
 		let muted = Style::new().fg(theme.muted);
 		if self.facts.lsp.is_empty() {
 			if index == 0 {
-				pc.frame.put(x, y, "No LSP servers", dim);
+				pc.frame.put(x.saturating_add(1), y, "No LSP servers", dim);
 			}
 			return;
 		}
@@ -366,10 +391,10 @@ impl Welcome {
 	}
 }
 
-/// Greedy word wrap on cell width; words wider than the budget are broken
-/// at grapheme boundaries so wide and emoji text never overflows the box.
-fn wrap_words(text: &str, budget: u16) -> Vec<Str> {
-	let mut lines = Vec::new();
+/// Greedy word wrap on cell width into `lines`; words wider than the
+/// budget are broken at grapheme boundaries so wide and emoji text never
+/// overflows the box.
+fn wrap_words(text: &str, budget: u16, lines: &mut Vec<Str>) {
 	let mut current = String::new();
 	for word in text.split_whitespace() {
 		let word_width = cell_width(word);
@@ -399,7 +424,18 @@ fn wrap_words(text: &str, budget: u16) -> Vec<Str> {
 	if !current.is_empty() {
 		lines.push(Str::new(current));
 	}
-	lines
+}
+
+/// Paints `glyph` `count` times from `(x, y)` without building a string;
+/// returns the column after the run.
+fn put_repeat(pc: &mut PaintCtx<'_>, x: u16, y: u16, glyph: char, count: u16, style: Style) -> u16 {
+	let mut utf8 = [0; 4];
+	let text = glyph.encode_utf8(&mut utf8);
+	let mut column = x;
+	for _ in 0..count {
+		column = pc.frame.put(column, y, text, style);
+	}
+	column
 }
 
 /// Paints `text` centered inside `width` cells starting at `x`.
@@ -470,20 +506,16 @@ impl Component for Welcome {
 		let WelcomeGeometry { box_width, left_col, right_col, show_right } = geometry;
 
 		// Top border with the embedded title after three rule cells.
-		let title = format!(" omp v{} ", self.version);
 		let mut column = pc.frame.put(x, y, tl.encode_utf8(&mut [0; 4]), dim);
 		let title_space = box_width - 2;
-		let prefix = repeat_char(horizontal, 3);
-		let title_width = 3 + cell_width(&title);
-		column = pc.frame.put(column, y, &prefix, dim);
+		let title_width = 3 + cell_width(&self.title);
+		column = put_repeat(pc, column, y, horizontal, 3, dim);
 		if title_width >= title_space {
-			let clipped = clip_to_width(&title, title_space.saturating_sub(3));
+			let clipped = clip_to_width(&self.title, title_space.saturating_sub(3));
 			column = pc.frame.put(column, y, clipped, muted);
 		} else {
-			column = pc.frame.put(column, y, &title, muted);
-			column = pc
-				.frame
-				.put(column, y, &repeat_char(horizontal, title_space - title_width), dim);
+			column = pc.frame.put(column, y, &self.title, muted);
+			column = put_repeat(pc, column, y, horizontal, title_space - title_width, dim);
 		}
 		pc.frame.put(column, y, tr.encode_utf8(&mut [0; 4]), dim);
 		y = y.saturating_add(1);
@@ -492,11 +524,13 @@ impl Component for Welcome {
 		let rows = Self::content_rows(show_right);
 		let left_x = x.saturating_add(1);
 		let right_x = left_x.saturating_add(left_col).saturating_add(1);
-		let vertical_glyph = vertical.encode_utf8(&mut [0; 4]).to_owned();
+		let mut vertical_utf8 = [0; 4];
+		let vertical_glyph: &str = vertical.encode_utf8(&mut vertical_utf8);
 		let logo_top = 3_u16;
 		let (logo_cols, logo_rows) = Brand::size();
 		let model_row = logo_top + logo_rows + 1;
-		let separator = format!(" {}", repeat_char(horizontal, right_col.saturating_sub(2)));
+		// The right-column rule: one pad cell then the horizontal run.
+		let separator_run = right_col.saturating_sub(2);
 		let lsp_top = 7_u16;
 		let sessions_top = lsp_top + 1 + u16::try_from(LSP_SLOTS).unwrap_or(u16::MAX) + 1;
 
@@ -511,7 +545,7 @@ impl Component for Welcome {
 			if y >= pc.clip {
 				return;
 			}
-			pc.frame.put(x, y, &vertical_glyph, dim);
+			pc.frame.put(x, y, vertical_glyph, dim);
 			match row {
 				1 => put_centered(pc, left_x, y, left_col, "Welcome back!", Style::new().bold()),
 				row if row == model_row => put_centered(pc, left_x, y, left_col, &self.model, muted),
@@ -522,7 +556,7 @@ impl Component for Welcome {
 			}
 			if show_right {
 				pc.frame
-					.put(right_x.saturating_sub(1), y, &vertical_glyph, dim);
+					.put(right_x.saturating_sub(1), y, vertical_glyph, dim);
 				let content_x = right_x.saturating_add(1);
 				match row {
 					0 => {
@@ -540,7 +574,8 @@ impl Component for Welcome {
 						pc.frame.put(column, y, text, muted);
 					},
 					5 => {
-						pc.frame.put(right_x, y, &separator, dim);
+						let column = pc.frame.put(right_x, y, " ", dim);
+						put_repeat(pc, column, y, horizontal, separator_run, dim);
 					},
 					row if row == lsp_top - 1 => {
 						pc.frame.put(content_x, y, "LSP Servers", accent);
@@ -549,7 +584,8 @@ impl Component for Welcome {
 						self.paint_lsp(pc, right_x, y, usize::from(row - lsp_top));
 					},
 					row if row == sessions_top - 2 => {
-						pc.frame.put(right_x, y, &separator, dim);
+						let column = pc.frame.put(right_x, y, " ", dim);
+						put_repeat(pc, column, y, horizontal, separator_run, dim);
 					},
 					row if row == sessions_top - 1 => {
 						pc.frame.put(content_x, y, "Recent sessions", accent);
@@ -562,10 +598,10 @@ impl Component for Welcome {
 					_ => {},
 				}
 				pc.frame
-					.put(right_x.saturating_add(right_col), y, &vertical_glyph, dim);
+					.put(right_x.saturating_add(right_col), y, vertical_glyph, dim);
 			} else {
 				pc.frame
-					.put(left_x.saturating_add(left_col), y, &vertical_glyph, dim);
+					.put(left_x.saturating_add(left_col), y, vertical_glyph, dim);
 			}
 			y = y.saturating_add(1);
 		}
@@ -573,15 +609,11 @@ impl Component for Welcome {
 		// Bottom border, with a tee where the column divider meets it.
 		if y < pc.clip {
 			let mut column = pc.frame.put(x, y, bl.encode_utf8(&mut [0; 4]), dim);
-			column = pc
-				.frame
-				.put(column, y, &repeat_char(horizontal, left_col), dim);
+			column = put_repeat(pc, column, y, horizontal, left_col, dim);
 			if show_right {
 				let tee = if pc.ctx.charset == Charset::Ascii { "+" } else { "┴" };
 				column = pc.frame.put(column, y, tee, dim);
-				column = pc
-					.frame
-					.put(column, y, &repeat_char(horizontal, right_col), dim);
+				column = put_repeat(pc, column, y, horizontal, right_col, dim);
 			}
 			pc.frame.put(column, y, br.encode_utf8(&mut [0; 4]), dim);
 			y = y.saturating_add(1);
@@ -592,9 +624,11 @@ impl Component for Welcome {
 		let label = Style::new().fg(theme.secondary).italic();
 		let body = Style::new().fg(theme.muted).italic();
 		let indent = cell_width(TIP_LABEL);
-		let (lines, inline) = self.tip_lines(box_width);
-		let count = lines.len();
-		for (index, line) in lines.into_iter().enumerate() {
+		let new_tag = self.new_tag;
+		let wrap = self.tip_lines(box_width);
+		let inline = wrap.inline;
+		let count = wrap.lines.len();
+		for (index, line) in wrap.lines.iter().enumerate() {
 			if y >= pc.clip {
 				return;
 			}
@@ -603,21 +637,17 @@ impl Component for Welcome {
 			} else {
 				x.saturating_add(1).saturating_add(indent)
 			};
-			let column = pc.frame.put(column, y, &line, body);
-			if self.new_tag && inline && index + 1 == count {
+			let column = pc.frame.put(column, y, line, body);
+			if new_tag && inline && index + 1 == count {
 				let column = pc.frame.put(column, y, " ", body);
 				Self::paint_new_tag(pc, column, y);
 			}
 			y = y.saturating_add(1);
 		}
-		if self.new_tag && !inline && count > 0 && y < pc.clip {
+		if new_tag && !inline && count > 0 && y < pc.clip {
 			Self::paint_new_tag(pc, x.saturating_add(1).saturating_add(indent), y);
 		}
 	}
-}
-
-fn repeat_char(glyph: char, count: u16) -> String {
-	std::iter::repeat_n(glyph, usize::from(count)).collect()
 }
 
 #[cfg(test)]
@@ -796,6 +826,28 @@ mod tests {
 		let rows = self::rows(welcome(&long, WelcomeFacts::default()), 40);
 		assert!(rows.iter().all(|row| cell_width(row) <= 38), "{rows:?}");
 		assert!(rows.len() > 22);
+	}
+
+	#[test]
+	fn tip_wrap_is_retained_across_frames_and_rebuilt_only_on_width_change() {
+		let mut component = welcome("Press shift+tab to cycle through reasoning effort levels of the current model", WelcomeFacts::default());
+		let ctx = UiContext::default();
+		let first = component.height(&ctx, 60);
+		let count = component.tip_wrap.lines.len();
+		assert!(count > 1, "the tip wraps at 60 columns");
+		// Every intro frame measures and paints at the same width: the
+		// wrapped lines are retained untouched (a sentinel survives).
+		component.tip_wrap.lines[0] = Str::new_static("sentinel");
+		for _ in 0..3 {
+			assert_eq!(component.height(&ctx, 60), first);
+			assert_eq!(component.tip_wrap.lines[0].as_str(), "sentinel");
+			assert_eq!(component.tip_wrap.lines.len(), count);
+		}
+		let wide = component.height(&ctx, 120);
+		assert!(wide < first, "a wider box needs fewer tip rows");
+		assert_eq!(component.tip_wrap.box_width, 100, "rewrapped for the new box width");
+		assert_ne!(component.tip_wrap.lines[0].as_str(), "sentinel");
+		assert!(component.tip_wrap.lines.len() < count);
 	}
 
 	#[test]

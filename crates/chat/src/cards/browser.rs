@@ -3,7 +3,9 @@
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_input, typed_result};
+use super::{
+	Card, CardStatus, CardView, Component, elapsed_badge, result_image, typed_input, typed_result,
+};
 
 /// Browser automation code-cell card.
 pub struct BrowserCard;
@@ -13,7 +15,7 @@ impl Card for BrowserCard {
 		"browser"
 	}
 
-	fn render(&self, view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Component {
+	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::browser::Params>(view);
 		let result = typed_result::<omp_tools::browser::Payload>(view);
 		let name = result
@@ -38,16 +40,21 @@ impl Card for BrowserCard {
 			.to_owned();
 		let kind = result
 			.as_ref()
-			.and_then(|value| value.get("browser"))
+			.and_then(|value| value.get("action"))
 			.and_then(Value::as_str)
 			.unwrap_or_default()
 			.to_owned();
-		let displays = result
+		let artifacts = result
 			.as_ref()
-			.and_then(|value| value.get("display"))
+			.and_then(|value| value.get("artifacts"))
 			.and_then(Value::as_array)
-			.cloned()
-			.unwrap_or_default();
+			.into_iter()
+			.flatten()
+			.filter_map(Value::as_str)
+			.map(|artifact| {
+				result_image(&omp_core::Str::new(artifact), "image/png", None, ui)
+			})
+			.collect::<Vec<_>>();
 		let returned = result
 			.as_ref()
 			.and_then(|value| value.get("result"))
@@ -80,8 +87,8 @@ impl Card for BrowserCard {
 					if let Some(fault) = fault {
 						<pre>{fault}</pre>
 					} else {
-						for display in displays { <pre>{display_value(&display)}</pre> }
 						if let Some(returned) = returned { <pre>{returned}</pre> }
+						if expanded { {artifacts} }
 					}
 				}
 			</box>

@@ -187,7 +187,7 @@ omp_con::var! {
 	/// `tui.codexResetFireworks`).
 	pub static CL_CODEX_FIREWORKS = cl_codex_fireworks: bool {
 		default: true,
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 }
 

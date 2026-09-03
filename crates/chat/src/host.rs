@@ -19,18 +19,20 @@ use omp_con::{
 	CL_STATUS_COMPACT_THINKING, Ctx, Source,
 };
 use omp_core::Str;
-use omp_dom::{Dom, Event, KnownTag, PropId, Snapshot, Tag, Value};
+use omp_dom::{Dom, Event, Handle, KnownTag, Op, PropId, Snapshot, Tag, Value};
 use omp_journal::{EntryId, blob::BlobRef};
 use omp_tui::{
-	CursorStyle, DebugOp, Dim, Frame, InputEvent, Key, Layer, OverlayAnchor, OverlayOptions,
-	Renderer, Size, Terminal, TerminalEvent, TerminalOptions, TtyOut, Ui, UiContext,
+	CursorStyle, DebugOp, Dim, Frame, InputEvent, Key, KeyEvent, Layer, MouseReport, OverlayAnchor,
+	OverlayOptions, Progress, Renderer, Size, Terminal, TerminalEvent, TerminalOptions, Theme, TtyOut, Ui,
+	UiContext,
 	anim::Intro,
 	components::Countdown,
-	detect,
+	negotiate_async,
 	paste::{Clipboard, ClipboardRead, spawn_clipboard_read},
 	respond_debug_query,
 	slots::{Mode, ResizePolicy},
 };
+use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::oneshot;
 
@@ -38,18 +40,25 @@ use crate::{
 	actions::{CL_DOUBLE_ESCAPE, CL_STT_HOLD, EscapeHook, EscapeRung, HostAction, HostMailbox},
 	autocomplete::slash,
 	cards::CardRegistry,
-	chrome::{ModelBadge, StatusFacts, Welcome, display_path, tip_for},
+	chrome::{
+		CL_SHOW_PROGRESS, CL_STARTUP_QUIET, CL_TITLE_STATE, ModelBadge, StatusFacts, TerminalTitle,
+		TitleState, Welcome, display_path, tip_for,
+	},
 	commands::{CompactionMethod, Selector},
-	composer::{Composer, ComposerAction, SpaceHold, SpaceHoldEvent},
+	composer::{Composer, ComposerAction, PrefixMode, SpaceHold, SpaceHoldEvent},
 	gitwatch::{GitFacts, GitWatch},
-	input::Bindings,
+	notices::{
+		error::{aborted_tool_tail, error_banner, pinned_error, retry_hint_row},
+		retry::{RetryLoader, RetryState, superseded_notice_keys},
+		voice::{SpeechSynth, Vocalizer},
+	},
 	overlays::{
 		HistoryPicker, ModelPicker, ModelRow, Overlay, Overlays, PanelAction, PanelAnchor,
-		PanelCx, PanelEvent, PickerEvent, Services,
+		PanelCx, PanelEvent, PickerEvent, QuickRoleRow, Services,
 	},
 	project::{BlockKind, BlockView, RenderedBlock, project},
 	status_band::Speculation,
-	status_line::StatusLine,
+	status_line::{StatusLine, director_mode},
 	transcript::Projection,
 	welcome::{WelcomeFacts, tip_seeded, welcome_seed},
 };
@@ -85,7 +94,7 @@ pub enum SpawnKind {
 }
 
 /// Commands emitted by the presentation actor to the application controller.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostCommand {
 	/// Begin a fresh explicit turn.
 	Submit(Str),
@@ -200,6 +209,65 @@ pub enum HostCommand {
 		/// `true` starts the session; `false` ends it.
 		active: bool,
 	},
+	/// Drop the model context in place, keeping the session (`/clear`, pi
+	/// `resetSessionContext`): journal a `compaction@1` at the head whose
+	/// summary is empty, so the projection starts over after it.
+	ContextReset,
+	/// Relocate the session to another project directory (`/move`, `/wt`):
+	/// the journal moves into that directory's session bucket and the
+	/// process working directory follows (pi `moveSession` + `setProjectDir`).
+	Move {
+		/// Existing target directory.
+		path: PathBuf,
+	},
+	/// Run one tool locally without a model turn (the `!` / `$` composer
+	/// prefixes, pi `handleBashCommand` / `handlePythonCommand`).
+	RunLocal {
+		/// What to run.
+		input: crate::composer::LocalInput,
+		/// The submitted line verbatim, handed back through
+		/// [`HostAction::LocalRefused`] when the controller cannot run it.
+		draft: Str,
+	},
+	/// Re-run the tool batch the last turn died on (pi `viewSession.retry()`
+	/// over `hasAbortedToolCallTail`): the controller rewinds to the
+	/// tool-calling assistant's tail (`Session::tool_tail_retry_target`) and
+	/// resumes the turn, re-dispatching the same calls without a model
+	/// round-trip. Emitted only while idle and [`aborted_tool_tail`] holds —
+	/// the exact predicate that shows the `<key> to Retry` status row.
+	Retry,
+	/// Answer (or dismiss, `None`) the `ask` dialog for the tool element
+	/// with call id `id`; the reply becomes that call's result.
+	AskAnswer {
+		/// `<ask id>` of the waiting call.
+		id:      Str,
+		/// Answers in question order, or `None` when the user pressed Esc.
+		answers: Option<Vec<omp_tools::ask::Answer>>,
+	},
+	/// Mutate the project checkout on behalf of the Git workbench (stage,
+	/// unstage, apply a patch, discard, commit). The controller runs it and
+	/// answers with `Outcome::Git` through the console mailbox (ADR 0005).
+	Git(crate::overlays::git::GitOp),
+	/// Request a refreshed project or all-projects session index. The
+	/// controller answers with `Outcome::SessionIndex`.
+	SessionIndex {
+		/// Requested index scope.
+		scope: crate::overlays::services::SessionScope,
+	},
+	/// Mutate application state on behalf of a dashboard (extension, agent,
+	/// plugin, account, session index, usage reset). The controller runs it
+	/// through the app's [`crate::overlays::services::Mutations`] owner and
+	/// answers with `Outcome::Service`.
+	Service(crate::overlays::services::Mutation),
+	/// Supervise one agent from the hub: revive a parked one, kill a live
+	/// one, or deliver text to it. The controller answers with
+	/// `Outcome::Agent`.
+	Agent {
+		/// Agent (job) id under `<meta><jobs>`.
+		id: Str,
+		/// Requested operation.
+		op: crate::overlays::hub::AgentOp,
+	},
 	/// Stop the application-owned controller loop.
 	Quit,
 }
@@ -226,6 +294,13 @@ pub const fn ctrl_c_action(turn_active: bool, repeated: bool) -> CtrlCAction {
 	}
 }
 
+/// Observer-local surface shown when the chat actor first paints.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialPanel {
+	/// Open the all-session resume picker.
+	Sessions,
+}
+
 /// Interactive actor construction options.
 pub struct HostOptions {
 	/// Initial detached controller snapshot.
@@ -240,12 +315,11 @@ pub struct HostOptions {
 	pub up:            Sender<Up>,
 	/// Shared command-stream context. It carries policy, not session state.
 	pub con:           Arc<Ctx>,
-	/// App-normalized physical bindings.
-	pub bindings:      Bindings,
 	/// Catalog roster for the model picker (`cl_model_select`).
 	pub models:        Vec<ModelRow>,
-	/// `(role, model key)` roster for `cl_model_cycle`, in cycle order.
-	pub cycle:         Vec<(Str, Str)>,
+	/// `(role, model key, thinking)` roster for `cl_model_cycle` and
+	/// `@role` picker rows, in cycle order.
+	pub cycle:         Vec<(Str, Str, Option<Str>)>,
 	/// Transcript resize policy.
 	pub resize_policy: ResizePolicy,
 	/// Launch model facts for the banner and status band.
@@ -259,6 +333,14 @@ pub struct HostOptions {
 	pub ui:            UiContext,
 	/// Application-supplied data feeds for dashboards and account commands.
 	pub services:      Arc<dyn Services>,
+	/// Text-to-speech backend for the assistant vocalizer (pi `speech.*`);
+	/// `None` leaves every speech mode silent.
+	pub speech:        Option<Arc<dyn SpeechSynth>>,
+	/// Whether startup resumed, forked, or imported a session. This explicit
+	/// launch fact suppresses the intro even when the resumed journal is empty.
+	pub resuming:      bool,
+	/// Surface requested by the CLI before the first paint.
+	pub initial_panel: Option<InitialPanel>,
 }
 
 /// Chat actor or terminal delivery failure.
@@ -317,7 +399,6 @@ pub(crate) struct Presenter {
 	pub(crate) commands:       Sender<HostCommand>,
 	pub(crate) up:             Sender<Up>,
 	pub(crate) con:            Arc<Ctx>,
-	pub(crate) bindings:       Bindings,
 	pub(crate) cards:          CardRegistry,
 	pub(crate) ui:             UiContext,
 	pub(crate) model:          ModelBadge,
@@ -344,7 +425,7 @@ pub(crate) struct Presenter {
 	/// The one console mailbox: bound commands post actions here.
 	pub(crate) mailbox:        Arc<HostMailbox>,
 	pub(crate) models:         Vec<ModelRow>,
-	pub(crate) cycle:          Vec<(Str, Str)>,
+	pub(crate) cycle:          Vec<(Str, Str, Option<Str>)>,
 	/// Last prompt sent as a turn, for `cl_retry`.
 	pub(crate) last_prompt:    Option<Str>,
 	/// Text the composer asked to copy; the terminal loop drains it into
@@ -376,6 +457,17 @@ pub(crate) struct Presenter {
 	approval_shown:            Option<Duration>,
 	/// Last presented terminal height, for panel viewports.
 	viewport_height:           u16,
+	/// Terminal title run-state machine (pi `title-generator.ts`); the
+	/// terminal actor writes its output, the native actor never reads it.
+	title:                     TerminalTitle,
+	/// Whether native OSC 9;4 progress is currently shown (pi
+	/// `#terminalProgressActive`).
+	progress_shown:            bool,
+	/// pi `startup.quiet`: the welcome block is never projected.
+	quiet:                     bool,
+	/// Launch project directory: the title label's fallback until the
+	/// kernel projects a cwd.
+	project:                   PathBuf,
 	/// Observer-local transcript facts: tool start instants, the thinking
 	/// speed gauge, and the reset banner.
 	pub(crate) transcript:     crate::transcript::Local,
@@ -386,6 +478,24 @@ pub(crate) struct Presenter {
 	pub(crate) notifications:  Vec<omp_tui::Notification>,
 	/// Periodic Codex quota refresh behind the reset fireworks.
 	quota:                     crate::celebrate::QuotaWatch,
+	/// Same-route provider retry the transport scheduled (pi
+	/// `#retryPending`): pre-commit, so observer-local, cleared by the next
+	/// inference start or turn end.
+	pub(crate) retrying:       Option<RetryState>,
+	/// Elements of a failed attempt that a retry superseded (pi
+	/// `#syntheticFailureCards`): their blocks leave the live projection so
+	/// the re-streamed attempt never shows the same call twice.
+	superseded:                Vec<Handle>,
+	/// Pinned error the user dismissed by sending the next message (pi
+	/// `clearPinnedError`), so the banner drops before the DOM catches up.
+	dismissed_error:           Option<Handle>,
+	/// Streaming assistant speech, when the app supplied a synthesizer.
+	speech:                    Option<Arc<Mutex<Vocalizer>>>,
+	/// `ask` call the notifier already toasted for.
+	ask_notified:              Option<Handle>,
+	/// `ask` call the open dialog was projected from; cleared once it is
+	/// answered so the dialog never reopens for the same call.
+	ask_open:                  Option<Handle>,
 }
 
 /// Observer-local band facts that never enter the DOM.
@@ -407,6 +517,9 @@ pub struct LocalFacts {
 	pub fast:             bool,
 	/// Thinking level rides the model icon (`cl_status_compact_thinking`).
 	pub compact_thinking: bool,
+	/// Background compaction summary in flight (`KernelEvent::
+	/// CompactionSpeculating`), pulsing the gauge tick until it settles.
+	pub speculation:      Speculation,
 }
 
 impl Default for LocalFacts {
@@ -420,6 +533,7 @@ impl Default for LocalFacts {
 			compact:          80,
 			fast:             false,
 			compact_thinking: true,
+			speculation:      Speculation::None,
 		}
 	}
 }
@@ -517,6 +631,8 @@ fn suspend_process() {
 
 impl Presenter {
 	fn new(options: HostOptions, width: u16) -> Self {
+		let resuming = options.resuming;
+		let initial_panel = options.initial_panel;
 		let mailbox = options.con.user::<HostMailbox>().unwrap_or_else(|| {
 			HostMailbox::install(&options.con);
 			options
@@ -541,14 +657,41 @@ impl Presenter {
 		// A resumed or already-running session starts active (pi derives
 		// `isStreaming` from the session, never from a local edge).
 		let turn_active = has_active_turn(&replica);
-		Self {
+		// pi `suppressWelcomeIntro: resuming`: a session opened with history
+		// (`--continue`, `--resume`, `--fork`, an import) rests at once; a
+		// quiet startup (`cl_startup_quiet`) shows no welcome at all.
+		let quiet = CL_STARTUP_QUIET.get(&options.con);
+		let intro = (!quiet && !resuming).then_some(Duration::ZERO);
+		// Toasts and the terminal title carry the live session name.
+		let session_name = StatusLine::name(&replica);
+		let mut title = TerminalTitle::new();
+		title.set_enabled(CL_TITLE_STATE.get(&options.con));
+		title.set_label(session_name.as_deref(), &options.project.to_string_lossy());
+		// The vocalizer answers Esc rung 4 while it has audio to silence
+		// and `cl_voice_silence` through the console slot.
+		let mut escape_hooks = Vec::new();
+		let speech = options.speech.map(|synth| {
+			let vocalizer = Arc::new(Mutex::new(Vocalizer::new(synth)));
+			crate::notices::voice::install(&options.con, Arc::clone(&vocalizer));
+			let hook = Arc::clone(&vocalizer);
+			escape_hooks.push(EscapeHook::new("voice", EscapeRung::Silence, move || {
+				let mut vocalizer = hook.lock();
+				if vocalizer.speaking() {
+					vocalizer.silence();
+					true
+				} else {
+					false
+				}
+			}));
+			vocalizer
+		});
+		let mut presenter = Self {
 			replica,
 			dom_events: options.dom_events,
 			kernel_events: options.kernel_events,
 			commands: options.commands,
 			up: options.up,
 			con: options.con,
-			bindings: options.bindings,
 			cards: CardRegistry::standard(),
 			ui: options.ui,
 			model: options.model,
@@ -562,7 +705,7 @@ impl Presenter {
 			last_escape: None,
 			left_taps: LeftTaps::default(),
 			clock: Instant::now(),
-			intro: Some(Duration::ZERO),
+			intro,
 			mailbox,
 			models: options.models,
 			cycle: options.cycle,
@@ -573,7 +716,7 @@ impl Presenter {
 			welcome: options.welcome,
 			clipboard_read: None,
 			services: options.services,
-			escape_hooks: Vec::new(),
+			escape_hooks,
 			focused_agent: None,
 			collab_guest: false,
 			space_hold: SpaceHold::default(),
@@ -581,11 +724,266 @@ impl Presenter {
 			live_active: false,
 			approval_shown: None,
 			viewport_height: 24,
+			title,
+			progress_shown: false,
+			quiet,
+			project: options.project,
 			transcript: crate::transcript::Local::default(),
 			quota: crate::celebrate::QuotaWatch::default(),
-			notifier: crate::notify::Notifier::new(None),
+			notifier: crate::notify::Notifier::new(session_name),
 			notifications: Vec::new(),
+			retrying: None,
+			superseded: Vec::new(),
+			dismissed_error: None,
+			speech,
+			ask_notified: None,
+			ask_open: None,
+		};
+		if initial_panel == Some(InitialPanel::Sessions) {
+			let _ = presenter.run_console("resume");
 		}
+		presenter
+	}
+
+	/// Applies one ephemeral kernel notification. Retry facts drive the
+	/// countdown loader and the superseded-card retraction; text deltas
+	/// feed the vocalizer; the thinking speed gauge reads usage. Returns
+	/// the strongest repaint the event asks for.
+	pub(crate) fn apply_kernel_event(&mut self, event: &KernelEvent) -> Routed {
+		let now = self.clock.elapsed();
+		let mut routed = if self.transcript.on_kernel_event(event, now) {
+			Routed::RebuildProjection
+		} else {
+			Routed::Ignored
+		};
+		match event {
+			KernelEvent::InferenceRetry { attempt, max_attempts, delay, reason } => {
+				self.retrying =
+					Some(RetryState::new(*attempt, *max_attempts, *delay, reason.clone(), now));
+				self.notifier.set_retry_pending(true);
+				// pi `#handleAutoRetryStart`: the failed attempt's synthetic
+				// cards leave the transcript before the retry streams.
+				for handle in superseded_notice_keys(&self.replica) {
+					if !self.superseded.contains(&handle) {
+						self.superseded.push(handle);
+					}
+				}
+				routed = Routed::RebuildProjection;
+			},
+			KernelEvent::InferenceStarted => {
+				if self.retrying.take().is_some() {
+					self.notifier.set_retry_pending(false);
+					routed = routed.max(Routed::Repaint);
+				}
+			},
+			KernelEvent::TurnEnded { stop } => {
+				if self.retrying.take().is_some() {
+					self.notifier.set_retry_pending(false);
+					routed = routed.max(Routed::Repaint);
+				}
+				if matches!(stop, omp_agent::TurnStop::Completed | omp_agent::TurnStop::Steered)
+					&& let Some(speech) = &self.speech
+				{
+					let mode = Vocalizer::mode(&self.con);
+					let text = last_assistant_text(&self.replica);
+					speech.lock().turn_ended(mode, text.as_deref().unwrap_or_default());
+				}
+			},
+			KernelEvent::TextDelta(delta) => {
+				if let Some(speech) = &self.speech {
+					let mode = Vocalizer::mode(&self.con);
+					speech.lock().push_text(mode, delta);
+				}
+			},
+			KernelEvent::ThinkingDelta(delta) => {
+				if let Some(speech) = &self.speech {
+					let mode = Vocalizer::mode(&self.con);
+					speech.lock().push_thinking(mode, delta);
+				}
+			},
+			// pi `compactionSpeculation`: the gauge tick pulses while the
+			// summary is produced and rests once the boundary lands.
+			KernelEvent::CompactionSpeculating { .. } => {
+				self.local.speculation = Speculation::Running;
+				self.sync_status();
+				routed = routed.max(Routed::Repaint);
+			},
+			KernelEvent::CompactionSettled { .. } => {
+				self.local.speculation = Speculation::None;
+				self.sync_status();
+				routed = routed.max(Routed::Repaint);
+			},
+			KernelEvent::Usage { .. }
+			| KernelEvent::ToolReady { .. }
+			| KernelEvent::ToolUpdate { .. }
+			| KernelEvent::ToolSettled { .. } => {},
+		}
+		routed
+	}
+
+	/// Stops speech at once: a new user message or an interrupt (pi
+	/// `vocalizer.clear`).
+	fn silence_speech(&self) {
+		if let Some(speech) = &self.speech {
+			speech.lock().clear();
+		}
+	}
+
+	/// Whether a DOM patch closed an assistant message (its `stop-reason`
+	/// landed) with a reason other than cancellation — the vocalizer flushes
+	/// the buffered partial then (pi `message_end`).
+	fn assistant_completed(event: &Event) -> bool {
+		let Event::Patch(patch) = event else {
+			return false;
+		};
+		patch.ops.iter().any(|op| {
+			matches!(
+				op,
+				Op::Set { prop, value: Value::Str(reason), .. }
+					if *prop == PropId::StopReason.into()
+						&& !matches!(reason.as_str(), "cancelled" | "aborted")
+			)
+		})
+	}
+
+	/// pi `notifyAsk`: the first `ask` call blocked on the user earns one
+	/// toast with its first question.
+	fn notify_ask(&mut self) {
+		let Some(ask) = waiting_ask(&self.replica) else {
+			return;
+		};
+		if self.ask_notified == Some(ask) {
+			return;
+		}
+		self.ask_notified = Some(ask);
+		let question = ask_questions(&self.replica, ask)
+			.and_then(|questions| questions.into_iter().next())
+			.map(|question| question.question)
+			.unwrap_or_default();
+		if let Some(toast) = self.notifier.ask_pending(&self.con, &question) {
+			self.notifications.push(toast);
+		}
+	}
+
+	/// Projects the `ask` dialog from the running `<ask>` element (pi
+	/// `AskDialogComponent` over the tool's `askDialog` request): opened once
+	/// per element, closed when the element settles or the turn moves on.
+	/// An answered dialog stays closed while its call finishes.
+	fn sync_ask(&mut self) {
+		let waiting = waiting_ask(&self.replica);
+		if waiting == self.ask_open {
+			return;
+		}
+		if self.ask_open.take().is_some() {
+			self.overlays.close_id(crate::overlays::ask::ID);
+		}
+		let Some(ask) = waiting else {
+			return;
+		};
+		let Some(questions) = ask_questions(&self.replica, ask) else {
+			return;
+		};
+		let id = self
+			.replica
+			.get(ask)
+			.and_then(|node| node.prop(&PropId::Id.into()))
+			.and_then(Value::as_str)
+			.map(Str::new);
+		let Some(id) = id else {
+			return;
+		};
+		// pi: `ask.timeout` seconds, never inside plan mode.
+		let timeout = (!self.director_engaged(PLAN_DIRECTOR))
+			.then(|| crate::overlays::ask::CL_ASK_TIMEOUT.get(&self.con))
+			.and_then(|seconds| u64::try_from(seconds).ok())
+			.filter(|seconds| *seconds > 0)
+			.map(Duration::from_secs);
+		let dialog = crate::overlays::ask::AskDialog::open(
+			id,
+			questions,
+			timeout,
+			self.clock.elapsed(),
+			self.viewport(),
+			&self.ui,
+		);
+		self.overlays.show(Overlay::Panel(Box::new(dialog)));
+		self.ask_open = Some(ask);
+		let _ = self
+			.commands
+			.send(HostCommand::Overlay { id: Str::new_static(crate::overlays::ask::ID), open: true });
+	}
+
+	/// Chord label of the `cl_retry` binding for the idle retry hint (pi
+	/// `keybindings.getKeys("app.retry")[0] ?? "f5"`).
+	fn retry_key_label(&self) -> Str {
+		self
+			.con
+			.binds()
+			.into_iter()
+			.filter(|(_, script)| script.split(";").any(|line| line.trim() == "cl_retry"))
+			.map(|(chord, _)| chord)
+			.min_by(|left, right| left.len().cmp(&right.len()).then_with(|| left.cmp(right)))
+			.unwrap_or_else(|| Str::new_static("f5"))
+	}
+
+	/// The pinned error banner above the editor: the error notice that ended
+	/// the last turn, until the next message is sent (pi `setErrorPinned` /
+	/// `clearPinnedError`).
+	fn banner_frame(&self, width: u16) -> Option<Frame> {
+		let (handle, text) = pinned_error(&self.replica)?;
+		if self.dismissed_error == Some(handle) || self.superseded.contains(&handle) {
+			return None;
+		}
+		Some(Ui::from_root(error_banner(text), width, self.ui.clone()).frame().clone())
+	}
+
+	/// pi's status container row above the editor: the retry countdown
+	/// loader while a retry is scheduled, else the transient notice, else
+	/// the idle `<key> to Retry` hint after a turn died on a tool call.
+	fn status_frame(&self, width: u16) -> Option<Frame> {
+		if let Some(state) = &self.retrying {
+			let mut ui = Ui::from_root(RetryLoader::new(state.clone()), width, self.ui.clone());
+			ui.tick(self.clock.elapsed());
+			return Some(ui.frame().clone());
+		}
+		if let Some(frame) = self.notice_frame(width) {
+			return Some(frame);
+		}
+		if !self.turn_active && aborted_tool_tail(&self.replica) {
+			let label = self.retry_key_label();
+			return Some(
+				Ui::from_root(retry_hint_row(&label), width, self.ui.clone())
+					.frame()
+					.clone(),
+			);
+		}
+		None
+	}
+
+	/// Next repaint the retry loader needs: its spinner frame or the next
+	/// whole second of the countdown.
+	fn retry_wake(&self) -> Option<Duration> {
+		let state = self.retrying.as_ref()?;
+		let now = self.clock.elapsed();
+		let spinner = self.ui.charset.spinner().next_change(now);
+		Some(match state.next_wake(now) {
+			Some(second) => spinner.min(second),
+			None => spinner,
+		})
+	}
+
+	/// The editor band: the pinned error banner stacked over the composer
+	/// (pi `errorBannerContainer` directly above `editorContainer`).
+	fn chrome_frame(&self, width: u16) -> Frame {
+		let composer = self.composer.frame();
+		let Some(banner) = self.banner_frame(width) else {
+			return composer.clone();
+		};
+		let rows = banner.size().height;
+		let mut frame = Frame::new(Size::new(width, rows.saturating_add(composer.size().height)));
+		frame.blit(&banner, 0, rows, 0, 0);
+		frame.blit(composer, 0, composer.size().height, 0, rows);
+		frame
 	}
 
 	/// Records a turn-activity edge; the band timer starts on the rising edge
@@ -601,6 +999,19 @@ impl Presenter {
 
 	fn show_thinking(&self) -> bool {
 		CL_SHOWTHINKING.get(&self.con)
+	}
+
+	/// Retires the intro clock once pi's 3000ms brand intro has played; the
+	/// caller reconciles so the welcome block flips to finalized (and may
+	/// retire under row pressure) without waiting for a DOM event.
+	fn settle_intro(&mut self, now: Duration) -> bool {
+		match self.intro {
+			Some(start) if Intro::done(now.saturating_sub(start)) => {
+				self.intro = None;
+				true
+			},
+			_ => false,
+		}
 	}
 
 	/// The welcome block. While pi's 3000ms brand intro runs the block stays
@@ -648,8 +1059,19 @@ impl Presenter {
 	}
 
 	fn blocks(&self) -> Vec<RenderedBlock> {
-		let mut blocks = vec![self.welcome()];
-		blocks.extend(project(&self.replica, &self.cards, &self.ui, &self.project_options()));
+		// pi `startup.quiet` skips the welcome screen.
+		let mut blocks = Vec::new();
+		if !self.quiet {
+			blocks.push(self.welcome());
+		}
+		let projected = project(&self.replica, &self.cards, &self.ui, &self.project_options());
+		for block in projected {
+			// Retry-superseded elements stay in the DOM but leave the view.
+			if Handle::new(block.view.key / 8).is_some_and(|handle| self.superseded.contains(&handle)) {
+				continue;
+			}
+			blocks.push(block);
+		}
 		blocks
 	}
 
@@ -657,11 +1079,37 @@ impl Presenter {
 		if let Event::Reset { snapshot } = event {
 			let next = Dom::from_snapshot(snapshot);
 			self.transcript.on_reset(&self.replica, &next);
+			// A replaced document drops every observer-local transcript fact
+			// keyed to the old one (pi `resetTranscript`).
+			self.superseded.clear();
+			self.dismissed_error = None;
+			self.ask_notified = None;
+			if self.ask_open.take().is_some() {
+				self.overlays.close_id(crate::overlays::ask::ID);
+			}
 		}
+		let completed = Self::assistant_completed(event);
 		self.replica.apply_event(event)?;
+		if completed && let Some(speech) = &self.speech {
+			let mode = Vocalizer::mode(&self.con);
+			speech.lock().message_completed(mode);
+		}
 		self.transcript.observe(&self.replica, self.clock.elapsed());
+		let panel_event = self
+			.overlays
+			.notify_panels(crate::overlays::PanelNote::Dom(&self.replica));
+		if panel_event != PanelEvent::Ignored {
+			let _ = self.apply_panel_event(panel_event)?;
+		}
+		self.notify_ask();
+		self.sync_ask();
 		let was_active = self.turn_active;
 		self.set_turn_active(has_active_turn(&self.replica));
+		// pi `sessionName || "Oh My Pi"` / `setSessionTerminalTitle`: a
+		// rename, `/new`, or `/resume` retitles later toasts and the tab.
+		if Self::sets_meta_prop(event, self.replica.meta()) {
+			self.sync_session_name();
+		}
 		if was_active
 			&& !self.turn_active
 			&& let Some(end) = crate::notify::Notifier::turn_end_from_dom(&self.replica)
@@ -676,6 +1124,32 @@ impl Presenter {
 			self.approval_shown = after.is_some().then(|| self.clock.elapsed());
 		}
 		Ok(())
+	}
+
+	/// Whether `event` replaced the document or set a prop on `<meta>` (the
+	/// session name and prompt facts live there).
+	fn sets_meta_prop(event: &Event, meta: Handle) -> bool {
+		match event {
+			Event::Reset { .. } => true,
+			Event::Patch(patch) => patch
+				.ops
+				.iter()
+				.any(|op| matches!(op, Op::Set { h, .. } if *h == meta)),
+			Event::Stream { node, .. } => *node == Some(meta),
+		}
+	}
+
+	/// Refreshes the session label on the notifier and the terminal title
+	/// from `<meta name>` and the projected cwd.
+	fn sync_session_name(&mut self) {
+		let name = StatusLine::name(&self.replica);
+		match StatusLine::cwd(&self.replica) {
+			Some(cwd) => self.title.set_label(name.as_deref(), cwd.as_str()),
+			None => self
+				.title
+				.set_label(name.as_deref(), &self.project.to_string_lossy()),
+		}
+		self.notifier.set_session_name(name);
 	}
 
 	/// Facts a panel reads while opening or running a call.
@@ -743,58 +1217,121 @@ impl Presenter {
 			.collect()
 	}
 
+	/// pi `model_changed`: when `ai_model` names a catalog row other than the
+	/// badge's, the badge is rebuilt from that row so the welcome box, the
+	/// context gauge, the thinking gate, and quota polling follow the switch
+	/// (picker, role cycle, console write, or a Director bind alike).
+	fn adopt_live_model(&mut self) {
+		let live = AI_MODEL.get(&self.con);
+		if live.is_empty() || live == self.model.identifier {
+			return;
+		}
+		if let Some(row) = self.models.iter().find(|row| row.key == live) {
+			self.model = ModelBadge::from_row(row);
+		}
+	}
+
 	fn sync_status(&mut self) -> bool {
+		self.adopt_live_model();
 		self.local.sync_con(&self.con, &self.model);
-		let facts = status_facts(&self.replica, &self.model, &self.local, self.turn_started);
-		// The composer wears the rail while the plan Director is engaged, and
-		// the band sits flush under the notice row painted directly above it
-		// (pi `EditorTopGap` / `statusRowOccupied`).
+		let mut facts = status_facts(&self.replica, &self.model, &self.local, self.turn_started);
+		facts.mode = director_mode(&self.replica);
+		// The composer wears the rail while the plan Director is engaged. pi's
+		// status row collapses the editor top gap (`EditorTopGap` /
+		// `statusRowOccupied`); this host paints the notice *in* the gap row
+		// instead (see `present`), so the gap stays and the band sits flush
+		// under the notice exactly as in pi.
 		let reshaped = self.composer.set_plan_mode(self.plan_engaged());
-		let gapped = self
-			.composer
-			.set_status_row_occupied(self.overlays.notice().is_some());
 		let ime = self
 			.composer
 			.set_ime_safe_cursor(CL_IME_SAFE_CURSOR.get(&self.con));
-		self.composer.set_status(facts) || reshaped || gapped || ime
+		self.composer.set_status(facts) || reshaped || ime
 	}
 
-	/// Routes one decoded key: the topmost focused overlay consumes it
-	/// first (pickers, approval hotkeys, command panels), then the console
-	/// bind table (pi checks app actions before editor keys, except Esc
-	/// while the autocomplete popup is open), then the space-hold gesture
-	/// and the double-Left gesture, then the composer.
+	/// Routes one semantic key from native/debug input. Real terminals use
+	/// [`Self::route_chord`] so a physical release and exact modifiers
+	/// survive through the command stream.
 	fn route_key(&mut self, key: Key) -> Result<Routed, HostError> {
-		// pi's status row disappears on the next input.
+		if self.overlays.approval().is_some() {
+			return self.route_approval_key(key);
+		}
+		if key == Key::Ctrl('c') && self.ask_open.is_some() {
+			return Ok(self.interrupt_turn());
+		}
+		if key == Key::Esc && self.ask_open.is_some() {
+			return self.route_unbound_key(key);
+		}
+		if let Some(chord) = crate::input::chord(key)
+			&& self.con.bound(chord.as_str()).is_some()
+		{
+			return self.run_bound_key(chord.as_str(), true);
+		}
+		if key == Key::Ctrl('c') {
+			return self.act(HostAction::Clear);
+		}
+		self.route_unbound_key(key)
+	}
+
+	/// Routes one exact physical edge through the live con bind table.
+	fn route_chord(&mut self, event: KeyEvent) -> Result<Routed, HostError> {
+		if self.overlays.approval().is_some() {
+			return if event.pressed {
+				event.key.map_or(Ok(Routed::Repaint), |key| self.route_approval_key(key))
+			} else {
+				Ok(Routed::Ignored)
+			};
+		}
+		if event.pressed && event.key == Some(Key::Ctrl('c')) && self.ask_open.is_some() {
+			return Ok(self.interrupt_turn());
+		}
+		let chord = event.chord.label();
+		if self.con.bound(chord.as_str()).is_some() {
+			return self.run_bound_key(chord.as_str(), event.pressed);
+		}
+		if event.pressed {
+			event.key.map_or(Ok(Routed::Ignored), |key| self.route_unbound_key(key))
+		} else {
+			Ok(Routed::Ignored)
+		}
+	}
+
+	/// Swallows every key while policy is blocked on approval. Escape is an
+	/// explicit denial, never a local-only overlay dismissal.
+	fn route_approval_key(&mut self, key: Key) -> Result<Routed, HostError> {
+		let Some(approval) = self.overlays.approval().cloned() else {
+			return Ok(Routed::Ignored);
+		};
+		let choice = match key {
+			Key::Esc => Some('n'),
+			Key::Char(value) => Some(value.to_ascii_lowercase()),
+			_ => None,
+		};
+		if let Some(decision) = choice.and_then(|choice| approval.decision(choice)) {
+			let _ = self
+				.commands
+				.send(HostCommand::Approve { id: approval.id, decision });
+			self.overlays.dismiss();
+		}
+		Ok(Routed::Repaint)
+	}
+
+	/// Routes a key after bind lookup. Bound editor commands re-enter here,
+	/// allowing one command to drive composers, pickers, and panels.
+	fn route_unbound_key(&mut self, key: Key) -> Result<Routed, HostError> {
 		let had_notice = self.overlays.notice().is_some();
 		self.overlays.clear_notice();
+		if key == Key::Ctrl('c') && self.ask_open.is_some() {
+			return Ok(self.interrupt_turn());
+		}
 		if self.overlays.modal() {
 			let event = match self.overlays.active_mut() {
 				Some(Overlay::Models(picker)) => Some(picker.key(key)),
 				Some(Overlay::History(picker)) => Some(picker.key(key)),
-				Some(Overlay::Approval(approval)) => {
-					if let Key::Char(value @ ('y' | 'n' | 'a')) = key {
-						let approval = approval.clone();
-						if let Some(decision) = approval.decision(value) {
-							let _ = self
-								.commands
-								.send(HostCommand::Approve { id: approval.id, decision });
-						}
-						self.overlays.dismiss();
-						return Ok(Routed::Repaint);
-					}
-					None
-				},
+				Some(Overlay::Approval(_)) => return self.route_approval_key(key),
 				Some(Overlay::Panel(panel)) => {
-					let event = match PanelAction::from_key(key) {
-						Some(action) => match panel.action(action) {
-							PanelEvent::Ignored => panel.key(key),
-							event => event,
-						},
-						None => panel.key(key),
-					};
+					panel.touch(self.clock.elapsed());
+					let event = panel.key(key);
 					let event = match (event, key) {
-						// A panel that ignores Esc still closes on it.
 						(PanelEvent::Ignored, Key::Esc) => PanelEvent::Close,
 						(event, _) => event,
 					};
@@ -806,15 +1343,18 @@ impl Presenter {
 				return self.apply_picker_event(event);
 			}
 		}
-		if let Some(command) = self.bindings.command(key) {
-			let esc_to_popup = command == "cl_interrupt" && self.composer.popup_open();
-			if !esc_to_popup {
-				let command = Str::new(command);
-				return self.run_console(command.as_str());
+		let side_reserved =
+			matches!(key, Key::Char('c') | Key::Up | Key::Down | Key::PageUp | Key::PageDown);
+		if side_reserved
+			&& self.composer.text().is_empty()
+			&& let Some(Overlay::Panel(panel)) = self.overlays.active_mut()
+			&& panel.anchor() == PanelAnchor::Side
+		{
+			panel.touch(self.clock.elapsed());
+			let event = panel.key(key);
+			if event != PanelEvent::Ignored {
+				return self.apply_panel_event(event);
 			}
-		} else if key == Key::Ctrl('c') {
-			// Emergency control: pi keeps Ctrl+C live even before bindings load.
-			return self.act(HostAction::Clear);
 		}
 		if let Some(routed) = self.gesture(key)? {
 			return Ok(routed);
@@ -825,6 +1365,57 @@ impl Presenter {
 		} else {
 			routed
 		})
+	}
+
+	/// Routes a pointer report to the focused overlay.
+	fn route_mouse(&mut self, report: MouseReport) -> Result<Routed, HostError> {
+		if self.overlays.approval().is_some() {
+			return Ok(Routed::Repaint);
+		}
+		match self.overlays.active_mut() {
+			Some(Overlay::Models(picker)) => {
+				let event = picker.mouse(report);
+				self.apply_picker_event(event)
+			},
+			Some(Overlay::History(picker)) => {
+				let event = picker.mouse(report);
+				self.apply_picker_event(event)
+			},
+			Some(Overlay::Panel(panel)) => {
+				panel.touch(self.clock.elapsed());
+				let event = panel.mouse(report);
+				self.apply_panel_event(event)
+			},
+			Some(Overlay::Approval(_)) => Ok(Routed::Repaint),
+			None => Ok(Routed::Ignored),
+		}
+	}
+
+	/// Routes pasted text to the focused picker or panel before the composer.
+	fn route_paste(&mut self, text: &str) -> Result<Routed, HostError> {
+		if self.overlays.approval().is_some() {
+			return Ok(Routed::Repaint);
+		}
+		match self.overlays.active_mut() {
+			Some(Overlay::Models(picker)) => {
+				let event = picker.paste(text);
+				return self.apply_picker_event(event);
+			},
+			Some(Overlay::History(picker)) => {
+				let event = picker.paste(text);
+				return self.apply_picker_event(event);
+			},
+			Some(Overlay::Panel(panel)) if panel.anchor() != PanelAnchor::Side => {
+				panel.touch(self.clock.elapsed());
+				let event = panel.paste(text);
+				if event != PanelEvent::Ignored {
+					return self.apply_panel_event(event);
+				}
+			},
+			_ => {},
+		}
+		self.composer.paste(text);
+		Ok(Routed::Repaint)
 	}
 
 	/// Composer-bound gestures that run before the editor sees the key:
@@ -947,8 +1538,14 @@ impl Presenter {
 			}
 			return Ok(Routed::Ignored);
 		}
-		// 8. Bash / eval prefix mode: clear the draft and leave the mode.
-		if self.composer.prefix_mode().is_some() {
+		// 8. Bash / eval: abort a running local command, else clear the
+		// draft and leave the prefix mode.
+		if local_run_active(&self.replica) {
+			return Ok(self.interrupt_turn());
+		}
+		if self.composer.prefix_mode().is_some()
+			|| self.composer.text().starts_with(['!', '$'])
+		{
 			self.composer.clear();
 			return Ok(Routed::Repaint);
 		}
@@ -988,14 +1585,16 @@ impl Presenter {
 		Ok(Routed::Ignored)
 	}
 
-	/// Whether main-session maintenance (compaction, handoff) is in flight:
-	/// the compaction Director is active while the kernel summarizes.
+	/// Whether main-session maintenance (compaction, handoff, a scheduled
+	/// provider retry) is in flight: the compaction Director is active while
+	/// the kernel summarizes, or the transport is counting down a retry.
 	fn maintenance_active(&self) -> bool {
-		self.turn_active && self.director_engaged("compaction")
+		self.retrying.is_some() || (self.turn_active && self.director_engaged("compaction"))
 	}
 
 	fn interrupt_turn(&mut self) -> Routed {
 		self.last_interrupt = Some(Instant::now());
+		self.silence_speech();
 		let _ = self.commands.send(HostCommand::Interrupt);
 		Routed::Ignored
 	}
@@ -1051,6 +1650,34 @@ impl Presenter {
 		}
 	}
 
+	/// Executes the script currently bound to one physical key edge.
+	///
+	/// Default scripts list contextual fallbacks from narrowest to broadest
+	/// (panel, editor, app). Once one posted action consumes the edge, later
+	/// fallbacks from that same script are discarded.
+	fn run_bound_key(&mut self, chord: &str, pressed: bool) -> Result<Routed, HostError> {
+		let before = self.projection_inputs();
+		let failure = self.con.key(chord, pressed).err();
+		let mut routed = if before == self.projection_inputs() {
+			if pressed { Routed::Repaint } else { Routed::Ignored }
+		} else {
+			Routed::RebuildProjection
+		};
+		let actions = self.mailbox.drain().collect::<Vec<_>>();
+		for action in actions {
+			let effect = self.act(action)?;
+			routed = routed.max(effect);
+			if effect != Routed::Ignored {
+				break;
+			}
+		}
+		if let Some(error) = failure {
+			self.overlays.notify(error.to_string());
+			routed = routed.max(Routed::Repaint);
+		}
+		Ok(routed)
+	}
+
 	/// Executes one console line and applies every action it posted.
 	///
 	/// Console failures become a notice rather than ending the host: a
@@ -1063,9 +1690,16 @@ impl Presenter {
 		} else {
 			Routed::RebuildProjection
 		};
-		let actions = self.mailbox.drain().collect::<Vec<_>>();
-		for action in actions {
-			routed = routed.max(self.act(action)?);
+		// An action may post more (a command-owned call replying through the
+		// console sink), so drain until the line's mailbox traffic settles.
+		loop {
+			let actions = self.mailbox.drain().collect::<Vec<_>>();
+			if actions.is_empty() {
+				break;
+			}
+			for action in actions {
+				routed = routed.max(self.act(action)?);
+			}
 		}
 		if let Some(error) = failure {
 			self.overlays.notify(error.to_string());
@@ -1138,6 +1772,13 @@ impl Presenter {
 		Routed::Repaint
 	}
 
+	/// A `!` / `$` line that cannot run right now goes back into the
+	/// composer verbatim (pi `editor.setText(text)`) with the reason shown.
+	fn refuse_local(&mut self, draft: &str, reason: impl Into<Str>) -> Routed {
+		self.composer.set_text(draft);
+		self.notice(reason)
+	}
+
 	/// Sends the draft as a submission. The controller — which knows whether
 	/// a turn is really running — starts a turn or steers the active one;
 	/// the replica's view may lag the kernel, so the host never decides.
@@ -1145,10 +1786,42 @@ impl Presenter {
 		if text.trim().is_empty() {
 			return Routed::Ignored;
 		}
+		// pi `handleSubmit`: `!cmd` / `$ code` run locally through the tool
+		// and never reach the model. Local execution belongs to the main
+		// session: while a subagent is focused the draft stays (pi
+		// `#submitToFocusedSession`), a collaboration guest is refused
+		// outright, and a run already in flight hands the draft back (pi
+		// "A bash command is already running. Press Esc to cancel it first.").
+		if let Some(local) = crate::composer::parse_local_input(&text) {
+			if self.focused_agent.is_some() {
+				return self.refuse_local(
+					&text,
+					"Commands run in the main session — press ←← to return first",
+				);
+			}
+			if self.collab_guest {
+				return self.notice("Local execution is host-only during a collab session");
+			}
+			if local_run_active(&self.replica) {
+				return self.refuse_local(&text, match local.mode {
+					PrefixMode::Bash => "A bash command is already running. Press Esc to cancel it first.",
+					PrefixMode::Eval => {
+						"A Python execution is already running. Press Esc to cancel it first."
+					},
+				});
+			}
+			self.set_turn_active(true);
+			self.dismissed_error = pinned_error(&self.replica).map(|(handle, _)| handle);
+			let _ = self.commands.send(HostCommand::RunLocal { input: local, draft: text });
+			return Routed::Repaint;
+		}
 		if !self.turn_active {
 			self.set_turn_active(true);
 			self.last_prompt = Some(text.clone());
 		}
+		// pi `clearPinnedError` + `vocalizer.clear()` on every send.
+		self.dismissed_error = pinned_error(&self.replica).map(|(handle, _)| handle);
+		self.silence_speech();
 		let _ = self.commands.send(HostCommand::Submit(text));
 		Routed::Repaint
 	}
@@ -1157,6 +1830,9 @@ impl Presenter {
 	pub(crate) fn act(&mut self, action: HostAction) -> Result<Routed, HostError> {
 		Ok(match action {
 			HostAction::Interrupt => {
+				if self.overlays.approval().is_some() {
+					return self.route_approval_key(Key::Esc);
+				}
 				if self.overlays.modal() {
 					self.close_overlay();
 					Routed::Repaint
@@ -1182,11 +1858,7 @@ impl Presenter {
 					.last_interrupt
 					.is_some_and(|prior| now.duration_since(prior) <= Duration::from_secs(1));
 				match ctrl_c_action(self.turn_active, repeated || interrupted) {
-					CtrlCAction::Interrupt => {
-						self.last_interrupt = Some(now);
-						let _ = self.commands.send(HostCommand::Interrupt);
-						Routed::Ignored
-					},
+					CtrlCAction::Interrupt => self.interrupt_turn(),
 					CtrlCAction::Quit => Routed::Quit,
 				}
 			},
@@ -1200,10 +1872,30 @@ impl Presenter {
 					return Ok(self.notice("No models are available to switch to"));
 				}
 				let current = self.current_model_index();
+				let live = self.live_model();
+				let quick_roles = self
+					.cycle
+					.iter()
+					.filter_map(|(role, model, thinking)| {
+						self
+							.models
+							.iter()
+							.position(|row| row.key == *model)
+							.map(|model| QuickRoleRow {
+								role: role.clone(),
+								model,
+								thinking: thinking.clone(),
+							})
+					})
+					.collect::<Vec<_>>();
+				let current_role =
+					quick_roles.iter().position(|role| self.models[role.model].key == live);
 				let picker = ModelPicker::open(
 					self.models.clone(),
 					current,
 					current,
+					quick_roles,
+					current_role,
 					session_only,
 					self.composer.frame().size().width,
 					&self.ui,
@@ -1214,23 +1906,52 @@ impl Presenter {
 					.send(HostCommand::Overlay { id: Str::new_static("models"), open: true });
 				Routed::Repaint
 			},
+			HostAction::ModelSet(selector) => {
+				// pi `/model <id>`: exact key (`provider/model`), bare model id,
+				// or display name; anything else is "Unknown model".
+				let wanted = selector.as_str().trim();
+				let found = self.models.iter().find(|row| {
+					row.key == wanted
+						|| row.key.rsplit_once('/').is_some_and(|(_, id)| id == wanted)
+						|| row.name.as_str().eq_ignore_ascii_case(wanted)
+				});
+				match found.cloned() {
+					Some(row) => self.select_model(&row, false, false),
+					None => self.notice(format!(
+						"Unknown model: {wanted}. Run /model without arguments to pick one."
+					)),
+				}
+			},
 			HostAction::FollowUp => {
 				let text = Str::new(self.composer.text());
-				let routed = self.submit(text);
-				if routed == Routed::Repaint {
-					self.composer.clear();
+				if text.trim().is_empty() {
+					return Ok(Routed::Ignored);
 				}
-				routed
+				// Clear before submitting so a refused local line lands back
+				// in the composer instead of being wiped afterwards.
+				self.composer.clear();
+				self.submit(text)
 			},
 			HostAction::Retry => {
 				if self.turn_active {
 					return Ok(self.notice("A turn is already running"));
+				}
+				// The hint row and the action share one predicate: a turn that
+				// died on a tool call replays that batch through the controller.
+				if aborted_tool_tail(&self.replica) {
+					let _ = self.commands.send(HostCommand::Retry);
+					return Ok(self.notice("Retrying the interrupted tool calls"));
 				}
 				match (self.last_turn_failed(), self.last_prompt.clone()) {
 					(true, Some(text)) => self.submit(text),
 					(true, None) => self.notice("Nothing to retry in this session"),
 					(false, _) => self.notice("Last turn did not fail; nothing to retry"),
 				}
+			},
+			HostAction::ToolsExpand => {
+				let expanded = crate::actions::CL_TOOLS_EXPANDED.get(&self.con);
+				crate::actions::CL_TOOLS_EXPANDED.set(&self.con, !expanded)?;
+				Routed::RebuildProjection
 			},
 			HostAction::PlanToggle => {
 				let engaged = self.plan_engaged();
@@ -1333,6 +2054,15 @@ impl Presenter {
 				}
 				Routed::Repaint
 			},
+			HostAction::SubmitDraft => {
+				let text = Str::new(self.composer.text());
+				if text.trim().is_empty() {
+					Routed::Ignored
+				} else {
+					self.composer.clear();
+					self.submit(text)
+				}
+			},
 			HostAction::EscapeHook(hook) => {
 				self.escape_hooks.retain(|prior| prior.id != hook.id);
 				self.escape_hooks.push(hook);
@@ -1363,6 +2093,44 @@ impl Presenter {
 				self.apply_panel_event(event)?
 			},
 			HostAction::Command(action) => self.run_command(action)?,
+			HostAction::Outcome(outcome) => {
+				let event = self.overlays.notify_panels(crate::overlays::PanelNote::Outcome(&outcome));
+				match event {
+					PanelEvent::Ignored => match outcome {
+						crate::overlays::Outcome::Service(outcome) => match outcome.result {
+							Ok(line) => self.notice(line),
+							Err(error) => self.notice(error.to_string()),
+						},
+						crate::overlays::Outcome::Git(outcome) => match outcome.result {
+							Ok(line) => self.notice(line),
+							Err(error) => self.notice(error.to_string()),
+						},
+						crate::overlays::Outcome::Agent(outcome) => match outcome.result {
+							Ok(line) => self.notice(line),
+							Err(error) => self.notice(error.to_string()),
+						},
+						crate::overlays::Outcome::SessionIndex(outcome) => match outcome.result {
+							Ok(_) => Routed::Ignored,
+							Err(error) => self.notice(error),
+						},
+					},
+					event => self.apply_panel_event(event)?,
+				}
+			},
+			HostAction::Editor(key) => self.route_unbound_key(key)?,
+			HostAction::Panel(action) => {
+				let event = match self.overlays.active_mut() {
+					Some(Overlay::Panel(panel)) => panel.action(action),
+					_ => PanelEvent::Ignored,
+				};
+				self.apply_panel_event(event)?
+			},
+			HostAction::LocalRefused { draft, reason } => {
+				// The optimistic activity edge from `submit` never had a turn
+				// behind it; roll it back with the draft.
+				self.set_turn_active(false);
+				self.refuse_local(&draft, reason)
+			},
 			HostAction::Reply { severity, text } => match severity {
 				omp_con::Severity::Info if text.is_empty() => Routed::Ignored,
 				_ => self.notice(text),
@@ -1400,6 +2168,24 @@ impl Presenter {
 				self.clipboard = Some(text);
 				Routed::Repaint
 			},
+			PanelEvent::Ask { id, answers } => {
+				// The element stays `running` until the tool folds the reply;
+				// forgetting the handle keeps the dialog from reopening
+				// meanwhile.
+				self.ask_open = None;
+				if self.overlays.close_id(crate::overlays::ask::ID) {
+					let _ = self.commands.send(HostCommand::Overlay {
+						id:   Str::new_static(crate::overlays::ask::ID),
+						open: false,
+					});
+				}
+				let _ = self.commands.send(HostCommand::AskAnswer { id, answers });
+				Routed::Repaint
+			},
+			PanelEvent::Command(command) => {
+				let _ = self.commands.send(command);
+				Routed::Repaint
+			},
 		})
 	}
 
@@ -1421,6 +2207,24 @@ impl Presenter {
 				let task = matches!(event, PickerEvent::PickTask(_));
 				self.close_overlay();
 				self.select_model(&row, task, session_only)
+			},
+			PickerEvent::PickRole(index) => {
+				let Some(Overlay::Models(picker)) = self.overlays.active() else {
+					return Ok(Routed::Repaint);
+				};
+				let Some(role) = picker.quick_roles().get(index).cloned() else {
+					return Ok(Routed::Repaint);
+				};
+				let Some(row) = picker.rows().get(role.model).cloned() else {
+					return Ok(Routed::Repaint);
+				};
+				self.close_overlay();
+				let routed = self.select_model(&row, false, true);
+				if let Some(thinking) = role.thinking {
+					AI_THINKING.set(&self.con, thinking)?;
+					self.sync_status();
+				}
+				routed
 			},
 			PickerEvent::Recall(text) => {
 				self.close_overlay();
@@ -1538,20 +2342,20 @@ impl Presenter {
 		let distinct = self
 			.cycle
 			.iter()
-			.map(|(_, model)| model)
+			.map(|(_, model, _)| model)
 			.collect::<std::collections::BTreeSet<_>>();
 		if distinct.len() < 2 {
 			return self.notice("Only one role model available");
 		}
 		let live = self.live_model();
-		let at = self.cycle.iter().position(|(_, model)| *model == live);
+		let at = self.cycle.iter().position(|(_, model, _)| *model == live);
 		let len = self.cycle.len();
 		let next = match (at, backward) {
 			(Some(index), false) => (index + 1) % len,
 			(Some(index), true) => (index + len - 1) % len,
 			(None, _) => 0,
 		};
-		let (role, model) = self.cycle[next].clone();
+		let (role, model, thinking) = self.cycle[next].clone();
 		let row = self.models.iter().find(|row| row.key == model).cloned();
 		let script = format!("ai_model {}", omp_con::Value::Str(model.clone()));
 		if let Err(error) = self.con.exec(&script, Source::Console) {
@@ -1560,9 +2364,12 @@ impl Presenter {
 		if let Some(row) = row.as_ref() {
 			self.reset_thinking_for(row);
 		}
+		if let Some(thinking) = thinking {
+			let _ = AI_THINKING.set(&self.con, thinking);
+		}
 		self.sync_status();
 		let mut track = String::new();
-		for (index, (name, _)) in self.cycle.iter().enumerate() {
+		for (index, (name, _, _)) in self.cycle.iter().enumerate() {
 			if index > 0 {
 				track.push_str("  ");
 			}
@@ -1688,7 +2495,7 @@ impl Presenter {
 					.next_wake(self.clock.elapsed(), self.model.provider.as_str())
 			})
 			.flatten();
-		[panel, self.approval_wake(), self.space_hold.next_wake(), quota]
+		[panel, self.approval_wake(), self.space_hold.next_wake(), quota, self.retry_wake()]
 			.into_iter()
 			.flatten()
 			.min()
@@ -1758,20 +2565,30 @@ impl Host {
 	/// Runs the real-terminal actor until `C-c`, debug quit, or terminal
 	/// closure.
 	pub async fn run(mut self) -> Result<(), HostError> {
-		let mut caps = detect();
 		loop {
+			let (caps, probe) = negotiate_async(Duration::from_millis(120)).await;
 			self.presenter.ui = self.presenter.ui.with_terminal_caps(&caps);
 			self
 				.presenter
 				.composer
 				.set_context(self.presenter.ui.clone());
-			let mut terminal =
-				Terminal::enter(TerminalOptions::new(caps).cursor_style(CursorStyle::BlinkingBar))?;
+			let mut terminal = Terminal::enter(
+				TerminalOptions::new(caps)
+					.probe_results(probe)
+					.cursor_style(CursorStyle::BlinkingBar),
+			)?;
+			terminal.edit_keymap(|keymap| keymap.set_chord_events(true));
 			let mut renderer = Renderer::new(TtyOut::new()?);
 			renderer.apply_caps(&caps)?;
 			let size = terminal.size()?;
 			self.presenter.composer.resize(size.width, size.height);
-			self.rebuild_projection(size);
+			// First entry creates the ledger; re-entry after a suspend, an
+			// external editor, or a display reset keeps it — rows already in
+			// native scrollback are never emitted again (ADR 0034).
+			if let Some(projection) = self.projection.as_mut() {
+				projection.resize(size);
+			}
+			self.reconcile_projection(size);
 			let result = self.event_loop(&mut terminal, &mut renderer, size).await;
 			let leave = terminal.leave();
 			let pause = match (result, leave) {
@@ -1802,7 +2619,7 @@ impl Host {
 						},
 					}
 				},
-				Pause::DisplayReset => caps = detect(),
+				Pause::DisplayReset => {},
 			}
 		}
 	}
@@ -1813,12 +2630,15 @@ impl Host {
 		renderer: &mut Renderer<TtyOut>,
 		mut size: Size,
 	) -> Result<Pause, HostError> {
+		self.sync_terminal_state(terminal)?;
 		self.present(renderer, size)?;
 		// One background clipboard read at a time (Ctrl+V / Ctrl+Shift+V);
 		// a stale result is dropped with its receiver.
 		let mut clipboard: Option<(oneshot::Receiver<Option<Clipboard>>, bool, Instant)> = None;
 		let mailbox = Arc::clone(&self.presenter.mailbox);
 		loop {
+			terminal.set_mouse(self.presenter.overlays.modal())?;
+			self.sync_terminal_state(terminal)?;
 			let deadline = self.next_deadline();
 			if let Some(scope) = self.presenter.clipboard_read.take() {
 				clipboard = Some((spawn_clipboard_read(scope), scope == ClipboardRead::Text, Instant::now()));
@@ -1850,6 +2670,19 @@ impl Host {
 										return Ok(pause);
 									}
 								}
+								if let Some(appearance) = terminal.appearance() {
+									let mut ui = self.presenter.ui.clone();
+									if ui.apply_appearance(appearance) {
+										self.presenter.ui = ui;
+										self
+											.presenter
+											.composer
+											.set_context(self.presenter.ui.clone());
+										self.reconcile_projection(size);
+										self.present(renderer, size)?;
+									}
+								}
+								self.sync_terminal_state(terminal)?;
 								continue;
 							}
 							let routed = self.input(event)?;
@@ -1870,7 +2703,15 @@ impl Host {
 					}
 				},
 				() = frame_deadline(self.presenter.clock, deadline) => {
-					if self.tick() {
+					self.sync_terminal_state(terminal)?;
+					let ticked = self.tick();
+					let settled = self
+						.presenter
+						.settle_intro(self.presenter.clock.elapsed());
+					if settled {
+						self.reconcile_projection(size);
+					}
+					if ticked || settled {
 						self.present(renderer, size)?;
 					}
 				},
@@ -1925,10 +2766,13 @@ impl Host {
 					let Ok(event) = kernel_event else {
 						break;
 					};
-					let now = self.presenter.clock.elapsed();
-					if self.presenter.transcript.on_kernel_event(&event, now) {
-						self.reconcile_projection(size);
-						self.present(renderer, size)?;
+					match self.presenter.apply_kernel_event(&event) {
+						Routed::RebuildProjection => {
+							self.reconcile_projection(size);
+							self.present(renderer, size)?;
+						},
+						Routed::Repaint => self.present(renderer, size)?,
+						_ => {},
 					}
 				},
 				git = recv_git(self.presenter.git_facts.as_ref()) => {
@@ -1965,8 +2809,11 @@ impl Host {
 				self.present(renderer, size)?;
 				Ok(None)
 			},
+			// A projection switch re-derives the blocks; the slot ledger is
+			// reconciled, never replaced, so rows already retired into native
+			// scrollback are not staged a second time (ADR 0034).
 			Routed::RebuildProjection => {
-				self.rebuild_projection(size);
+				self.reconcile_projection(size);
 				self.present(renderer, size)?;
 				Ok(None)
 			},
@@ -1981,10 +2828,53 @@ impl Host {
 			.projection
 			.as_ref()
 			.and_then(|projection| projection.next_wake());
-		[composer, blocks, self.presenter.next_wake()]
+		let intro = self
+			.presenter
+			.intro
+			.map(|start| start.saturating_add(Intro::DURATION));
+		let title = self
+			.presenter
+			.title
+			.next_wake(self.presenter.ui.charset, self.presenter.clock.elapsed());
+		[composer, blocks, self.presenter.next_wake(), intro, title]
 			.into_iter()
 			.flatten()
 			.min()
+	}
+
+	/// Synchronizes title and OSC progress from the same retained run state
+	/// used by the status band.
+	fn sync_terminal_state(&mut self, terminal: &mut Terminal) -> Result<(), HostError> {
+		let attention = self.presenter.overlays.approval().is_some()
+			|| self.presenter.ask_open.is_some();
+		let working = self.presenter.turn_active
+			|| self.presenter.maintenance_active()
+			|| self.presenter.local.speculation == Speculation::Running;
+		let state = if attention {
+			TitleState::Attention
+		} else if working {
+			TitleState::Working
+		} else {
+			TitleState::Idle
+		};
+		self.presenter.title.set_enabled(CL_TITLE_STATE.get(&self.presenter.con));
+		self.presenter.title.set_state(state);
+		if let Some(title) = self
+			.presenter
+			.title
+			.emit(self.presenter.ui.charset, self.presenter.clock.elapsed())
+		{
+			terminal.set_title(title)?;
+		}
+		let show_progress = CL_SHOW_PROGRESS.get(&self.presenter.con) && working;
+		if show_progress && !self.presenter.progress_shown {
+			terminal.set_progress(Progress::Indeterminate)?;
+			self.presenter.progress_shown = true;
+		} else if !show_progress && self.presenter.progress_shown {
+			terminal.set_progress(Progress::Clear)?;
+			self.presenter.progress_shown = false;
+		}
+		Ok(())
 	}
 
 	fn tick(&mut self) -> bool {
@@ -1998,7 +2888,7 @@ impl Host {
 			self.presenter.notice(error.to_string());
 			true
 		});
-		let countdown = self.presenter.approval_wake().is_some();
+		let countdown = self.presenter.approval_wake().is_some() || self.presenter.retrying.is_some();
 		let hold = self.presenter.tick_space_hold(now);
 		let quota = self.presenter.tick_quota(now).unwrap_or_else(|error| {
 			self.presenter.notice(error.to_string());
@@ -2100,6 +2990,7 @@ impl Host {
 	fn input(&mut self, event: InputEvent) -> Result<Routed, HostError> {
 		match event {
 			InputEvent::Key(key) => self.presenter.route_key(key),
+			InputEvent::Chord(event) => self.presenter.route_chord(event),
 			InputEvent::Paste(text) => {
 				// An empty bracketed paste is how some terminals announce an
 				// image-only pasteboard (macOS Cmd+V): read the clipboard.
@@ -2107,20 +2998,10 @@ impl Host {
 					self.presenter.clipboard_read = Some(ClipboardRead::Smart);
 					return Ok(Routed::Ignored);
 				}
-				if let Some(Overlay::Panel(panel)) = self.presenter.overlays.active_mut()
-					&& panel.anchor() != PanelAnchor::Side
-				{
-					let event = panel.paste(text.as_str());
-					if event != PanelEvent::Ignored {
-						return self.presenter.apply_panel_event(event);
-					}
-				}
-				self.presenter.composer.paste(text.as_str());
-				Ok(Routed::Repaint)
+				self.presenter.route_paste(text.as_str())
 			},
-			InputEvent::Mouse(_) | InputEvent::Focus(_) | InputEvent::Response(_) => {
-				Ok(Routed::Ignored)
-			},
+			InputEvent::Mouse(report) => self.presenter.route_mouse(report),
+			InputEvent::Focus(_) | InputEvent::Response(_) => Ok(Routed::Ignored),
 		}
 	}
 
@@ -2139,12 +3020,19 @@ impl Host {
 			Some(Projection::new(size, self.resize_policy, &self.presenter.ui, blocks, mirror, now));
 	}
 
+	/// Admits the current blocks into the retained ledger. Only the first
+	/// paint ([`Self::rebuild_projection`]) ever creates a ledger: after
+	/// that every change — new tails, reorders, projection toggles — is
+	/// reconciled so retired rows are emitted exactly once.
 	fn reconcile_projection(&mut self, size: Size) {
 		let now = self.presenter.clock.elapsed();
 		let blocks = self.presenter.blocks();
 		let mirror = self.presenter.blocks();
-		if !self.projection_mut().reconcile(blocks, mirror, now) {
-			self.rebuild_projection(size);
+		match self.projection.as_mut() {
+			Some(projection) => {
+				projection.reconcile(blocks, mirror, now);
+			},
+			None => self.rebuild_projection(size),
 		}
 	}
 
@@ -2166,14 +3054,29 @@ impl Host {
 		self.presenter.viewport_height = size.height;
 		let approval = self.presenter.approval_frame(size.width);
 		let overlay = self.presenter.overlay_frame(size);
-		let notice = self.presenter.notice_frame(size.width);
+		let notice = self.presenter.status_frame(size.width);
+		// The editor band: the pinned error banner (when any) over the
+		// composer, retired against and anchored as one chrome block.
+		let chrome = self.presenter.chrome_frame(size.width);
+		let chrome_rows = chrome.size().height;
 		let composer = &self.presenter.composer;
 		let projection = self
 			.projection
 			.as_mut()
 			.expect("projection initialized before presentation");
-		projection.retire_under_pressure(composer.height(), size.height);
-		let document = projection.document(composer.frame(), size);
+		projection.retire_under_pressure(chrome_rows, size.height);
+		let document = projection.document(&chrome, size);
+		// pi's status row sits directly above the editor and collapses the
+		// editor top gap (`EditorTopGap`): here the retry loader / notice /
+		// retry hint paints over the composer's gap row itself, wherever the
+		// composer lands — under the live content while it fits, else at the
+		// tail — and below the banner when one is pinned.
+		let above_composer = size
+			.height
+			.saturating_sub(projection.composer_top(chrome_rows, size))
+			.saturating_sub(chrome_rows)
+			.saturating_add(composer.height())
+			.saturating_sub(1);
 		let document_options = OverlayOptions::default()
 			.width(Dim::Cells(size.width))
 			.anchor(OverlayAnchor::TopLeft)
@@ -2219,11 +3122,10 @@ impl Host {
 			),
 		};
 		let picker = overlay.map(|(frame, _)| frame);
-		// pi's status row sits directly above the editor.
 		let notice_options = OverlayOptions::default()
 			.width(Dim::Cells(size.width))
 			.anchor(OverlayAnchor::BottomLeft)
-			.margin(omp_tui::OverlayMargin { bottom: composer.height(), ..Default::default() })
+			.margin(omp_tui::OverlayMargin { bottom: above_composer, ..Default::default() })
 			.non_modal()
 			.z(15);
 		let modal = approval.is_some() || (picker.is_some() && picker_modal);
@@ -2274,10 +3176,14 @@ pub enum NativeEffect {
 /// Window creation and GPU delivery stay in `omp-gui`; this type owns only the
 /// projection, composer, overlays, and command mailbox.
 pub struct NativeHost {
-	presenter:      Presenter,
-	frame:          Frame,
-	approval_frame: Option<Frame>,
-	size:           Size,
+	presenter:       Presenter,
+	frame:           Frame,
+	approval_frame:  Option<Frame>,
+	size:            Size,
+	/// Presentation-clock instant the composited status row (retry
+	/// countdown loader) next changes, so [`NativeHost::poll`] repaints it
+	/// without a controller event.
+	status_deadline: Option<Duration>,
 }
 
 impl NativeHost {
@@ -2289,6 +3195,7 @@ impl NativeHost {
 			frame: Frame::new(size),
 			approval_frame: None,
 			size,
+			status_deadline: None,
 		};
 		host.refresh();
 		host
@@ -2301,8 +3208,8 @@ impl NativeHost {
 			self.presenter.apply_dom_event(&event)?;
 			changed = true;
 		}
-		while self.presenter.kernel_events.try_recv().is_ok() {
-			changed = true;
+		while let Ok(event) = self.presenter.kernel_events.try_recv() {
+			changed |= self.presenter.apply_kernel_event(&event) != Routed::Ignored;
 		}
 		while let Some(git) = self
 			.presenter
@@ -2315,6 +3222,8 @@ impl NativeHost {
 		}
 		let now = self.presenter.clock.elapsed();
 		changed |= self.presenter.composer.tick(now);
+		// The retry loader's spinner and countdown advance on the clock alone.
+		changed |= self.status_deadline.is_some_and(|due| now >= due);
 		if changed {
 			self.refresh();
 			Ok(NativeEffect::Consumed)
@@ -2332,13 +3241,29 @@ impl NativeHost {
 
 	/// Routes one real native key through the chat input path.
 	pub fn key(&mut self, key: Key) -> Result<NativeEffect, HostError> {
-		Ok(match self.presenter.route_key(key)? {
+		let routed = self.presenter.route_key(key)?;
+		Ok(self.finish_native_input(routed))
+	}
+
+	/// Routes an exact native chord edge, including key release.
+	pub fn chord(&mut self, event: KeyEvent) -> Result<NativeEffect, HostError> {
+		let routed = self.presenter.route_chord(event)?;
+		Ok(self.finish_native_input(routed))
+	}
+
+	/// Routes a native pointer report through the active overlay hit map.
+	pub fn mouse(&mut self, report: MouseReport) -> Result<NativeEffect, HostError> {
+		let routed = self.presenter.route_mouse(report)?;
+		Ok(self.finish_native_input(routed))
+	}
+
+	fn finish_native_input(&mut self, routed: Routed) -> NativeEffect {
+		match routed {
 			Routed::Quit => NativeEffect::Quit,
 			Routed::Ignored => NativeEffect::Ignored,
 			// A window has no tty to release: the external editor runs in
 			// place, suspend and display reset degrade to a repaint.
 			Routed::ExternalEditor => {
-				// Chips expand into the draft; the edited text lands verbatim.
 				let draft = self.presenter.composer.text();
 				match crate::editor::edit_draft_detached(
 					&draft,
@@ -2357,7 +3282,7 @@ impl NativeHost {
 				self.refresh();
 				NativeEffect::Consumed
 			},
-		})
+		}
 	}
 
 	/// Executes a console line exactly as a bound key would, applying every
@@ -2373,10 +3298,52 @@ impl NativeHost {
 		})
 	}
 
+	/// Catalog badge currently projected into the welcome/status surfaces.
+	#[must_use]
+	pub const fn model_badge(&self) -> &ModelBadge {
+		&self.presenter.model
+	}
+
 	/// Text of the visible transient notice, when one is showing.
 	#[must_use]
 	pub fn notice(&self) -> Option<&str> {
 		self.presenter.overlays.notice()
+	}
+
+	/// The scheduled provider retry the countdown loader shows, when any.
+	#[must_use]
+	pub const fn retrying(&self) -> Option<&RetryState> {
+		self.presenter.retrying.as_ref()
+	}
+
+	/// The status row above the editor: retry loader, transient notice, or
+	/// idle retry hint.
+	#[must_use]
+	pub fn status_frame(&self) -> Option<Frame> {
+		self.presenter.status_frame(self.size.width)
+	}
+
+	/// The pinned error banner above the editor, when one is showing.
+	#[must_use]
+	pub fn banner_frame(&self) -> Option<Frame> {
+		self.presenter.banner_frame(self.size.width)
+	}
+
+	/// Descriptors of the blocks the view shows, welcome first, including
+	/// observer-local blocks and excluding retry-superseded elements.
+	#[must_use]
+	pub fn blocks(&self) -> Vec<BlockView> {
+		self
+			.presenter
+			.blocks()
+			.into_iter()
+			.map(|block| block.view)
+			.collect()
+	}
+
+	/// Desktop toasts decided since the last drain.
+	pub fn take_notifications(&mut self) -> Vec<omp_tui::Notification> {
+		std::mem::take(&mut self.presenter.notifications)
 	}
 
 	/// Whether a key-consuming overlay (picker or approval) is open.
@@ -2421,6 +3388,12 @@ impl NativeHost {
 	#[must_use]
 	pub const fn recording(&self) -> bool {
 		self.presenter.stt_recording
+	}
+
+	/// Whether the view believes a turn (or local run) is in flight.
+	#[must_use]
+	pub const fn turn_active(&self) -> bool {
+		self.presenter.turn_active
 	}
 
 	/// Ids of the registered Esc hooks.
@@ -2485,11 +3458,14 @@ impl NativeHost {
 		}
 	}
 
-	/// Routes clipboard text through the same composer used by the terminal.
+	/// Routes clipboard text through the active picker/panel before the
+	/// composer, matching bracketed-paste ordering in the terminal host.
 	pub fn paste(&mut self, text: &str) -> NativeEffect {
-		self.presenter.composer.paste(text);
-		self.refresh();
-		NativeEffect::Consumed
+		let routed = match self.presenter.route_paste(text) {
+			Ok(routed) => routed,
+			Err(error) => self.presenter.notice(error.to_string()),
+		};
+		self.native_effect(routed)
 	}
 
 	/// Returns the current document frame.
@@ -2521,13 +3497,24 @@ impl NativeHost {
 		let tree = omp_tui::dom! { <col gap=1>{components}</col> };
 		let transcript = Ui::from_root(tree, self.size.width, self.presenter.ui.clone());
 		let rows = transcript.frame().size().height;
-		let composer = self.presenter.composer.frame();
-		let height = rows.saturating_add(composer.size().height);
+		// pi's status container sits between the transcript and the editor
+		// band in every actor: the retry countdown loader, the transient
+		// notice, or the idle `<key> to Retry` hint after an aborted tool tail.
+		let status = self.presenter.status_frame(self.size.width);
+		let status_rows = status.as_ref().map_or(0, |frame| frame.size().height);
+		let chrome = self.presenter.chrome_frame(self.size.width);
+		let height = rows
+			.saturating_add(status_rows)
+			.saturating_add(chrome.size().height);
 		let mut frame = Frame::new(Size::new(self.size.width, height));
 		frame.blit(transcript.frame(), 0, rows, 0, 0);
-		frame.blit(composer, 0, composer.size().height, 0, rows);
+		if let Some(status) = &status {
+			frame.blit(status, 0, status_rows, 0, rows);
+		}
+		frame.blit(&chrome, 0, chrome.size().height, 0, rows.saturating_add(status_rows));
 		self.frame = frame;
 		self.approval_frame = self.presenter.approval_frame(self.size.width);
+		self.status_deadline = self.presenter.retry_wake();
 	}
 }
 
@@ -2556,6 +3543,44 @@ async fn recv_git(facts: Option<&Receiver<GitFacts>>) -> GitFacts {
 		},
 		None => future::pending().await,
 	}
+}
+
+/// The `<ask status=running>` element of the last turn, when the tool is
+/// blocked on the user.
+fn waiting_ask(dom: &Dom) -> Option<Handle> {
+	let turn = crate::notices::retry::last_turn(dom)?;
+	dom.children(turn).iter().rev().copied().find(|handle| {
+		dom.get(*handle).is_some_and(|node| {
+			node.tag == Tag::Custom(Str::new_static("ask"))
+				&& node.prop(&PropId::Status.into()).and_then(Value::as_str) == Some("running")
+		})
+	})
+}
+
+/// The questions journaled in an `<ask>` element's `<input>`.
+fn ask_questions(dom: &Dom, ask: Handle) -> Option<Vec<omp_tools::ask::Question>> {
+	let args = dom
+		.children(ask)
+		.iter()
+		.filter_map(|handle| dom.get(*handle))
+		.find(|node| node.tag == Tag::Known(KnownTag::Input))
+		.and_then(|input| input.content.as_deref())?;
+	serde_json::from_str::<omp_tools::ask::Params>(args)
+		.ok()
+		.map(|params| params.questions)
+		.filter(|questions| !questions.is_empty())
+}
+
+/// Visible text of the newest assistant message in the last turn, for the
+/// `yield` speech mode's one-shot utterance.
+fn last_assistant_text(dom: &Dom) -> Option<Str> {
+	let turn = crate::notices::retry::last_turn(dom)?;
+	dom.children(turn)
+		.iter()
+		.rev()
+		.filter_map(|handle| dom.get(*handle))
+		.find(|node| node.tag == Tag::Known(KnownTag::Assistant))
+		.and_then(|node| crate::notices::prop_text(node, PropId::Text))
 }
 
 /// Project root for `@` file completion: the session cwd projected into
@@ -2588,6 +3613,7 @@ fn status_facts(
 	// compaction speculation, the credential's billing plan and account.
 	StatusFacts {
 		model,
+		mode: None,
 		thinking: local.thinking.clone(),
 		compact_thinking: local.compact_thinking,
 		fast: local.fast,
@@ -2600,7 +3626,7 @@ fn status_facts(
 		tokens: status.context,
 		context_window: badge.context_window,
 		compact_percent: local.compact,
-		speculation: Speculation::None,
+		speculation: local.speculation,
 		tokens_in: status.tokens_in,
 		tokens_out: status.tokens_out,
 		cache_read: status.cache_read,
@@ -2615,12 +3641,13 @@ fn status_facts(
 }
 
 /// Whether the kernel is still working on the last turn, decided by the
-/// newest lifecycle element in it. A notice closes the turn (the kernel ends
-/// an interrupted or failed turn with one); an open assistant or a running
+/// newest lifecycle element in it. Only terminal error/interrupt notices
+/// close the turn; informational notices are transparent. An open assistant or a running
 /// tool keeps it active; a settled tool defers to its assistant, whose
 /// `tool_calls` stop means another inference follows; `<usage>` is
 /// per-inference accounting and closes nothing; a turn with only the user's
-/// message is awaiting its first inference.
+/// message is awaiting its first inference; a local run (a turn holding
+/// only its tool element) is over once that element settles.
 fn has_active_turn(dom: &Dom) -> bool {
 	let Some(turn) = dom.children(dom.body()).last() else {
 		return false;
@@ -2630,7 +3657,17 @@ fn has_active_turn(dom: &Dom) -> bool {
 			continue;
 		};
 		match node.tag {
-			Tag::Known(KnownTag::Notice) => return false,
+			Tag::Known(KnownTag::Notice) => {
+				let kind = node.prop(&PropId::Kind.into()).and_then(Value::as_str);
+				let interrupted = matches!(kind, Some("warn" | "warning"))
+					&& node.content.as_deref().is_some_and(|text| {
+						text.starts_with("Turn interrupted") || text.starts_with("Interrupted")
+					});
+				if matches!(kind, Some("error" | "interrupt" | "interrupted")) || interrupted {
+					return false;
+				}
+			},
+			Tag::Known(KnownTag::User) => return true,
 			Tag::Known(KnownTag::Assistant) => {
 				return node
 					.prop(&PropId::StopReason.into())
@@ -2638,18 +3675,34 @@ fn has_active_turn(dom: &Dom) -> bool {
 					.is_none_or(|reason| reason == "tool_calls");
 			},
 			Tag::Custom(_) => {
-				let settled = node
-					.prop(&PropId::Status.into())
-					.and_then(Value::as_str)
-					.is_some_and(|status| matches!(status, "ok" | "error" | "cancelled" | "aborted"));
-				if !settled {
+				if !tool_settled(node) {
 					return true;
 				}
 			},
 			_ => {},
 		}
 	}
-	true
+	false
+}
+
+fn tool_settled(node: &omp_dom::Node) -> bool {
+	node
+		.prop(&PropId::Status.into())
+		.and_then(Value::as_str)
+		.is_some_and(|status| matches!(status, "ok" | "error" | "cancelled" | "aborted"))
+}
+
+/// Whether the newest turn is a host-run `!`/`$` command still executing:
+/// its first element is a tool (no user message opened it) and that tool
+/// has not settled (pi `session.isBashRunning` / `isEvalRunning`).
+fn local_run_active(dom: &Dom) -> bool {
+	let Some(turn) = dom.children(dom.body()).last() else {
+		return false;
+	};
+	let mut children = dom.children(*turn).iter().filter_map(|handle| dom.get(*handle));
+	children
+		.next()
+		.is_some_and(|first| matches!(first.tag, Tag::Custom(_)) && !tool_settled(first))
 }
 
 fn approval_frame(

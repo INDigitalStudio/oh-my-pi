@@ -1,11 +1,60 @@
-//! pi keybinding parity: every pi default chord that omp implements is bound
-//! by the default cfg to the console command in the migration table.
+//! Literal pi keybinding parity for both the TUI and coding-agent registries.
+
+use std::collections::BTreeSet;
 
 use omp_app::keybindings::{DEFAULT_BINDS, PI_ACTIONS, config::ConsoleKeybindings};
+use omp_chat::input::normalize_chord;
 
-/// pi `KEYBINDINGS` defaults (packages/coding-agent/src/config/keybindings.ts),
-/// action id → default chords.
+/// Pi `getDefaultPasteImageKeys(process.platform)`.
+#[cfg(target_os = "macos")]
+const IMAGE_PASTE_KEYS: &[&str] = &["ctrl+v", "super+v"];
+#[cfg(target_os = "windows")]
+const IMAGE_PASTE_KEYS: &[&str] = &["ctrl+v", "alt+v"];
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const IMAGE_PASTE_KEYS: &[&str] = &["ctrl+v"];
+
+/// Literal `TUI_KEYBINDINGS` plus coding-agent `KEYBINDINGS`, including
+/// actions with no default. Keep this table line-for-line comparable with
+/// `/work/pi/packages/{tui/src,coding-agent/src/config}/keybindings.ts`.
 const PI_DEFAULTS: &[(&str, &[&str])] = &[
+	("tui.editor.cursorUp", &["up"]),
+	("tui.editor.cursorDown", &["down"]),
+	("tui.editor.cursorLeft", &["left", "ctrl+b"]),
+	("tui.editor.cursorRight", &["right", "ctrl+f"]),
+	("tui.editor.cursorWordLeft", &["alt+left", "ctrl+left", "alt+b"]),
+	("tui.editor.cursorWordRight", &["alt+right", "ctrl+right", "alt+f"]),
+	("tui.editor.cursorLineStart", &["home", "ctrl+a"]),
+	("tui.editor.cursorLineEnd", &["end", "ctrl+e"]),
+	("tui.editor.jumpForward", &["ctrl+]"]),
+	("tui.editor.jumpBackward", &["ctrl+alt+]"]),
+	("tui.editor.pageUp", &["pageup"]),
+	("tui.editor.pageDown", &["pagedown"]),
+	("tui.editor.deleteCharBackward", &["backspace"]),
+	("tui.editor.deleteCharForward", &["delete", "ctrl+d"]),
+	(
+		"tui.editor.deleteWordBackward",
+		&["ctrl+w", "alt+backspace", "ctrl+backspace", "super+alt+backspace"],
+	),
+	(
+		"tui.editor.deleteWordForward",
+		&["alt+delete", "alt+d", "super+alt+delete", "super+alt+d"],
+	),
+	("tui.editor.deleteToLineStart", &["ctrl+u"]),
+	("tui.editor.deleteToLineEnd", &["ctrl+k"]),
+	("tui.editor.yank", &["ctrl+y"]),
+	("tui.editor.yankPop", &["alt+y"]),
+	("tui.editor.undo", &["ctrl+-", "ctrl+_"]),
+	("tui.editor.spellingSuggestions", &["ctrl+."]),
+	("tui.input.newLine", &["shift+enter", "ctrl+j"]),
+	("tui.input.submit", &["enter"]),
+	("tui.input.tab", &["tab"]),
+	("tui.input.copy", &["ctrl+c"]),
+	("tui.select.up", &["up"]),
+	("tui.select.down", &["down"]),
+	("tui.select.pageUp", &["pageup"]),
+	("tui.select.pageDown", &["pagedown"]),
+	("tui.select.confirm", &["enter"]),
+	("tui.select.cancel", &["escape", "ctrl+c"]),
 	("app.interrupt", &["escape"]),
 	("app.clear", &["ctrl+c"]),
 	("app.exit", &["ctrl+d"]),
@@ -23,38 +72,27 @@ const PI_DEFAULTS: &[(&str, &[&str])] = &[
 	("app.message.followUp", &["ctrl+q", "ctrl+enter"]),
 	("app.retry", &["f5", "alt+r"]),
 	("app.message.dequeue", &["alt+up", "shift+up"]),
-	("app.clipboard.pasteImage", &["ctrl+v"]),
+	("app.clipboard.pasteImage", IMAGE_PASTE_KEYS),
 	("app.clipboard.pasteTextRaw", &["ctrl+shift+v", "alt+shift+v"]),
 	("app.clipboard.copyLine", &["alt+shift+l"]),
 	("app.clipboard.copyPrompt", &["alt+shift+c"]),
+	("app.session.new", &[]),
+	("app.session.tree", &[]),
+	("app.session.fork", &[]),
+	("app.session.resume", &[]),
 	("app.agents.hub", &["alt+a"]),
 	("app.session.observe", &["ctrl+s"]),
+	("app.session.togglePath", &["ctrl+p"]),
+	("app.session.toggleSort", &["ctrl+s"]),
+	("app.session.rename", &["ctrl+r"]),
+	("app.session.delete", &["ctrl+d"]),
+	("app.session.deleteNoninvasive", &["ctrl+backspace"]),
+	("app.tree.foldOrUp", &["ctrl+left", "alt+left"]),
+	("app.tree.unfoldOrDown", &["ctrl+right", "alt+right"]),
 	("app.plan.toggle", &["alt+shift+p"]),
 	("app.history.search", &["ctrl+r"]),
+	("app.stt.toggle", &[]),
 	("app.live.toggle", &["ctrl+l"]),
-];
-
-/// pi defaults deliberately not bound by omp, each with its reason.
-const NOT_BOUND: &[(&str, &str)] = &[
-	// The editor keymap in crates/tui owns Ctrl+Enter as a newline chord
-	// (`submit_remap_on_ctrl_enter_wins_over_newline_default`); alt+enter is
-	// bound instead.
-	("ctrl+enter", "app.message.followUp"),
-	// Steering is journaled at the kernel's safe point (ADR 0003
-	// `<queues><steering>`); there is no local queue to dequeue from.
-	("alt+up", "app.message.dequeue"),
-	("shift+up", "app.message.dequeue"),
-	// Editor-level chords: the decoder lowers them to Key::Paste/PasteRaw/
-	// CopyLine/CopyPrompt and the composer handles them directly.
-	("ctrl+v", "app.clipboard.pasteImage"),
-	("ctrl+shift+v", "app.clipboard.pasteTextRaw"),
-	("alt+shift+v", "app.clipboard.pasteTextRaw"),
-	("alt+shift+l", "app.clipboard.copyLine"),
-	("alt+shift+c", "app.clipboard.copyPrompt"),
-	// Not ported yet: agent hub / session observer / live voice.
-	("alt+a", "app.agents.hub"),
-	("ctrl+s", "app.session.observe"),
-	("ctrl+l", "app.live.toggle"),
 ];
 
 fn default_bindings() -> ConsoleKeybindings {
@@ -65,48 +103,43 @@ fn default_bindings() -> ConsoleKeybindings {
 }
 
 #[test]
-fn every_pi_default_is_bound_or_explicitly_excluded() {
+fn literal_full_pi_keymap_is_expressed_by_default_cfg() {
 	let bindings = default_bindings();
-	let mut table = Vec::new();
+	let action_commands: std::collections::BTreeMap<_, _> = PI_ACTIONS.iter().copied().collect();
+	let declared_actions: BTreeSet<_> = PI_ACTIONS.iter().map(|(action, _)| *action).collect();
+	let oracle_actions: BTreeSet<_> = PI_DEFAULTS.iter().map(|(action, _)| *action).collect();
+	assert_eq!(declared_actions, oracle_actions, "migration table must cover the full pi keymap");
+
+	let mut oracle_chords = BTreeSet::new();
 	for (action, chords) in PI_DEFAULTS {
-		let expected = PI_ACTIONS
-			.iter()
-			.find_map(|(id, command)| (id == action).then_some(*command));
+		let command = action_commands[action];
 		for chord in *chords {
-			let bound = bindings.command_for(chord);
-			let excluded = NOT_BOUND
-				.iter()
-				.any(|(excluded, id)| excluded == chord && id == action);
-			table.push(format!("{action:32} {chord:14} -> {}", bound.unwrap_or("(unbound)")));
-			match (expected, bound, excluded) {
-				(Some(command), Some(bound), false) => {
-					assert_eq!(bound, command, "{action} {chord} binds the wrong command");
-				},
-				(_, None, true) => {},
-				(None, None, false) => {
-					panic!("{action} {chord}: no omp command and not in NOT_BOUND")
-				},
-				(_, Some(bound), true) => {
-					panic!("{action} {chord} is listed as excluded but bound to {bound}")
-				},
-				(Some(command), None, false) => {
-					panic!("{action} {chord} should bind {command} but is unbound")
-				},
-				(None, Some(bound), false) => {
-					panic!("{action} {chord} bound to {bound} without a PI_ACTIONS entry")
-				},
-			}
+			let chord = normalize_chord(chord).expect("literal pi chord normalizes");
+			oracle_chords.insert(chord.clone());
+			let script = bindings
+				.command_for(chord.as_str())
+				.unwrap_or_else(|| panic!("{action} default `{chord}` is not bound"));
+			assert!(
+				script.split(";").any(|statement| statement.trim() == command),
+				"{action} default `{chord}` runs `{script}`, missing `{command}`"
+			);
 		}
 	}
-	eprintln!("{}", table.join("\n"));
+	let actual_chords: BTreeSet<_> = bindings.bindings.keys().cloned().collect();
+	assert_eq!(actual_chords, oracle_chords, "default cfg has a non-pi chord or misses a pi chord");
 }
 
 #[test]
-fn every_default_bind_names_a_registered_console_command() {
+fn every_default_bind_names_registered_console_commands() {
 	let ctx = omp_con::Ctx::new();
-	for (_, command) in default_bindings().bindings {
-		let name = command.split_whitespace().next().expect("non-empty bind");
-		assert!(ctx.find(name).is_some(), "bind runs unknown console name `{name}`");
+	for (_, script) in default_bindings().bindings {
+		for statement in script.split(";") {
+			let name = statement
+				.split_whitespace()
+				.next()
+				.expect("non-empty bind statement");
+			assert!(ctx.find(name).is_some(), "bind runs unknown console name `{name}`");
+		}
 	}
 }
 

@@ -52,6 +52,8 @@ pub mod progress_reporter;
 pub mod ps_cmd;
 pub mod render_cmd;
 pub mod rpc_mode;
+/// Process- and presentation-level pi setting convars.
+pub mod settings;
 #[cfg(feature = "local-tts")]
 pub mod say_cmd;
 /// Feature-disabled local speech command.
@@ -83,23 +85,20 @@ pub mod voice;
 pub mod welcome_facts;
 pub mod worktree_cmd;
 
-use std::{
-	fs,
-	path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 pub use miette::{IntoDiagnostic, Report, Result};
 
-/// Returns the archived command-stream configuration path: `<config
-/// dir>/config.cfg` (`~/.o2/config.cfg` by default, `OMP_CONFIG_DIR`
-/// overrides).
+/// Returns the archived command-stream configuration path for the selected
+/// profile: `<config dir>/config.cfg` (`~/.o2/config.cfg` by default,
+/// `~/.o2/profiles/<profile>/config.cfg` under `--profile`/`OMP_PROFILE`,
+/// `OMP_CONFIG_DIR` overrides the root).
 ///
 /// # Errors
 ///
 /// [`omp_core::dirs::DataDirError::HomeUnset`] when no home directory is set.
 pub fn config_path() -> std::result::Result<PathBuf, omp_core::dirs::DataDirError> {
-	let home = omp_core::dirs::home_dir().ok_or(omp_core::dirs::DataDirError::HomeUnset)?;
-	Ok(omp_core::dirs::config_dir(&home).join("config.cfg"))
+	Ok(omp_driver::cfg::CfgFiles::new(None)?.user_path("config"))
 }
 
 /// Builds the process control context from user and exact-project cfg files.
@@ -111,33 +110,27 @@ pub fn process_ctx(project_root: &Path) -> Result<omp_con::Ctx> {
 }
 
 /// [`process_ctx`] over a caller-prepared builder (reply sink, user objects).
+///
+/// The [`omp_driver::cfg::CfgFiles`] resolver stays installed as the
+/// context's loader and saver, so `exec <profile>` and `writecfg` (model
+/// picker, `/settings`, `omp config set`) work for the whole process life
+/// (ADR 0014), reading `<user>/<name>.cfg` plus the `<project>/.omp`
+/// overlay and writing the user file atomically.
 pub fn process_ctx_with(project_root: &Path, builder: omp_con::CtxBuilder) -> Result<omp_con::Ctx> {
-	let user = config_path().into_diagnostic()?;
-	let project = project_root.join(".omp/config.cfg");
-	let mut script = String::new();
-	for path in [&user, &project] {
-		if path.is_file() {
-			if !script.is_empty() {
-				script.push('\n');
-			}
-			script.push_str(&keybindings::migrate_generated_preamble(
-				&fs::read_to_string(path).into_diagnostic()?,
-			));
-		}
-	}
-	let ctx = builder.build();
+	let files = omp_driver::cfg::CfgFiles::new(Some(project_root)).into_diagnostic()?;
+	let loader = files.clone();
+	let saver = files.clone();
+	let ctx = builder
+		.loader(move |name: &str| loader.load(name))
+		.saver(move |name: &str, contents: &str| omp_con::CfgSaver::save(&saver, name, contents))
+		.build();
 	ctx.exec(
 		keybindings::DEFAULT_BINDS,
 		omp_con::Source::Config(omp_core::Str::new_static(keybindings::DEFAULT_BINDS_NAME)),
 	)
 	.into_diagnostic()?;
 	ctx.seal_bind_defaults();
-	let outcome = ctx.exec_configs(
-		&|name: &str| {
-			(name == "config.cfg" && !script.is_empty()).then(|| omp_core::Str::new(script.as_str()))
-		},
-		None,
-	);
+	let outcome = ctx.exec_configs(&files, None);
 	if outcome.failed > 0 {
 		tracing::warn!(
 			failed = outcome.failed,

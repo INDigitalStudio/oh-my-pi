@@ -44,7 +44,12 @@ impl Card for EvalCard {
 					.map(str::to_owned)
 			})
 			.unwrap_or_default();
-		let output = result.as_ref().map(output_text).unwrap_or_default();
+		let live = matches!(view.status, CardStatus::StreamingArgs | CardStatus::InProgress);
+		let output = view
+			.output
+			.map(str::to_owned)
+			.unwrap_or_else(|| result.as_ref().map(output_text).unwrap_or_default());
+		let output = output_preview(&output, expanded);
 		let displays = result.as_ref().map(display_values).unwrap_or_default();
 		let duration = result.as_ref().and_then(|value| {
 			value
@@ -59,7 +64,6 @@ impl Card for EvalCard {
 				.and_then(Value::as_str)
 				.map(str::to_owned)
 		});
-		let live = matches!(view.status, CardStatus::StreamingArgs | CardStatus::InProgress);
 		let state = match view.status {
 			CardStatus::StreamingArgs | CardStatus::InProgress => "running",
 			CardStatus::Done => icon(ui, "done"),
@@ -80,7 +84,7 @@ impl Card for EvalCard {
 					if !code.is_empty() {
 						<pre>{code}</pre>
 					}
-					if matches!(view.status, CardStatus::Done | CardStatus::Failed) && (!output.is_empty() || fault.is_some()) {
+					if !output.is_empty() || fault.is_some() {
 						<hr title="Output" title_pad=3/>
 						if !output.is_empty() {
 							<pre>{output}</pre>
@@ -108,6 +112,20 @@ impl Card for EvalCard {
 
 fn icon<'a>(ui: &'a UiContext, name: &'a str) -> &'a str {
 	ui.charset.icon_named(name).unwrap_or(name)
+}
+
+fn output_preview(output: &str, expanded: bool) -> String {
+	if expanded {
+		return output.to_owned();
+	}
+	let lines = output.lines().collect::<Vec<_>>();
+	let skipped = lines.len().saturating_sub(20);
+	let tail = lines.into_iter().skip(skipped).collect::<Vec<_>>().join("\n");
+	if skipped == 0 {
+		tail
+	} else {
+		format!("… ({skipped} earlier lines)\n{tail}")
+	}
 }
 
 fn output_text(result: &Value) -> String {

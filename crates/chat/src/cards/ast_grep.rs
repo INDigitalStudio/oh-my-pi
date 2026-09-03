@@ -1,4 +1,4 @@
-//! Typed card for `ast_grep@1`.
+//! Typed card for `ast_grep@2`.
 
 use std::collections::BTreeSet;
 

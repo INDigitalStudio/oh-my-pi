@@ -71,8 +71,8 @@ fn render_recall(view: &CardView<'_>, expanded: bool) -> Component {
 			<row gap=1><icon name="memory-tool"/><text>{title}</text></row>
 			if expanded {
 				for (index, item) in items.iter().enumerate() {
-					<text pad-x=2>{format!("{}. [{:.2}] {}", index + 1, item.get("score").and_then(Value::as_f64).unwrap_or_default(), field(item, "content").unwrap_or_default())}</text>
-					if let Some(context) = item.get("context").and_then(Value::as_str) {
+					<text pad-x=2>{format!("{}. [{:.2}] {}", index + 1, item.get("score").and_then(Value::as_f64).unwrap_or_default(), item.pointer("/memory/content").and_then(Value::as_str).unwrap_or_default())}</text>
+					if let Some(context) = item.pointer("/memory/metadata/context").and_then(Value::as_str) {
 						<text pad-x=5 fg=muted>{format!("({context})")}</text>
 					}
 				}

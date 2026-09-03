@@ -1,7 +1,8 @@
 //! Codex quota-reset celebration (pi `codex-reset-fireworks.ts`): a
 //! top-third fireworks animation over the transcript — 34 frames at 85 ms
 //! of rockets, bursts, and a drifting star field above a banner naming the
-//! event. Any key dismisses it; it closes on its own after the last frame.
+//! event. The animation loops until Escape dismisses it; other keys are
+//! consumed without disturbing the celebration.
 //!
 //! The canvas is one retained [`Frame`] plus a per-cell priority plane;
 //! each animation frame repaints in place (pi's priority compositing:
@@ -99,9 +100,10 @@ pub struct Fireworks {
 	started:  Option<Duration>,
 	/// Animation frame index in `0..FRAME_COUNT`.
 	index:    u32,
+	/// Absolute animation step, used to schedule the next frame across loops.
+	step:     u32,
 	/// Frame index and canvas size last painted into `frame`.
 	painted:  Option<(u32, Size)>,
-	done:     bool,
 }
 
 impl Fireworks {
@@ -117,8 +119,8 @@ impl Fireworks {
 			priority: vec![0; cells(canvas)],
 			started: None,
 			index: 0,
+			step: 0,
 			painted: None,
-			done: false,
 		}
 	}
 
@@ -360,8 +362,12 @@ impl Panel for Fireworks {
 		PanelAnchor::Full
 	}
 
-	fn key(&mut self, _key: Key) -> PanelEvent {
-		PanelEvent::Close
+	fn key(&mut self, key: Key) -> PanelEvent {
+		if key == Key::Esc {
+			PanelEvent::Close
+		} else {
+			PanelEvent::Consumed
+		}
 	}
 
 	fn frame(&mut self, viewport: Size) -> &Frame {
@@ -375,11 +381,12 @@ impl Panel for Fireworks {
 	fn tick(&mut self, now: Duration) -> bool {
 		let started = *self.started.get_or_insert(now);
 		let elapsed = now.saturating_sub(started);
-		let frames = u32::try_from(elapsed.as_millis() / FRAME_INTERVAL.as_millis()).unwrap_or(u32::MAX);
-		if frames >= FRAME_COUNT {
-			self.done = true;
+		let step = u32::try_from(elapsed.as_millis() / FRAME_INTERVAL.as_millis()).unwrap_or(u32::MAX);
+		if step == self.step {
+			return false;
 		}
-		let index = frames.min(FRAME_COUNT - 1);
+		self.step = step;
+		let index = step % FRAME_COUNT;
 		if index == self.index {
 			return false;
 		}
@@ -388,15 +395,8 @@ impl Panel for Fireworks {
 	}
 
 	fn next_wake(&self) -> Option<Duration> {
-		if self.done {
-			return None;
-		}
 		let started = self.started?;
-		Some(started + FRAME_INTERVAL * (self.index + 1))
-	}
-
-	fn finished(&self) -> bool {
-		self.done
+		Some(started + FRAME_INTERVAL * self.step.saturating_add(1))
 	}
 }
 
@@ -430,7 +430,7 @@ mod tests {
 	}
 
 	#[test]
-	fn fireworks_runs_34_frames_at_85ms_then_closes() {
+	fn fireworks_runs_34_frames_at_85ms_then_loops() {
 		let mut panel = open(CodexResetEvent::UnscheduledWeeklyReset, 80, 24);
 		assert_eq!(panel.frame(Size { width: 80, height: 24 }).size(), Size::new(80, 7), "top third");
 		let start = Duration::from_secs(10);
@@ -441,22 +441,24 @@ mod tests {
 		assert_eq!(panel.frame_index(), 1);
 		assert_eq!(panel.next_wake(), Some(start + Duration::from_millis(170)));
 		assert!(!panel.finished());
-		// A late tick lands on the frame the clock says, never past the last.
+		// The frame after the last wraps to zero and schedules the next loop.
 		assert!(panel.tick(start + Duration::from_millis(85 * 33)));
 		assert_eq!(panel.frame_index(), 33);
+		assert!(panel.tick(start + Duration::from_millis(85 * 34)));
+		assert_eq!(panel.frame_index(), 0);
 		assert!(!panel.finished());
-		assert!(!panel.tick(start + Duration::from_millis(85 * 34)));
-		assert_eq!(panel.frame_index(), 33);
-		assert!(panel.finished(), "closes after the last frame's interval elapses");
-		assert_eq!(panel.next_wake(), None);
+		assert_eq!(
+			panel.next_wake(),
+			Some(start + Duration::from_millis(85 * 35))
+		);
 	}
 
 	#[test]
-	fn any_key_dismisses_fireworks() {
+	fn only_escape_dismisses_fireworks() {
 		let mut panel = open(CodexResetEvent::SavedResetBanked { added: 1, available: 3 }, 80, 24);
-		assert_eq!(panel.key(Key::Char('x')), PanelEvent::Close);
+		assert_eq!(panel.key(Key::Char('x')), PanelEvent::Consumed);
 		assert_eq!(panel.key(Key::Esc), PanelEvent::Close);
-		assert_eq!(panel.key(Key::Enter), PanelEvent::Close);
+		assert_eq!(panel.key(Key::Enter), PanelEvent::Consumed);
 		assert_eq!(panel.id(), "fireworks");
 		assert_eq!(panel.anchor(), PanelAnchor::Full);
 	}

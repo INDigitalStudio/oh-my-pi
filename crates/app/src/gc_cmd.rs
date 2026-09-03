@@ -14,18 +14,21 @@ use crate::cli::GcArgs;
 /// Scans native `.oms` journals and optionally prunes abandoned branches.
 pub fn run(args: GcArgs) -> miette::Result<()> {
 	let data_dir = omp_core::dirs::data_dir(args.data_dir).into_diagnostic()?;
-	let sessions = args
+	let roots = args
 		.sessions_dir
-		.unwrap_or_else(|| data_dir.join("sessions"));
+		.map_or_else(|| project_session_roots(&data_dir), |directory| Ok(vec![directory]))
+		.into_diagnostic()?;
 	let mut paths = Vec::new();
-	collect_journals(&sessions, &mut paths).into_diagnostic()?;
+	for sessions in roots {
+		collect_journals(&sessions, &mut paths).into_diagnostic()?;
+	}
 	paths.sort();
 
 	let mut journals = 0usize;
 	let mut entries_pruned = 0usize;
 	let mut bytes_reclaimed = 0u64;
 	for path in paths {
-		let (_, entries) = Journal::open(&path).into_diagnostic()?;
+		let entries = Journal::scan(&path).into_diagnostic()?;
 		let abandoned_count = abandoned(&entries).count();
 		if abandoned_count == 0 {
 			continue;
@@ -61,6 +64,24 @@ pub fn run(args: GcArgs) -> miette::Result<()> {
 	Ok(())
 }
 
+fn project_session_roots(data_dir: &Path) -> io::Result<Vec<PathBuf>> {
+	let projects = data_dir.join("projects");
+	let entries = match fs::read_dir(&projects) {
+		Ok(entries) => entries,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(error) => return Err(error),
+	};
+	let mut roots = Vec::new();
+	for entry in entries {
+		let sessions = entry?.path().join("sessions");
+		if sessions.is_dir() {
+			roots.push(sessions);
+		}
+	}
+	roots.sort();
+	Ok(roots)
+}
+
 fn collect_journals(directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<()> {
 	let entries = match fs::read_dir(directory) {
 		Ok(entries) => entries,
@@ -78,4 +99,35 @@ fn collect_journals(directory: &Path, output: &mut Vec<PathBuf>) -> io::Result<(
 		}
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use tempfile::tempdir;
+
+	use super::*;
+
+	#[test]
+	fn defaults_to_every_project_session_root() {
+		let scratch = tempdir().expect("scratch");
+		let first = scratch.path().join("projects/first/sessions");
+		let second = scratch.path().join("projects/second/sessions");
+		fs::create_dir_all(&first).expect("first project");
+		fs::create_dir_all(&second).expect("second project");
+		fs::create_dir_all(scratch.path().join("projects/third/cache")).expect("unrelated state");
+
+		let roots = project_session_roots(scratch.path()).expect("project roots");
+		assert_eq!(roots, vec![first.clone(), second.clone()]);
+
+		let first_journal = first.join("a.oms");
+		let second_journal = second.join("b.oms");
+		fs::write(&first_journal, "").expect("first journal");
+		fs::write(&second_journal, "").expect("second journal");
+		let mut journals = Vec::new();
+		for root in roots {
+			collect_journals(&root, &mut journals).expect("collect");
+		}
+		journals.sort();
+		assert_eq!(journals, vec![first_journal, second_journal]);
+	}
 }

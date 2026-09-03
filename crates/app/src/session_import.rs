@@ -2,14 +2,14 @@
 
 use std::{
 	fs,
-	io::{BufRead as _, BufReader},
+	io::{self, BufRead, BufReader, IsTerminal as _, Write},
 	path::{Path, PathBuf},
 	time::SystemTime,
 };
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_core::Str;
-use omp_dom::PropId;
+use omp_dom::{Op, PropId, PropKey, Txn, Value as DomValue};
 use omp_session::{ComponentRegistry, Session};
 use serde_json::Value;
 
@@ -24,8 +24,8 @@ pub enum ForeignFormat {
 	Codex,
 }
 
-/// Resolves the newest requested foreign session, imports it, and rewrites the
-/// launch to resume the resulting native journal.
+/// Lets the operator select a requested foreign session, imports it, and
+/// rewrites the launch to resume the resulting native journal.
 pub(crate) fn prepare(args: &mut ChatArgs) -> miette::Result<()> {
 	let format = if args.from_claude {
 		ForeignFormat::Claude
@@ -39,16 +39,32 @@ pub(crate) fn prepare(args: &mut ChatArgs) -> miette::Result<()> {
 		ForeignFormat::Claude => home.join(".claude/projects"),
 		ForeignFormat::Codex => home.join(".codex/sessions"),
 	};
-	let source = newest_jsonl(&root)?.ok_or_else(|| {
-		miette!(
-			"no importable {} sessions were found under {}",
-			match format {
-				ForeignFormat::Claude => "Claude Code",
-				ForeignFormat::Codex => "Codex",
-			},
-			root.display(),
-		)
-	})?;
+	let candidates = jsonl_candidates(&root)?;
+	let source = match candidates.as_slice() {
+		[] => {
+			return Err(miette!(
+				"no importable {} sessions were found under {}",
+				match format {
+					ForeignFormat::Claude => "Claude Code",
+					ForeignFormat::Codex => "Codex",
+				},
+				root.display(),
+			));
+		},
+		[only] => only.clone(),
+		_ if !io::stdin().is_terminal() => {
+			return Err(miette!(
+				"multiple foreign sessions were found; rerun from an interactive terminal to select one"
+			));
+		},
+		_ => {
+			let stdin = io::stdin();
+			let mut input = stdin.lock();
+			let stderr = io::stderr();
+			let mut output = stderr.lock();
+			select_candidate(&candidates, &mut input, &mut output)?
+		},
+	};
 	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let project = fs::canonicalize(&args.project).into_diagnostic()?;
 	let state_dir =
@@ -106,6 +122,30 @@ pub fn import_file(
 	}
 	let mut session =
 		Session::create(destination, ComponentRegistry::standard()).into_diagnostic()?;
+	let cause = session
+		.head()
+		.ok_or_else(|| miette!("imported session has no genesis entry"))?;
+	session
+		.patch(Txn {
+			cause,
+			label: Some(Str::new_static("session.import")),
+			ops:   vec![
+				Op::Set {
+					h:     session.dom().meta(),
+					prop:  PropKey::Custom(Str::new_static("import-source")),
+					value: DomValue::Str(Str::new(source.to_string_lossy())),
+				},
+				Op::Set {
+					h:     session.dom().meta(),
+					prop:  PropKey::Custom(Str::new_static("import-format")),
+					value: DomValue::Str(Str::new_static(match format {
+						ForeignFormat::Claude => "claude",
+						ForeignFormat::Codex => "codex",
+					})),
+				},
+			],
+		})
+		.into_diagnostic()?;
 	let mut turn_open = false;
 	for (role, text) in &messages {
 		match *role {
@@ -216,13 +256,13 @@ fn text_content(value: &Value) -> Option<Str> {
 	(!text.is_empty()).then(|| Str::new(text))
 }
 
-fn newest_jsonl(root: &Path) -> miette::Result<Option<PathBuf>> {
+fn jsonl_candidates(root: &Path) -> miette::Result<Vec<PathBuf>> {
 	let mut stack = vec![root.to_path_buf()];
-	let mut newest: Option<(SystemTime, PathBuf)> = None;
+	let mut candidates = Vec::new();
 	while let Some(directory) = stack.pop() {
 		let entries = match fs::read_dir(&directory) {
 			Ok(entries) => entries,
-			Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+			Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
 			Err(source) => return Err(source).into_diagnostic(),
 		};
 		for entry in entries {
@@ -232,15 +272,80 @@ fn newest_jsonl(root: &Path) -> miette::Result<Option<PathBuf>> {
 			if metadata.is_dir() {
 				stack.push(path);
 			} else if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
-				let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-				if newest
-					.as_ref()
-					.is_none_or(|(current, _)| modified > *current)
-				{
-					newest = Some((modified, path));
-				}
+				candidates.push((metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH), path));
 			}
 		}
 	}
-	Ok(newest.map(|(_, path)| path))
+	candidates.sort_by(|(left_time, left_path), (right_time, right_path)| {
+		right_time
+			.cmp(left_time)
+			.then_with(|| left_path.cmp(right_path))
+	});
+	Ok(candidates.into_iter().map(|(_, path)| path).collect())
+}
+
+fn select_candidate(
+	candidates: &[PathBuf],
+	input: &mut impl BufRead,
+	output: &mut impl Write,
+) -> miette::Result<PathBuf> {
+	writeln!(output, "Select a foreign session to import:").into_diagnostic()?;
+	for (index, path) in candidates.iter().enumerate() {
+		writeln!(output, "  {}. {}", index + 1, path.display()).into_diagnostic()?;
+	}
+	write!(output, "Selection [1-{}]: ", candidates.len()).into_diagnostic()?;
+	output.flush().into_diagnostic()?;
+	let mut line = String::new();
+	input.read_line(&mut line).into_diagnostic()?;
+	let selected = line
+		.trim()
+		.parse::<usize>()
+		.ok()
+		.and_then(|value| value.checked_sub(1))
+		.and_then(|index| candidates.get(index))
+		.ok_or_else(|| miette!("invalid foreign session selection"))?;
+	Ok(selected.clone())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn foreign_picker_lists_every_candidate_and_honors_the_explicit_selection() {
+		let candidates = vec![PathBuf::from("newest.jsonl"), PathBuf::from("older.jsonl")];
+		let mut input = io::Cursor::new(b"2\n");
+		let mut output = Vec::new();
+		let selected = select_candidate(&candidates, &mut input, &mut output).unwrap();
+		assert_eq!(selected, PathBuf::from("older.jsonl"));
+		let rendered = String::from_utf8(output).unwrap();
+		assert!(rendered.contains("1. newest.jsonl"));
+		assert!(rendered.contains("2. older.jsonl"));
+	}
+
+	#[test]
+	fn imported_session_records_source_selection_metadata() {
+		let directory = tempfile::tempdir().unwrap();
+		let source = directory.path().join("source.jsonl");
+		let destination = directory.path().join("destination.oms");
+		fs::write(
+			&source,
+			r#"{"type":"user","message":{"content":"hello"}}"#,
+		)
+		.unwrap();
+		assert_eq!(import_file(ForeignFormat::Claude, &source, &destination).unwrap(), 1);
+		let session =
+			Session::open(&destination, ComponentRegistry::standard()).unwrap();
+		let meta = session.dom().get(session.dom().meta()).unwrap();
+		assert_eq!(
+			meta.prop(&PropKey::Custom(Str::new_static("import-source")))
+				.and_then(DomValue::as_str),
+			Some(source.to_string_lossy().as_ref())
+		);
+		assert_eq!(
+			meta.prop(&PropKey::Custom(Str::new_static("import-format")))
+				.and_then(DomValue::as_str),
+			Some("claude")
+		);
+	}
 }

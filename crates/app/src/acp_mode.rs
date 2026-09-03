@@ -1,6 +1,10 @@
 //! Agent Client Protocol adapter over the journal-first kernel and session.
 
-use std::{env, fs, path::PathBuf, sync::Arc};
+use std::{
+	env, fs,
+	path::{Path, PathBuf},
+	sync::Arc,
+};
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_agent::{
@@ -8,7 +12,7 @@ use omp_agent::{
 };
 use omp_core::Str;
 use omp_dom::Event;
-use omp_driver::discovery::roles;
+use omp_driver::{discovery::roles, headless::kernel::SessionHome};
 use omp_session::Session;
 use serde_json::{Map, Value, json};
 use tokio::io::{
@@ -60,67 +64,118 @@ async fn run_inner(args: ChatArgs) -> miette::Result<()> {
 		.clone()
 		.or_else(|| launch_roles.primary.map(|value| Str::from(value.as_str())))
 		.ok_or_else(|| miette!("ACP mode requires a configured default model role"))?;
+	let prompt_slots = crate::spec::resolve_prompt_slots(
+		&project,
+		&home,
+		args.prompt_settings.custom_prompt.as_deref(),
+		args.prompt_settings.append_prompt.as_deref(),
+	)?;
+	let prompt = omp_driver::headless::kernel::PromptOverrides {
+		custom_prompt: prompt_slots.system,
+		append_prompt: prompt_slots.append,
+		personality: args.prompt_settings.personality.clone(),
+		include_model: args.prompt_settings.include_model_in_prompt,
+		include_workstation: args.prompt_settings.include_workstation,
+		include_workspace_tree: args.prompt_settings.include_workspace_tree,
+		render_mermaid: args.prompt_settings.render_mermaid,
+		include_skills: args.prompt_settings.skills_enabled,
+		null_prompt: args.prompt_settings.null_prompt,
+	};
+	let approval_mode = args.effective_approval().map(Into::into);
+	let live_sessions = Arc::new(omp_driver::sessions::SessionRegistry::new());
 	let gateway = match args.gateway.as_ref() {
 		Some(endpoint) => Some(endpoint.connect().await.into_diagnostic()?),
 		None => None,
 	};
-	let (kernel, session, _) = omp_driver::headless::kernel::compose_kernel(
+	let options = omp_driver::headless::kernel::KernelOptions {
+		continue_session: args.continue_session,
+		session: args
+			.resume
+			.as_ref()
+			.map(|value| PathBuf::from(value.as_str())),
+		fork: args
+			.fork
+			.as_ref()
+			.map(|value| PathBuf::from(value.as_str())),
+		sessions_dir: args.session_dir.clone(),
+		ephemeral: args.no_session,
+		no_tools: args.no_tools,
+		tools: args.tools.as_ref().map(|tools| tools.0.clone()),
+		py_eval: args.py_eval,
+		spawn_idle_timeout: args.envd_idle_timeout,
+		api_key: args.api_key.clone(),
+		approval_mode,
+		model_override: args.model.is_some(),
+		prompt,
+		provider: args
+			.provider
+			.as_ref()
+			.map(|value| omp_catalog::ProviderId::from(value.as_str()))
+			.or_else(|| {
+				args.api_key.as_ref().and_then(|_| {
+					model
+						.split_once('/')
+						.map(|(provider, _)| omp_catalog::ProviderId::from(provider))
+				})
+			}),
+		gateway,
+		sessions: Some(Arc::clone(&live_sessions)),
+		session_name: None,
+		tool_registry: None,
+		..omp_driver::headless::kernel::KernelOptions::default()
+	};
+	let (kernel, mut session, _) = omp_driver::headless::kernel::compose_kernel(
 		&data_dir,
 		&project,
 		model.as_str(),
-		ctx,
-		omp_driver::headless::kernel::KernelOptions {
-			continue_session: args.continue_session,
-			session: args
-				.resume
-				.as_ref()
-				.map(|value| PathBuf::from(value.as_str())),
-			sessions_dir: args.session_dir,
-			ephemeral: args.no_session,
-			no_tools: args.no_tools,
-			py_eval: args.py_eval,
-			spawn_idle_timeout: args.envd_idle_timeout,
-			api_key: args.api_key.clone(),
-			provider: args
-				.provider
-				.as_ref()
-				.map(|value| omp_catalog::ProviderId::from(value.as_str()))
-				.or_else(|| {
-					args.api_key.as_ref().and_then(|_| {
-						model
-							.split_once('/')
-							.map(|(provider, _)| omp_catalog::ProviderId::from(provider))
-					})
-				}),
-			gateway,
-			sessions: None,
-			session_name: None,
-			tool_registry: None,
-		},
+		Arc::clone(&ctx),
+		options.clone(),
 	)
 	.await
 	.into_diagnostic()?;
-	serve_acp(kernel, session, stdin(), stdout()).await
+	crate::chat_cmd::apply_launch_thinking(&ctx, args.thinking).into_diagnostic()?;
+	if args.plan_mode || args.plan_yolo {
+		crate::chat_cmd::set_plan_mode(&mut session, true).into_diagnostic()?;
+	}
+	let home = SessionHome::new(
+		&data_dir,
+		&project,
+		&options,
+		model,
+		kernel.mailbox(),
+	)
+	.into_diagnostic()?;
+	serve_acp(kernel, session, home, stdin(), stdout()).await
+}
+
+struct TurnCompletion<C> {
+	kernel:   Kernel<C>,
+	session:  Session,
+	id:       Option<Value>,
+	response: Result<Value, (i64, &'static str)>,
+}
+
+enum InputEvent<C> {
+	Line(Option<String>),
+	Turn(TurnCompletion<C>),
 }
 
 /// Serves ACP over caller-provided NDJSON transport halves.
 #[doc(hidden)]
 pub async fn serve_acp<C, R, W>(
-	mut kernel: Kernel<C>,
+	kernel: Kernel<C>,
 	mut session: Session,
+	home: SessionHome,
 	input: R,
 	mut output: W,
 ) -> miette::Result<()>
 where
-	C: Inference + Send + 'static,
+	C: Inference + Send + Sync + 'static,
 	R: AsyncRead + Unpin,
 	W: AsyncWrite + Unpin + Send + 'static,
 {
-	let session_id = session
-		.journal_path()
-		.file_stem()
-		.and_then(|value| value.to_str())
-		.map_or_else(|| Str::new_static("session"), Str::new);
+	home.register(&session);
+	let mut session_id = session_identifier(&session);
 	let (output_tx, output_rx) = flume::unbounded::<Value>();
 	let writer = tokio::spawn(async move {
 		while let Ok(value) = output_rx.recv_async().await {
@@ -132,23 +187,37 @@ where
 		Ok::<(), miette::Report>(())
 	});
 	let (_, events) = session.subscribe();
-	let patch_tx = output_tx.clone();
-	let patch_session_id = session_id.clone();
-	let forwarder = tokio::spawn(async move {
-		while let Ok(event) = events.recv_async().await {
-			if patch_tx
-				.send(acp_event_value(&patch_session_id, event)?)
-				.is_err()
-			{
-				break;
-			}
-		}
-		Ok::<(), miette::Report>(())
-	});
+	let mut forwarder = Some(forward_events(events, output_tx.clone(), session_id.clone()));
 	let mailbox = kernel.mailbox();
+	let mut controller = Some((kernel, session));
+	let mut active: Option<tokio::task::JoinHandle<TurnCompletion<C>>> = None;
 	let mut initialized = false;
 	let mut lines = BufReader::new(input).lines();
-	while let Some(line) = lines.next_line().await.into_diagnostic()? {
+
+	loop {
+		let input_event: InputEvent<C> = if let Some(turn) = active.as_mut() {
+			tokio::select! {
+				completed = turn => InputEvent::Turn(completed.into_diagnostic()?),
+				line = lines.next_line() => InputEvent::Line(line.into_diagnostic()?),
+			}
+		} else {
+			InputEvent::Line(lines.next_line().await.into_diagnostic()?)
+		};
+		let line = match input_event {
+			InputEvent::Turn(completed) => {
+				active = None;
+				restore_turn(completed, &mut controller, &output_tx)?;
+				continue;
+			},
+			InputEvent::Line(Some(line)) => line,
+			InputEvent::Line(None) => {
+				if let Some(turn) = active.take() {
+					let _ = mailbox.send(Up::Interrupt);
+					restore_turn(turn.await.into_diagnostic()?, &mut controller, &output_tx)?;
+				}
+				break;
+			},
+		};
 		if line.trim().is_empty() {
 			continue;
 		}
@@ -210,39 +279,106 @@ where
 				}
 			},
 			"authenticate" => Ok(json!({})),
-			"session/new" | "session/load" | "session/resume" => Ok(json!({
-				"sessionId": session_id,
-				"modes": {"currentModeId": "default", "availableModes": []},
-				"models": {"currentModelId": "configured", "availableModels": []},
-			})),
+			"session/new" if active.is_some() => Err((-32001, "a turn is already running")),
+			"session/new" => {
+				let next = match home.create(None) {
+					Ok(next) => next,
+					Err(source) => {
+						if let Some(id) = id {
+							output_tx
+								.send(error(id, -32000, &source.to_string()))
+								.into_diagnostic()?;
+						}
+						continue;
+					},
+				};
+				switch_session(
+					&mut controller,
+					next,
+					&home,
+					&output_tx,
+					&mut forwarder,
+					&mut session_id,
+				)
+				.await?;
+				Ok(session_descriptor(session_id.as_str()))
+			},
+			"session/load" | "session/resume" if active.is_some() => {
+				Err((-32001, "a turn is already running"))
+			},
+			"session/load" | "session/resume" => {
+				let selector = match requested_session(&params) {
+					Ok(selector) => selector,
+					Err(message) => {
+						if let Some(id) = id {
+							output_tx.send(error(id, -32602, message)).into_diagnostic()?;
+						}
+						continue;
+					},
+				};
+				let next = match home.open(Path::new(selector)) {
+					Ok(next) => next,
+					Err(source) => {
+						if let Some(id) = id {
+							output_tx
+								.send(error(id, -32000, &source.to_string()))
+								.into_diagnostic()?;
+						}
+						continue;
+					},
+				};
+				switch_session(
+					&mut controller,
+					next,
+					&home,
+					&output_tx,
+					&mut forwarder,
+					&mut session_id,
+				)
+				.await?;
+				Ok(session_descriptor(session_id.as_str()))
+			},
+			"session/prompt" if active.is_some() => Err((-32001, "a turn is already running")),
 			"session/prompt" => match prompt_text(&params) {
-				Ok(text) => match kernel
-					.run_turn(
-						&mut session,
-						TurnInput { text, attachments: Vec::new() },
-						RunControl::default(),
-					)
-					.await
-				{
-					Ok(outcome) => Ok(json!({
-						"stopReason": if outcome.stop == omp_agent::TurnStop::Cancelled {
-							"cancelled"
-						} else {
-							"end_turn"
-						},
-						"text": outcome.assistant_text,
-					})),
-					Err(_) => Err((-32000, "agent turn failed")),
+				Ok(text) => {
+					let (mut kernel, mut session) =
+						controller.take().expect("idle ACP controller owns its kernel and session");
+					active = Some(tokio::spawn(async move {
+						let response = match kernel
+							.run_turn(
+								&mut session,
+								TurnInput { text, attachments: Vec::new() },
+								RunControl::default(),
+							)
+							.await
+						{
+							Ok(outcome) => Ok(json!({
+								"stopReason": if outcome.stop == omp_agent::TurnStop::Cancelled {
+									"cancelled"
+								} else {
+									"end_turn"
+								},
+								"text": outcome.assistant_text,
+							})),
+							Err(_) => Err((-32000, "agent turn failed")),
+						};
+						TurnCompletion { kernel, session, id, response }
+					}));
+					continue;
 				},
 				Err(message) => Err((-32602, message)),
 			},
 			"session/cancel" => {
-				let _ = mailbox.send(Up::Interrupt);
+				if active.is_some() {
+					let _ = mailbox.send(Up::Interrupt);
+				}
 				Ok(json!({}))
 			},
 			"session/approve" => match approval(&params) {
 				Ok((id, decision)) => {
-					let _ = mailbox.send(Up::Approve { id, decision });
+					if active.is_some() {
+						let _ = mailbox.send(Up::Approve { id, decision });
+					}
 					Ok(json!({}))
 				},
 				Err(message) => Err((-32602, message)),
@@ -250,6 +386,10 @@ where
 			"session/close" | "shutdown" => {
 				if let Some(id) = id {
 					output_tx.send(success(id, json!({}))).into_diagnostic()?;
+				}
+				if let Some(turn) = active.take() {
+					let _ = mailbox.send(Up::Interrupt);
+					restore_turn(turn.await.into_diagnostic()?, &mut controller, &output_tx)?;
 				}
 				break;
 			},
@@ -263,12 +403,106 @@ where
 			output_tx.send(response).into_diagnostic()?;
 		}
 	}
+
+	let (kernel, mut session) = controller
+		.take()
+		.expect("ACP controller owns its kernel and session after active turn completion");
 	session.process_exit().into_diagnostic()?;
+	home.unregister(&session);
 	drop(session);
+	drop(kernel);
+	if let Some(forwarder) = forwarder {
+		forwarder.await.into_diagnostic()??;
+	}
 	drop(output_tx);
-	forwarder.await.into_diagnostic()??;
 	writer.await.into_diagnostic()??;
 	Ok(())
+}
+
+fn forward_events(
+	events: flume::Receiver<Event>,
+	output: flume::Sender<Value>,
+	session_id: Str,
+) -> tokio::task::JoinHandle<miette::Result<()>> {
+	tokio::spawn(async move {
+		while let Ok(event) = events.recv_async().await {
+			if output.send(acp_event_value(session_id.as_str(), event)?).is_err() {
+				break;
+			}
+		}
+		Ok(())
+	})
+}
+
+fn restore_turn<C>(
+	completed: TurnCompletion<C>,
+	controller: &mut Option<(Kernel<C>, Session)>,
+	output: &flume::Sender<Value>,
+) -> miette::Result<()> {
+	let TurnCompletion { kernel, session, id, response } = completed;
+	*controller = Some((kernel, session));
+	if let Some(id) = id {
+		let response = match response {
+			Ok(value) => success(id, value),
+			Err((code, message)) => error(id, code, message),
+		};
+		output.send(response).into_diagnostic()?;
+	}
+	Ok(())
+}
+
+async fn switch_session<C>(
+	controller: &mut Option<(Kernel<C>, Session)>,
+	mut next: Session,
+	home: &SessionHome,
+	output: &flume::Sender<Value>,
+	forwarder: &mut Option<tokio::task::JoinHandle<miette::Result<()>>>,
+	session_id: &mut Str,
+) -> miette::Result<()> {
+	let (snapshot, events) = next.subscribe();
+	let (kernel, mut previous) =
+		controller.take().expect("idle ACP controller owns its kernel and session");
+	let _ = previous.session_switch();
+	home.unregister(&previous);
+	drop(previous);
+	if let Some(previous_forwarder) = forwarder.take() {
+		previous_forwarder.await.into_diagnostic()??;
+	}
+	home.register(&next);
+	*session_id = session_identifier(&next);
+	output
+		.send(acp_event_value(
+			session_id.as_str(),
+			Event::Reset { snapshot },
+		)?)
+		.into_diagnostic()?;
+	*forwarder = Some(forward_events(events, output.clone(), session_id.clone()));
+	*controller = Some((kernel, next));
+	Ok(())
+}
+
+fn session_identifier(session: &Session) -> Str {
+	session
+		.journal_path()
+		.file_stem()
+		.and_then(|value| value.to_str())
+		.map_or_else(|| Str::new_static("session"), Str::new)
+}
+
+fn requested_session(params: &Map<String, Value>) -> Result<&str, &'static str> {
+	params
+		.get("sessionId")
+		.or_else(|| params.get("session"))
+		.and_then(Value::as_str)
+		.ok_or("session/load requires sessionId")
+}
+
+fn session_descriptor(session_id: &str) -> Value {
+	json!({
+		"sessionId": session_id,
+		"modes": {"currentModeId": "default", "availableModes": []},
+		"models": {"currentModelId": "configured", "availableModels": []},
+	})
 }
 
 fn prompt_text(params: &Map<String, Value>) -> Result<Str, &'static str> {

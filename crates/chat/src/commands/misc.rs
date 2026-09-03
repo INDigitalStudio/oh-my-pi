@@ -8,8 +8,9 @@
 //! live setting), asks the application through the [`Services`] seam, or
 //! opens an observer-local panel. Commands whose backing service left the
 //! tree in the kernel cutover (`/collab`, `/join`, `/leave`, `/prewalk`,
-//! `/advisor`, `/vision`) are registered so the palette matches pi and
-//! answer with the exact missing seam instead of pretending.
+//! `/advisor`) are registered so the palette matches pi and answer with the
+//! exact missing seam instead of pretending. `/vision` sets the journaled
+//! `ai_vision` convar the kernel's request projection consumes.
 //!
 //! [`Services`]: crate::overlays::services::Services
 
@@ -74,16 +75,13 @@ const DEFERRED_PREWALK: &str = "Prewalk is unavailable: it needs a prewalk Direc
                                 the kernel cutover); sv_task_agent_prewalk only affects children.";
 const DEFERRED_ADVISOR: &str = "Advisor is unavailable: no advisor Director exists in \
                                 crates/agent/src/directors (only prompts/modes/advisor.md).";
-const DEFERRED_VISION: &str = "Vision override is unavailable: images already flow through the \
-                               read tool; the per-session image-input policy (legacy \
-                               vision_override) has no consumer in omp-tools.";
 
 omp_con::var! {
 	/// Uses the premium extended-context pricing tier of the current model
 	/// (pi `/extended-context`).
 	pub static AI_EXTENDED_CONTEXT = ai_extended_context: bool {
 		default: false,
-		flags: archive | session | inherit,
+		flags: archive | session,
 	};
 }
 
@@ -125,6 +123,15 @@ fn var_text(cx: &PanelCx<'_>, name: &str) -> Str {
 	cx.con
 		.get(name)
 		.map_or_else(|| Str::new_static("unset"), |value| Str::new(value.to_string()))
+}
+
+/// How `ai_vision` reads in a notice (pi `formatVisionStatus`).
+fn vision_flow(mode: &str) -> &'static str {
+	match mode {
+		"on" => "always sent",
+		"off" => "never sent",
+		_ => "sent when the route accepts image input",
+	}
 }
 
 fn var_bool(cx: &PanelCx<'_>, name: &str) -> Option<bool> {
@@ -441,14 +448,23 @@ omp_con::cmd! {
 		}))
 	};
 
-	/// Image inspection policy: `/vision [on|off|auto|status]`.
+	/// Image input policy: `/vision [on|off|auto|status]` sets the
+	/// session's `ai_vision` (auto follows the route's image capability).
 	vision(?mode: Str) = |ctx, args| {
-		match args.opt::<Str>(0)?.as_deref().map(str::trim) {
-			None | Some("on" | "off" | "auto" | "status") => {
-				call(ctx, PanelCall::new(|_cx| notice(DEFERRED_VISION)))
-			},
-			Some(_) => Err(usage("Usage: /vision [on|off|auto|status]")),
-		}
+		let mode = match args.opt::<Str>(0)?.as_deref().map(str::trim) {
+			None | Some("status") => None,
+			Some(word @ ("on" | "off" | "auto")) => Some(Str::new(word)),
+			Some(_) => return Err(usage("Usage: /vision [on|off|auto|status]")),
+		};
+		call(ctx, PanelCall::new(move |cx| {
+			if let Some(mode) = &mode
+				&& let Err(error) = set_var(cx, "ai_vision", Value::Str(mode.clone()))
+			{
+				return notice(error);
+			}
+			let current = var_text(cx, "ai_vision");
+			notice(sf!("Vision mode: {current} · images {}", vision_flow(&current)))
+		}))
 	};
 
 	/// Reasons on the cheap model until the first edit: `/prewalk [on|off|status]`.
@@ -608,5 +624,13 @@ mod tests {
 		assert!(matches!(event, PanelEvent::Notice(text) if text.contains("7546bcfa06")));
 		let (_, event) = run_call("prewalk on");
 		assert!(matches!(event, PanelEvent::Notice(text) if text.contains("Director")));
+	}
+
+	#[test]
+	fn vision_sets_the_session_convar_and_reports_the_flow() {
+		let (_, event) = run_call("vision off");
+		assert!(matches!(&event, PanelEvent::Notice(text) if text == "Vision mode: off · images never sent"), "{event:?}");
+		let (_, event) = run_call("vision status");
+		assert!(matches!(&event, PanelEvent::Notice(text) if text.starts_with("Vision mode: ")), "{event:?}");
 	}
 }

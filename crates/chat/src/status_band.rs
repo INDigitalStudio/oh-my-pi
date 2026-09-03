@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use omp_core::{Str, sf};
 use omp_tui::{
-	Cached, Charset, Color, Component, Icon, PaintCtx, Prop, Props, Rect, Slot, Style, UiContext,
+	Charset, Color, Component, Icon, PaintCtx, Prop, Props, Rect, Slot, Style, Theme, UiContext,
 	anim::{Easing, Tween},
 	cell_width,
 	components::{
-		CompactionBoundaries, ContextGauge, GaugeCell, Segment, Status, compaction_boundary_color,
+		CompactionBoundaries, ContextGauge, GaugeCell, compaction_boundary_color,
 		compaction_threshold_color, spend_label, write_compact_count,
 	},
 	next_slot,
@@ -57,11 +57,56 @@ pub struct AdvisorBadge {
 	pub yielded: bool,
 }
 
+/// Lifecycle of an engaged goal Director (pi `goalMode.status`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GoalState {
+	/// Working toward the objective.
+	Active,
+	/// Temporarily paused while preserving the objective.
+	Paused,
+	/// The objective was met.
+	Complete,
+	/// The token budget ran out first.
+	BudgetLimited,
+	/// The goal was dropped.
+	Dropped,
+}
+
+/// The active Director workflow shown as the band's mode chip (pi `mode`
+/// segment). At most one shows, in pi's precedence: plan, prewalk, goal,
+/// vibe, loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModeChip {
+	/// The plan Director is engaged.
+	Plan,
+	/// The plan Director is paused.
+	PlanPaused,
+	/// Prewalk is armed and controls the model handoff.
+	Prewalk,
+	/// The goal Director is engaged.
+	Goal(GoalState),
+	/// The vibe Director is engaged.
+	Vibe,
+	/// Loop mode is engaged; `limit` is `(remaining, initial)` iterations
+	/// when the loop is bounded.
+	Loop {
+		/// Remaining and initial iterations of a bounded loop.
+		limit: Option<(u32, u32)>,
+	},
+	/// Loop mode is paused, retaining its optional iteration limit.
+	LoopPaused {
+		/// Remaining and initial iterations of a bounded loop.
+		limit: Option<(u32, u32)>,
+	},
+}
+
 /// Facts painted by the composer status band.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatusFacts {
 	/// Short model label.
 	pub model:             Str,
+	/// Active Director workflow, when one owns subsequent turns.
+	pub mode:              Option<ModeChip>,
 	/// Reasoning level (`off`, `minimal` … `max`) when the model can reason;
 	/// `None` for models without thinking.
 	pub thinking:          Option<Str>,
@@ -122,6 +167,7 @@ impl Default for StatusFacts {
 	fn default() -> Self {
 		Self {
 			model:             Str::default(),
+			mode:              None,
 			thinking:          None,
 			compact_thinking:  true,
 			fast:              false,
@@ -327,6 +373,7 @@ fn speculation_flip(now: Duration) -> Duration {
 enum Chip {
 	Brand,
 	Model,
+	Mode,
 	Path,
 	Git,
 	Session,
@@ -342,8 +389,27 @@ type Label = (Chip, Str, Color);
 
 /// Both fitted groups of the band.
 struct Layout {
-	left:  SmallVec<Label, 4>,
+	left:  SmallVec<Label, 5>,
 	right: SmallVec<Label, 6>,
+}
+
+/// What a fitted layout depends on besides the facts: the row width, the
+/// glyph set, the context revision (theme colors), and the brand label's
+/// width (the timer grows from `9s` to `10s` to `1m00s`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LayoutKey {
+	width:       u16,
+	charset:     Charset,
+	revision:    u64,
+	brand_width: u16,
+}
+
+/// The fitted layout retained across animation frames (ADR 0030: the cache
+/// owns the memory; the spinner repaints the band continuously while only
+/// the brand text moves).
+struct LayoutCache {
+	key:    LayoutKey,
+	layout: Layout,
 }
 
 /// One-row composer status in pi's band layout.
@@ -361,6 +427,11 @@ pub struct StatusBand {
 	/// Brand foreground easing between idle and working; `None` until the
 	/// first paint knows the theme.
 	fade:  Option<Tween<Color>>,
+	/// Scratch for the brand label (spinner and timer), reused every frame.
+	brand: String,
+	/// Fitted labels for the last `(facts, width, charset, revision, brand
+	/// width)`; only the brand text and color are patched per frame.
+	cache: Option<LayoutCache>,
 }
 
 impl StatusBand {
@@ -369,7 +440,7 @@ impl StatusBand {
 	pub fn new(facts: StatusFacts) -> Self {
 		let mut props = Props::new();
 		props.set(Prop::Id, STATUS_ID);
-		Self { props, slot: next_slot(), facts, fade: None }
+		Self { props, slot: next_slot(), facts, fade: None, brand: String::new(), cache: None }
 	}
 
 	/// Replaces the facts; returns whether anything changed.
@@ -378,7 +449,70 @@ impl StatusBand {
 			return false;
 		}
 		self.facts = facts;
+		self.cache = None;
 		true
+	}
+
+	/// Whether the fitted layout is retained for `key` (test hook).
+	#[cfg(test)]
+	fn cached_for(&self, key: LayoutKey) -> bool {
+		self.cache.as_ref().is_some_and(|cache| cache.key == key)
+	}
+
+	/// Writes the brand label for `now` into the scratch: the spinner and
+	/// elapsed timer while working, else the brand glyph; one trailing pad.
+	fn write_brand(&mut self, charset: Charset, now: Duration) {
+		self.brand.clear();
+		match self.facts.working {
+			Some(started) => {
+				self.brand.push_str(charset.spinner().at(now));
+				self.brand.push(' ');
+				elapsed_label(&mut self.brand, now.saturating_sub(started));
+			},
+			None => self.brand.push_str(charset.icon(Icon::Omp)),
+		}
+		self.brand.push(' ');
+	}
+
+	/// Mode chip text and color (pi `modeSegment`), when a Director owns
+	/// subsequent turns.
+	fn mode_label(&self, charset: Charset, theme: &Theme) -> Option<(Str, Color)> {
+		let mode = self.facts.mode?;
+		Some(match mode {
+			ModeChip::Plan => (sf!("{} Plan", charset.icon(Icon::Plan)), theme.accent),
+			ModeChip::PlanPaused => (
+				sf!("{} Plan {}", charset.icon(Icon::Plan), charset.icon(Icon::Pause)),
+				theme.warn,
+			),
+			ModeChip::Prewalk => (sf!("{} Prewalk", charset.icon(Icon::Prewalk)), theme.accent),
+			ModeChip::Goal(state) => {
+				let (icon, color) = match state {
+					GoalState::Active => (Icon::Goal, theme.accent),
+					GoalState::Paused => (Icon::Pause, theme.warn),
+					GoalState::Complete => (Icon::Success, theme.ok),
+					GoalState::BudgetLimited => (Icon::WarningStatus, theme.warn),
+					GoalState::Dropped => (Icon::Aborted, theme.muted),
+				};
+				(sf!("{} Goal", charset.icon(icon)), color)
+			},
+			ModeChip::Vibe => (sf!("{} Vibe", charset.icon(Icon::Agents)), theme.accent),
+			ModeChip::Loop { limit } => {
+				let icon = charset.icon(Icon::Loop);
+				let label = match limit {
+					Some((remaining, initial)) => sf!("{icon} Loop running {remaining}/{initial}"),
+					None => sf!("{icon} Loop running"),
+				};
+				(label, theme.info)
+			},
+			ModeChip::LoopPaused { limit } => {
+				let icon = charset.icon(Icon::Pause);
+				let label = match limit {
+					Some((remaining, initial)) => sf!("{icon} Loop paused {remaining}/{initial}"),
+					None => sf!("{icon} Loop paused"),
+				};
+				(label, theme.warn)
+			},
+		})
 	}
 
 	/// Model icon: the thinking glyph in compact mode, else the model icon.
@@ -429,24 +563,18 @@ impl StatusBand {
 		Str::new(text)
 	}
 
-	/// Left-group labels at `path_max`, in band order.
-	fn left_labels(&self, pc: &PaintCtx<'_>, path_max: u16) -> SmallVec<Label, 4> {
+	/// Left-group labels at `path_max`, in band order. The brand label is
+	/// the scratch written by [`Self::write_brand`] for this frame; its color
+	/// is patched per frame by the caller.
+	fn left_labels(&self, pc: &PaintCtx<'_>, path_max: u16) -> SmallVec<Label, 5> {
 		let charset = pc.ctx.charset;
 		let theme = pc.ctx.theme;
 		let mut labels = SmallVec::new();
-		let mut brand = String::new();
-		match self.facts.working {
-			Some(started) => {
-				brand.push_str(charset.spinner().at(pc.now));
-				brand.push(' ');
-				elapsed_label(&mut brand, pc.now.saturating_sub(started));
-			},
-			None => brand.push_str(charset.icon(Icon::Omp)),
-		}
-		brand.push(' ');
-		let brand_color = self.fade.map_or(theme.muted, |fade| fade.sample(pc.now));
-		labels.push((Chip::Brand, Str::new(brand), brand_color));
+		labels.push((Chip::Brand, Str::new(&self.brand), theme.muted));
 		labels.push((Chip::Model, self.model_label(charset), theme.ok));
+		if let Some((label, color)) = self.mode_label(charset, &theme) {
+			labels.push((Chip::Mode, label, color));
+		}
 		if !self.facts.cwd.is_empty() {
 			let icon = charset.icon(if self.facts.scratch {
 				Icon::ScratchFolder
@@ -558,8 +686,9 @@ impl StatusBand {
 	}
 
 	/// Fits both groups into `width` around the gauge (pi `#buildStatusLine`):
-	/// clamp the session title, pop right chips, shrink the path, then drop
-	/// non-path left chips from the right.
+	/// clamp the session title, pop right chips, shrink the path, then shed
+	/// secondary left chips. Active workflow mode is the last chip removed:
+	/// unlike git/model decoration it changes how the next turn behaves.
 	fn fitted(&self, pc: &PaintCtx<'_>, width: u16) -> Layout {
 		let charset = pc.ctx.charset;
 		let left_chrome = charset.status_band();
@@ -611,16 +740,21 @@ impl StatusBand {
 				left = self.left_labels(pc, path_max);
 				continue;
 			}
-			let drop = left
-				.iter()
-				.rposition(|(chip, ..)| *chip != Chip::Path)
+			let drop = [Chip::Git, Chip::Model, Chip::Brand, Chip::Path, Chip::Mode]
+				.into_iter()
+				.find_map(|candidate| {
+					left.iter()
+						.position(|(chip, ..)| *chip == candidate)
+				})
 				.unwrap_or(left.len() - 1);
 			left.remove(drop);
 		}
 	}
 
-	/// Paints one powerline group at `rect` and returns the labels' first
-	/// columns, so callers can overpaint spans inside a chip.
+	/// Paints one powerline group at `rect` — the same cells the `<status>`
+	/// component paints, written straight into the frame from the fitted
+	/// labels so an animation frame builds no component — and reports each
+	/// label's first column so callers can overpaint spans inside a chip.
 	fn paint_group(
 		pc: &mut PaintCtx<'_>,
 		labels: &[Label],
@@ -629,33 +763,56 @@ impl StatusBand {
 		mut on_label: impl FnMut(Chip, u16),
 	) {
 		let theme = pc.ctx.theme;
-		let (left_cap, separator, _) = if end {
+		let (left_cap, separator, cap) = if end {
 			pc.ctx.charset.status_band_end()
 		} else {
 			pc.ctx.charset.status_band()
 		};
-		let mut group = Status::new()
-			.with(Prop::Bg, theme.panel)
-			.with(Prop::Fg, theme.fg);
-		if end {
-			group = group.with_str(Prop::Align, "right");
-		}
-		let mut column = rect
-			.x
-			.saturating_add(cell_width(left_cap))
-			.saturating_add(1);
-		let step = cell_width(separator).saturating_add(2);
+		let band = Style::new().fg(theme.fg).bg(theme.panel);
+		let edge = Style::new().fg(theme.panel);
+		let y = rect.y;
+		let mut column = pc.frame.put(rect.x, y, left_cap, edge);
+		column = pc.frame.put(column, y, " ", band);
 		for (index, (chip, label, color)) in labels.iter().enumerate() {
 			if index > 0 {
-				column = column.saturating_add(step);
+				column = pc.frame.put(column, y, " ", band.dim());
+				column = pc.frame.put(column, y, separator, band.dim());
+				column = pc.frame.put(column, y, " ", band.dim());
 			}
 			on_label(*chip, column);
-			column = column.saturating_add(cell_width(label));
-			group = group.segment(Segment::new().label(label.clone()).with(Prop::Fg, *color));
+			column = pc.frame.put(column, y, label, band.fg(*color));
 		}
-		let mut group = Cached::new(Box::new(group));
-		group.place(pc.ctx, rect);
-		group.paint(pc);
+		column = pc.frame.put(column, y, " ", band);
+		pc.frame.put(column, y, cap, edge);
+	}
+
+	/// The fitted layout for this frame: reused while the facts, width,
+	/// charset, theme revision, and brand width hold; the brand label's
+	/// text and color are patched in per frame.
+	fn layout(&mut self, pc: &PaintCtx<'_>, width: u16, brand_color: Color) -> &Layout {
+		let key = LayoutKey {
+			width,
+			charset: pc.ctx.charset,
+			revision: pc.ctx.revision,
+			brand_width: cell_width(&self.brand),
+		};
+		if self.cache.as_ref().is_none_or(|cache| cache.key != key) {
+			let layout = self.fitted(pc, width);
+			self.cache = Some(LayoutCache { key, layout });
+		}
+		let cache = self.cache.as_mut().expect("layout cached above");
+		if let Some(brand) = cache
+			.layout
+			.left
+			.first_mut()
+			.filter(|(chip, ..)| *chip == Chip::Brand)
+		{
+			// The brand text is at most a spinner glyph, a timer, and two
+			// pads: inline in `Str`, so this never allocates.
+			brand.1 = Str::new(&self.brand);
+			brand.2 = brand_color;
+		}
+		&cache.layout
 	}
 }
 
@@ -694,6 +851,7 @@ impl Component for StatusBand {
 		};
 		let fade = self.fade.get_or_insert_with(|| Tween::settled(target));
 		fade.retarget(pc.now, target, BRAND_FADE, Easing::EaseInOut);
+		let brand_color = fade.sample(pc.now);
 		if !fade.is_settled(pc.now) {
 			pc.wake(self.slot, pc.now.saturating_add(BRAND_FADE_FRAME));
 		}
@@ -704,16 +862,25 @@ impl Component for StatusBand {
 			pc.wake(self.slot, spinner.min(next_second));
 		}
 
-		let Layout { left, right } = self.fitted(pc, rect.width);
-		let left_width = Self::group_width(&left, charset.status_band()).min(rect.width);
-		let right_width = Self::group_width(&right, charset.status_band_end())
-			.min(rect.width.saturating_sub(left_width));
+		self.write_brand(charset, pc.now);
 		let advisor = self.advisor_span(charset);
+		let advisor_badge = self.facts.advisor;
+		let slot = self.slot;
+		let (tokens, context_window, compact_percent, speculation) = (
+			self.facts.tokens,
+			self.facts.context_window,
+			self.facts.compact_percent,
+			self.facts.speculation,
+		);
+		let Layout { left, right } = self.layout(pc, rect.width, brand_color);
+		let left_width = Self::group_width(left, charset.status_band()).min(rect.width);
+		let right_width = Self::group_width(right, charset.status_band_end())
+			.min(rect.width.saturating_sub(left_width));
 		let mut advisor_column = None;
 		if left_width > 0 {
 			Self::paint_group(
 				pc,
-				&left,
+				left,
 				Rect::new(rect.x, rect.y, left_width, 1),
 				false,
 				|chip, x| {
@@ -723,7 +890,7 @@ impl Component for StatusBand {
 				},
 			);
 		}
-		if let Some(((column, icon), badge)) = advisor_column.zip(self.facts.advisor)
+		if let Some(((column, icon), badge)) = advisor_column.zip(advisor_badge)
 			&& column.saturating_add(cell_width(icon)) <= rect.x.saturating_add(left_width)
 		{
 			// pi paints the badge as its own span inside the model chip, so
@@ -739,7 +906,7 @@ impl Component for StatusBand {
 		}
 		if right_width > 0 {
 			let x = rect.x.saturating_add(rect.width - right_width);
-			Self::paint_group(pc, &right, Rect::new(x, rect.y, right_width, 1), true, |_, _| {});
+			Self::paint_group(pc, right, Rect::new(x, rect.y, right_width, 1), true, |_, _| {});
 		}
 
 		let gap = rect
@@ -749,13 +916,14 @@ impl Component for StatusBand {
 		if gap == 0 {
 			return;
 		}
-		let rule = charset.rule().encode_utf8(&mut [0; 4]).to_owned();
+		let mut rule_utf8 = [0; 4];
+		let rule: &str = charset.rule().encode_utf8(&mut rule_utf8);
 		let gauge = ContextGauge::plan(
 			gap,
-			self.facts.tokens,
-			self.facts.context_window,
+			tokens,
+			context_window,
 			Some(CompactionBoundaries {
-				threshold_percent:   f64::from(self.facts.compact_percent),
+				threshold_percent:   f64::from(compact_percent),
 				speculation_percent: None,
 			}),
 		);
@@ -765,11 +933,11 @@ impl Component for StatusBand {
 		// Background speculation animates the compaction tick: pulsing
 		// accent/muted while a summary is produced, solid accent once armed
 		// (pi `contextPctSegment`).
-		let threshold = match self.facts.speculation {
+		let threshold = match speculation {
 			Speculation::None => boundary,
 			Speculation::Armed => Style::new().fg(theme.accent),
 			Speculation::Running => {
-				pc.wake(self.slot, speculation_flip(pc.now));
+				pc.wake(slot, speculation_flip(pc.now));
 				Style::new().fg(if speculation_on(pc.now) {
 					theme.accent
 				} else {
@@ -786,8 +954,8 @@ impl Component for StatusBand {
 		let mut column = rect.x.saturating_add(left_width);
 		for index in 0..gauge.width() {
 			column = match gauge.cell(index) {
-				GaugeCell::Used => pc.frame.put(column, rect.y, &rule, used),
-				GaugeCell::Unused => pc.frame.put(column, rect.y, &rule, unused),
+				GaugeCell::Used => pc.frame.put(column, rect.y, rule, used),
+				GaugeCell::Unused => pc.frame.put(column, rect.y, rule, unused),
 				GaugeCell::Threshold => pc.frame.put(column, rect.y, tick, threshold),
 				GaugeCell::Speculation => pc.frame.put(column, rect.y, tick, boundary),
 				GaugeCell::Percent(text) => pc.frame.put(column, rect.y, text, percent),
@@ -1072,6 +1240,99 @@ pub(crate) mod tests {
 		ui.tick(Duration::from_secs(61));
 		let row = frame_text(ui.frame()).lines().next().unwrap().to_owned();
 		assert!(row.contains(" 1m  >"), "{row}");
+	}
+
+	#[test]
+	fn working_frames_reuse_the_fitted_layout_until_the_timer_widens() {
+		let ctx = UiContext::default();
+		let mut ui = Ui::from_root(
+			StatusBand::new(StatusFacts { working: Some(Duration::ZERO), ..facts() }),
+			80,
+			ctx.clone(),
+		);
+		let cached = |ui: &Ui, brand: &str| {
+			ui.with_component::<StatusBand, _>(STATUS_ID, |band| {
+				band.cached_for(LayoutKey {
+					width:       80,
+					charset:     ctx.charset,
+					revision:    ui.context().revision,
+					brand_width: cell_width(brand),
+				})
+			})
+			.expect("the band is the root")
+		};
+		// `⠋ 0s ` … `⠴ 9s `: same width, one fit shared by every spinner frame.
+		assert!(cached(&ui, "⠋ 0s "));
+		for millis in [80, 160, 1_000, 5_500, 9_900] {
+			ui.tick(Duration::from_millis(millis));
+			assert!(cached(&ui, "⠋ 0s "), "frame at {millis}ms reused the fit");
+		}
+		// `10s` is one cell wider: the fit is redone once, then held.
+		ui.tick(Duration::from_millis(10_100));
+		assert!(!cached(&ui, "⠋ 0s "));
+		assert!(cached(&ui, "⠋ 10s "));
+		ui.tick(Duration::from_millis(30_000));
+		assert!(cached(&ui, "⠋ 10s "));
+		let row = frame_text(ui.frame()).lines().next().unwrap().to_owned();
+		assert!(row.contains(" 30s  > ⬢ Sonnet 4.5"), "the patched brand text paints: {row}");
+		// A fact change invalidates and immediately rebuilds the fit through
+		// `Ui::with_component_mut`; the replacement label must be present
+		// while the same geometry key is cached again.
+		ui.with_component_mut::<StatusBand, _>(STATUS_ID, |band| {
+			band.set_facts(StatusFacts { working: Some(Duration::ZERO), fast: true, ..facts() })
+		});
+		assert!(cached(&ui, "⠋ 10s "));
+		let row = frame_text(ui.frame()).lines().next().unwrap().to_owned();
+		assert!(row.contains("Sonnet 4.5 ⚡"), "changed facts rebuilt cached labels: {row}");
+	}
+
+	#[test]
+	fn mode_chip_shows_the_active_director_after_the_model() {
+		let theme = UiContext::default().theme;
+		let chip = |mode: ModeChip| {
+			let row = self::row(StatusFacts { mode: Some(mode), ..facts() }, 100);
+			row.split(" > ").nth(2).expect("mode chip").to_owned()
+		};
+		assert_eq!(chip(ModeChip::Plan), "🗺 Plan");
+		assert_eq!(chip(ModeChip::PlanPaused), "🗺 Plan ⏸");
+		assert_eq!(chip(ModeChip::Prewalk), "🏃 Prewalk");
+		assert_eq!(chip(ModeChip::Vibe), "👥 Vibe");
+		assert_eq!(chip(ModeChip::Goal(GoalState::Active)), "🎯 Goal");
+		assert_eq!(chip(ModeChip::Goal(GoalState::Paused)), "⏸ Goal");
+		assert_eq!(chip(ModeChip::Goal(GoalState::Complete)), "✔ Goal");
+		assert_eq!(chip(ModeChip::Goal(GoalState::BudgetLimited)), "⚠ Goal");
+		assert_eq!(chip(ModeChip::Goal(GoalState::Dropped)), "⏹ Goal");
+		assert_eq!(chip(ModeChip::Loop { limit: None }), "↻ Loop running");
+		assert_eq!(chip(ModeChip::Loop { limit: Some((3, 5)) }), "↻ Loop running 3/5");
+		assert_eq!(chip(ModeChip::LoopPaused { limit: None }), "⏸ Loop paused");
+		assert_eq!(chip(ModeChip::LoopPaused { limit: Some((3, 5)) }), "⏸ Loop paused 3/5");
+		let row = self::row(StatusFacts { mode: Some(ModeChip::Plan), ..facts() }, 100);
+		assert!(row.starts_with(" π  > ⬢ Sonnet 4.5 > 🗺 Plan > 📁 ~/proj > ⑂ main ▶"), "{row}");
+		assert!(!self::row(facts(), 100).contains("Plan"), "no chip without a Director");
+
+		// Paused goals paint warn, dropped goals paint muted: the chip color
+		// is semantic, not the model green.
+		let color_at = |mode, glyph| {
+			let ui = Ui::from_root(
+				StatusBand::new(StatusFacts { mode: Some(mode), ..facts() }),
+				100,
+				UiContext::default(),
+			);
+			let row = frame_text(ui.frame()).lines().next().unwrap().to_owned();
+			let column = row
+				.chars()
+				.take_while(|ch| *ch != glyph)
+				.map(|ch| cell_width(ch.encode_utf8(&mut [0; 4])))
+				.sum::<u16>();
+			ui.frame().cell(column, 0).style().foreground_color()
+		};
+		assert_eq!(color_at(ModeChip::Goal(GoalState::Paused), '⏸'), theme.warn);
+		assert_eq!(color_at(ModeChip::Goal(GoalState::Dropped), '⏹'), theme.muted);
+
+		// The active mode outlives decorative brand/model/git/path chips under
+		// pressure because it changes how the next turn behaves.
+		let row = self::row(StatusFacts { mode: Some(ModeChip::Plan), ..facts() }, 40);
+		assert!(row.contains("Plan"), "{row}");
 	}
 
 	#[test]

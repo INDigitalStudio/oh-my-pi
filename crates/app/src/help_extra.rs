@@ -33,6 +33,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
 	"read",
 	"report_issue",
 	"rewind",
+	"security_scan",
 	"shell",
 	"think",
 	"todo",

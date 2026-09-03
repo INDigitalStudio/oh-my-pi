@@ -1250,7 +1250,7 @@ impl PsAction {
 /// Standalone read-tool options.
 #[derive(Clone, Debug, Args)]
 pub struct ReadCliArgs {
-	/// Path, URL, or internal URI passed to `read@1`.
+	/// Path, URL, or internal URI passed to `read@2`.
 	pub path: Str,
 }
 
@@ -2815,6 +2815,9 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		write_license_output(io::stdout().lock()).into_diagnostic()?;
 		return Ok(());
 	}
+	if let Some(cwd) = cli.cwd.as_deref() {
+		env::set_current_dir(cwd).into_diagnostic()?;
+	}
 	if let Some(journal) = cli.export.as_deref() {
 		let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 		let cwd = env::current_dir().into_diagnostic()?;
@@ -2839,9 +2842,6 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			installed.path.display()
 		);
 		return Ok(());
-	}
-	if let Some(cwd) = cli.cwd.as_deref() {
-		env::set_current_dir(cwd).into_diagnostic()?;
 	}
 	let terminal_auth = cli.acp_terminal_auth;
 	if !cli.allow_home
@@ -3075,51 +3075,69 @@ fn parse_with_terminal(
 fn builtin_contribution_names() -> impl Iterator<Item = Str> {
 	[
 		"add-dir",
+		"advisor",
 		"alias",
 		"allow-home",
 		"api-key",
+		"append-system-prompt",
+		"approval-mode",
+		"auto-approve",
 		"config",
+		"continue",
 		"cwd",
+		"export",
 		"ext",
 		"ext-only",
 		"extension",
-		"hook",
-		"plugin-dir",
+		"external-thinking",
+		"fork",
+		"from-claude",
+		"from-codex",
 		"gui",
+		"help",
+		"hide-thinking",
+		"hook",
 		"license",
+		"max-time",
+		"mode",
 		"model",
 		"models",
 		"no-ext",
 		"no-extensions",
 		"no-lsp",
+		"no-prewalk",
 		"no-pty",
 		"no-rules",
+		"no-session",
 		"no-skills",
 		"no-title",
 		"no-tools",
 		"plan",
-		"prewalk",
-		"prewalk-into",
-		"advisor",
+		"plan-mode",
 		"plan-yolo",
 		"plan-yolo-into",
-		"yolo",
-		"auto-approve",
-		"hide-thinking",
-		"external-thinking",
-		"from-claude",
-		"from-codex",
+		"plugin-dir",
+		"prewalk",
+		"prewalk-into",
+		"print",
+		"print-thoughts",
 		"profile",
+		"prompt-cache-key",
 		"provider",
 		"provider-session-id",
-		"plan-mode",
+		"resume",
+		"service-tier",
+		"session",
+		"session-dir",
 		"skills",
 		"slow",
 		"smol",
 		"system-prompt",
-		"append-system-prompt",
+		"thinking",
 		"tools",
 		"trusted-extension",
+		"version",
+		"yolo",
 	]
 	.into_iter()
 	.map(Str::new_static)
@@ -3541,6 +3559,7 @@ pub(crate) fn chat_request_with_messages(
 		top_logprobs:      None,
 		safety:            Arc::from([]),
 		negotiation:       NegotiationPolicy::default(),
+		forced_call:       None,
 	}
 }
 
@@ -3878,6 +3897,99 @@ mod tests {
 			assert_eq!(dispatch_target(parse(arguments).command.as_ref()), target);
 		}
 	}
+	#[test]
+	fn literal_pi_launch_flag_oracle_is_reserved_by_the_cli() {
+		// Literal oracle from pi
+		// `packages/coding-agent/src/cli/flag-tables.ts`
+		// STRING_SETTERS + OPTIONAL_FLAGS + VALUELESS_FLAGS. Short aliases are
+		// represented by their long spellings because contribution names do
+		// not carry dashes.
+		const PI_LONG_FLAGS: &[&str] = &[
+			"--cwd",
+			"--config",
+			"--add-dir",
+			"--mode",
+			"--fork",
+			"--provider",
+			"--model",
+			"--smol",
+			"--slow",
+			"--plan",
+			"--prewalk-into",
+			"--plan-yolo-into",
+			"--max-time",
+			"--service-tier",
+			"--api-key",
+			"--system-prompt",
+			"--append-system-prompt",
+			"--provider-session-id",
+			"--prompt-cache-key",
+			"--session-dir",
+			"--models",
+			"--tools",
+			"--thinking",
+			"--export",
+			"--hook",
+			"--extension",
+			"--trusted-extension",
+			"--plugin-dir",
+			"--skills",
+			"--approval-mode",
+			"--resume",
+			"--session",
+			"--help",
+			"--version",
+			"--allow-home",
+			"--continue",
+			"--from-claude",
+			"--from-codex",
+			"--no-session",
+			"--no-tools",
+			"--no-lsp",
+			"--no-pty",
+			"--hide-thinking",
+			"--advisor",
+			"--external-thinking",
+			"--prewalk",
+			"--no-prewalk",
+			"--plan-yolo",
+			"--print",
+			"--print-thoughts",
+			"--no-extensions",
+			"--no-skills",
+			"--no-rules",
+			"--no-title",
+			"--auto-approve",
+			"--yolo",
+		];
+		fn collect(command: &clap::Command, flags: &mut Vec<String>) {
+			for argument in command.get_arguments() {
+				if let Some(long) = argument.get_long() {
+					flags.push(format!("--{long}"));
+				}
+				for alias in argument.get_visible_aliases().into_iter().flatten() {
+					flags.push(format!("--{alias}"));
+				}
+			}
+			for child in command.get_subcommands() {
+				collect(child, flags);
+			}
+		}
+		// `--help` is Clap's generated action rather than a declared argument;
+		// `--print` is normalized into the `print` command before Clap.
+		let mut parsed = vec!["--help".to_owned(), "--print".to_owned()];
+		collect(&omp_command(false), &mut parsed);
+		let reserved = builtin_contribution_names().collect::<Vec<_>>();
+		for flag in PI_LONG_FLAGS {
+			let name = flag.trim_start_matches("--");
+			assert!(parsed.iter().any(|parsed| parsed == flag), "pi launch flag {flag} is not parsed");
+			assert!(
+				reserved.iter().any(|reserved| reserved.as_str() == name),
+				"pi launch flag {flag} is not reserved by omp"
+			);
+		}
+	}
+
 	#[test]
 	fn parses_chat_composition_options() {
 		let Some(Command::Chat(args)) = parse(&[

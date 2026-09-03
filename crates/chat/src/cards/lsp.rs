@@ -40,6 +40,7 @@ impl Card for LspCard {
 		let result = typed_result::<omp_tools::lsp::Payload>(view);
 		let files = result
 			.as_ref()
+			.and_then(|value| value.get("data"))
 			.and_then(|value| value.get("references"))
 			.and_then(Value::as_array)
 			.cloned()

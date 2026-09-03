@@ -2,21 +2,25 @@
 //! (`extension-dashboard.ts`, `extension-list.ts`, `inspector-panel.ts`)
 //! as a full-screen [`Panel`]. Provider tabs on top, a searchable
 //! inventory list on the left, the inspector on the right, pi's footer at
-//! the bottom. Rows come from [`Services::extensions`]; Space flips the
-//! persisted switch through [`Services::set_extension_enabled`].
+//! the bottom. Rows come from [`Services::extensions`]; Space asks the
+//! controller to flip the persisted switch (`HostCommand::Service` with
+//! [`Mutation::SetExtensionEnabled`]) and the row changes only once the
+//! outcome comes back through [`Panel::notify`] (ADR 0005).
 
 use std::{sync::Arc, time::Duration};
 
 use omp_core::{Str, sf};
 use omp_tui::{
-	Component, Frame, IntoComponent as _, Key, Size, Ui, UiContext, UiEvent, cell_width,
+	Component, Frame, IntoComponent as _, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent,
+	cell_width,
 	components::Tabs, dom,
 };
 
 use super::{
-	Panel, PanelAction, PanelAnchor, PanelEvent,
-	services::{ExtensionKind, ExtensionRow, ExtensionStatus, Services},
+	Outcome, Panel, PanelAction, PanelAnchor, PanelEvent, PanelNote,
+	services::{ExtensionKind, ExtensionRow, ExtensionStatus, Mutation, ServiceOutcome, Services},
 };
+use crate::host::HostCommand;
 
 /// pi `extFooter()` with `expandKeyHint()` resolved to the Ctrl+O chord.
 const FOOTER: &str =
@@ -32,6 +36,7 @@ const COLLAPSED_ITEMS: usize = 8;
 /// Description lines shown before the inspector folds it (pi
 /// `MCP_INLINE_DESC_LINES`).
 const COLLAPSED_DESC_LINES: usize = 3;
+const TABS_ID: &str = "extension-tabs";
 /// Poll cadence while a server is still connecting.
 const CONNECTING_POLL: Duration = Duration::from_secs(1);
 /// Tab order (pi `kindOrder`) restricted to the kinds this host feeds.
@@ -220,23 +225,36 @@ impl ExtensionsDashboard {
 		self.rebuild();
 	}
 
-	/// pi `#activateSelected`: flip the persisted switch behind the row.
+	/// pi `#activateSelected`: ask the controller to flip the persisted
+	/// switch behind the row; the row itself changes in [`Self::settle`].
 	fn toggle_selected(&mut self) -> PanelEvent {
 		let Some(row) = self.selected() else {
 			return PanelEvent::Consumed;
 		};
-		let (id, enabled) = (row.id.clone(), !row.enabled);
-		if let Err(error) = self.services.set_extension_enabled(&id, enabled) {
-			return PanelEvent::Notice(sf!("{error}"));
-		}
+		PanelEvent::Command(HostCommand::Service(Mutation::SetExtensionEnabled {
+			id:      row.id.clone(),
+			enabled: !row.enabled,
+		}))
+	}
+
+	/// Applies a settled extension toggle: the row flips to the state the
+	/// controller confirmed and the outcome's line becomes the notice.
+	fn settle(&mut self, outcome: &ServiceOutcome) -> PanelEvent {
+		let Mutation::SetExtensionEnabled { id, enabled } = &outcome.mutation else {
+			return PanelEvent::Ignored;
+		};
+		let line = match &outcome.result {
+			Ok(line) => line.clone(),
+			Err(error) => return PanelEvent::Notice(sf!("{error}")),
+		};
 		self.refresh();
 		if let Some(row) = self
 			.rows
 			.iter_mut()
-			.find(|row| row.id == id && row.enabled != enabled)
+			.find(|row| row.id == *id && row.enabled != *enabled)
 		{
-			row.enabled = enabled;
-			row.status = if enabled {
+			row.enabled = *enabled;
+			row.status = if *enabled {
 				ExtensionStatus::Connecting
 			} else {
 				ExtensionStatus::Disabled
@@ -244,7 +262,7 @@ impl ExtensionsDashboard {
 			self.next_wake = Some(Duration::ZERO);
 		}
 		self.rebuild();
-		PanelEvent::Consumed
+		PanelEvent::Notice(line)
 	}
 
 	/// Re-reads the roster; a failed read keeps the rows on screen.
@@ -286,7 +304,7 @@ impl ExtensionsDashboard {
 		let body = dom! {
 			<row gap=1>
 				<col w={left}>
-					<row><text fg=muted>{"Search: "}</text><text>{query}</text><text fg=accent>{"_"}</text></row>
+					<row gap=1><text fg=muted>{"Search:"}</text><row><text>{query}</text><text fg=accent>{"_"}</text></row></row>
 					<text>{" "}</text>
 					if empty {
 						<text fg=muted truncate>{"  No extensions found for this provider."}</text>
@@ -301,9 +319,10 @@ impl ExtensionsDashboard {
 				</scroll>
 			</row>
 		};
-		let mut body = Some(body.into_component());
-		let mut tabs = Tabs::new();
-		for (index, tab) in self.tabs.iter().enumerate() {
+		// The tab set is the chip bar only (pi's `TabBar`); the two-column
+		// body is a sibling so its height never depends on pane selection.
+		let mut tabs = Tabs::new().with_str(Prop::Id, TABS_ID);
+		for tab in &self.tabs {
 			let count = self
 				.rows
 				.iter()
@@ -316,17 +335,14 @@ impl ExtensionsDashboard {
 				Str::new_static(label)
 			};
 			let icon = tab.map_or("", tab_icon);
-			let pane = match (index == self.tab, body.take()) {
-				(true, Some(body)) => body,
-				_ => dom! { <col/> }.into_component(),
-			};
-			tabs = tabs.pane_icon(icon, title, pane);
+			tabs = tabs.pane_icon(icon, title, dom! { <col/> });
 		}
 		let tabs = tabs.select(self.tab as u16);
 		let tree = dom! {
 			<box border=round title="Extension Control Center">
 				<col>
 					{tabs}
+					{body}
 					<hr border=round/>
 					<text fg=muted truncate>{FOOTER}</text>
 				</col>
@@ -556,6 +572,43 @@ impl Panel for ExtensionsDashboard {
 		}
 	}
 
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		let event =
+			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		if event == UiEvent::Cancel {
+			return PanelEvent::Close;
+		}
+		let selected = self
+			.ui
+			.values()
+			.get(TABS_ID)
+			.and_then(serde_json::Value::as_str)
+			.map(str::to_owned);
+		if let Some(selected) = selected {
+			let label = selected
+				.split_once(" (")
+				.map_or(selected.as_str(), |(label, _)| label);
+			if let Some(tab) = self
+				.tabs
+				.iter()
+				.position(|tab| tab.map_or("all", ExtensionKind::label) == label)
+				&& tab != self.tab
+			{
+				self.tab = tab;
+				self.reflow_items(false);
+				self.rebuild();
+			}
+		}
+		PanelEvent::Consumed
+	}
+
+	fn notify(&mut self, note: PanelNote<'_>) -> PanelEvent {
+		match note {
+			PanelNote::Outcome(Outcome::Service(outcome)) => self.settle(outcome),
+			PanelNote::Outcome(_) | PanelNote::Dom(_) => PanelEvent::Ignored,
+		}
+	}
+
 	fn frame(&mut self, viewport: Size) -> &Frame {
 		if viewport.width != self.width || viewport.height != self.height {
 			self.width = viewport.width;
@@ -715,6 +768,7 @@ const fn kind_origin(kind: ExtensionKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+	use omp_tui::{Mods, Mouse, MouseButton};
 	use parking_lot::Mutex;
 
 	use super::*;
@@ -722,27 +776,53 @@ mod tests {
 
 	#[derive(Default)]
 	struct Feed {
-		rows:    Mutex<Vec<ExtensionRow>>,
-		toggles: Mutex<Vec<(Str, bool)>>,
+		rows: Mutex<Vec<ExtensionRow>>,
 	}
 
 	impl Services for Feed {
 		fn extensions(&self) -> ServiceResult<Vec<ExtensionRow>> {
 			Ok(self.rows.lock().clone())
 		}
+	}
 
-		fn set_extension_enabled(&self, id: &str, enabled: bool) -> ServiceResult<()> {
-			self.toggles.lock().push((Str::new(id), enabled));
-			let mut rows = self.rows.lock();
-			if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
-				row.enabled = enabled;
-				row.status = if enabled {
+	/// What the controller would do with the mutation: persist the flip so
+	/// the next `extensions()` read reflects it, then settle the outcome.
+	fn settle(feed: &Feed, mutation: &Mutation) -> Outcome {
+		if let Mutation::SetExtensionEnabled { id, enabled } = mutation {
+			let mut rows = feed.rows.lock();
+			if let Some(row) = rows.iter_mut().find(|row| row.id == *id) {
+				row.enabled = *enabled;
+				row.status = if *enabled {
 					ExtensionStatus::Ready
 				} else {
 					ExtensionStatus::Disabled
 				};
 			}
-			Ok(())
+		}
+		Outcome::Service(ServiceOutcome {
+			mutation: mutation.clone(),
+			result:   Ok(sf!("Extension {}", mutation.verb())),
+		})
+	}
+
+	fn point(text: &str, needle: &str) -> (u16, u16) {
+		text.lines()
+			.enumerate()
+			.find_map(|(row, line)| {
+				let byte = line.find(needle)?;
+				Some((cell_width(&line[..byte]), u16::try_from(row).ok()?))
+			})
+			.expect("text point")
+	}
+
+	fn click(col: u16, row: u16) -> MouseReport {
+		MouseReport {
+			kind: Mouse::Click,
+			col,
+			row,
+			button: MouseButton::Left,
+			mods: Mods::default(),
+			pressed: true,
 		}
 	}
 
@@ -764,12 +844,11 @@ mod tests {
 
 	fn feed() -> Arc<Feed> {
 		Arc::new(Feed {
-			rows:    Mutex::new(vec![
+			rows: Mutex::new(vec![
 				row("mcp:github", ExtensionKind::Mcp, ExtensionStatus::Ready),
 				row("mcp:linear", ExtensionKind::Mcp, ExtensionStatus::Connecting),
 				row("ext:acme.hello", ExtensionKind::Python, ExtensionStatus::Ready),
 			]),
-			toggles: Mutex::new(Vec::new()),
 		})
 	}
 
@@ -782,7 +861,7 @@ mod tests {
 	fn dashboard_renders_tabs_rows_inspector_and_footer() {
 		let feed = feed();
 		let mut panel = open(&feed);
-		let text = omp_tui::frame_text(panel.frame(Size { width: 100, height: 24 }));
+		let text = omp_tui::frame_text(panel.frame(Size { width: 120, height: 24 }));
 		assert!(text.contains("Extension Control Center"), "title missing:\n{text}");
 		assert!(text.contains("all"), "all tab missing:\n{text}");
 		assert!(text.contains("mcp (2)"), "mcp tab missing:\n{text}");
@@ -796,22 +875,34 @@ mod tests {
 		assert!(text.contains("Esc: close"), "footer missing:\n{text}");
 		assert!(text.contains("Select an extension"), "header row selects nothing:\n{text}");
 		assert_eq!(panel.key(Key::Down), PanelEvent::Consumed);
-		let text = omp_tui::frame_text(panel.frame(Size { width: 100, height: 24 }));
+		let text = omp_tui::frame_text(panel.frame(Size { width: 120, height: 24 }));
 		assert!(text.contains("Connected"), "inspector status missing:\n{text}");
 		assert!(text.contains("issue_read"), "inspector tools missing:\n{text}");
 		assert!(text.contains("Origin:"), "origin missing:\n{text}");
 	}
 
 	#[test]
+	fn clicking_a_provider_tab_updates_the_dashboard_projection() {
+		let feed = feed();
+		let mut panel = open(&feed);
+		let size = Size { width: 120, height: 24 };
+		let painted = omp_tui::frame_text(panel.frame(size));
+		let (col, row) = point(&painted, "mcp (2)");
+		assert_eq!(panel.mouse(click(col, row)), PanelEvent::Consumed);
+		assert_eq!(panel.tab(), "mcp");
+		assert_eq!(panel.selected().map(|row| row.id.as_str()), Some("mcp:github"));
+	}
+
+	#[test]
 	fn right_switches_provider_tab_and_flattens_the_list() {
 		let feed = feed();
 		let mut panel = open(&feed);
-		panel.frame(Size { width: 100, height: 24 });
+		panel.frame(Size { width: 120, height: 24 });
 		assert_eq!(panel.tab(), "all");
 		assert_eq!(panel.key(Key::Right), PanelEvent::Consumed);
 		assert_eq!(panel.tab(), "mcp");
 		assert_eq!(panel.selected().map(|row| row.id.as_str()), Some("mcp:github"));
-		let text = omp_tui::frame_text(panel.frame(Size { width: 100, height: 24 }));
+		let text = omp_tui::frame_text(panel.frame(Size { width: 120, height: 24 }));
 		assert!(!text.contains("MCP Servers (2)"), "provider view is flat:\n{text}");
 		assert!(!text.contains("acme.hello"), "other kinds hidden:\n{text}");
 		assert_eq!(panel.key(Key::Right), PanelEvent::Consumed);
@@ -823,48 +914,75 @@ mod tests {
 	}
 
 	#[test]
-	fn space_toggles_the_selected_extension_through_services() {
+	fn space_asks_the_controller_and_flips_the_row_on_the_outcome() {
 		let feed = feed();
 		let mut panel = open(&feed);
-		panel.frame(Size { width: 100, height: 24 });
+		panel.frame(Size { width: 120, height: 24 });
 		panel.key(Key::Right);
-		assert_eq!(panel.key(Key::Space), PanelEvent::Consumed);
-		assert_eq!(feed.toggles.lock().as_slice(), &[(Str::new_static("mcp:github"), false)]);
+		let expected = Mutation::SetExtensionEnabled { id: Str::new_static("mcp:github"), enabled: false };
+		assert_eq!(
+			panel.key(Key::Space),
+			PanelEvent::Command(HostCommand::Service(expected.clone())),
+			"Space travels to the controller as a typed command"
+		);
+		assert_eq!(
+			panel.selected().map(|row| row.enabled),
+			Some(true),
+			"the row waits for the controller's outcome"
+		);
+		let text = omp_tui::frame_text(panel.frame(Size { width: 120, height: 24 }));
+		assert!(!text.contains("inactive"), "row flipped before the outcome:\n{text}");
+		let outcome = settle(&feed, &expected);
+		assert_eq!(
+			panel.notify(PanelNote::Outcome(&outcome)),
+			PanelEvent::Notice(Str::new_static("Extension disabled"))
+		);
 		assert_eq!(panel.selected().map(|row| row.enabled), Some(false));
-		let text = omp_tui::frame_text(panel.frame(Size { width: 100, height: 24 }));
+		let text = omp_tui::frame_text(panel.frame(Size { width: 120, height: 24 }));
 		assert!(text.contains("inactive"), "disabled hint missing:\n{text}");
 		assert!(text.contains("Disabled (manually disabled)"), "badge missing:\n{text}");
-		assert_eq!(panel.key(Key::Enter), PanelEvent::Consumed);
-		assert_eq!(feed.toggles.lock().len(), 2);
+		let expected = Mutation::SetExtensionEnabled { id: Str::new_static("mcp:github"), enabled: true };
+		assert_eq!(panel.key(Key::Enter), PanelEvent::Command(HostCommand::Service(expected.clone())));
+		let outcome = settle(&feed, &expected);
+		assert_eq!(
+			panel.notify(PanelNote::Outcome(&outcome)),
+			PanelEvent::Notice(Str::new_static("Extension enabled"))
+		);
 		assert_eq!(panel.selected().map(|row| row.enabled), Some(true));
 	}
 
 	#[test]
-	fn toggle_failure_surfaces_as_a_notice() {
-		struct Unavailable;
-		impl Services for Unavailable {
-			fn extensions(&self) -> ServiceResult<Vec<ExtensionRow>> {
-				Ok(vec![row("ext:acme.hello", ExtensionKind::Python, ExtensionStatus::Ready)])
-			}
-		}
-		let services: Arc<dyn Services> = Arc::new(Unavailable);
-		let mut panel =
-			ExtensionsDashboard::open(&services, &UiContext::default()).expect("dashboard opens");
-		panel.key(Key::Down);
-		assert!(matches!(panel.key(Key::Space), PanelEvent::Notice(text) if text.contains("unavailable")));
+	fn foreign_outcomes_are_ignored_and_failures_surface_as_notices() {
+		let feed = feed();
+		let mut panel = open(&feed);
+		panel.key(Key::Right);
+		let foreign = Outcome::Service(ServiceOutcome {
+			mutation: Mutation::ReloadExtensions,
+			result:   Ok(Str::new_static("Reloaded")),
+		});
+		assert_eq!(panel.notify(PanelNote::Outcome(&foreign)), PanelEvent::Ignored);
+		let failed = Outcome::Service(ServiceOutcome {
+			mutation: Mutation::SetExtensionEnabled { id: Str::new_static("mcp:github"), enabled: false },
+			result:   Err(crate::overlays::services::ServiceError::Unavailable("extensions")),
+		});
+		assert!(matches!(
+			panel.notify(PanelNote::Outcome(&failed)),
+			PanelEvent::Notice(text) if text.contains("unavailable")
+		));
+		assert_eq!(panel.selected().map(|row| row.enabled), Some(true), "a failed toggle leaves the row");
 	}
 
 	#[test]
 	fn search_filters_and_escape_clears_before_closing() {
 		let feed = feed();
 		let mut panel = open(&feed);
-		panel.frame(Size { width: 100, height: 24 });
+		panel.frame(Size { width: 120, height: 24 });
 		for character in "lin".chars() {
 			assert_eq!(panel.key(Key::Char(character)), PanelEvent::Consumed);
 		}
 		assert_eq!(panel.selected().map(|row| row.id.as_str()), Some("mcp:linear"));
-		let text = omp_tui::frame_text(panel.frame(Size { width: 100, height: 24 }));
-		assert!(text.contains("Search: lin"), "query missing:\n{text}");
+		let text = omp_tui::frame_text(panel.frame(Size { width: 120, height: 24 }));
+		assert!(text.contains("Search: lin_"), "query missing:\n{text}");
 		assert!(!text.contains("github"), "filtered rows hidden:\n{text}");
 		assert_eq!(panel.key(Key::Esc), PanelEvent::Consumed, "first Esc clears the query");
 		assert!(panel.selected().is_none(), "cleared search returns to the grouped view");

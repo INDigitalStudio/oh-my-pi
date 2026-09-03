@@ -6,17 +6,23 @@
 //!
 //! omp agent definitions are `<agent>.cfg` class scripts (ADR 0013), so the
 //! strip carries only the two knobs the class file owns: `enabled`
-//! (`sv_task_disabled_agents`, toggled through
-//! [`Services::set_agent_enabled`]) and the read-only `model` shown from the
-//! cfg's `ai_model` line. pi's per-agent model/prewalk/advisor overrides
+//! (`sv_task_disabled_agents`, flipped by the controller through
+//! `HostCommand::Service` with [`Mutation::SetAgentEnabled`]; the row
+//! changes when the outcome arrives in [`Panel::notify`]) and the read-only
+//! `model` shown from the cfg's `ai_model` line. pi's per-agent
+//! model/prewalk/advisor overrides
 //! and the AI-drafted "New agent" flow have no cfg-side seam here.
 
 use std::sync::Arc;
 
 use omp_core::{Str, sf};
-use omp_tui::{Frame, IntoComponent, Key, Size, Ui, UiContext, dom};
+use omp_tui::{Frame, IntoComponent, Key, MouseReport, Size, Ui, UiContext, UiEvent, dom};
 
-use super::{Panel, PanelAction, PanelAnchor, PanelCx, PanelEvent, Services, services::AgentRow};
+use super::{
+	Outcome, Panel, PanelAction, PanelAnchor, PanelCx, PanelEvent, PanelNote, Services,
+	services::{AgentRow, Mutation, ServiceOutcome},
+};
+use crate::host::HostCommand;
 
 /// pi `agents-hub.ts` sidebar width clamp.
 const SIDEBAR_MIN_WIDTH: u16 = 16;
@@ -207,22 +213,36 @@ impl AgentsHub {
 		self.scroll = 0;
 	}
 
-	fn toggle_selected(&mut self) {
+	/// Asks the controller to flip the selected agent; the row changes in
+	/// [`Self::settle`] once the outcome comes back.
+	fn toggle_selected(&mut self) -> PanelEvent {
 		let Some(&index) = self.rows.get(self.index) else {
-			return;
+			return PanelEvent::Consumed;
 		};
 		let agent = &self.agents[index];
-		let enabled = !agent.enabled;
-		match self.services.set_agent_enabled(agent.name.as_str(), enabled) {
-			Ok(()) => {
-				let agent = &mut self.agents[index];
-				agent.enabled = enabled;
-				let state = if enabled { "enabled" } else { "disabled" };
-				self.notice = Some(sf!("{} {state}", agent.name));
+		PanelEvent::Command(HostCommand::Service(Mutation::SetAgentEnabled {
+			name:    agent.name.clone(),
+			enabled: !agent.enabled,
+		}))
+	}
+
+	/// Applies a settled agent toggle to its row and the status line.
+	fn settle(&mut self, outcome: &ServiceOutcome) -> PanelEvent {
+		let Mutation::SetAgentEnabled { name, enabled } = &outcome.mutation else {
+			return PanelEvent::Ignored;
+		};
+		match &outcome.result {
+			Ok(_) => {
+				if let Some(agent) = self.agents.iter_mut().find(|agent| agent.name == *name) {
+					agent.enabled = *enabled;
+				}
+				self.notice = Some(sf!("{name} {}", outcome.mutation.verb()));
 				self.error = None;
 			},
 			Err(error) => self.error = Some(Str::new(error.to_string())),
 		}
+		self.rebuild();
+		PanelEvent::Consumed
 	}
 
 	fn activate_chip(&mut self) -> PanelEvent {
@@ -234,9 +254,8 @@ impl AgentsHub {
 				if let Some(at) = self.rows.iter().position(|&row| row == index) {
 					self.index = at;
 				}
-				self.toggle_selected();
 				self.rebuild();
-				PanelEvent::Consumed
+				self.toggle_selected()
 			},
 			Chip::Model => {
 				let agent = &self.agents[index];
@@ -582,7 +601,7 @@ impl Panel for AgentsHub {
 					self.strip = Some((index, 0));
 				}
 			},
-			Key::Space if self.query.is_empty() => self.toggle_selected(),
+			Key::Space if self.query.is_empty() => return self.toggle_selected(),
 			Key::Backspace => {
 				if self.query.pop().is_some() {
 					self.build_rows();
@@ -595,6 +614,23 @@ impl Panel for AgentsHub {
 		}
 		self.rebuild();
 		PanelEvent::Consumed
+	}
+
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		match self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods)
+		{
+			UiEvent::Cancel => PanelEvent::Close,
+			_ => PanelEvent::Consumed,
+		}
+	}
+
+	fn notify(&mut self, note: PanelNote<'_>) -> PanelEvent {
+		match note {
+			PanelNote::Outcome(Outcome::Service(outcome)) => self.settle(outcome),
+			PanelNote::Outcome(_) | PanelNote::Dom(_) => PanelEvent::Ignored,
+		}
 	}
 
 	fn paste(&mut self, text: &str) -> PanelEvent {
@@ -626,27 +662,17 @@ mod tests {
 
 	use omp_con::Ctx;
 	use omp_dom::Dom;
-	use parking_lot::Mutex;
 
 	use super::*;
-	use crate::overlays::services::{ServiceError, ServiceResult};
+	use crate::overlays::services::{ServiceError, ServiceOutcome, ServiceResult};
 
 	struct TestServices {
-		rows:    Vec<AgentRow>,
-		toggled: Mutex<Vec<(Str, bool)>>,
+		rows: Vec<AgentRow>,
 	}
 
 	impl Services for TestServices {
 		fn agents(&self) -> ServiceResult<Vec<AgentRow>> {
 			Ok(self.rows.clone())
-		}
-
-		fn set_agent_enabled(&self, name: &str, enabled: bool) -> ServiceResult<()> {
-			if name == "broken" {
-				return Err(ServiceError::Unavailable("agent toggling"));
-			}
-			self.toggled.lock().push((Str::new(name), enabled));
-			Ok(())
 		}
 	}
 
@@ -663,7 +689,7 @@ mod tests {
 	}
 
 	fn hub(rows: Vec<AgentRow>) -> (AgentsHub, Arc<TestServices>) {
-		let services = Arc::new(TestServices { rows, toggled: Mutex::new(Vec::new()) });
+		let services = Arc::new(TestServices { rows });
 		let dyn_services: Arc<dyn Services> = Arc::clone(&services) as Arc<dyn Services>;
 		let dom = Dom::default();
 		let con = Ctx::new();
@@ -703,20 +729,30 @@ mod tests {
 	}
 
 	#[test]
-	fn space_toggles_through_services_and_notice_shows() {
-		let (mut hub, services) = hub(vec![agent("sonic", "project", None, None)]);
-		assert_eq!(hub.key(Key::Space), PanelEvent::Consumed);
-		assert_eq!(services.toggled.lock().as_slice(), [(Str::new_static("sonic"), false)]);
+	fn space_toggles_through_the_controller_and_notice_shows() {
+		let (mut hub, _) = hub(vec![agent("sonic", "project", None, None)]);
+		let mutation = Mutation::SetAgentEnabled {
+			name: Str::new_static("sonic"),
+			enabled: false,
+		};
+		assert_eq!(
+			hub.key(Key::Space),
+			PanelEvent::Command(HostCommand::Service(mutation.clone()))
+		);
+		assert!(hub.agents()[0].enabled, "rows change only after the owner settles");
+		let outcome = Outcome::Service(ServiceOutcome {
+			mutation,
+			result: Ok(Str::new_static("Agent sonic disabled")),
+		});
+		assert_eq!(hub.notify(PanelNote::Outcome(&outcome)), PanelEvent::Consumed);
 		assert!(!hub.agents()[0].enabled);
 		let painted = text(&mut hub);
 		assert!(painted.contains("sonic disabled"), "{painted}");
-		assert_eq!(hub.key(Key::Space), PanelEvent::Consumed);
-		assert!(hub.agents()[0].enabled);
 	}
 
 	#[test]
 	fn strip_enter_toggles_and_model_chip_notices() {
-		let (mut hub, services) =
+		let (mut hub, _) =
 			hub(vec![agent("sonic", "project", Some("@smol"), Some("/p/.omp/sonic.cfg"))]);
 		assert_eq!(hub.key(Key::Enter), PanelEvent::Consumed);
 		let painted = text(&mut hub);
@@ -731,8 +767,13 @@ mod tests {
 		);
 		assert!(hub.strip.is_none());
 		assert_eq!(hub.key(Key::Enter), PanelEvent::Consumed);
-		assert_eq!(hub.key(Key::Enter), PanelEvent::Consumed);
-		assert_eq!(services.toggled.lock().as_slice(), [(Str::new_static("sonic"), false)]);
+		assert!(matches!(
+			hub.key(Key::Enter),
+			PanelEvent::Command(HostCommand::Service(Mutation::SetAgentEnabled {
+				name,
+				enabled: false,
+			})) if name == "sonic"
+		));
 		assert_eq!(hub.key(Key::Enter), PanelEvent::Consumed);
 		assert_eq!(hub.key(Key::Esc), PanelEvent::Consumed);
 		assert!(hub.strip.is_none());
@@ -773,7 +814,19 @@ mod tests {
 	#[test]
 	fn toggle_failure_shows_the_error_row() {
 		let (mut hub, _) = hub(vec![agent("broken", "project", None, None)]);
-		assert_eq!(hub.key(Key::Space), PanelEvent::Consumed);
+		let mutation = Mutation::SetAgentEnabled {
+			name: Str::new_static("broken"),
+			enabled: false,
+		};
+		assert_eq!(
+			hub.key(Key::Space),
+			PanelEvent::Command(HostCommand::Service(mutation.clone()))
+		);
+		let outcome = Outcome::Service(ServiceOutcome {
+			mutation,
+			result: Err(ServiceError::Unavailable("agent toggling")),
+		});
+		assert_eq!(hub.notify(PanelNote::Outcome(&outcome)), PanelEvent::Consumed);
 		assert!(hub.agents()[0].enabled);
 		let painted = text(&mut hub);
 		assert!(painted.contains("unavailable"), "{painted}");

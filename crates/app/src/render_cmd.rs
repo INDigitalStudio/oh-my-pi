@@ -5,12 +5,18 @@ use std::{
 	env, fs,
 	io::{self, Write as _},
 	path::{Path, PathBuf},
+	sync::Arc,
 	time::{Duration, Instant},
 };
 
 use clap::Args;
 use miette::{IntoDiagnostic as _, miette};
+use omp_chat::{
+	HostMailbox, HostOptions, ModelBadge, NativeHost, overlays::NoServices, welcome::WelcomeFacts,
+};
 use omp_core::Str;
+use omp_dom::{KnownTag, PropId, Tag, Value};
+use omp_tui::{Frame, Size, UiContext, frame_ansi, frame_text, slots::ResizePolicy};
 
 /// Headless transcript replay and finalized-history rendering options.
 #[derive(Clone, Debug, Args)]
@@ -64,8 +70,9 @@ pub fn export_session(
 ) -> miette::Result<ExportedSession> {
 	let selector = selector.to_string_lossy();
 	let source = resolve_target(Some(&selector), data_dir, cwd)?;
-	let session = omp_session::Session::open(&source, omp_session::ComponentRegistry::standard())
-		.into_diagnostic()?;
+	let mut session =
+		omp_session::Session::open(&source, omp_session::ComponentRegistry::standard())
+			.into_diagnostic()?;
 	let stem = source
 		.file_stem()
 		.and_then(|value| value.to_str())
@@ -75,7 +82,8 @@ pub fn export_session(
 	if source != journal {
 		fs::copy(&source, &journal).into_diagnostic()?;
 	}
-	fs::write(&transcript, crate::print_mode::transcript_text(session.dom())).into_diagnostic()?;
+	fs::write(&transcript, production_transcript(&mut session, 100, true, cwd)?)
+		.into_diagnostic()?;
 	Ok(ExportedSession { journal, transcript })
 }
 
@@ -110,24 +118,29 @@ fn render_session(args: &RenderArgs, data_dir: &Path, cwd: &Path) -> miette::Res
 	let open_start = Instant::now();
 	let path = resolve_target(args.session.as_deref(), data_dir, cwd)?;
 	let source_bytes = fs::metadata(&path).into_diagnostic()?.len();
-	let session = omp_session::Session::open(&path, omp_session::ComponentRegistry::standard())
-		.into_diagnostic()?;
 	let open = open_start.elapsed();
 
-	let project_start = Instant::now();
-	let transcript = crate::print_mode::transcript_text(session.dom());
-	let project = project_start.elapsed();
-	let rows = u16::try_from(transcript.lines().count()).unwrap_or(u16::MAX);
-	let items = omp_session::project_thread(session.dom()).len();
-
 	let replay_start = Instant::now();
+	let mut session =
+		omp_session::Session::open(&path, omp_session::ComponentRegistry::standard())
+			.into_diagnostic()?;
 	let replay = replay_start.elapsed();
+	let items = omp_session::project_thread(session.dom()).len();
+	let width = args.width.unwrap_or(100);
+
+	let project_start = Instant::now();
+	let host = production_host(&mut session, width, cwd)?;
+	let project = project_start.elapsed();
+
 	let batch_start = Instant::now();
+	let transcript = rendered_transcript(&host, args.plain);
 	let batch_render = batch_start.elapsed();
+	let rows = u16::try_from(transcript.lines().count()).unwrap_or(u16::MAX);
+
 	let mut repaint_times = Vec::with_capacity(args.repaint.unwrap_or(0) as usize);
 	for _ in 0..args.repaint.unwrap_or(0) {
 		let start = Instant::now();
-		let _ = crate::print_mode::transcript_text(session.dom());
+		let _ = production_transcript(&mut session, width, args.plain, cwd)?;
 		repaint_times.push(start.elapsed());
 	}
 
@@ -143,6 +156,80 @@ fn render_session(args: &RenderArgs, data_dir: &Path, cwd: &Path) -> miette::Res
 		batch_render,
 		repaint_times,
 	})
+}
+
+fn production_transcript(
+	session: &mut omp_session::Session,
+	width: u16,
+	plain: bool,
+	project: &Path,
+) -> miette::Result<String> {
+	let host = production_host(session, width, project)?;
+	Ok(rendered_transcript(&host, plain))
+}
+
+fn production_host(
+	session: &mut omp_session::Session,
+	width: u16,
+	project: &Path,
+) -> miette::Result<NativeHost> {
+	let (snapshot, dom_events) = session.subscribe();
+	let (_, kernel_events) = flume::unbounded();
+	let (commands, _) = flume::unbounded();
+	let (up, _) = flume::unbounded();
+	let con = Arc::new(HostMailbox::new().attach(omp_con::Ctx::builder()).build());
+	con.run("cl_startup_quiet 1").into_diagnostic()?;
+	let model = session
+		.dom()
+		.children(session.dom().body())
+		.iter()
+		.flat_map(|turn| session.dom().children(*turn))
+		.find_map(|handle| {
+			let node = session.dom().get(*handle)?;
+			(node.tag == Tag::Known(KnownTag::Assistant))
+				.then(|| node.prop(&PropId::Model.into()).and_then(Value::as_str))
+				.flatten()
+		})
+		.unwrap_or("session");
+	Ok(NativeHost::new(
+		HostOptions {
+			snapshot,
+			dom_events,
+			kernel_events,
+			commands,
+			up,
+			con,
+			models: Vec::new(),
+			cycle: Vec::new(),
+			resize_policy: ResizePolicy::Rebuild,
+			model: ModelBadge::from_identifier(model),
+			project: project.to_path_buf(),
+			welcome: WelcomeFacts::default(),
+			ui: UiContext::default(),
+			services: Arc::new(NoServices),
+			speech: None,
+			resuming: true,
+			initial_panel: None,
+		},
+		Size::new(width, 32),
+	))
+}
+
+fn rendered_transcript(host: &NativeHost, plain: bool) -> String {
+	let status_rows = host.status_frame().map_or(0, |frame| frame.size().height);
+	let transcript_rows = host
+		.frame()
+		.size()
+		.height
+		.saturating_sub(status_rows)
+		.saturating_sub(host.editor_rows());
+	let mut transcript = Frame::new(Size::new(host.frame().size().width, transcript_rows));
+	transcript.blit(host.frame(), 0, transcript_rows, 0, 0);
+	if plain {
+		frame_text(&transcript)
+	} else {
+		frame_ansi(&transcript)
+	}
 }
 
 fn resolve_target(selector: Option<&str>, data_dir: &Path, cwd: &Path) -> miette::Result<PathBuf> {
@@ -233,6 +320,7 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
 	use omp_dom::{KnownTag, PropId, Tag};
+	use serde_json::value::RawValue;
 	use tempfile::tempdir;
 
 	use super::*;
@@ -275,7 +363,32 @@ mod tests {
 			.stream_append(stream, "hello back")
 			.expect("append text");
 		session.stream_close(stream).expect("close text");
-		session.assistant_end("stop").expect("finish assistant");
+		session.assistant_end("tool_calls").expect("finish assistant");
+		let call = session
+			.call(
+				"custom_tool",
+				1,
+				"call-render",
+				None,
+				Some(
+					RawValue::from_string(
+						r#"{"i":"Inspecting fixture","path":"a/very/long/fixture/path.txt"}"#
+							.to_owned(),
+					)
+					.expect("args"),
+				),
+				None,
+			)
+			.expect("tool call");
+		session
+			.settle(
+				call,
+				RawValue::from_string(
+					r#"{"content":[{"type":"text","text":"tool result body"}]}"#.to_owned(),
+				)
+				.expect("outcome"),
+			)
+			.expect("tool result");
 		drop(session);
 		let args = RenderArgs {
 			session: Some(Str::from(path.to_string_lossy().as_ref())),
@@ -288,7 +401,29 @@ mod tests {
 		let first = render_session(&args, scratch.path(), &root).expect("first replay");
 		let second = render_session(&args, scratch.path(), &root).expect("second replay");
 		assert_eq!(first.transcript, second.transcript);
-		assert_eq!(first.transcript, "hello back\n");
+		assert!(first.transcript.contains("hello fixture"), "user block missing");
+		assert!(first.transcript.contains("hello back"), "assistant block missing");
+		assert!(first.transcript.contains("custom_tool"), "tool card missing");
+		assert!(first.transcript.contains("tool result body"), "tool result missing");
+		assert!(!first.transcript.contains('\u{1b}'), "--plain leaked ANSI");
+
+		let mut narrow = args.clone();
+		narrow.width = Some(24);
+		let narrow = render_session(&narrow, scratch.path(), &root).expect("narrow replay");
+		assert_ne!(first.transcript, narrow.transcript, "--width did not change layout");
+		assert!(
+			narrow
+				.transcript
+				.lines()
+				.all(|line| omp_tui::cell_width(line) <= 24),
+			"rendered line exceeded requested width",
+		);
+
+		let mut styled = args.clone();
+		styled.plain = false;
+		let styled = render_session(&styled, scratch.path(), &root).expect("styled replay");
+		assert!(styled.transcript.contains('\u{1b}'), "styled render omitted ANSI");
+
 		let timing = timing_report(&first);
 		assert!(timing.contains("open") && timing.contains("project") && timing.contains("replay"));
 		assert!(timing.contains("batch") && timing.contains("repaint"));

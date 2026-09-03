@@ -140,13 +140,16 @@ impl BenchEnvironment {
 		}
 
 		let boot_at = Instant::now();
+		let con = Arc::new(omp_con::Ctx::new());
+		let convars = Arc::new(omp_envd::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 		let server = Arc::new(
 			EnvServer::open_local(
 				site.path(),
 				state.path(),
 				Registry::new(),
 				config,
-				&omp_con::Ctx::new(),
+				&con,
+				convars,
 				RegistryBridges::default(),
 			)
 			.await

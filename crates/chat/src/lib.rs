@@ -33,6 +33,8 @@ pub mod notify;
 pub mod overlays;
 /// Pure session-DOM transcript projection.
 pub mod project;
+/// Presentation and interaction pi setting convars.
+pub mod settings;
 /// Composer status band.
 pub mod status_band;
 /// DOM-derived status values.
@@ -47,7 +49,8 @@ pub mod welcome;
 pub use actions::{HostAction, HostMailbox};
 pub use chrome::ModelBadge;
 pub use host::{
-	CtrlCAction, Host, HostCommand, HostError, HostOptions, LocalFacts, NativeEffect, NativeHost,
+	CtrlCAction, Host, HostCommand, HostError, HostOptions, InitialPanel, LocalFacts, NativeEffect,
+	NativeHost,
 	UpEvent, ctrl_c_action, render_surface,
 };
 pub use overlays::{ModelRow, PickerEvent};

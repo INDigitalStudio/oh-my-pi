@@ -17,7 +17,7 @@
 
 use omp_core::{Str, StrMut, sf};
 use omp_dom::{Dom, KnownTag, PropId, PropKey, Tag, Value};
-use omp_tui::{Frame, Key, Prop, Size, Ui, UiContext, UiEvent, dom};
+use omp_tui::{Frame, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent, dom};
 
 use super::{Panel, PanelAction, PanelAnchor, PanelCx, PanelEvent};
 
@@ -270,6 +270,12 @@ impl Panel for RewindPanel {
 		self.route(event)
 	}
 
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		let event =
+			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		self.route(event)
+	}
+
 	fn frame(&mut self, viewport: Size) -> &Frame {
 		self.height = viewport.height;
 		let (list, preview) = self.split();
@@ -354,6 +360,7 @@ mod tests {
 
 	use omp_con::Ctx;
 	use omp_session::{ComponentRegistry, Session};
+	use omp_tui::{Mods, Mouse, MouseButton};
 
 	use super::super::{NoServices, Services};
 	use super::*;
@@ -381,6 +388,20 @@ mod tests {
 			services: &services,
 		};
 		RewindPanel::open(&cx)
+	}
+
+	fn mouse(kind: Mouse, col: u16, row: u16, button: MouseButton) -> MouseReport {
+		MouseReport { kind, col, row, button, mods: Mods::default(), pressed: true }
+	}
+
+	fn point(text: &str, needle: &str) -> (u16, u16) {
+		text.lines()
+			.enumerate()
+			.find_map(|(row, line)| {
+				let byte = line.find(needle)?;
+				Some((omp_tui::cell_width(&line[..byte]), u16::try_from(row).unwrap()))
+			})
+			.expect("text point")
 	}
 
 	/// `cause` of the `<turn>` at `index` under the body.
@@ -438,6 +459,28 @@ mod tests {
 			panel.key(Key::Enter),
 			PanelEvent::Finish(sf!("rewind {cause} \"second\\nline two\""))
 		);
+	}
+
+	#[test]
+	fn click_commits_a_turn_and_wheel_moves_the_highlight() {
+		let session = session(&["first", "second", "third"]);
+		let mut panel = open(&session).expect("panel");
+		let text = omp_tui::frame_text(panel.frame(Size { width: 100, height: 30 }));
+		let (col, row) = point(&text, "#1  first");
+		let cause = turn_cause(session.dom(), 0);
+		assert_eq!(
+			panel.mouse(mouse(Mouse::Click, col, row, MouseButton::Left)),
+			PanelEvent::Finish(sf!("rewind {cause} \"first\""))
+		);
+
+		let mut panel = open(&session).expect("panel");
+		let text = omp_tui::frame_text(panel.frame(Size { width: 100, height: 30 }));
+		let (col, row) = point(&text, "#3  third");
+		assert_eq!(
+			panel.mouse(mouse(Mouse::WheelUp, col, row, MouseButton::WheelUp)),
+			PanelEvent::Consumed
+		);
+		assert_eq!(panel.selected(), 1, "wheel changes the retained select highlight");
 	}
 
 	#[test]

@@ -12,7 +12,7 @@ pub struct ReportIssueCard;
 
 impl Card for ReportIssueCard {
 	fn tool(&self) -> &'static str {
-		"report_tool_issue"
+		"report_issue"
 	}
 
 	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {

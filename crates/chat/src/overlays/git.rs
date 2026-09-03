@@ -1,11 +1,10 @@
 //! Fullscreen Git workbench (pi `cli/git-tui`).
 //!
 //! A split diff viewer with staging, a tree/flat sidebar, and a commit
-//! composer, driven directly by [`omp_vcs`] from the actor thread. Every
-//! repository read is a local filesystem or object-database call, so no
-//! `Services` seam is involved; the panel re-reads status only when the
-//! index, `HEAD`, or the viewed file changed on disk (checked every
-//! [`REFRESH_MS`]).
+//! composer. Repository reads use [`omp_vcs`] from the actor thread, while
+//! every mutation is emitted as a typed [`HostCommand::Git`] for the
+//! controller (ADR 0005). The panel re-reads status only after an outcome or
+//! when the index, `HEAD`, or viewed file changes on disk.
 //!
 //! Deviations from pi, by ADR 0032 (the renderer owns presentation policy)
 //! and the no-network actor rule: author avatars (pi fetches GitHub
@@ -24,16 +23,19 @@ use omp_core::{IntoStr, Str, sf};
 use omp_dom::Dom;
 use omp_tui::{
 	Color, DiffActionKind, DiffBuildOptions, DiffDocument, DiffPane, DiffPaneState, DiffPatchTarget,
-	DiffTarget, DiffWhitespaceMode, Frame, Icon, Key, Prop, Size, Ui, UiContext, UiEvent, ViewMode,
+	DiffTarget, DiffWhitespaceMode, Frame, Icon, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent,
+	ViewMode,
 	cell_width,
 	components::{Col, EditInput, EditorPane, Tree, TreeAnnotation, TreeNode},
 	dom,
 };
-use omp_vcs::{
-	ApplyOptions, CommitOptions, DiffOptions, StatusOptions, UntrackedMode, git::GitRepo,
-};
+use omp_vcs::{DiffOptions, StatusOptions, UntrackedMode, git::GitRepo};
 
-use super::{Panel, PanelAnchor, PanelCx, PanelEvent};
+use super::{
+	Outcome, Panel, PanelAnchor, PanelCx, PanelEvent, PanelNote,
+	services::ServiceResult,
+};
+use crate::host::HostCommand;
 
 /// pi `REFRESH_MS`: how often the on-disk fingerprint is re-checked.
 pub const REFRESH_MS: Duration = Duration::from_millis(2_000);
@@ -66,6 +68,44 @@ const DESCRIPTION_PANE_ID: &str = "git-commit-description-pane";
 const AMEND_ID: &str = "git-amend";
 const COMMIT_ID: &str = "git-commit";
 const VIEW_STYLE_ID: &str = "git-sidebar-view";
+
+/// Repository mutation requested by the workbench through the controller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GitOp {
+	/// Add paths to the index; `None` stages every change.
+	Stage(Option<Vec<Str>>),
+	/// Remove paths from the index; `None` unstages every change.
+	Unstage(Option<Vec<Str>>),
+	/// Apply a unified patch to the index or worktree.
+	Apply {
+		/// Unified patch text.
+		patch:  Str,
+		/// Semantic mutation; the controller derives apply options from it.
+		action: GitPatchAction,
+		/// Whether the patch covers selected lines or a complete hunk.
+		scope:  GitPatchScope,
+	},
+	/// Restore worktree paths from the index.
+	Discard(Vec<Str>),
+	/// Create or amend a commit.
+	Commit {
+		/// Complete commit message.
+		message:   Str,
+		/// Amend `HEAD`.
+		amend:     bool,
+		/// Stage every change before committing.
+		stage_all: bool,
+	},
+}
+
+/// Settled controller response for one [`GitOp`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitOutcome {
+	/// Request that settled.
+	pub op:     GitOp,
+	/// Human-readable success line or typed service failure.
+	pub result: ServiceResult<Str>,
+}
 
 /// Kind of change reported for one Git path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
@@ -172,12 +212,24 @@ struct GitFileContents {
 	too_large: bool,
 }
 
-/// Patch mutation requested from a diff selection.
+/// Semantic patch mutation requested from a diff selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GitPatchOp {
+pub enum GitPatchAction {
+	/// Apply worktree changes to the index.
 	Stage,
+	/// Reverse index changes out of the index.
 	Unstage,
+	/// Reverse worktree changes out of the worktree.
 	Discard,
+}
+
+/// Granularity of a selected patch, used for the controller's outcome line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitPatchScope {
+	/// Explicit line selection.
+	Selection,
+	/// Complete diff hunk.
+	Hunk,
 }
 
 /// Errors surfaced as sticky status messages.
@@ -384,77 +436,25 @@ impl GitModel {
 		}
 	}
 
-	fn stage(&self, paths: Option<&[Str]>) -> GitResult<Str> {
-		let Some(paths) = paths else {
-			self.repo.stage_files(&[])?;
-			return Ok(Str::new_static("Staged all changes"));
-		};
-		let owned = paths.iter().map(ToString::to_string).collect::<Vec<_>>();
-		self.repo.stage_files(&owned)?;
-		Ok(if let [path] = paths {
-			sf!("Staged {path}")
-		} else {
-			sf!("Staged {} files", paths.len())
-		})
-	}
-
-	fn unstage(&self, paths: Option<&[Str]>) -> GitResult<Str> {
-		let Some(paths) = paths else {
-			self.repo.unstage(&[])?;
-			return Ok(Str::new_static("Unstaged all changes"));
-		};
-		let owned = paths.iter().map(ToString::to_string).collect::<Vec<_>>();
-		self.repo.unstage(&owned)?;
-		Ok(if let [path] = paths {
-			sf!("Unstaged {path}")
-		} else {
-			sf!("Unstaged {} files", paths.len())
-		})
-	}
-
-	/// Applies one inclusive old/new line selection of `path`'s diff.
-	fn apply_lines(
+	/// Builds the unified patch for one inclusive old/new line selection.
+	/// Applying it is controller authority and happens only after the caller
+	/// emits [`GitOp::Apply`].
+	fn selected_patch(
 		&self,
-		op: GitPatchOp,
+		action: GitPatchAction,
 		path: &str,
 		old: (u32, u32),
 		new: (u32, u32),
-		hunk: bool,
 	) -> GitResult<Str> {
 		let raw = self.repo.diff_text(&DiffOptions {
-			cached: op == GitPatchOp::Unstage,
+			cached: action == GitPatchAction::Unstage,
 			files: vec![path.to_owned()],
 			..DiffOptions::default()
 		})?;
-		let reverse = op != GitPatchOp::Stage;
-		let selected = select_lines(&raw, old, new, reverse).ok_or(GitError::EmptySelection)?;
-		self.repo.apply_patch(&selected, &ApplyOptions {
-			cached: op != GitPatchOp::Discard,
-			index_path: None,
-			reverse,
-			three_way: false,
-		})?;
-		let scope = if hunk { "hunk" } else { "selection" };
-		Ok(match op {
-			GitPatchOp::Stage => sf!("Staged {scope}"),
-			GitPatchOp::Unstage => sf!("Unstaged {scope}"),
-			GitPatchOp::Discard => sf!("Discarded {scope}"),
-		})
-	}
-
-	fn commit_create(&self, message: &str, amend: bool, stage_all: bool) -> GitResult<Str> {
-		if stage_all {
-			self.repo.stage_files(&[])?;
-		}
-		let sha = self
-			.repo
-			.commit_create(message, &CommitOptions { amend, ..CommitOptions::default() })?;
-		let short = &sha[..sha.len().min(7)];
-		Ok(if amend {
-			sf!("Amended {short}")
-		} else {
-			sf!("Committed {short}")
-		})
+		let reverse = action != GitPatchAction::Stage;
+		select_lines(&raw, old, new, reverse)
+			.map(Str::new)
+			.ok_or(GitError::EmptySelection)
 	}
 
 	/// Filesystem facts whose change means the snapshot may be stale.
@@ -1186,30 +1186,62 @@ impl GitWorkbench {
 		if paths.is_empty() {
 			return PanelEvent::Consumed;
 		}
-		let outcome = match area {
-			GitArea::Unstaged => self.model.stage(Some(&paths)),
-			GitArea::Staged => self.model.unstage(Some(&paths)),
+		let op = match area {
+			GitArea::Unstaged => GitOp::Stage(Some(paths)),
+			GitArea::Staged => GitOp::Unstage(Some(paths)),
 			GitArea::Commit => return PanelEvent::Consumed,
 		};
-		self.settle(outcome)
+		PanelEvent::Command(HostCommand::Git(op))
 	}
 
 	fn stage_all(&mut self) -> PanelEvent {
-		let outcome = self.model.stage(None);
-		self.settle(outcome)
+		PanelEvent::Command(HostCommand::Git(GitOp::Stage(None)))
 	}
 
 	fn unstage_all(&mut self) -> PanelEvent {
-		let outcome = self.model.unstage(None);
-		self.settle(outcome)
+		PanelEvent::Command(HostCommand::Git(GitOp::Unstage(None)))
 	}
 
-	fn settle(&mut self, outcome: GitResult<Str>) -> PanelEvent {
-		match outcome {
-			Ok(message) => self.done(message),
-			Err(error) => self.fail(error),
+	fn settle(&mut self, outcome: &GitOutcome) -> PanelEvent {
+		match &outcome.result {
+			Ok(message) => {
+				self.done(message.clone());
+				if matches!(&outcome.op, GitOp::Commit { .. }) {
+					self.amend = false;
+					self.rebuild_with_form("", "");
+				}
+				PanelEvent::Notice(message.clone())
+			},
+			Err(error) => {
+				let message = sf!("{error}");
+				self.set_status(message.clone(), self.ctx.theme.err, true);
+				self.pending_discard = None;
+				self.rebuild();
+				PanelEvent::Notice(message)
+			},
 		}
-		PanelEvent::Consumed
+	}
+
+	fn request_patch(
+		&mut self,
+		action: GitPatchAction,
+		scope: GitPatchScope,
+		path: &str,
+		old: (u32, u32),
+		new: (u32, u32),
+		clear_selection: bool,
+	) -> PanelEvent {
+		let patch = match self.model.selected_patch(action, path, old, new) {
+			Ok(patch) => patch,
+			Err(error) => {
+				self.fail(error);
+				return PanelEvent::Consumed;
+			},
+		};
+		if clear_selection {
+			let _ = self.clear_diff_selection();
+		}
+		PanelEvent::Command(HostCommand::Git(GitOp::Apply { patch, action, scope }))
 	}
 
 	fn toggle_amend(&mut self) -> PanelEvent {
@@ -1251,32 +1283,11 @@ impl GitWorkbench {
 			sf!("{summary}\n\n{body}")
 		};
 		let stage_all = self.snapshot.staged.is_empty();
-		match self.model.commit_create(message.as_str(), self.amend, stage_all) {
-			Ok(message) => {
-				self.amend = false;
-				self.set_status(message, self.ctx.theme.ok, false);
-				self.pending_discard = None;
-				match self.model.snapshot() {
-					Ok(snapshot) => {
-						self.snapshot = snapshot;
-						self.sidebar_rows = sidebar_rows(&self.snapshot, self.tree, &self.ctx);
-						self.sidebar_selected = self.first_file_target().unwrap_or(0);
-						self.selected = first_file(&self.snapshot).map(|file| (file.area, file.path.clone()));
-						self.load_selected();
-						self.fingerprint = self
-							.model
-							.fingerprint(self.selected.as_ref().map(|(_, path)| path.as_str()));
-					},
-					Err(error) => {
-						self.fail(error);
-						return PanelEvent::Consumed;
-					},
-				}
-				self.rebuild_with_form("", "");
-			},
-			Err(error) => self.fail(error),
-		}
-		PanelEvent::Consumed
+		PanelEvent::Command(HostCommand::Git(GitOp::Commit {
+			message,
+			amend: self.amend,
+			stage_all,
+		}))
 	}
 
 	fn request_diff_action(&mut self, action: DiffActionKind) -> PanelEvent {
@@ -1400,22 +1411,27 @@ impl GitWorkbench {
 		if !valid || (action == DiffActionKind::Discard && target == DiffTarget::File) {
 			return PanelEvent::Consumed;
 		}
-		let op = match action {
-			DiffActionKind::Stage => GitPatchOp::Stage,
-			DiffActionKind::Unstage => GitPatchOp::Unstage,
-			DiffActionKind::Discard => GitPatchOp::Discard,
+		let action = match action {
+			DiffActionKind::Stage => GitPatchAction::Stage,
+			DiffActionKind::Unstage => GitPatchAction::Unstage,
+			DiffActionKind::Discard => GitPatchAction::Discard,
 		};
 		match target {
-			DiffTarget::File => match op {
-				GitPatchOp::Stage | GitPatchOp::Unstage => self.stage_paths(area, vec![path]),
-				GitPatchOp::Discard => PanelEvent::Consumed,
+			DiffTarget::File => match action {
+				GitPatchAction::Stage | GitPatchAction::Unstage => {
+					self.stage_paths(area, vec![path])
+				},
+				GitPatchAction::Discard => PanelEvent::Consumed,
 			},
 			DiffTarget::Lines { old, new } => {
-				let outcome = self.model.apply_lines(op, path.as_str(), old, new, false);
-				if outcome.is_ok() {
-					let _ = self.clear_diff_selection();
-				}
-				self.settle(outcome)
+				self.request_patch(
+					action,
+					GitPatchScope::Selection,
+					path.as_str(),
+					old,
+					new,
+					true,
+				)
 			},
 			DiffTarget::Hunk(index) => {
 				let ranges = self
@@ -1431,8 +1447,14 @@ impl GitWorkbench {
 				let Some((old, new)) = ranges else {
 					return PanelEvent::Consumed;
 				};
-				let outcome = self.model.apply_lines(op, path.as_str(), old, new, true);
-				self.settle(outcome)
+				self.request_patch(
+					action,
+					GitPatchScope::Hunk,
+					path.as_str(),
+					old,
+					new,
+					false,
+				)
 			},
 		}
 	}
@@ -2203,6 +2225,20 @@ impl Panel for GitWorkbench {
 		PanelEvent::Consumed
 	}
 
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		let event =
+			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		self.sync_control_values();
+		self.route_ui(event)
+	}
+
+	fn notify(&mut self, note: PanelNote<'_>) -> PanelEvent {
+		match note {
+			PanelNote::Outcome(Outcome::Git(outcome)) => self.settle(outcome),
+			PanelNote::Outcome(_) | PanelNote::Dom(_) => PanelEvent::Ignored,
+		}
+	}
+
 	fn frame(&mut self, viewport: Size) -> &Frame {
 		let width = viewport.width.max(40);
 		let height = viewport.height.max(10);
@@ -2710,10 +2746,31 @@ pub(crate) fn project_root(dom: &Dom) -> PathBuf {
 mod tests {
 	use std::process::Command;
 
-	use omp_tui::frame_text;
-	use omp_vcs::{StatusOptions, UntrackedMode};
+	use omp_tui::{Mods, Mouse, MouseButton, frame_text};
+	use omp_vcs::{ApplyOptions, CommitOptions, StatusOptions, UntrackedMode};
 
 	use super::*;
+
+	fn point(text: &str, needle: &str) -> (u16, u16) {
+		text.lines()
+			.enumerate()
+			.find_map(|(row, line)| {
+				let byte = line.find(needle)?;
+				Some((cell_width(&line[..byte]), u16::try_from(row).ok()?))
+			})
+			.expect("text point")
+	}
+
+	fn click(col: u16, row: u16) -> MouseReport {
+		MouseReport {
+			kind: Mouse::Click,
+			col,
+			row,
+			button: MouseButton::Left,
+			mods: Mods::default(),
+			pressed: true,
+		}
+	}
 
 	fn git(root: &Path, args: &[&str]) {
 		let output = Command::new("git")
@@ -2760,6 +2817,104 @@ mod tests {
 			.expect("status")
 	}
 
+	fn controller_outcome(root: &Path, op: GitOp) -> GitOutcome {
+		let repo = GitRepo::require(root).expect("repo");
+		let result = match &op {
+			GitOp::Stage(paths) => {
+				let paths = paths
+					.as_ref()
+					.map(|paths| paths.iter().map(ToString::to_string).collect::<Vec<_>>())
+					.unwrap_or_default();
+				repo.stage_files(&paths)
+					.map(|()| match paths.as_slice() {
+						[] => Str::new_static("Staged all changes"),
+						[path] => sf!("Staged {path}"),
+						paths => sf!("Staged {} files", paths.len()),
+					})
+					.map_err(super::super::services::ServiceError::failed)
+			},
+			GitOp::Unstage(paths) => {
+				let paths = paths
+					.as_ref()
+					.map(|paths| paths.iter().map(ToString::to_string).collect::<Vec<_>>())
+					.unwrap_or_default();
+				repo.unstage(&paths)
+					.map(|()| match paths.as_slice() {
+						[] => Str::new_static("Unstaged all changes"),
+						[path] => sf!("Unstaged {path}"),
+						paths => sf!("Unstaged {} files", paths.len()),
+					})
+					.map_err(super::super::services::ServiceError::failed)
+			},
+			GitOp::Apply { patch, action, scope } => {
+				let options = ApplyOptions {
+					cached: *action != GitPatchAction::Discard,
+					index_path: None,
+					reverse: *action != GitPatchAction::Stage,
+					three_way: false,
+				};
+				repo.apply_patch(patch.as_str(), &options)
+					.map(|()| {
+						let verb = match action {
+							GitPatchAction::Stage => "Staged",
+							GitPatchAction::Unstage => "Unstaged",
+							GitPatchAction::Discard => "Discarded",
+						};
+						let scope = match scope {
+							GitPatchScope::Selection => "selection",
+							GitPatchScope::Hunk => "hunk",
+						};
+						sf!("{verb} {scope}")
+					})
+					.map_err(super::super::services::ServiceError::failed)
+			},
+			GitOp::Discard(_) => unreachable!("the panel represents discards as selected patches"),
+			GitOp::Commit { message, amend, stage_all } => {
+				let staged = if *stage_all {
+					repo.stage_files(&[])
+				} else {
+					Ok(())
+				};
+				staged
+					.and_then(|()| {
+						repo.commit_create(message.as_str(), &CommitOptions {
+							amend: *amend,
+							..CommitOptions::default()
+						})
+					})
+					.map(|sha| {
+						let short = &sha[..sha.len().min(7)];
+						if *amend { sf!("Amended {short}") } else { sf!("Committed {short}") }
+					})
+					.map_err(super::super::services::ServiceError::failed)
+			},
+		};
+		GitOutcome { op, result }
+	}
+
+	fn settle_command(panel: &mut GitWorkbench, root: &Path, event: PanelEvent) -> GitOp {
+		let op = match event {
+			PanelEvent::Command(HostCommand::Git(op)) => op,
+			other => panic!("expected typed Git command, got {other:?}"),
+		};
+		let outcome = controller_outcome(root, op.clone());
+		assert!(matches!(
+			panel.notify(PanelNote::Outcome(&Outcome::Git(outcome))),
+			PanelEvent::Notice(_)
+		));
+		op
+	}
+
+	#[test]
+	fn close_button_mouse_hit_routes_through_the_workbench_reducer() {
+		let dir = fixture();
+		let mut panel = open(dir.path());
+		let close = panel.ctx.charset.icon(Icon::Close);
+		let painted = frame_text(panel.frame(Size { width: 120, height: 30 }));
+		let (col, row) = point(&painted, close);
+		assert_eq!(panel.mouse(click(col, row)), PanelEvent::Close);
+	}
+
 	#[test]
 	fn workbench_lists_sections_stages_commits_and_closes() {
 		let dir = fixture();
@@ -2792,7 +2947,15 @@ mod tests {
 			panel.current_sidebar_target(),
 			Some(SidebarTarget::File { area: GitArea::Unstaged, .. })
 		));
-		assert_eq!(panel.key(Key::Space), PanelEvent::Consumed);
+		let event = panel.key(Key::Space);
+		assert_eq!(
+			event,
+			PanelEvent::Command(HostCommand::Git(GitOp::Stage(Some(vec![
+				Str::new_static("src/lib.rs"),
+			]))))
+		);
+		assert!(status(root).contains(" M src/lib.rs"), "actor mutated the index: {}", status(root));
+		settle_command(&mut panel, root, event);
 		assert_eq!(panel.status_text(), "Staged src/lib.rs");
 		assert!(status(root).contains("M  src/lib.rs"), "not staged: {}", status(root));
 		assert_eq!(panel.snapshot().staged.len(), 1);
@@ -2806,7 +2969,21 @@ mod tests {
 		assert!(matches!(panel.current_sidebar_target(), Some(SidebarTarget::Description)));
 		assert_eq!(panel.key(Key::Down), PanelEvent::Consumed);
 		assert!(matches!(panel.current_sidebar_target(), Some(SidebarTarget::Commit)));
-		assert_eq!(panel.key(Key::Enter), PanelEvent::Consumed);
+		let event = panel.key(Key::Enter);
+		assert_eq!(
+			event,
+			PanelEvent::Command(HostCommand::Git(GitOp::Commit {
+				message: Str::new_static("tweak b"),
+				amend: false,
+				stage_all: false,
+			}))
+		);
+		assert!(GitRepo::require(root)
+			.expect("repo")
+			.log_onelines(1)
+			.expect("log before outcome")[0]
+			.ends_with("initial"));
+		settle_command(&mut panel, root, event);
 		assert!(panel.status_text().starts_with("Committed "), "status: {}", panel.status_text());
 		let log = GitRepo::require(root)
 			.expect("repo")
@@ -2846,7 +3023,17 @@ mod tests {
 		assert_eq!(panel.key(Key::Tab), PanelEvent::Consumed);
 		assert_eq!(panel.key(Key::Char('4')), PanelEvent::Consumed);
 		assert_eq!(panel.view_mode, ViewMode::Hunk);
-		assert_eq!(panel.key(Key::Char('s')), PanelEvent::Consumed);
+		let event = panel.key(Key::Char('s'));
+		assert!(matches!(
+			&event,
+			PanelEvent::Command(HostCommand::Git(GitOp::Apply {
+				action: GitPatchAction::Stage,
+				scope: GitPatchScope::Hunk,
+				..
+			}))
+		));
+		assert!(status(root).contains(" M src/lib.rs"), "actor mutated the index: {}", status(root));
+		settle_command(&mut panel, root, event);
 		assert_eq!(panel.status_text(), "Staged hunk", "status: {}", panel.status_text());
 		assert!(status(root).contains("M  src/lib.rs"), "status: {}", status(root));
 		assert_eq!(panel.key(Key::Char('v')), PanelEvent::Consumed);
@@ -2862,13 +3049,31 @@ mod tests {
 		let mut panel = open(root);
 		assert_eq!(panel.key(Key::Tab), PanelEvent::Consumed);
 		assert_eq!(panel.key(Key::Char('4')), PanelEvent::Consumed);
-		assert_eq!(panel.key(Key::Char('s')), PanelEvent::Consumed);
+		let event = panel.key(Key::Char('s'));
+		assert!(matches!(
+			&event,
+			PanelEvent::Command(HostCommand::Git(GitOp::Apply {
+				action: GitPatchAction::Stage,
+				scope: GitPatchScope::Hunk,
+				..
+			}))
+		));
+		settle_command(&mut panel, root, event);
 		assert_eq!(panel.status_text(), "Staged hunk");
 		// Move onto the staged copy and pull the hunk back out of the index.
 		panel.selected = Some((GitArea::Staged, Str::new_static("src/lib.rs")));
 		panel.load_selected();
 		panel.rebuild();
-		assert_eq!(panel.key(Key::Char('u')), PanelEvent::Consumed);
+		let event = panel.key(Key::Char('u'));
+		assert!(matches!(
+			&event,
+			PanelEvent::Command(HostCommand::Git(GitOp::Apply {
+				action: GitPatchAction::Unstage,
+				scope: GitPatchScope::Hunk,
+				..
+			}))
+		));
+		settle_command(&mut panel, root, event);
 		assert_eq!(panel.status_text(), "Unstaged hunk");
 		assert!(status(root).contains(" M src/lib.rs"), "status: {}", status(root));
 		// Discard needs a second x within the pending window.
@@ -2880,7 +3085,16 @@ mod tests {
 		assert_eq!(panel.key(Key::Char('j')), PanelEvent::Consumed);
 		assert!(panel.pending_discard.is_none(), "any other key cancels the confirmation");
 		assert_eq!(panel.key(Key::Char('x')), PanelEvent::Consumed);
-		assert_eq!(panel.key(Key::Char('x')), PanelEvent::Consumed);
+		let event = panel.key(Key::Char('x'));
+		assert!(matches!(
+			&event,
+			PanelEvent::Command(HostCommand::Git(GitOp::Apply {
+				action: GitPatchAction::Discard,
+				scope: GitPatchScope::Hunk,
+				..
+			}))
+		));
+		settle_command(&mut panel, root, event);
 		assert_eq!(panel.status_text(), "Discarded hunk");
 		assert_eq!(
 			fs::read_to_string(root.join("src/lib.rs")).expect("lib"),

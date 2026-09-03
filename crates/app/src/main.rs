@@ -88,6 +88,18 @@ async fn main() -> ExitCode {
 	}
 	if env::args_os()
 		.nth(1)
+		.is_some_and(|arg| arg == omp_envd::shell_child::SHELL_CHILD_ARG)
+	{
+		return match omp_envd::shell_child::run_shell_child_entry().await {
+			Ok(code) => code,
+			Err(error) => {
+				eprintln!("omp shell child: {error}");
+				ExitCode::FAILURE
+			},
+		};
+	}
+	if env::args_os()
+		.nth(1)
 		.is_some_and(|arg| arg == omp_envd::exthost::EXT_HOST_ARG)
 	{
 		return match omp_envd::exthost::run_ext_host_entry() {

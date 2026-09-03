@@ -18,7 +18,8 @@ use std::fmt::Write as _;
 
 use omp_core::{Str, StrMut, sf};
 use omp_tui::{
-	Component as _, Dim, Frame, Key, Size, Ui, UiContext, UiEvent, components::Markdown, dom,
+	Component as _, Dim, Frame, Key, Mouse, MouseReport, Size, Ui, UiContext, UiEvent,
+	components::Markdown, dom,
 };
 
 use super::{Panel, PanelAction, PanelAnchor, PanelCx, PanelEvent};
@@ -636,18 +637,58 @@ impl PlanReviewPanel {
 			Key::Esc => {
 				self.annotating = None;
 				self.dirty = true;
+				PanelEvent::Consumed
 			},
-			Key::Enter => self.submit_annotation(),
+			Key::Enter => {
+				self.submit_annotation();
+				PanelEvent::Consumed
+			},
 			_ => {
-				if let UiEvent::Changed { id, value } = self.ui.handle_key(key)
-					&& id.as_str() == "note"
-					&& let Some(annotating) = &mut self.annotating
-				{
-					annotating.draft = value;
-				}
+				let event = self.ui.handle_key(key);
+				self.route_ui(event)
 			},
 		}
-		PanelEvent::Consumed
+	}
+
+	fn route_ui(&mut self, event: UiEvent) -> PanelEvent {
+		match event {
+			UiEvent::Cancel => PanelEvent::Close,
+			UiEvent::Changed { id, value } if id.as_str() == "note" => {
+				if let Some(annotating) = &mut self.annotating {
+					annotating.draft = value;
+				}
+				PanelEvent::Consumed
+			},
+			UiEvent::Changed { id, value } if id.as_str() == "tier" => {
+				if let Some(index) = self
+					.cycle
+					.iter()
+					.position(|(role, _)| role.as_str() == value.as_str())
+					&& index != self.slider
+				{
+					self.slider = index;
+					self.dirty = true;
+				}
+				PanelEvent::Consumed
+			},
+			_ => PanelEvent::Consumed,
+		}
+	}
+
+	fn sync_pointer_tier(&mut self) {
+		let values = self.ui.values();
+		let Some(role) = values.get("tier").and_then(|value| value.as_str()) else {
+			return;
+		};
+		if let Some(index) = self
+			.cycle
+			.iter()
+			.position(|(candidate, _)| candidate.as_str() == role)
+			&& index != self.slider
+		{
+			self.slider = index;
+			self.dirty = true;
+		}
 	}
 
 	/// pi `#buildHelp`.
@@ -967,13 +1008,28 @@ impl Panel for PlanReviewPanel {
 			return PanelEvent::Ignored;
 		}
 		self.sync();
-		if let UiEvent::Changed { id, value } = self.ui.handle_paste(text)
-			&& id.as_str() == "note"
-			&& let Some(annotating) = &mut self.annotating
-		{
-			annotating.draft = value;
+		let event = self.ui.handle_paste(text);
+		self.route_ui(event)
+	}
+
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		self.sync();
+		let event =
+			self.ui.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let routed = self.route_ui(event);
+		if self.annotating.is_none() {
+			self.sync_pointer_tier();
 		}
-		PanelEvent::Consumed
+		if report.row > 0 && report.row <= self.rows {
+			match report.kind {
+				Mouse::WheelUp => self.offset = self.offset.saturating_sub(1),
+				Mouse::WheelDown => {
+					self.offset = self.offset.saturating_add(1).min(self.max_offset());
+				},
+				_ => {},
+			}
+		}
+		routed
 	}
 
 	fn frame(&mut self, viewport: Size) -> &Frame {
@@ -1244,6 +1300,7 @@ mod tests {
 
 	use omp_con::Ctx;
 	use omp_dom::Dom;
+	use omp_tui::{Mods, MouseButton};
 
 	use super::*;
 	use crate::overlays::services::{ServiceError, ServiceResult, Services};
@@ -1312,6 +1369,20 @@ mod tests {
 		omp_tui::frame_text(panel.frame(size))
 	}
 
+	fn mouse(kind: Mouse, col: u16, row: u16, button: MouseButton) -> MouseReport {
+		MouseReport { kind, col, row, button, mods: Mods::default(), pressed: true }
+	}
+
+	fn point(text: &str, needle: &str) -> (u16, u16) {
+		text.lines()
+			.enumerate()
+			.find_map(|(row, line)| {
+				let byte = line.find(needle)?;
+				Some((omp_tui::cell_width(&line[..byte]), u16::try_from(row).unwrap()))
+			})
+			.expect("text point")
+	}
+
 	const NARROW: Size = Size { width: 60, height: 24 };
 	const WIDE: Size = Size { width: 100, height: 30 };
 
@@ -1329,8 +1400,12 @@ mod tests {
 		for option in OPTIONS {
 			assert!(text.contains(option), "option {option:?} missing:\n{text}");
 		}
-		assert!(text.contains("↑↓ select · ⏎ confirm · c copy · tab regions · esc cancel"), "help missing:\n{text}");
+		// The 57-cell help exceeds the 56 inner cells of a 60-column overlay,
+		// so it truncates exactly like pi's `fit(content, width - 4)`.
+		assert!(text.contains("↑↓ select · ⏎ confirm · c copy · tab regions · esc canc…"), "help missing:\n{text}");
 		assert!(!text.contains("continue with"), "lone role must not show the slider:\n{text}");
+		let wide = self::text(&mut panel, WIDE);
+		assert!(wide.contains("↑↓ select · ⏎ confirm · c copy · tab regions · esc cancel"), "help missing:\n{wide}");
 	}
 
 	#[test]
@@ -1345,6 +1420,30 @@ mod tests {
 		assert!(after.contains("slow-model"), "detail must follow the slider:\n{after}");
 		assert_eq!(panel.key(Key::Right), PanelEvent::Consumed, "slider clamps at the last role");
 		assert_eq!(panel.key(Key::Enter), PanelEvent::Finish(Str::new_static("plan_approve slow")));
+	}
+
+	#[test]
+	fn pointer_selects_a_role_and_wheel_scrolls_the_plan() {
+		let mut panel = open(plan(), &["smol", "default", "slow"], NARROW).unwrap();
+		let before = text(&mut panel, NARROW);
+		let (col, row) = point(&before, "slow");
+		assert_eq!(
+			panel.mouse(mouse(Mouse::Click, col, row, MouseButton::Left)),
+			PanelEvent::Consumed
+		);
+		assert_eq!(panel.key(Key::Enter), PanelEvent::Finish(Str::new_static("plan_approve slow")));
+
+		let short = Size { width: 60, height: 14 };
+		let mut panel = open(plan(), &["default"], short).unwrap();
+		let before = text(&mut panel, short);
+		let (col, row) = point(&before, "Auth plan");
+		assert_eq!(
+			panel.mouse(mouse(Mouse::WheelDown, col, row, MouseButton::WheelDown)),
+			PanelEvent::Consumed
+		);
+		assert_eq!(panel.offset, 1, "wheel keeps the mirrored body offset in sync");
+		let after = text(&mut panel, short);
+		assert_ne!(after, before, "wheel must move the plan viewport");
 	}
 
 	#[test]
