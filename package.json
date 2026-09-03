@@ -10,6 +10,7 @@
 			"python/robomp/web"
 		],
 		"catalog": {
+			"@changesets/cli": "^2.31.1",
 			"@babel/generator": "^7.29.7",
 			"@babel/parser": "^7.29.7",
 			"@babel/traverse": "^7.29.7",
@@ -74,6 +75,8 @@
 	},
 	"type": "module",
 	"scripts": {
+		"changeset": "bun --bun x @changesets/cli",
+		"version:changesets": "bun --bun x @changesets/cli version",
 		"setup": "bun scripts/setup.ts",
 		"dev": "bun --cwd=packages/coding-agent src/cli.ts",
 		"dev:timing": "PI_TIMING=x bun --cwd=packages/coding-agent --preload ../utils/src/module-timer.ts src/cli.ts",
@@ -174,6 +177,7 @@
 		"sherpa-onnx-node": "1.13.2"
 	},
 	"devDependencies": {
+		"@changesets/cli": "catalog:",
 		"@types/bun": "catalog:",
 		"@typescript/native-preview": "catalog:",
 		"lint-staged": "catalog:",
