@@ -127,16 +127,13 @@ async fn allow_keeps_the_projection_and_view_matches_the_request() {
 	assert_eq!(refs[1]["role"], "assistant");
 	assert!(view["usage"]["total_tokens"].as_u64().is_some());
 	assert_eq!(view["prompt_hash"].as_str().map(str::len), Some(16));
-	assert_eq!(
-		texts,
-		vec![
-			(Role::User, "first".to_owned()),
-			(Role::Assistant, "one".to_owned()),
-			(Role::User, "second".to_owned()),
-			(Role::Assistant, "two".to_owned()),
-			(Role::User, "third".to_owned()),
-		]
-	);
+	assert_eq!(texts, vec![
+		(Role::User, "first".to_owned()),
+		(Role::Assistant, "one".to_owned()),
+		(Role::User, "second".to_owned()),
+		(Role::Assistant, "two".to_owned()),
+		(Role::User, "third".to_owned()),
+	]);
 }
 
 #[tokio::test]
@@ -154,7 +151,8 @@ async fn transform_applies_the_context_patch_to_the_request_only() {
 		let mut effective = view.clone();
 		// Prune the first exchange (ids 0 and 1) with a placeholder and
 		// pin a note right before the pending user turn.
-		effective["prune"] = serde_json::json!([{"ids": ["0", "1"], "reason": "old", "keep_placeholder": true}]);
+		effective["prune"] =
+			serde_json::json!([{"ids": ["0", "1"], "reason": "old", "keep_placeholder": true}]);
 		effective["insert"] = serde_json::json!([{
 			"parts": [{"text": "remember the budget"}],
 			"anchor": {"relation": "tail"},
@@ -169,16 +167,13 @@ async fn transform_applies_the_context_patch_to_the_request_only() {
 	})
 	.await;
 	// The third request saw ids 0..=4: `first`, `one`, `second`, `two`, `third`.
-	assert_eq!(
-		texts,
-		vec![
-			(Role::User, "[context pruned: old]".to_owned()),
-			(Role::User, "second".to_owned()),
-			(Role::Assistant, "two".to_owned()),
-			(Role::User, "third".to_owned()),
-			(Role::Developer, "remember the budget".to_owned()),
-		]
-	);
+	assert_eq!(texts, vec![
+		(Role::User, "[context pruned: old]".to_owned()),
+		(Role::User, "second".to_owned()),
+		(Role::Assistant, "two".to_owned()),
+		(Role::User, "third".to_owned()),
+		(Role::Developer, "remember the budget".to_owned()),
+	]);
 }
 
 #[tokio::test]

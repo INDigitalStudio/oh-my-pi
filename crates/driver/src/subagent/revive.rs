@@ -210,6 +210,9 @@ async fn live_loop(child: Revived, first: Option<Str>, cancel: CancellationToken
 				id,
 				agent,
 				text: run.text,
+				description: None,
+				assignment: None,
+				stats: None,
 				session_path,
 				tokens_in: run.tokens_in,
 				tokens_out: run.tokens_out,
@@ -311,8 +314,7 @@ async fn drive(
 			.with_request_budget(child.settings.soft_request_budget)
 			.with_request_budget_notice(child.settings.soft_request_budget_notice);
 		let outcome = {
-			let turn =
-				kernel.run_turn(&mut session, TurnInput { text, attachments }, control);
+			let turn = kernel.run_turn(&mut session, TurnInput { text, attachments }, control);
 			tokio::pin!(turn);
 			loop {
 				tokio::select! {

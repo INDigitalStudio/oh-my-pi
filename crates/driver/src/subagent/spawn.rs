@@ -3,7 +3,7 @@
 use std::{
 	path::{Path, PathBuf},
 	sync::Arc,
-	time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH},
+	time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
 use omp_agent::{
@@ -112,6 +112,7 @@ impl SubagentSpawner for DriverSubagentSpawner {
 		request: TaskParams,
 		updates: &'a flume::Sender<TaskUpdate>,
 	) -> Result<TaskPayload, TaskFault> {
+		let started = Instant::now();
 		let request = request.into_batch();
 		admit_batch(&self.parent_ctx, &self.jobs, &request.tasks)
 			.map_err(|source| TaskFault { message: Str::new(source.to_string()) })?;
@@ -151,6 +152,9 @@ impl SubagentSpawner for DriverSubagentSpawner {
 				id:           id.clone(),
 				agent:        prepared.agent.clone(),
 				text:         Str::default(),
+				description:  None,
+				assignment:   Some(prepared.child.task.clone()),
+				stats:        None,
 				session_path: Str::new(prepared.session_path.to_string_lossy()),
 				tokens_in:    0,
 				tokens_out:   0,
@@ -200,7 +204,10 @@ impl SubagentSpawner for DriverSubagentSpawner {
 				.await;
 			children.push(result);
 		}
-		Ok(TaskPayload::Settled { children })
+		Ok(TaskPayload::Settled {
+			children,
+			duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+		})
 	}
 }
 
@@ -447,9 +454,9 @@ pub async fn admit_child(
 fn subagent_spec(parent_ctx: &Ctx, child: &ChildRequest, model: &str) -> serde_json::Value {
 	let settings = TaskSettings::from_con(parent_ctx);
 	let depth = SV_TASK_RECURSION_DEPTH.get(parent_ctx);
-	let worktree = child.isolated.unwrap_or(
-		settings.isolation.mode != super::settings::TaskIsolationMode::None,
-	);
+	let worktree = child
+		.isolated
+		.unwrap_or(settings.isolation.mode != super::settings::TaskIsolationMode::None);
 	let merge = if worktree {
 		<&'static str>::from(settings.isolation.merge)
 	} else {
@@ -529,7 +536,9 @@ fn child_from_spec(
 				.as_str()
 				.filter(|name| {
 					let mut chars = name.chars();
-					chars.next().is_some_and(|first| first.is_ascii_alphabetic())
+					chars
+						.next()
+						.is_some_and(|first| first.is_ascii_alphabetic())
 						&& name.len() <= 32
 						&& chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 				})
@@ -912,6 +921,9 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 			id: prepared.id,
 			agent: prepared.agent,
 			text: turn.assistant_text,
+			description: None,
+			assignment: Some(prepared.child.task.clone()),
+			stats: None,
 			session_path: Str::new(prepared.session_path.to_string_lossy()),
 			tokens_in: turn.tokens_in,
 			tokens_out: turn.tokens_out,
@@ -1436,7 +1448,9 @@ mod tests {
 		for key in ["isolation", "worktree", "merge", "max_depth", "budget", "labels"] {
 			assert!(spec.get(key).is_some(), "SubagentSpec field {key} missing");
 		}
-		let ungated = admit_child(None, &ctx, plain_child(), "m").await.expect("no gate");
+		let ungated = admit_child(None, &ctx, plain_child(), "m")
+			.await
+			.expect("no gate");
 		assert_eq!(ungated, plain_child());
 	}
 
@@ -1449,7 +1463,9 @@ mod tests {
 		let error = admit_child(Some(&gate.hooks), &ctx, plain_child(), "m")
 			.await
 			.expect_err("denied spawn");
-		assert!(matches!(&error, SpawnError::Denied { reason } if reason.as_str() == "no scouts today"));
+		assert!(
+			matches!(&error, SpawnError::Denied { reason } if reason.as_str() == "no scouts today")
+		);
 		assert_eq!(error.to_string(), "subagent spawn denied by extension: no scouts today");
 	}
 

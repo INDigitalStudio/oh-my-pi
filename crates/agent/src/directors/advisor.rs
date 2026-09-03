@@ -36,8 +36,8 @@ use omp_con::Ctx;
 use omp_core::{FastHashMap, FastHashSet, Str};
 use omp_dom::{Dom, Handle, KnownTag, Node, NodeSpec, Op, PropId, PropKey, Tag, Value};
 use omp_inference::{
-	ChatEvent, ChatRequest, ContentPart, ErrorKind, Message, OpaqueJson, Role, Setting,
-	ToolChoice, ToolDefinition, ToolInputConstraint, ToolResultContent,
+	ChatEvent, ChatRequest, ContentPart, ErrorKind, Message, OpaqueJson, Role, Setting, ToolChoice,
+	ToolDefinition, ToolInputConstraint, ToolResultContent,
 	pi_settings::{AI_ADVISOR_ENABLED, AI_ADVISOR_IMMUNE_TURNS, AI_ADVISOR_SYNC_BACKLOG},
 };
 use omp_session::{Session, projection::project_thread};
@@ -45,8 +45,8 @@ use strum::{Display, EnumString};
 
 use crate::director::{
 	BindValue, BoxFut, Director, DirectorCx, DirectorEffect, DirectorError, DirectorRegistry,
-	DirectorStack, MutDirectorCx, Prepared, StateUpdate, TurnView, Verdict, find_director,
-	patch, state_bool, state_int, state_str, update_ops,
+	DirectorStack, MutDirectorCx, Prepared, StateUpdate, TurnView, Verdict, find_director, patch,
+	state_bool, state_int, state_str, update_ops,
 };
 
 /// Director family and registry id.
@@ -189,13 +189,13 @@ pub enum Channel {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeliveryFacts {
 	/// The primary loop is mid-turn (a sync-backlog review).
-	pub streaming:                     bool,
+	pub streaming: bool,
 	/// The primary's tail is a terminal text answer with no queued prompts.
 	pub terminal_answer_no_queued_work: bool,
 	/// Inside the post-interrupt immune window.
-	pub immune_active:                 bool,
+	pub immune_active: bool,
 	/// The plan Director is engaged: only user-driven turns converge.
-	pub plan_mode:                     bool,
+	pub plan_mode: bool,
 }
 
 /// pi `resolveAdvisorDeliveryChannel` plus the plan-mode preserve rule that
@@ -358,9 +358,11 @@ impl Advisor {
 		}
 		if delivered >= items.len() {
 			if !wip && !self.yielded {
-				patch(cx.session, "advisor.review", update_ops(handle, vec![
-					StateUpdate::new("yielded", BindValue::Bool(true)),
-				]))?;
+				patch(
+					cx.session,
+					"advisor.review",
+					update_ops(handle, vec![StateUpdate::new("yielded", BindValue::Bool(true))]),
+				)?;
 			}
 			return Ok(false);
 		}
@@ -388,20 +390,22 @@ impl Advisor {
 				// note per update; a suppressed note never burns the slot.
 				let accepted = notes.into_iter().find(|note| {
 					let key = normalize_note(note.note.as_str());
-					!key.is_empty()
-						&& !CONTENT_FREE.contains(&key.as_str())
-						&& seen.insert(key)
+					!key.is_empty() && !CONTENT_FREE.contains(&key.as_str()) && seen.insert(key)
 				});
 				if let Some(note) = accepted {
 					let facts = DeliveryFacts {
 						streaming: wip,
 						terminal_answer_no_queued_work,
 						immune_active: self.immune_active(cx.con),
-						plan_mode:                     plan_engaged(dom),
+						plan_mode: plan_engaged(dom),
 					};
 					let channel = delivery_channel(note.severity, facts);
 					ops.push(notice_op(dom, cx.turn, &note));
-					ops.push(developer_op(dom, cx.turn, advisory_text(note.note.as_str(), note.severity)));
+					ops.push(developer_op(
+						dom,
+						cx.turn,
+						advisory_text(note.note.as_str(), note.severity),
+					));
 					if channel == Channel::Steer {
 						// pi `#recordAdvisorInterruptDelivered`: arm the immune
 						// window only when a turn is actually steered.
@@ -421,13 +425,15 @@ impl Advisor {
 					));
 				},
 				ErrorKind::TargetNotFound | ErrorKind::RouteUnavailable => {
-					updates.push(StateUpdate::new("status", BindValue::Str(Str::new_static("no_model"))));
+					updates
+						.push(StateUpdate::new("status", BindValue::Str(Str::new_static("no_model"))));
 				},
 				ErrorKind::Cancelled => return Ok(false),
 				_ => {
 					let failures = self.failures.saturating_add(1);
 					if failures >= MAX_FAILURES {
-						updates.push(StateUpdate::new("status", BindValue::Str(Str::new_static("error"))));
+						updates
+							.push(StateUpdate::new("status", BindValue::Str(Str::new_static("error"))));
 						updates.push(StateUpdate::new("failures", BindValue::Int(0)));
 						updates.push(StateUpdate::new("delivered", BindValue::Int(items.len() as i64)));
 						updates.push(StateUpdate::new("compactions", BindValue::Int(compactions)));
@@ -613,7 +619,8 @@ fn earlier_notes(dom: &Dom) -> Vec<Note> {
 			let Some(node) = dom.get(*handle) else {
 				continue;
 			};
-			if node.tag != Tag::Known(KnownTag::Notice) || prop_str(node, PropId::Kind) != Some(FAMILY) {
+			if node.tag != Tag::Known(KnownTag::Notice) || prop_str(node, PropId::Kind) != Some(FAMILY)
+			{
 				continue;
 			}
 			let Some(note) = node.content.clone() else {
@@ -667,7 +674,14 @@ fn advisor_request(update: Str, earlier: &[Note]) -> ChatRequest {
 	messages.push(text_message(Role::System, Str::new(system)));
 	if !earlier.is_empty() {
 		let mut recap = String::from("### Your earlier advice (never repeat it)\n");
-		for note in earlier.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
+		for note in earlier
+			.iter()
+			.rev()
+			.take(8)
+			.collect::<Vec<_>>()
+			.into_iter()
+			.rev()
+		{
 			let _ = writeln!(recap, "- [{}] {}", note.severity, one_line(note.note.as_str(), 200));
 		}
 		messages.push(text_message(Role::User, Str::new(recap)));
@@ -761,7 +775,11 @@ pub fn render_update(messages: &[Message], wip: bool) -> Str {
 				if text.trim().is_empty() {
 					continue;
 				}
-				let label = if message.role == Role::User { "**user**:" } else { "**developer**:" };
+				let label = if message.role == Role::User {
+					"**user**:"
+				} else {
+					"**developer**:"
+				};
 				push_labeled(&mut body, &mut last_label, label, &[text]);
 			},
 			Role::Assistant => {
@@ -902,7 +920,11 @@ fn tool_call_line(
 		None => format!("{head} ⇒ pending"),
 		Some((content, is_error)) => {
 			let text = result_text(content);
-			let lines = if text.is_empty() { 0 } else { text.lines().count().max(1) };
+			let lines = if text.is_empty() {
+				0
+			} else {
+				text.lines().count().max(1)
+			};
 			let count = format!("{lines} {}", if lines == 1 { "line" } else { "lines" });
 			let mut base = if is_error {
 				let first = one_line(text.lines().next().unwrap_or_default(), PRIMARY_ARG_MAX);
@@ -960,7 +982,9 @@ fn primary_arg(name: &str, args: &serde_json::Value) -> String {
 			let note = field("note");
 			let severity = field("severity");
 			match (note, severity) {
-				(Some(note), Some(severity)) => return one_line(&format!("{severity}: {note}"), PRIMARY_ARG_MAX),
+				(Some(note), Some(severity)) => {
+					return one_line(&format!("{severity}: {note}"), PRIMARY_ARG_MAX);
+				},
 				(Some(text), None) | (None, Some(text)) => return one_line(&text, PRIMARY_ARG_MAX),
 				(None, None) => {},
 			}
@@ -1077,11 +1101,7 @@ fn clip_start(text: &str, max: usize) -> &str {
 /// pi `boundedFencedToolContext`: an adaptive fence sized past the longest
 /// backtick run, or indented code when the run would eat the budget.
 fn bounded_fenced(text: &str, language: &str) -> String {
-	let longest = text
-		.split(|c| c != '`')
-		.map(str::len)
-		.max()
-		.unwrap_or(0);
+	let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
 	if longest * 2 > TOOL_IO_MAX_BYTES / 2 {
 		let (bounded, truncated) =
 			truncate_middle(text, TOOL_IO_MAX_BYTES - ELIDED_MARKER.len() - 2, TOOL_IO_MAX_LINES);
@@ -1163,7 +1183,8 @@ mod tests {
 	fn advisory_bytes_match_pi_batch_content() {
 		assert_eq!(
 			advisory_text("a < b", Severity::Blocker).as_str(),
-			"<advisory severity=\"blocker\" guidance=\"weigh, don't blindly obey\">\na &lt; b\n</advisory>"
+			"<advisory severity=\"blocker\" guidance=\"weigh, don't blindly obey\">\na &lt; \
+			 b\n</advisory>"
 		);
 	}
 
@@ -1179,19 +1200,20 @@ mod tests {
 
 	#[test]
 	fn update_renders_watched_roles_and_wip_trailer() {
-		let messages = vec![
-			text_message(Role::User, Str::new_static("do it")),
-			Message {
-				role:    Role::Assistant,
-				content: Arc::from([
-					ContentPart::Reasoning { text: Str::new_static("hm"), proof: None },
-					ContentPart::Text { text: Str::new_static("ok"), proof: None },
-				]),
-				name:    None,
-			},
-		];
+		let messages = vec![text_message(Role::User, Str::new_static("do it")), Message {
+			role:    Role::Assistant,
+			content: Arc::from([
+				ContentPart::Reasoning { text: Str::new_static("hm"), proof: None },
+				ContentPart::Text { text: Str::new_static("ok"), proof: None },
+			]),
+			name:    None,
+		}];
 		let update = render_update(&messages, true);
-		assert!(update.starts_with("### Session update\n\n**user**:\ndo it\n\n**agent**:\n_thinking:_ hm\nok"));
+		assert!(
+			update.starts_with(
+				"### Session update\n\n**user**:\ndo it\n\n**agent**:\n_thinking:_ hm\nok"
+			)
+		);
 		assert!(update.ends_with("---\n\n[in progress — more steps follow]"));
 	}
 

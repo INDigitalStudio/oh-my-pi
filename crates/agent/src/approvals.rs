@@ -490,7 +490,12 @@ impl RouteInner {
 		);
 	}
 
-	fn notify_resolved(&self, ticket: &ApprovalTicket, decision: &ApprovalDecision, waited: Duration) {
+	fn notify_resolved(
+		&self,
+		ticket: &ApprovalTicket,
+		decision: &ApprovalDecision,
+		waited: Duration,
+	) {
 		let Some(hooks) = &self.hooks else {
 			return;
 		};
@@ -631,7 +636,9 @@ impl ApprovalDesk {
 			request.ticket.created_at_ms,
 		)?;
 		if let Some(grant) = session_grant(session, &ticket) {
-			let ticket = self.book.decide(session, ticket.ticket_id.as_str(), grant.clone())?;
+			let ticket = self
+				.book
+				.decide(session, ticket.ticket_id.as_str(), grant.clone())?;
 			let _ = request.respond(grant);
 			return Ok(ticket);
 		}
@@ -656,7 +663,9 @@ impl ApprovalDesk {
 		call_id: Str,
 		spec: ApprovalSpec,
 	) -> Result<ApprovalTicket, ApprovalError> {
-		let ticket = self.book.open_for(session, Some(call_id), vec![spec], epoch_millis())?;
+		let ticket = self
+			.book
+			.open_for(session, Some(call_id), vec![spec], epoch_millis())?;
 		if let Some(grant) = session_grant(session, &ticket) {
 			return self.book.decide(session, ticket.ticket_id.as_str(), grant);
 		}

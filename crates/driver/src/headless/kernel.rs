@@ -361,19 +361,19 @@ fn admission_spec(
 		None => sf!("{name} {}", args.chars().take(512).collect::<String>()),
 	};
 	omp_agent::ApprovalSpec {
-		title:         sf!("Run {name}"),
+		title: sf!("Run {name}"),
 		body,
 		subject,
-		kind:          Str::new_static(kind),
-		scopes:        vec![Str::new_static("once"), Str::new_static("session")],
-		default:       Some(false),
-		route:         Str::new_static("user"),
-		approver:      None,
-		timeout_ms:    query.deadline_ms,
-		unreachable:   Str::new_static("deny"),
+		kind: Str::new_static(kind),
+		scopes: vec![Str::new_static("once"), Str::new_static("session")],
+		default: Some(false),
+		route: Str::new_static("user"),
+		approver: None,
+		timeout_ms: query.deadline_ms,
+		unreachable: Str::new_static("deny"),
 		require_human: true,
-		pattern:       None,
-		evidence:      vec![sf!("tool `{name}` requires approval under the session approval mode")],
+		pattern: None,
+		evidence: vec![sf!("tool `{name}` requires approval under the session approval mode")],
 	}
 }
 
@@ -430,19 +430,19 @@ impl omp_agent::ToolAdmission for SettingsAdmission {
 					),
 				};
 				omp_agent::ToolAdmissionVerdict::Prompt(omp_agent::ApprovalSpec {
-					title:         sf!("Run {name}"),
+					title: sf!("Run {name}"),
 					body,
 					subject,
-					kind:          Str::new_static(kind),
-					scopes:        vec![Str::new_static("once"), Str::new_static("session")],
-					default:       Some(false),
-					route:         Str::new_static("user"),
-					approver:      None,
-					timeout_ms:    0,
-					unreachable:   Str::new_static("deny"),
+					kind: Str::new_static(kind),
+					scopes: vec![Str::new_static("once"), Str::new_static("session")],
+					default: Some(false),
+					route: Str::new_static("user"),
+					approver: None,
+					timeout_ms: 0,
+					unreachable: Str::new_static("deny"),
 					require_human: true,
-					pattern:       None,
-					evidence:      vec![sf!(
+					pattern: None,
+					evidence: vec![sf!(
 						"{} tier under approval mode {}",
 						<&'static str>::from(resolved.tier),
 						<&'static str>::from(self.settings.approval_mode)
@@ -833,6 +833,13 @@ impl omp_agent::Inference for ComposedInference {
 		}
 	}
 
+	fn set_debug_session(&mut self, session: Option<Str>) {
+		if let Self::Production(inference) = self {
+			inference.meta.debug_session = session;
+			inference.client.set_call_meta(inference.meta.clone());
+		}
+	}
+
 	fn install_retry_sink(&mut self, sink: omp_inference::RetrySink) {
 		match self {
 			Self::Production(inference) => inference.install_retry_sink(sink),
@@ -1084,6 +1091,7 @@ pub async fn compose_kernel(
 			deadline: None,
 			budget: ExecutionBudget::default(),
 			session: None,
+			debug_session: None,
 			response_hooks: Default::default(),
 		};
 		let client = Client::new(stack.registry.service(), planner, meta.clone()).with_affinity(
@@ -1114,6 +1122,14 @@ pub async fn compose_kernel(
 		options.ephemeral,
 		terminal.as_deref(),
 	)?;
+	let debug_session = journal_path
+		.file_stem()
+		.and_then(|name| name.to_str())
+		.map(Str::new);
+	if let ComposedInference::Production(production) = &mut inference {
+		production.meta.debug_session = debug_session;
+		production.client.set_call_meta(production.meta.clone());
+	}
 	let ephemeral_journal = options
 		.ephemeral
 		.then(|| EphemeralJournal { path: journal_path.clone() });
@@ -1195,10 +1211,10 @@ pub async fn compose_kernel(
 	// where each prompt is journaled under `<queues><prompts>` and answered
 	// by the host's `Up::Approve`.
 	let approvals = kernel.approval_route();
-	kernel
-		.inference()
-		.environment()
-		.bind_approval_authority(Some(Arc::new(omp_agent::ApprovalBook::new())), Some(approvals.clone()));
+	kernel.inference().environment().bind_approval_authority(
+		Some(Arc::new(omp_agent::ApprovalBook::new())),
+		Some(approvals.clone()),
+	);
 	let mut kernel = kernel
 		.with_external_executor(Arc::new(EnvToolExecutor::new(tool_client, approvals)))
 		.with_tool_admission(Arc::new(SettingsAdmission::new(&ctx, options.approval_mode)));
@@ -1227,19 +1243,17 @@ pub async fn compose_kernel(
 		// pi `atMaxDepth`: a child at the recursion ceiling never sees `task`,
 		// so it cannot plan a delegation the spawner would refuse.
 		if !crate::subagent::settings::task_withheld(&ctx) {
-			kernel = kernel.with_session_tool(Arc::new(
-				crate::subagent::spawn::TaskSessionTool::new(
-					data_dir.to_path_buf(),
-					project_root.clone(),
-					sessions_dir,
-					Arc::clone(&live_sessions),
-					Arc::clone(&ctx),
-					cfg,
-					hub_environment.clone(),
-					name.clone(),
-					model,
-				),
-			));
+			kernel = kernel.with_session_tool(Arc::new(crate::subagent::spawn::TaskSessionTool::new(
+				data_dir.to_path_buf(),
+				project_root.clone(),
+				sessions_dir,
+				Arc::clone(&live_sessions),
+				Arc::clone(&ctx),
+				cfg,
+				hub_environment.clone(),
+				name.clone(),
+				model,
+			)));
 		}
 		kernel = kernel.with_session_tool(Arc::new(crate::subagent::hub::HubSessionTool::new(
 			hub_environment,
@@ -1682,7 +1696,8 @@ pub fn journaled_prompt_facts(session: &Session) -> crate::discovery::PromptFact
 	else {
 		return facts;
 	};
-	let Ok(serde_json::Value::Object(mut values)) = serde_json::from_str::<serde_json::Value>(raw.get())
+	let Ok(serde_json::Value::Object(mut values)) =
+		serde_json::from_str::<serde_json::Value>(raw.get())
 	else {
 		return facts;
 	};
@@ -1726,11 +1741,7 @@ fn discover_prompt_material(
 	} else {
 		ActiveRules::default()
 	};
-	for warning in context_files
-		.warnings
-		.iter()
-		.chain(&rules.warnings)
-	{
+	for warning in context_files.warnings.iter().chain(&rules.warnings) {
 		tracing::warn!(path = %warning.path.display(), "{}", warning.message);
 	}
 	Ok((context_files, Arc::new(rules)))
@@ -2068,7 +2079,7 @@ mod tests {
 			&overrides,
 			&crate::discovery::PromptFacts::default(),
 		)
-			.expect("prompt facts");
+		.expect("prompt facts");
 		let value = session
 			.dom()
 			.get(session.dom().meta())
@@ -2095,9 +2106,13 @@ mod tests {
 				.expect("session");
 		let discovered = crate::discovery::PromptFacts {
 			skills:             vec![serde_json::json!({ "name": "tla", "description": "TLA" })],
-			context_files:      vec![serde_json::json!({ "origin": "/p/AGENTS.md", "content": "ctx" })],
+			context_files:      vec![
+				serde_json::json!({ "origin": "/p/AGENTS.md", "content": "ctx" }),
+			],
 			always_apply_rules: vec![serde_json::json!({ "name": "RULES", "content": "sticky" })],
-			rules:              vec![serde_json::json!({ "name": "style", "description": "d", "globs": ["*.rs"] })],
+			rules:              vec![
+				serde_json::json!({ "name": "style", "description": "d", "globs": ["*.rs"] }),
+			],
 			active_repository:  Some(crate::discovery::active_repo::ActiveRepository {
 				relative_root: std::path::PathBuf::from("omp"),
 			}),
@@ -2177,13 +2192,21 @@ mod tests {
 		// only the scratch project's files are asserted.
 		use crate::discovery::rules::Level;
 		let project_files = |files: &crate::discovery::rules::ContextFiles| {
-			files.files.iter().filter(|file| file.level == Level::Project).count()
+			files
+				.files
+				.iter()
+				.filter(|file| file.level == Level::Project)
+				.count()
 		};
 		let project_rules = |rules: &crate::discovery::rules::ActiveRules| {
-			rules.rules.iter().filter(|rule| rule.level == Level::Project).count()
+			rules
+				.rules
+				.iter()
+				.filter(|rule| rule.level == Level::Project)
+				.count()
 		};
-		let (files, rules) = super::discover_prompt_material(&project, &PromptOverrides::default())
-			.expect("discovery");
+		let (files, rules) =
+			super::discover_prompt_material(&project, &PromptOverrides::default()).expect("discovery");
 		assert_eq!(project_files(&files), 1);
 		assert_eq!(project_rules(&rules), 1);
 
@@ -2194,7 +2217,8 @@ mod tests {
 
 		let no_context =
 			PromptOverrides { include_context_files: false, ..PromptOverrides::default() };
-		let (files, rules) = super::discover_prompt_material(&project, &no_context).expect("discovery");
+		let (files, rules) =
+			super::discover_prompt_material(&project, &no_context).expect("discovery");
 		assert!(files.files.is_empty(), "--no-context-files suppresses context files");
 		assert_eq!(project_rules(&rules), 1);
 	}

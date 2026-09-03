@@ -759,12 +759,17 @@ async fn user_image_attachment_reaches_the_request_with_its_bytes_and_mime() {
 	// session builds the identical media part.
 	let journal = std::fs::read_to_string(&journal_path).expect("journal reads");
 	assert!(
-		journal.contains(&format!(r#""h":"{}","n":{},"mime":"image/png""#, attachment.blob, png.len())),
+		journal.contains(&format!(
+			r#""h":"{}","n":{},"mime":"image/png""#,
+			attachment.blob,
+			png.len()
+		)),
 		"{journal}"
 	);
 	drop(session);
-	let restored = omp_session::Session::open(&journal_path, omp_session::ComponentRegistry::default())
-		.expect("session restores");
+	let restored =
+		omp_session::Session::open(&journal_path, omp_session::ComponentRegistry::default())
+			.expect("session restores");
 	let (inference, requests) = ScriptedInference::new([text_script("still a png")]);
 	let mut kernel = Kernel::new(
 		inference,
@@ -825,9 +830,9 @@ async fn steered_image_attachment_reaches_the_next_request() {
 		.iter()
 		.find(|message| {
 			message.role == Role::User
-				&& message.content.iter().any(|part| {
-					matches!(part, ContentPart::Text { text, .. } if text.contains("also look at"))
-				})
+				&& message.content.iter().any(
+					|part| matches!(part, ContentPart::Text { text, .. } if text.contains("also look at")),
+				)
 		})
 		.expect("steered user message");
 	let image = steered

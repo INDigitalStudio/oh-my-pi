@@ -443,7 +443,9 @@ mod tests {
 		assert!(!task_withheld(&ctx), "one level below the ceiling may still delegate");
 		SV_TASK_RECURSION_DEPTH.set(&ctx, 2).expect("depth");
 		assert!(task_withheld(&ctx), "a child at the ceiling never sees `task`");
-		SV_TASK_MAX_RECURSION_DEPTH.set(&ctx, -1).expect("unlimited");
+		SV_TASK_MAX_RECURSION_DEPTH
+			.set(&ctx, -1)
+			.expect("unlimited");
 		assert!(!task_withheld(&ctx), "-1 is unlimited");
 	}
 }

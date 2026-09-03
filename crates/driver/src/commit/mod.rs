@@ -215,6 +215,7 @@ impl CommitGenerator {
 			deadline:       None,
 			budget:         ExecutionBudget::default(),
 			session:        None,
+			debug_session:  None,
 			response_hooks: Default::default(),
 		};
 		let answer = omp_inference::router::execute_registry_call(

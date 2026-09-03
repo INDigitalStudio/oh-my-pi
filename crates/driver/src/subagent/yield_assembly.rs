@@ -126,7 +126,11 @@ fn resolve_local_ref<'s>(root: &'s Json, reference: &str) -> Option<&'s Json> {
 /// `last_turn` is the child's final assistant text, used by a string-typed
 /// terminal yield with an empty `result`. `array_labels` names the sections
 /// that always accumulate into a list.
-pub(crate) fn assemble(yields: &[YieldParams], last_turn: &str, array_labels: &[&str]) -> Assembled {
+pub(crate) fn assemble(
+	yields: &[YieldParams],
+	last_turn: &str,
+	array_labels: &[&str],
+) -> Assembled {
 	let Some(last) = yields.last() else {
 		return Assembled::Missing;
 	};
@@ -189,7 +193,11 @@ pub(crate) fn assemble(yields: &[YieldParams], last_turn: &str, array_labels: &[
 fn append_section(sections: &mut Map<String, Json>, label: &str, value: Json, force_array: bool) {
 	match sections.get_mut(label) {
 		None => {
-			let value = if force_array { Json::Array(vec![value]) } else { value };
+			let value = if force_array {
+				Json::Array(vec![value])
+			} else {
+				value
+			};
 			sections.insert(label.to_owned(), value);
 		},
 		Some(Json::Array(existing)) => existing.push(value),
@@ -265,7 +273,10 @@ mod tests {
 	#[test]
 	fn last_turn_terminal_uses_assistant_text_only_without_sections() {
 		let only_last_turn = [params(json!({"type": "result", "result": {}}))];
-		assert_eq!(assemble(&only_last_turn, "final words", &[]), Assembled::Data(json!("final words")));
+		assert_eq!(
+			assemble(&only_last_turn, "final words", &[]),
+			Assembled::Data(json!("final words"))
+		);
 		assert_eq!(
 			assemble(&only_last_turn, "", &[]),
 			Assembled::Error(WARNING_NULL_YIELD.to_owned())

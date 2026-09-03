@@ -5,8 +5,9 @@
 //! project directory `<project>/.omp/prompts` (both scanned recursively; a
 //! nested `review/rust.md` is still `/rust`, its source reads
 //! `(project:review)`), then every `--prompt-template <file|dir>` path
-//! (`(custom)`). The first template to claim a name wins. `--no-prompt-templates`
-//! drops the discovered directories; explicit paths always load.
+//! (`(custom)`). The first template to claim a name wins.
+//! `--no-prompt-templates` drops the discovered directories; explicit paths
+//! always load.
 //!
 //! Expansion (pi `expandPromptTemplate`): `$1`, `$2`, … are positional words,
 //! `$ARGUMENTS` / `$@` every word, `$@[n]` words from `n`, `$@[n:len]` a
@@ -66,7 +67,11 @@ impl PromptTemplates {
 			out.load_dir(&project_root.join(".omp/prompts"), Level::Project, "", true);
 		}
 		for path in explicit {
-			let path = if path.is_absolute() { path.clone() } else { project_root.join(path) };
+			let path = if path.is_absolute() {
+				path.clone()
+			} else {
+				project_root.join(path)
+			};
 			match fs::metadata(&path) {
 				Ok(metadata) if metadata.is_dir() => out.load_dir(&path, Level::Project, "", false),
 				Ok(_) if is_markdown(&path) => out.load_file(&path, Str::new_static("(custom)")),
@@ -138,7 +143,10 @@ impl PromptTemplates {
 		paths.sort();
 		// pi orders shallower entries first so a top-level template claims
 		// its name before a nested namesake.
-		for path in paths.iter().filter(|path| path.is_file() && is_markdown(path)) {
+		for path in paths
+			.iter()
+			.filter(|path| path.is_file() && is_markdown(path))
+		{
 			let source = if !standard {
 				Str::new_static("(custom)")
 			} else {
@@ -152,8 +160,15 @@ impl PromptTemplates {
 			self.load_file(path, source);
 		}
 		for path in paths.iter().filter(|path| path.is_dir()) {
-			let name = path.file_name().map(|name| name.to_string_lossy()).unwrap_or_default();
-			let nested = if subdir.is_empty() { name.into_owned() } else { format!("{subdir}:{name}") };
+			let name = path
+				.file_name()
+				.map(|name| name.to_string_lossy())
+				.unwrap_or_default();
+			let nested = if subdir.is_empty() {
+				name.into_owned()
+			} else {
+				format!("{subdir}:{name}")
+			};
 			self.load_dir(path, level, &nested, standard);
 		}
 	}
@@ -179,7 +194,10 @@ impl PromptTemplates {
 				return;
 			},
 		};
-		let Some(name) = path.file_stem().map(|stem| Str::new(stem.to_string_lossy())) else {
+		let Some(name) = path
+			.file_stem()
+			.map(|stem| Str::new(stem.to_string_lossy()))
+		else {
 			return;
 		};
 		if self.get(&name).is_some() {
@@ -387,7 +405,8 @@ fn match_placeholder(tail: &str, args: &[Str]) -> (Option<String>, usize) {
 			let (start, length) = spec
 				.split_once(':')
 				.map_or((spec, None), |(start, length)| (start, Some(length)));
-			if !start.is_empty() && start.bytes().all(|b| b.is_ascii_digit())
+			if !start.is_empty()
+				&& start.bytes().all(|b| b.is_ascii_digit())
 				&& length.is_none_or(|length| length.bytes().all(|b| b.is_ascii_digit()))
 			{
 				let consumed = 1 + 2 + close + 1;
@@ -412,10 +431,7 @@ fn match_placeholder(tail: &str, args: &[Str]) -> (Option<String>, usize) {
 	if body.starts_with('@') {
 		return (Some(args.join(" ")), 2);
 	}
-	let digits = body
-		.bytes()
-		.take_while(u8::is_ascii_digit)
-		.count();
+	let digits = body.bytes().take_while(u8::is_ascii_digit).count();
 	if digits > 0 {
 		let index = body[..digits].parse::<usize>().unwrap_or(0);
 		let value = index
@@ -449,18 +465,19 @@ mod tests {
 	fn substitutes_positional_windows_and_all_args_without_rescanning_values() {
 		let args = words(&["a", "$1", "c", "d"]);
 		assert_eq!(substitute_args("$1|$2|$5|$@|$ARGUMENTS", &args), "a|$1||a $1 c d|a $1 c d");
-		assert_eq!(substitute_args("$@[2] $@[2:2] $@[3:] $@[9] $@[0] $@[1:0]", &args), "$1 c d $1 c c d   ");
+		assert_eq!(
+			substitute_args("$@[2] $@[2:2] $@[3:] $@[9] $@[0] $@[1:0]", &args),
+			"$1 c d $1 c c d   "
+		);
 		assert_eq!(substitute_args("cost $5.00 and $x", &[]), "cost .00 and $x");
 	}
 
 	#[test]
 	fn parses_quoted_words_like_pi() {
-		assert_eq!(parse_command_args("one \"two words\" 'three'\tfour"), words(&[
-			"one",
-			"two words",
-			"three",
-			"four"
-		]));
+		assert_eq!(
+			parse_command_args("one \"two words\" 'three'\tfour"),
+			words(&["one", "two words", "three", "four"])
+		);
 		assert!(parse_command_args("   ").is_empty());
 	}
 
@@ -488,7 +505,10 @@ mod tests {
 			fs::create_dir_all(path.parent().unwrap()).unwrap();
 			fs::write(path, text).unwrap();
 		};
-		write(config_root.join("agent/prompts/review.md"), "---\ndescription: Review code\n---\nReview $ARGUMENTS");
+		write(
+			config_root.join("agent/prompts/review.md"),
+			"---\ndescription: Review code\n---\nReview $ARGUMENTS",
+		);
 		write(project.join(".omp/prompts/review.md"), "project namesake loses");
 		write(project.join(".omp/prompts/fix.md"), "Fix the failing test in $1\nsecond line");
 		write(project.join(".omp/prompts/rust/lint.md"), "Lint rust");
@@ -517,14 +537,17 @@ mod tests {
 		]);
 		assert_eq!(templates.warnings.len(), 2, "{:?}", templates.warnings);
 		assert_eq!(
-			templates.expand_line("/fix src/lib.rs \"and more\"").as_deref(),
+			templates
+				.expand_line("/fix src/lib.rs \"and more\"")
+				.as_deref(),
 			Some("Fix the failing test in src/lib.rs\nsecond line")
 		);
 		assert_eq!(templates.expand_line("/review a b").as_deref(), Some("Review a b"));
 		assert_eq!(templates.expand_line("/unknown a").as_deref(), None);
 		assert_eq!(templates.expand_line("plain text").as_deref(), None);
 
-		let suppressed = PromptTemplates::discover(&project, &config_root, &[root.join("extra.md")], false);
+		let suppressed =
+			PromptTemplates::discover(&project, &config_root, &[root.join("extra.md")], false);
 		let names = suppressed
 			.templates
 			.iter()

@@ -103,7 +103,8 @@ pub(crate) fn queue_steering(
 		.with_prop(PropId::Status, Value::Str(Str::new_static("queued")))
 		.with_content(text);
 	if !attachments.is_empty() {
-		node = node.with_prop(PropId::Data, Value::Json(serde_json::value::to_raw_value(attachments)?));
+		node =
+			node.with_prop(PropId::Data, Value::Json(serde_json::value::to_raw_value(attachments)?));
 	}
 	session.patch(Txn {
 		cause,
@@ -155,7 +156,8 @@ pub(crate) fn queue_prompt(
 		.with_prop(PropId::Status, Value::Str(Str::new_static("pending")))
 		.with_content(text);
 	if !attachments.is_empty() {
-		node = node.with_prop(PropId::Data, Value::Json(serde_json::value::to_raw_value(attachments)?));
+		node =
+			node.with_prop(PropId::Data, Value::Json(serde_json::value::to_raw_value(attachments)?));
 	}
 	session.patch(Txn {
 		cause,
@@ -637,7 +639,9 @@ mod tests {
 		);
 		let node = session.dom().get(prompt).expect("queued prompt remains");
 		assert_eq!(
-			node.prop(&PropKey::from(PropId::Status)).and_then(Value::as_str),
+			node
+				.prop(&PropKey::from(PropId::Status))
+				.and_then(Value::as_str),
 			Some("pending"),
 			"a failed decode must not mark the prompt sent"
 		);

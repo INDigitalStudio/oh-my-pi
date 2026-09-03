@@ -8,17 +8,8 @@ use crate::director::{BindValue, Director, Slot};
 const CLAIMS: &[Slot] = &[Slot::Mode, Slot::Loop];
 /// Tools the vibe coordinator may use: inspection, tracking, and the real
 /// `task`/`hub` session orchestration primitives; never direct mutation.
-pub const VIBE_TOOLS: &[&str] = &[
-	"read",
-	"grep",
-	"glob",
-	"todo",
-	"think",
-	"ask",
-	"task",
-	"hub",
-	"yield",
-];
+pub const VIBE_TOOLS: &[&str] =
+	&["read", "grep", "glob", "todo", "think", "ask", "task", "hub", "yield"];
 
 /// Restricts the roster and defers delivery while coordinating vibe workers.
 pub struct Vibe {

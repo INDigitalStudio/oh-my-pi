@@ -31,7 +31,11 @@ pub fn resolve(cwd: &Path) -> Option<ActiveRepository> {
 		return None;
 	}
 	let mut names: Vec<_> = fs::read_dir(cwd)
-		.and_then(|entries| entries.map(|entry| entry.map(|entry| entry.file_name())).collect())
+		.and_then(|entries| {
+			entries
+				.map(|entry| entry.map(|entry| entry.file_name()))
+				.collect()
+		})
 		.unwrap_or_default();
 	names.sort_unstable();
 	let mut found = None;

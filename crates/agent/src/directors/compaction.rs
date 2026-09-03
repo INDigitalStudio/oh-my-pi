@@ -506,11 +506,9 @@ fn text_message(role: Role, text: Str) -> Message {
 
 /// The message with every media part replaced by pi's `[image]` text.
 fn media_as_text(message: &Message) -> Message {
-	if !message
-		.content
-		.iter()
-		.any(|part| matches!(part, ContentPart::Image(_) | ContentPart::Audio(_) | ContentPart::Document(_)))
-	{
+	if !message.content.iter().any(|part| {
+		matches!(part, ContentPart::Image(_) | ContentPart::Audio(_) | ContentPart::Document(_))
+	}) {
 		return message.clone();
 	}
 	let content = message

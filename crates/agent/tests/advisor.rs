@@ -4,7 +4,8 @@ use std::{collections::VecDeque, future::Future, sync::Arc};
 
 use omp_agent::{
 	DispatchPolicy, Inference, Kernel, RunControl, RuntimeFlags, StaticPrompt, TurnInput, TurnStop,
-	directors::advisor::{self, MODEL_SELECTOR}, find_director, state_bool, state_int, state_str,
+	directors::advisor::{self, MODEL_SELECTOR},
+	find_director, state_bool, state_int, state_str,
 };
 use omp_con::Ctx;
 use omp_core::{Str, sf};
@@ -31,15 +32,15 @@ enum AdvisorReply {
 
 #[derive(Clone)]
 struct Calls {
-	primary: Arc<Mutex<Vec<ChatRequest>>>,
-	advisor: Arc<Mutex<Vec<ChatRequest>>>,
+	primary:   Arc<Mutex<Vec<ChatRequest>>>,
+	advisor:   Arc<Mutex<Vec<ChatRequest>>>,
 	selectors: Arc<Mutex<Vec<Str>>>,
 }
 
 struct RoutedInference {
 	primary: VecDeque<Vec<ChatEvent>>,
 	advisor: VecDeque<AdvisorReply>,
-	calls: Calls,
+	calls:   Calls,
 }
 
 impl RoutedInference {
@@ -48,15 +49,18 @@ impl RoutedInference {
 		advisor: impl IntoIterator<Item = AdvisorReply>,
 	) -> (Self, Calls) {
 		let calls = Calls {
-			primary: Arc::new(Mutex::new(Vec::new())),
-			advisor: Arc::new(Mutex::new(Vec::new())),
+			primary:   Arc::new(Mutex::new(Vec::new())),
+			advisor:   Arc::new(Mutex::new(Vec::new())),
 			selectors: Arc::new(Mutex::new(Vec::new())),
 		};
-		(Self {
-			primary: primary.into_iter().collect(),
-			advisor: advisor.into_iter().collect(),
-			calls: calls.clone(),
-		}, calls)
+		(
+			Self {
+				primary: primary.into_iter().collect(),
+				advisor: advisor.into_iter().collect(),
+				calls:   calls.clone(),
+			},
+			calls,
+		)
 	}
 }
 
@@ -66,7 +70,10 @@ impl Inference for RoutedInference {
 		request: ChatRequest,
 	) -> impl Future<Output = Result<ChatStream, omp_inference::Error>> + Send {
 		self.calls.primary.lock().push(request);
-		let events = self.primary.pop_front().expect("one primary script per request");
+		let events = self
+			.primary
+			.pop_front()
+			.expect("one primary script per request");
 		async move { Ok(streaming(events)) }
 	}
 
@@ -77,7 +84,10 @@ impl Inference for RoutedInference {
 	) -> impl Future<Output = Result<ChatStream, omp_inference::Error>> + Send {
 		self.calls.selectors.lock().push(Str::new(selector));
 		self.calls.advisor.lock().push(request);
-		let reply = self.advisor.pop_front().expect("one advisor script per review");
+		let reply = self
+			.advisor
+			.pop_front()
+			.expect("one advisor script per review");
 		async move {
 			match reply {
 				AdvisorReply::Events(events) => Ok(streaming(events)),
@@ -92,10 +102,14 @@ impl Inference for RoutedInference {
 }
 
 fn advisor_note(note: &str, severity: &str) -> Vec<ChatEvent> {
-	tool_script("advisor-1", "advise", serde_json::json!({
-		"note": note,
-		"severity": severity,
-	}))
+	tool_script(
+		"advisor-1",
+		"advise",
+		serde_json::json!({
+			"note": note,
+			"severity": severity,
+		}),
+	)
 }
 
 fn kernel(inference: RoutedInference, root: &std::path::Path) -> Kernel<RoutedInference> {
@@ -106,11 +120,11 @@ fn kernel(inference: RoutedInference, root: &std::path::Path) -> Kernel<RoutedIn
 		StaticPrompt(sf!("primary system")),
 	)
 	.with_runtime_flags(RuntimeFlags {
-		automatic_compaction: false,
-		goal_enabled: true,
-		autolearn_enabled: false,
+		automatic_compaction:     false,
+		goal_enabled:             true,
+		autolearn_enabled:        false,
 		autolearn_min_tool_calls: 5,
-		recover_inline_edits: true,
+		recover_inline_edits:     true,
 	})
 }
 
@@ -121,19 +135,26 @@ fn session(root: &std::path::Path) -> Session {
 fn request_contains(request: &ChatRequest, role: Role, needle: &str) -> bool {
 	request.messages.iter().any(|message| {
 		message.role == role
-			&& message.content.iter().any(|part| {
-				matches!(part, ContentPart::Text { text, .. } if text.contains(needle))
-			})
+			&& message
+				.content
+				.iter()
+				.any(|part| matches!(part, ContentPart::Text { text, .. } if text.contains(needle)))
 	})
 }
 
 fn append_completed_turn(session: &mut Session, text: &str) {
 	session.begin_turn().expect("turn");
-	session.user("historical request", Vec::new()).expect("user");
+	session
+		.user("historical request", Vec::new())
+		.expect("user");
 	session
 		.assistant_start("primary", "scripted", "scripted/primary")
 		.expect("assistant");
-	let turn = *session.dom().children(session.dom().body()).last().expect("turn handle");
+	let turn = *session
+		.dom()
+		.children(session.dom().body())
+		.last()
+		.expect("turn handle");
 	let assistant = *session
 		.dom()
 		.children(turn)
@@ -145,7 +166,9 @@ fn append_completed_turn(session: &mut Session, text: &str) {
 				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Assistant))
 		})
 		.expect("assistant handle");
-	let sid = session.stream_open(assistant, PropKey::from(PropId::Text)).expect("text stream");
+	let sid = session
+		.stream_open(assistant, PropKey::from(PropId::Text))
+		.expect("text stream");
 	session.stream_append(sid, text).expect("text");
 	session.stream_close(sid).expect("close");
 	session.assistant_end("stop").expect("assistant end");
@@ -157,25 +180,35 @@ fn ai_advisor_enabled_controls_idempotent_launch_engagement() {
 	let mut session = session(root.path());
 	let con = Ctx::new();
 	advisor::apply_launch(&mut session, &con).expect("disabled launch");
-	assert_eq!(session.dom().count("directors director[family=advisor]").expect("selector"), 0);
+	assert_eq!(
+		session
+			.dom()
+			.count("directors director[family=advisor]")
+			.expect("selector"),
+		0
+	);
 	omp_inference::pi_settings::AI_ADVISOR_ENABLED
 		.set(&con, true)
 		.expect("enable advisor");
 	advisor::apply_launch(&mut session, &con).expect("enabled launch");
 	advisor::apply_launch(&mut session, &con).expect("idempotent launch");
-	assert_eq!(session.dom().count("directors director[family=advisor]").expect("selector"), 1);
+	assert_eq!(
+		session
+			.dom()
+			.count("directors director[family=advisor]")
+			.expect("selector"),
+		1
+	);
 }
 
 #[tokio::test]
 async fn blocker_review_continues_and_reaches_the_main_model() {
 	let root = tempfile::tempdir().expect("temporary directory");
-	let (inference, calls) = RoutedInference::new(
-		[text_script("candidate"), text_script("fixed")],
-		[
+	let (inference, calls) =
+		RoutedInference::new([text_script("candidate"), text_script("fixed")], [
 			AdvisorReply::Events(advisor_note("Verify the failing edge.", "blocker")),
 			AdvisorReply::Events(empty_script()),
-		],
-	);
+		]);
 	let mut kernel = kernel(inference, root.path());
 	let mut session = session(root.path());
 	advisor::engage(&mut session).expect("advisor engages");
@@ -208,7 +241,10 @@ async fn blocker_review_continues_and_reaches_the_main_model() {
 	drop(advisor_requests);
 	assert_eq!(calls.selectors.lock().as_slice(), [MODEL_SELECTOR, MODEL_SELECTOR]);
 	assert_eq!(
-		session.dom().count("body turn notice[kind=advisor]").expect("notice selector"),
+		session
+			.dom()
+			.count("body turn notice[kind=advisor]")
+			.expect("notice selector"),
 		1
 	);
 	let (_, node) = find_director(session.dom(), advisor::FAMILY).expect("advisor frame");
@@ -221,13 +257,10 @@ async fn blocker_review_continues_and_reaches_the_main_model() {
 #[tokio::test]
 async fn sync_backlog_reviews_before_the_next_primary_request() {
 	let root = tempfile::tempdir().expect("temporary directory");
-	let (inference, calls) = RoutedInference::new(
-		[text_script("done")],
-		[
-			AdvisorReply::Events(advisor_note("Check the boundary.", "blocker")),
-			AdvisorReply::Events(empty_script()),
-		],
-	);
+	let (inference, calls) = RoutedInference::new([text_script("done")], [
+		AdvisorReply::Events(advisor_note("Check the boundary.", "blocker")),
+		AdvisorReply::Events(empty_script()),
+	]);
 	let con = Arc::new(Ctx::new());
 	omp_inference::pi_settings::AI_ADVISOR_SYNC_BACKLOG
 		.set(&con, Str::new_static("1"))
@@ -248,33 +281,23 @@ async fn sync_backlog_reviews_before_the_next_primary_request() {
 	assert_eq!(outcome.stop, TurnStop::Completed);
 	let primary = calls.primary.lock();
 	assert_eq!(primary.len(), 1);
-	assert!(request_contains(
-		&primary[0],
-		Role::System,
-		"<advisory severity=\"blocker\""
-	));
+	assert!(request_contains(&primary[0], Role::System, "<advisory severity=\"blocker\""));
 	drop(primary);
 	let advisor_requests = calls.advisor.lock();
 	assert_eq!(advisor_requests.len(), 2);
-	assert!(request_contains(
-		&advisor_requests[0],
-		Role::User,
-		"[in progress — more steps follow]"
-	));
+	assert!(request_contains(&advisor_requests[0], Role::User, "[in progress — more steps follow]"));
 	assert_eq!(calls.selectors.lock().first().map(Str::as_str), Some(MODEL_SELECTOR));
 }
 
 #[tokio::test]
 async fn missing_advisor_role_is_journaled_as_unhealthy_without_failing_the_primary() {
 	let root = tempfile::tempdir().expect("temporary directory");
-	let (inference, _) = RoutedInference::new(
-		[text_script("candidate")],
-		[AdvisorReply::Failure(Error::planning(
+	let (inference, _) =
+		RoutedInference::new([text_script("candidate")], [AdvisorReply::Failure(Error::planning(
 			ErrorKind::TargetNotFound,
 			ErrorDetail::target(Str::new_static(MODEL_SELECTOR)),
 			ExecutionReceipt::default(),
-		))],
-	);
+		))]);
 	let mut kernel = kernel(inference, root.path());
 	let mut session = session(root.path());
 	advisor::engage(&mut session).expect("advisor engages");
@@ -297,10 +320,10 @@ async fn missing_advisor_role_is_journaled_as_unhealthy_without_failing_the_prim
 async fn turn_cancellation_drops_an_in_flight_advisor_without_journaling_delivery() {
 	let root = tempfile::tempdir().expect("temporary directory");
 	let started = Arc::new(Notify::new());
-	let (inference, calls) = RoutedInference::new(
-		[text_script("candidate")],
-		[AdvisorReply::Pending(Arc::clone(&started))],
-	);
+	let (inference, calls) =
+		RoutedInference::new([text_script("candidate")], [AdvisorReply::Pending(Arc::clone(
+			&started,
+		))]);
 	let mut kernel = kernel(inference, root.path());
 	let mut session = session(root.path());
 	advisor::engage(&mut session).expect("advisor engages");
@@ -321,7 +344,13 @@ async fn turn_cancellation_drops_an_in_flight_advisor_without_journaling_deliver
 		.expect("cancellation is an outcome");
 	assert_eq!(outcome.stop, TurnStop::Cancelled);
 	assert_eq!(calls.advisor.lock().len(), 1);
-	assert_eq!(session.dom().count("body turn notice[kind=advisor]").expect("selector"), 0);
+	assert_eq!(
+		session
+			.dom()
+			.count("body turn notice[kind=advisor]")
+			.expect("selector"),
+		0
+	);
 	let (_, node) = find_director(session.dom(), advisor::FAMILY).expect("advisor frame");
 	assert_eq!(state_str(node, "status").as_deref(), Some("running"));
 	assert!(!state_bool(node, "yielded").unwrap_or(false));

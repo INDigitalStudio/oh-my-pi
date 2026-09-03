@@ -86,6 +86,13 @@ pub trait Inference: Send {
 		self.chat(request)
 	}
 
+	/// Rebinds observer-only wire capture to the live journal after a session
+	/// switch. Inference stacks without a local transport keep the default
+	/// no-op.
+	fn set_debug_session(&mut self, session: Option<Str>) {
+		let _ = session;
+	}
+
 	/// Installs the observer that receives same-route retry notices for
 	/// every subsequent chat. Inference stacks without a retry layer keep the
 	/// default no-op.
@@ -499,6 +506,14 @@ impl<C> Kernel<C> {
 	#[must_use]
 	pub const fn inference(&self) -> &C {
 		&self.client
+	}
+
+	/// Rebinds private debug capture to one durable session identity.
+	pub fn set_debug_session(&mut self, session: Option<Str>)
+	where
+		C: Inference,
+	{
+		self.client.set_debug_session(session);
 	}
 
 	/// Borrows the composed runtime tool registry.
@@ -1001,7 +1016,13 @@ impl<C: Inference> Kernel<C> {
 							.into();
 					}
 				}
-				let preflight_control = CallControl::new(self.mailbox_rx.clone(), turn_cancel.clone(), self.cancel.clone(), Some(control.clone()), self.approvals.clone());
+				let preflight_control = CallControl::new(
+					self.mailbox_rx.clone(),
+					turn_cancel.clone(),
+					self.cancel.clone(),
+					Some(control.clone()),
+					self.approvals.clone(),
+				);
 				let preflight = {
 					let mut cx = MutDirectorCx {
 						session,
@@ -1055,7 +1076,13 @@ impl<C: Inference> Kernel<C> {
 				directors.prepare_inference(session.dom(), &director_cx, &mut request);
 				let request_started = Instant::now();
 				requests_started = requests_started.saturating_add(1);
-				let opening_control = CallControl::new(self.mailbox_rx.clone(), turn_cancel.clone(), self.cancel.clone(), Some(control.clone()), self.approvals.clone());
+				let opening_control = CallControl::new(
+					self.mailbox_rx.clone(),
+					turn_cancel.clone(),
+					self.cancel.clone(),
+					Some(control.clone()),
+					self.approvals.clone(),
+				);
 				let stream = {
 					let hooks = self.lifecycle_hooks.clone();
 					let opening = self.client.chat(request);
@@ -1137,7 +1164,13 @@ impl<C: Inference> Kernel<C> {
 					.iter()
 					.map(|call| (call.call_id().clone(), crate::dispatch::call_target(call)))
 					.collect::<Vec<_>>();
-				let call_control = CallControl::new(self.mailbox_rx.clone(), turn_cancel.clone(), self.cancel.clone(), Some(control.clone()), self.approvals.clone());
+				let call_control = CallControl::new(
+					self.mailbox_rx.clone(),
+					turn_cancel.clone(),
+					self.cancel.clone(),
+					Some(control.clone()),
+					self.approvals.clone(),
+				);
 				let reports = self
 					.dispatcher
 					.drive(session, std::mem::take(&mut driven.calls), Some(&call_control))
@@ -1264,7 +1297,13 @@ impl<C: Inference> Kernel<C> {
 			// Cold candidate-yield hooks (the advisor's second-model review)
 			// run under the same turn control as the pre-inference hooks: an
 			// interrupt drops the review mid-flight.
-			let yield_control = CallControl::new(self.mailbox_rx.clone(), turn_cancel.clone(), self.cancel.clone(), Some(control.clone()), self.approvals.clone());
+			let yield_control = CallControl::new(
+				self.mailbox_rx.clone(),
+				turn_cancel.clone(),
+				self.cancel.clone(),
+				Some(control.clone()),
+				self.approvals.clone(),
+			);
 			let reviewed = {
 				let mut cx = MutDirectorCx {
 					session,
@@ -1430,7 +1469,13 @@ impl<C: Inference> Kernel<C> {
 		turn_cancel: &crate::TurnCancellation,
 		control: &RunControl,
 	) -> Result<Awaited, KernelError> {
-		let call_control = CallControl::new(self.mailbox_rx.clone(), turn_cancel.clone(), self.cancel.clone(), Some(control.clone()), self.approvals.clone());
+		let call_control = CallControl::new(
+			self.mailbox_rx.clone(),
+			turn_cancel.clone(),
+			self.cancel.clone(),
+			Some(control.clone()),
+			self.approvals.clone(),
+		);
 		loop {
 			let jobs = Arc::clone(self.dispatcher.jobs());
 			let signal = tokio::select! {
@@ -1551,7 +1596,13 @@ impl<C: Inference> Kernel<C> {
 				.dispatcher
 				.prepare(call.identity, call_id, call.entry, cancellation)?;
 		prepared.commit(call.args);
-		let call_control = CallControl::new(self.mailbox_rx.clone(), turn_cancel.clone(), self.cancel.clone(), Some(control.clone()), self.approvals.clone());
+		let call_control = CallControl::new(
+			self.mailbox_rx.clone(),
+			turn_cancel.clone(),
+			self.cancel.clone(),
+			Some(control.clone()),
+			self.approvals.clone(),
+		);
 		let mut reports = self
 			.dispatcher
 			.drive(session, vec![prepared], Some(&call_control))
@@ -1575,17 +1626,13 @@ impl<C: Inference> Kernel<C> {
 	/// request assembly. The projection ([`Self::project_request`]) is
 	/// synchronous over the session so no session borrow crosses the hook
 	/// await (`Session` is not `Sync`).
-	async fn finish_request(
-		&self,
-		projected: ProjectedRequest,
-	) -> Result<ChatRequest, KernelError> {
+	async fn finish_request(&self, projected: ProjectedRequest) -> Result<ChatRequest, KernelError> {
 		let ProjectedRequest { facts, mut messages, tools } = projected;
 		// `thread_projection` (Python `ContextView` → `ContextPatch`): an
 		// extension edits this request's working copy of the projection;
 		// the journal and DOM stay untouched.
 		if let Some(hooks) = &self.lifecycle_hooks {
-			let outcome =
-				crate::context::gate_thread_projection(hooks, &facts, &mut messages).await?;
+			let outcome = crate::context::gate_thread_projection(hooks, &facts, &mut messages).await?;
 			if outcome.applied > 0 {
 				tracing::debug!(
 					applied = outcome.applied,
@@ -1639,10 +1686,7 @@ impl<C: Inference> Kernel<C> {
 				..Default::default()
 			});
 		}
-		items.extend(crate::prompt::project_thread_with_attachments(
-			session.dom(),
-			session.blobs(),
-		)?);
+		items.extend(crate::prompt::project_thread_with_attachments(session.dom(), session.blobs())?);
 		let mut messages = InferenceMessage::from_thread_items(&items)?;
 		crate::events::strip_unsigned_reasoning(&mut messages);
 		crate::vision::apply(session.dom(), &route, &mut messages);
@@ -1710,7 +1754,13 @@ impl<C: Inference> Kernel<C> {
 		let mut stop_reason = Str::new_static("stop");
 		let mut completed = false;
 		let mut had_tool_calls = false;
-		let call_control = CallControl::new(self.mailbox_rx.clone(), turn_cancel.clone(), self.cancel.clone(), Some(control.clone()), self.approvals.clone());
+		let call_control = CallControl::new(
+			self.mailbox_rx.clone(),
+			turn_cancel.clone(),
+			self.cancel.clone(),
+			Some(control.clone()),
+			self.approvals.clone(),
+		);
 		// pi `message.ttft`: first visible or reasoning byte (or the first
 		// streamed tool-call fragment) after the request left the kernel.
 		let mut first_token: Option<Instant> = None;
@@ -2364,7 +2414,13 @@ impl<C: Inference> Kernel<C> {
 						.prepare(identity, call_id.clone(), entry, cancellation)?;
 				prepared.arg_delta(args.get());
 				prepared.commit(args);
-				let call_control = CallControl::new(self.mailbox_rx.clone(), turn_cancel.clone(), self.cancel.clone(), Some(control.clone()), self.approvals.clone());
+				let call_control = CallControl::new(
+					self.mailbox_rx.clone(),
+					turn_cancel.clone(),
+					self.cancel.clone(),
+					Some(control.clone()),
+					self.approvals.clone(),
+				);
 				let mut reports = self
 					.dispatcher
 					.drive(session, vec![prepared], Some(&call_control))
@@ -2437,8 +2493,13 @@ impl<C: Inference> Kernel<C> {
 		turn: &crate::TurnCancellation,
 	) -> Result<DrainedSteering, SessionError> {
 		let mut drained = DrainedSteering::default();
-		let control =
-			CallControl::new(self.mailbox_rx.clone(), turn.clone(), self.cancel.clone(), None, self.approvals.clone());
+		let control = CallControl::new(
+			self.mailbox_rx.clone(),
+			turn.clone(),
+			self.cancel.clone(),
+			None,
+			self.approvals.clone(),
+		);
 		while let Ok(message) = self.mailbox_rx.try_recv() {
 			match control.handle(session, message)? {
 				Received::Steering => drained.received = true,
@@ -2496,7 +2557,13 @@ impl<C: Inference> Kernel<C> {
 		let director = CompactionDirector::manual(focus).with_method(method);
 		let route = self.current_route();
 		let turn_cancel = self.cancel.begin_turn();
-		let preflight_control = CallControl::new(self.mailbox_rx.clone(), turn_cancel.clone(), self.cancel.clone(), Some(control.clone()), self.approvals.clone());
+		let preflight_control = CallControl::new(
+			self.mailbox_rx.clone(),
+			turn_cancel.clone(),
+			self.cancel.clone(),
+			Some(control.clone()),
+			self.approvals.clone(),
+		);
 		// Only an interrupt/cancel may end the summary inference; every other
 		// mailbox message (steering, peer, approvals) is journaled once the
 		// session is free again, exactly as a blocking `/compact` in pi.
@@ -3129,6 +3196,7 @@ mod streaming_edit_tests {
 			ty:      TypeSpec::BOOL,
 			flags:   VarFlags::SESSION,
 			default: Value::Bool(false),
+			ui:      None,
 		})
 		.expect("setting registers");
 		ctx.set("sv_tools_edit_streaming_abort", Value::Bool(enabled), Origin::Session)

@@ -100,9 +100,7 @@ impl<C: Inference> Kernel<C> {
 		// Steering typed while a local command runs has no inference to
 		// land in; it goes back to the mailbox for the next model turn.
 		for (text, attachments) in steering {
-			let _ = self
-				.mailbox_tx
-				.send(crate::Up::Steer { text, attachments });
+			let _ = self.mailbox_tx.send(crate::Up::Steer { text, attachments });
 		}
 		let stop = match dispatched {
 			Ok(_) if turn_cancel.is_turn_cancelled() => TurnStop::Cancelled,

@@ -131,8 +131,7 @@ fn decision(approved: bool, scope: ApprovalScope) -> ApprovalDecision {
 fn prompts(session: &Session) -> Vec<omp_agent::ApprovalTicket> {
 	let dom = session.dom();
 	let prompts = omp_session::components::prompts::prompts_handle(dom).expect("prompts");
-	dom
-		.children(prompts)
+	dom.children(prompts)
 		.iter()
 		.filter_map(|handle| dom.get(*handle))
 		.filter_map(|node| {
@@ -236,9 +235,19 @@ async fn allow_journals_the_decision_and_the_tool_runs() {
 	assert_eq!(journaled.len(), 1);
 	assert_eq!(journaled[0].ticket_id, seen[0].ticket_id);
 	assert_eq!(journaled[0].state, TicketState::Decided);
-	assert!(journaled[0].decision.as_ref().is_some_and(|decision| decision.approved));
+	assert!(
+		journaled[0]
+			.decision
+			.as_ref()
+			.is_some_and(|decision| decision.approved)
+	);
 	let outputs = results(&harness.session);
-	assert!(outputs.iter().any(|text| text.contains("\"ran\":\"make build\"")), "{outputs:?}");
+	assert!(
+		outputs
+			.iter()
+			.any(|text| text.contains("\"ran\":\"make build\"")),
+		"{outputs:?}"
+	);
 	assert!(harness.kernel.waiting_approvals().is_empty());
 }
 
@@ -252,7 +261,12 @@ async fn deny_journals_the_denial_and_the_tool_reports_it() {
 	assert_eq!(seen.len(), 1);
 	let journaled = prompts(&harness.session);
 	assert_eq!(journaled[0].state, TicketState::Decided);
-	assert!(journaled[0].decision.as_ref().is_some_and(|decision| !decision.approved));
+	assert!(
+		journaled[0]
+			.decision
+			.as_ref()
+			.is_some_and(|decision| !decision.approved)
+	);
 	let outputs = results(&harness.session);
 	assert!(outputs.iter().any(|text| text.contains("denied by user")), "{outputs:?}");
 }
@@ -274,7 +288,13 @@ async fn session_grant_answers_a_repeated_subject_from_the_tree() {
 	let auto = &journaled[1];
 	assert_eq!(auto.state, TicketState::Decided);
 	assert_eq!(auto.decision.as_ref().map(|decision| decision.source), Some(ApprovalSource::Config));
-	assert!(results(&harness.session).iter().filter(|text| text.contains("\"ran\"")).count() >= 2);
+	assert!(
+		results(&harness.session)
+			.iter()
+			.filter(|text| text.contains("\"ran\""))
+			.count()
+			>= 2
+	);
 }
 
 #[tokio::test]

@@ -5,21 +5,20 @@
 //! Two pi capabilities, ported from `packages/coding-agent/src/capability/
 //! {context-file,rule}.ts` and their `discovery/*` providers:
 //!
-//! * **Context files** (pi `--no-context-files`): `AGENTS.md`, `CLAUDE.md`
-//!   and friends walked up from the project root — one file per directory
-//!   depth, the highest-priority provider winning a tie (`.omp/AGENTS.md`,
-//!   then `.claude/CLAUDE.md`, then standalone `AGENTS.md`, then standalone
+//! * **Context files** (pi `--no-context-files`): `AGENTS.md`, `CLAUDE.md` and
+//!   friends walked up from the project root — one file per directory depth,
+//!   the highest-priority provider winning a tie (`.omp/AGENTS.md`, then
+//!   `.claude/CLAUDE.md`, then standalone `AGENTS.md`, then standalone
 //!   `CLAUDE.md`) — plus the user-level `<config root>/agent/AGENTS.md`.
 //!   Injected whole, farthest first so the closest file reads last.
-//! * **Rules** (pi `--no-rules`): Markdown documents with optional
-//!   frontmatter (`description`, `globs`, `alwaysApply`, `condition`,
-//!   `scope`, `agents`) from `.omp/rules`, `<config root>/agent/rules`, the
-//!   sticky `RULES.md`, `.agent[s]/rules`, `.cursor/rules`, `.windsurf/rules`,
-//!   `.clinerules`, and the legacy `.cursorrules` / `.windsurfrules` files.
-//!   Name conflicts resolve first-source-wins in that order (pi provider
-//!   priority). `alwaysApply` rules are injected in full; described rules are
-//!   listed by name and globs for the model to read through `rule://<name>`
-//!   (pi `bucketRules`).
+//! * **Rules** (pi `--no-rules`): Markdown documents with optional frontmatter
+//!   (`description`, `globs`, `alwaysApply`, `condition`, `scope`, `agents`)
+//!   from `.omp/rules`, `<config root>/agent/rules`, the sticky `RULES.md`,
+//!   `.agent[s]/rules`, `.cursor/rules`, `.windsurf/rules`, `.clinerules`, and
+//!   the legacy `.cursorrules` / `.windsurfrules` files. Name conflicts resolve
+//!   first-source-wins in that order (pi provider priority). `alwaysApply`
+//!   rules are injected in full; described rules are listed by name and globs
+//!   for the model to read through `rule://<name>` (pi `bucketRules`).
 
 use std::{
 	collections::BTreeSet,
@@ -231,25 +230,50 @@ impl ActiveRules {
 
 		// native (100): project `.omp/rules`, user `agent/rules`, sticky RULES.md.
 		if let Some(config) = &nearest_config {
-			for rule in rules_in_dir(&config.join("rules"), "native", Level::Project, &["md", "mdc"], &mut warnings) {
+			for rule in rules_in_dir(
+				&config.join("rules"),
+				"native",
+				Level::Project,
+				&["md", "mdc"],
+				&mut warnings,
+			) {
 				admit(rule, &mut warnings);
 			}
 		}
-		for rule in rules_in_dir(&config_root.join("agent/rules"), "native", Level::User, &["md", "mdc"], &mut warnings) {
+		for rule in rules_in_dir(
+			&config_root.join("agent/rules"),
+			"native",
+			Level::User,
+			&["md", "mdc"],
+			&mut warnings,
+		) {
 			admit(rule, &mut warnings);
 		}
-		if let Some(rule) = whole_file_rule(&config_root.join("agent/RULES.md"), "RULES", "native", Level::User, &mut warnings) {
+		if let Some(rule) = whole_file_rule(
+			&config_root.join("agent/RULES.md"),
+			"RULES",
+			"native",
+			Level::User,
+			&mut warnings,
+		) {
 			admit(rule, &mut warnings);
 		}
 		if let Some(config) = &nearest_config
-			&& let Some(rule) = whole_file_rule(&config.join("RULES.md"), "RULES@project", "native", Level::Project, &mut warnings)
-		{
+			&& let Some(rule) = whole_file_rule(
+				&config.join("RULES.md"),
+				"RULES@project",
+				"native",
+				Level::Project,
+				&mut warnings,
+			) {
 			admit(rule, &mut warnings);
 		}
 		// agents: `.agent/rules` and `.agents/rules` (project walk-up + home).
 		for dir in &ancestors {
 			for name in [".agent/rules", ".agents/rules"] {
-				for rule in rules_in_dir(&dir.join(name), "agents", Level::Project, &["md"], &mut warnings) {
+				for rule in
+					rules_in_dir(&dir.join(name), "agents", Level::Project, &["md"], &mut warnings)
+				{
 					admit(rule, &mut warnings);
 				}
 			}
@@ -260,20 +284,50 @@ impl ActiveRules {
 			}
 		}
 		// cursor: `.cursor/rules/*.mdc` plus the legacy `.cursorrules` file.
-		for rule in rules_in_dir(&project_root.join(".cursor/rules"), "cursor", Level::Project, &["mdc", "md"], &mut warnings) {
+		for rule in rules_in_dir(
+			&project_root.join(".cursor/rules"),
+			"cursor",
+			Level::Project,
+			&["mdc", "md"],
+			&mut warnings,
+		) {
 			admit(rule, &mut warnings);
 		}
-		if let Some(rule) = whole_file_rule(&project_root.join(".cursorrules"), "cursorrules", "cursor", Level::Project, &mut warnings) {
+		if let Some(rule) = whole_file_rule(
+			&project_root.join(".cursorrules"),
+			"cursorrules",
+			"cursor",
+			Level::Project,
+			&mut warnings,
+		) {
 			admit(rule, &mut warnings);
 		}
 		// windsurf: `.windsurf/rules/*.md`, legacy `.windsurfrules`, global memories.
-		for rule in rules_in_dir(&project_root.join(".windsurf/rules"), "windsurf", Level::Project, &["md"], &mut warnings) {
+		for rule in rules_in_dir(
+			&project_root.join(".windsurf/rules"),
+			"windsurf",
+			Level::Project,
+			&["md"],
+			&mut warnings,
+		) {
 			admit(rule, &mut warnings);
 		}
-		if let Some(rule) = whole_file_rule(&project_root.join(".windsurfrules"), "windsurfrules", "windsurf", Level::Project, &mut warnings) {
+		if let Some(rule) = whole_file_rule(
+			&project_root.join(".windsurfrules"),
+			"windsurfrules",
+			"windsurf",
+			Level::Project,
+			&mut warnings,
+		) {
 			admit(rule, &mut warnings);
 		}
-		if let Some(rule) = whole_file_rule(&home.join(".codeium/windsurf/memories/global_rules.md"), "global_rules", "windsurf", Level::User, &mut warnings) {
+		if let Some(rule) = whole_file_rule(
+			&home.join(".codeium/windsurf/memories/global_rules.md"),
+			"global_rules",
+			"windsurf",
+			Level::User,
+			&mut warnings,
+		) {
 			admit(rule, &mut warnings);
 		}
 		// cline: `.clinerules` file or directory, nearest ancestor.
@@ -286,7 +340,9 @@ impl ActiveRules {
 				for rule in rules_in_dir(&found, "cline", Level::Project, &["md"], &mut warnings) {
 					admit(rule, &mut warnings);
 				}
-			} else if let Some(rule) = whole_file_rule(&found, "clinerules", "cline", Level::Project, &mut warnings) {
+			} else if let Some(rule) =
+				whole_file_rule(&found, "clinerules", "cline", Level::Project, &mut warnings)
+			{
 				admit(rule, &mut warnings);
 			}
 		}
@@ -449,10 +505,7 @@ impl OneOrMany {
 	fn into_vec(self, split_commas: bool) -> Vec<Str> {
 		let items = match self {
 			Self::None => return Vec::new(),
-			Self::One(value) if split_commas => value
-				.split(',')
-				.map(str::to_owned)
-				.collect(),
+			Self::One(value) if split_commas => value.split(',').map(str::to_owned).collect(),
 			Self::One(value) => vec![value],
 			Self::Many(values) => values,
 		};
@@ -467,7 +520,10 @@ impl OneOrMany {
 
 /// Splits `---` frontmatter from a Markdown document (pi `parseFrontmatter`).
 pub(super) fn split_frontmatter(source: &str) -> (Option<&str>, &str) {
-	let Some(rest) = source.strip_prefix("---\n").or_else(|| source.strip_prefix("---\r\n")) else {
+	let Some(rest) = source
+		.strip_prefix("---\n")
+		.or_else(|| source.strip_prefix("---\r\n"))
+	else {
 		return (None, source);
 	};
 	let Some(end) = rest.find("\n---") else {
@@ -637,7 +693,9 @@ impl RuleResolver {
 			} else {
 				available.join(", ")
 			};
-			Fault::Source { message: Str::new(format!("Unknown rule: {name}\nAvailable: {available}")) }
+			Fault::Source {
+				message: Str::new(format!("Unknown rule: {name}\nAvailable: {available}")),
+			}
 		})
 	}
 
@@ -839,13 +897,28 @@ mod tests {
 			&repo.join(".omp/rules/style.md"),
 			"---\ndescription: House style\nglobs: \"*.rs, *.toml\"\n---\nUse tabs.\n",
 		);
-		write(&repo.join(".omp/rules/always.mdc"), "---\nalwaysApply: true\n---\nNever force-push.\n");
+		write(
+			&repo.join(".omp/rules/always.mdc"),
+			"---\nalwaysApply: true\n---\nNever force-push.\n",
+		);
 		write(&repo.join(".omp/rules/hidden.md"), "no frontmatter, only rule:// reaches this\n");
-		write(&repo.join(".omp/rules/sub-only.md"), "---\ndescription: Subagents\nagents: [sub, review-*]\n---\nbody\n");
-		write(&repo.join(".omp/RULES.md"), "---\ndescription: ignored for sticky\n---\nSticky project rules.\n");
-		write(&config_root.join("agent/rules/style.md"), "---\ndescription: shadowed by project\n---\nuser\n");
+		write(
+			&repo.join(".omp/rules/sub-only.md"),
+			"---\ndescription: Subagents\nagents: [sub, review-*]\n---\nbody\n",
+		);
+		write(
+			&repo.join(".omp/RULES.md"),
+			"---\ndescription: ignored for sticky\n---\nSticky project rules.\n",
+		);
+		write(
+			&config_root.join("agent/rules/style.md"),
+			"---\ndescription: shadowed by project\n---\nuser\n",
+		);
 		write(&config_root.join("agent/RULES.md"), "User sticky.\n");
-		write(&project.join(".cursor/rules/cursor.mdc"), "---\ndescription: Cursor rule\nglobs:\n  - src/**\n---\ncursor body\n");
+		write(
+			&project.join(".cursor/rules/cursor.mdc"),
+			"---\ndescription: Cursor rule\nglobs:\n  - src/**\n---\ncursor body\n",
+		);
 		write(&project.join(".cursorrules"), "legacy cursor rules\n");
 		write(&repo.join(".clinerules"), "legacy cline rules\n");
 		write(&repo.join(".omp/rules/broken.md"), "---\ndescription: [unclosed\n---\nbody\n");
@@ -906,19 +979,29 @@ mod tests {
 	#[tokio::test]
 	async fn rule_url_reads_lists_and_completes() {
 		let (_temp, home, repo, project) = layout();
-		write(&repo.join(".omp/rules/style.md"), "---\ndescription: House style\n---\nline one\nline two\n");
+		write(
+			&repo.join(".omp/rules/style.md"),
+			"---\ndescription: House style\n---\nline one\nline two\n",
+		);
 		let rules = Arc::new(ActiveRules::discover(&project, &home, &home.join(".o2")));
 		let resolver = rules.resolver();
 		assert_eq!(resolver.entry().scheme, Scheme::Rule);
 		let body = resolver.read("style", &ParsedSelector::None).await.unwrap();
 		assert_eq!(std::str::from_utf8(&body).unwrap(), "line one\nline two\n");
 		let index = resolver.read("", &ParsedSelector::None).await.unwrap();
-		assert!(std::str::from_utf8(&index).unwrap().contains("- rule://style: House style"));
+		assert!(
+			std::str::from_utf8(&index)
+				.unwrap()
+				.contains("- rule://style: House style")
+		);
 		let listing = resolver.list("", 10, usize::MAX).await.unwrap();
 		assert_eq!(listing.entries[0].uri, "rule://style");
 		let completions = resolver.complete("sty", 5).await.unwrap();
 		assert_eq!(completions[0].value, "rule://style");
-		let missing = resolver.read("nope", &ParsedSelector::None).await.unwrap_err();
+		let missing = resolver
+			.read("nope", &ParsedSelector::None)
+			.await
+			.unwrap_err();
 		assert!(matches!(missing, Fault::Source { .. }));
 	}
 }

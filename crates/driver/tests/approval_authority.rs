@@ -7,8 +7,8 @@ use std::{future::ready, sync::Arc, time::Duration};
 
 use futures::stream;
 use omp_agent::{
-	ApprovalDecision, ApprovalScope, ApprovalSource, DispatchPolicy, Inference, Kernel,
-	KernelEvent, RunControl, StaticPrompt, TicketState, TurnInput, Up,
+	ApprovalDecision, ApprovalScope, ApprovalSource, DispatchPolicy, Inference, Kernel, KernelEvent,
+	RunControl, StaticPrompt, TicketState, TurnInput, Up,
 };
 use omp_catalog::{ProviderId, RouteId};
 use omp_core::Str;
@@ -26,8 +26,8 @@ use omp_session::{ComponentRegistry, Session};
 /// starts (`bash` declares no effects by design: its exact spawn/fs effects
 /// are admitted at the environment boundary through the same bound route).
 struct WriteThenText {
-	path:    String,
-	turns:   usize,
+	path:  String,
+	turns: usize,
 }
 
 impl Inference for WriteThenText {
@@ -57,7 +57,11 @@ impl Inference for WriteThenText {
 			};
 			vec![
 				ChatEvent::Started(meta),
-				ChatEvent::ToolCallStarted { index: 0, id: call.id.clone(), name: call.name.clone() },
+				ChatEvent::ToolCallStarted {
+					index: 0,
+					id:    call.id.clone(),
+					name:  call.name.clone(),
+				},
 				ChatEvent::ToolArgumentsDelta {
 					index: 0,
 					bytes: bytes::Bytes::from(serde_json::to_vec(&arguments).expect("args")),
@@ -101,8 +105,7 @@ fn decision(approved: bool) -> ApprovalDecision {
 fn prompts(session: &Session) -> Vec<omp_agent::ApprovalTicket> {
 	let dom = session.dom();
 	let prompts = omp_session::components::prompts::prompts_handle(dom).expect("prompts");
-	dom
-		.children(prompts)
+	dom.children(prompts)
 		.iter()
 		.filter_map(|handle| dom.get(*handle))
 		.filter_map(|node| {
@@ -166,7 +169,8 @@ async fn run(approve: bool) -> (Session, String, bool) {
 				assert_eq!(ticket.invocation_id.as_deref(), Some("write-1"));
 				assert_eq!(ticket.reasons[0].kind.as_str(), "tool");
 				assert_eq!(ticket.reasons[0].subject.as_str(), "write");
-				let _ = mailbox.send(Up::Approve { id: ticket.ticket_id, decision: decision(approve) });
+				let _ = mailbox
+					.send(Up::Approve { id: ticket.ticket_id, decision: decision(approve) });
 			}
 		}
 	});
@@ -206,7 +210,12 @@ async fn approval_always_ask_write_deny_journals_a_denied_result() {
 	let tickets = prompts(&session);
 	assert_eq!(tickets.len(), 1, "one journaled approval prompt: {tickets:?}");
 	assert_eq!(tickets[0].state, TicketState::Decided);
-	assert!(tickets[0].decision.as_ref().is_some_and(|decision| !decision.approved));
+	assert!(
+		tickets[0]
+			.decision
+			.as_ref()
+			.is_some_and(|decision| !decision.approved)
+	);
 	assert!(
 		result.contains("denied by user: not today"),
 		"denied bash must settle with the denial: {result}"
@@ -220,7 +229,12 @@ async fn approval_always_ask_write_allow_runs_the_tool() {
 	let tickets = prompts(&session);
 	assert_eq!(tickets.len(), 1);
 	assert_eq!(tickets[0].state, TicketState::Decided);
-	assert!(tickets[0].decision.as_ref().is_some_and(|decision| decision.approved));
+	assert!(
+		tickets[0]
+			.decision
+			.as_ref()
+			.is_some_and(|decision| decision.approved)
+	);
 	assert!(written, "approved write ran: {result}");
 	assert!(result.contains("\"kind\":\"ok\""), "approved write settled ok: {result}");
 }

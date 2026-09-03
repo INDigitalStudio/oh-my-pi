@@ -153,7 +153,11 @@ pub fn context_view(facts: &ContextFacts, messages: &[Message]) -> JsonValue {
 	let total = facts.prompt_head_tokens.saturating_add(message_tokens);
 	let reserve = (facts.context_window as f64 * 0.15).floor() as u64;
 	let usable = facts.context_window.saturating_sub(reserve);
-	let fraction = if usable == 0 { 0.0 } else { total as f64 / usable as f64 };
+	let fraction = if usable == 0 {
+		0.0
+	} else {
+		total as f64 / usable as f64
+	};
 	let (provider, _) = facts
 		.model
 		.split_once('/')
@@ -229,17 +233,20 @@ pub fn apply_context_patch(
 		.map(|(seq, message)| (Some(seq), message))
 		.collect();
 	let bound = messages.len();
-	let position = |rows: &[(Option<usize>, Message)], id: &JsonValue| -> Result<usize, ContextPatchError> {
-		let seq = id
-			.as_str()
-			.and_then(|id| id.parse::<usize>().ok())
-			.filter(|seq| *seq < bound)
-			.ok_or_else(|| ContextPatchError::UnknownItem { id: Str::new(id.as_str().unwrap_or("")) })?;
-		rows
-			.iter()
-			.position(|(row, _)| *row == Some(seq))
-			.ok_or_else(|| ContextPatchError::UnknownItem { id: sf!("{seq}") })
-	};
+	let position =
+		|rows: &[(Option<usize>, Message)], id: &JsonValue| -> Result<usize, ContextPatchError> {
+			let seq = id
+				.as_str()
+				.and_then(|id| id.parse::<usize>().ok())
+				.filter(|seq| *seq < bound)
+				.ok_or_else(|| ContextPatchError::UnknownItem {
+					id: Str::new(id.as_str().unwrap_or("")),
+				})?;
+			rows
+				.iter()
+				.position(|(row, _)| *row == Some(seq))
+				.ok_or_else(|| ContextPatchError::UnknownItem { id: sf!("{seq}") })
+		};
 	let mut applied = 0;
 
 	for op in prune {
@@ -284,7 +291,11 @@ pub fn apply_context_patch(
 				.cloned()
 				.chain(std::iter::once(ContentPart::Text { text, proof: None }))
 				.collect::<Vec<_>>();
-			let replaced = Message { role: message.role, content: Arc::from(kept), name: message.name.clone() };
+			let replaced = Message {
+				role:    message.role,
+				content: Arc::from(kept),
+				name:    message.name.clone(),
+			};
 			rows[at] = (*seq, replaced);
 		}
 		applied += 1;
@@ -304,7 +315,11 @@ pub fn apply_context_patch(
 		}
 		positions.sort_unstable();
 		positions.dedup();
-		let at = if last_position { *positions.last().expect("ids nonempty") } else { positions[0] };
+		let at = if last_position {
+			*positions.last().expect("ids nonempty")
+		} else {
+			positions[0]
+		};
 		for removed in positions.iter().rev() {
 			rows.remove(*removed);
 		}
@@ -367,7 +382,10 @@ pub fn apply_context_patch(
 	Ok(ProjectionOutcome { applied, note })
 }
 
-fn ids_of<'a>(op: &'a JsonValue, field: &'static str) -> Result<&'a [JsonValue], ContextPatchError> {
+fn ids_of<'a>(
+	op: &'a JsonValue,
+	field: &'static str,
+) -> Result<&'a [JsonValue], ContextPatchError> {
 	match op.get("ids") {
 		Some(JsonValue::Array(ids)) if !ids.is_empty() => Ok(ids.as_slice()),
 		_ => Err(ContextPatchError::Malformed { field }),
@@ -386,7 +404,10 @@ fn role_of(value: Option<&JsonValue>) -> Result<Role, ContextPatchError> {
 
 /// Decodes Python `Part`s (`TextPart {text}`, `JsonPart {json}`, `BlobPart
 /// {blob, alt}`) into text content; blob parts contribute their alt text.
-fn parts_of(value: Option<&JsonValue>, op: &'static str) -> Result<Vec<ContentPart>, ContextPatchError> {
+fn parts_of(
+	value: Option<&JsonValue>,
+	op: &'static str,
+) -> Result<Vec<ContentPart>, ContextPatchError> {
 	let Some(JsonValue::Array(parts)) = value else {
 		return Err(ContextPatchError::EmptyParts { op });
 	};
@@ -528,9 +549,12 @@ mod tests {
 			]),
 			name:    None,
 		}];
-		apply_context_patch(&mut messages, &serde_json::json!({
-			"drop_parts": [{"ids": ["0"], "reason": "large"}],
-		}))
+		apply_context_patch(
+			&mut messages,
+			&serde_json::json!({
+				"drop_parts": [{"ids": ["0"], "reason": "large"}],
+			}),
+		)
 		.expect("drop parts");
 		assert!(matches!(messages[0].content[0], ContentPart::ToolCall { .. }));
 		assert!(matches!(
@@ -552,11 +576,17 @@ mod tests {
 		);
 		assert_eq!(texts(&messages), ["a", "b"]);
 		assert_eq!(
-			apply_context_patch(&mut messages, &serde_json::json!({"insert": [{"parts": [], "anchor": {"relation": "tail"}}]})),
+			apply_context_patch(
+				&mut messages,
+				&serde_json::json!({"insert": [{"parts": [], "anchor": {"relation": "tail"}}]})
+			),
 			Err(ContextPatchError::EmptyParts { op: "insert" })
 		);
 		assert_eq!(
-			apply_context_patch(&mut messages, &serde_json::json!({"insert": [{"parts": [{"text": "x"}], "anchor": {"relation": "middle"}}]})),
+			apply_context_patch(
+				&mut messages,
+				&serde_json::json!({"insert": [{"parts": [{"text": "x"}], "anchor": {"relation": "middle"}}]})
+			),
 			Err(ContextPatchError::UnknownAnchor { relation: Str::new_static("middle") })
 		);
 	}

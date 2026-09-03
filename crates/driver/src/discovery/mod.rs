@@ -21,8 +21,8 @@ pub struct PromptFacts {
 	/// `{origin, content}` rows of [`rules::ContextFiles::prompt_facts`]; empty
 	/// under `--no-context-files`.
 	pub context_files:      Vec<serde_json::Value>,
-	/// `{name, content}` rows injected whole ([`rules::ActiveRules::prompt_facts`]);
-	/// empty under `--no-rules`.
+	/// `{name, content}` rows injected whole
+	/// ([`rules::ActiveRules::prompt_facts`]); empty under `--no-rules`.
 	pub always_apply_rules: Vec<serde_json::Value>,
 	/// `{name, description, globs}` rulebook rows read through `rule://`.
 	pub rules:              Vec<serde_json::Value>,

@@ -160,8 +160,5 @@ async fn jobs_oversized_settlement_is_spilled_to_the_cas_and_resolvable() {
 	let resolved = omp_agent::resolve_output(&session, inline)
 		.expect("blob read")
 		.expect("addressable");
-	assert_eq!(
-		serde_json::from_str::<serde_json::Value>(resolved.get()).expect("json"),
-		full
-	);
+	assert_eq!(serde_json::from_str::<serde_json::Value>(resolved.get()).expect("json"), full);
 }

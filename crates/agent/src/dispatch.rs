@@ -28,11 +28,10 @@ use omp_journal::{
 };
 use omp_session::{Session, SessionError};
 use omp_tool::{
-	Effects,
 	Abort, ArtifactLifetime, BlobRef as ToolBlobRef, CallOutcome, CallOutcomeDetails, CapsBase,
-	ErasedEv, ErasedOutcome, ExpectedArtifact, IncomingParams, Interrupt, InvocationFeed, JobKind,
-	JobMetadata, JobOwner, JobRef, ModelClass, Part, PromptCaps, Registry, RegistryError, Rev,
-	ToolIdentity, ToolRoute, ToolSpec,
+	Effects, ErasedEv, ErasedOutcome, ExpectedArtifact, IncomingParams, Interrupt, InvocationFeed,
+	JobKind, JobMetadata, JobOwner, JobRef, ModelClass, Part, PromptCaps, Registry, RegistryError,
+	Rev, ToolIdentity, ToolRoute, ToolSpec,
 };
 use serde_json::value::RawValue;
 use thiserror::Error;
@@ -259,7 +258,12 @@ pub enum Received {
 /// approval mode and per-tool overrides).
 pub trait ToolAdmission: Send + Sync {
 	/// Decides one committed call before its unit starts.
-	fn admit(&self, name: &str, effects: &omp_tool::Effects, args: &RawValue) -> ToolAdmissionVerdict;
+	fn admit(
+		&self,
+		name: &str,
+		effects: &omp_tool::Effects,
+		args: &RawValue,
+	) -> ToolAdmissionVerdict;
 }
 
 /// One admission answer.
@@ -360,12 +364,14 @@ impl CallControl {
 				}
 				Ok(Received::None)
 			},
-			Up::Approve { id, decision } => match self.approvals.decide(session, id.as_str(), decision) {
-				Ok(ticket) => Ok(Received::Approved(ticket)),
-				Err(error) => {
-					tracing::debug!(%error, ticket = %id, "approval decision targets no live prompt");
-					Ok(Received::None)
-				},
+			Up::Approve { id, decision } => {
+				match self.approvals.decide(session, id.as_str(), decision) {
+					Ok(ticket) => Ok(Received::Approved(ticket)),
+					Err(error) => {
+						tracing::debug!(%error, ticket = %id, "approval decision targets no live prompt");
+						Ok(Received::None)
+					},
+				}
 			},
 			Up::Subscribe(reply) => {
 				let _ = reply.send(session.subscribe());
@@ -1250,8 +1256,10 @@ impl Dispatcher {
 							self.jobs.apply_lifecycle(session, &work).await;
 						},
 						Received::Approved(ticket) => {
-							let approved =
-								ticket.decision.as_ref().is_some_and(|decision| decision.approved);
+							let approved = ticket
+								.decision
+								.as_ref()
+								.is_some_and(|decision| decision.approved);
 							for call in calls.iter_mut().filter(|call| {
 								call.phase == Phase::AwaitingApproval
 									&& call.ticket.as_deref() == Some(ticket.ticket_id.as_str())
@@ -1459,7 +1467,11 @@ impl Dispatcher {
 							.map_err(|source| DispatchError::Approval { source })?;
 						if ticket.state == crate::TicketState::Decided {
 							// A session-wide grant in the tree decided it at once.
-							if !ticket.decision.as_ref().is_some_and(|decision| decision.approved) {
+							if !ticket
+								.decision
+								.as_ref()
+								.is_some_and(|decision| decision.approved)
+							{
 								let mut output = std::mem::take(call.output(&self.committer.policy));
 								let report = self.committer.commit_abort(
 									session,
