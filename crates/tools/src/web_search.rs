@@ -1,10 +1,6 @@
 //! Canonical web-search tool over an application-owned inference backend.
 
-use std::{
-	error,
-	fmt::{self, Display},
-	sync::Arc,
-};
+use std::sync::Arc;
 
 use async_stream::stream;
 use futures::Stream;
@@ -79,10 +75,11 @@ pub struct BackendError {
 }
 
 /// Search invocation failure.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, thiserror::Error)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fault {
 	/// The application-owned inference backend rejected or failed the request.
+	#[error("web search failed ({code}): {message}")]
 	Search {
 		/// Provider selected explicitly for the failed attempt, when known.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,18 +90,6 @@ pub enum Fault {
 		message:  Str,
 	},
 }
-
-impl Display for Fault {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::Search { code, message, .. } => {
-				write!(formatter, "web search failed ({code}): {message}")
-			},
-		}
-	}
-}
-
-impl error::Error for Fault {}
 
 /// Application-owned canonical search execution boundary.
 ///

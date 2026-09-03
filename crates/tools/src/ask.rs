@@ -2,8 +2,6 @@
 
 use std::{
 	collections::HashSet,
-	error,
-	fmt::{self, Display},
 	future,
 	future::Future,
 	pin::Pin,
@@ -97,21 +95,24 @@ pub struct Payload {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Update {}
 /// Ask validation or presenter failure.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, thiserror::Error)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fault {
 	/// Arguments violate the picker contract.
+	#[error("{message}")]
 	Invalid {
 		/// Stable validation explanation.
 		message: Str,
 	},
 	/// The environment presentation bridge failed.
+	#[error("{message}")]
 	Presenter {
 		/// Stable bridge failure explanation.
 		message: Str,
 	},
 	/// The user dismissed the dialog without answering (pi `ToolAbortError
 	/// "Ask tool was cancelled by the user"`).
+	#[error("{message}")]
 	Cancelled {
 		/// Stable cancellation explanation.
 		message: Str,
@@ -124,16 +125,6 @@ impl Fault {
 		Self::Cancelled { message: Str::new_static("Ask tool was cancelled by the user") }
 	}
 }
-impl Display for Fault {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::Invalid { message } | Self::Presenter { message } | Self::Cancelled { message } => {
-				f.write_str(message)
-			},
-		}
-	}
-}
-impl error::Error for Fault {}
 
 /// UI bridge implemented by the environment's `omp.ui.v1.UiRequest` dispatcher.
 ///

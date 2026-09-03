@@ -1,10 +1,6 @@
 //! Native desktop capture, input, and accessibility device.
 
-use std::{
-	error,
-	fmt::{self, Display},
-	sync::Arc,
-};
+use std::sync::Arc;
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -148,20 +144,14 @@ pub struct Payload {
 }
 
 /// Native desktop failure.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, thiserror::Error)]
+#[error("{message}")]
 pub struct Fault {
 	/// Stable failure category.
 	pub code:    Str,
 	/// Secret-free permission or backend diagnostic.
 	pub message: Str,
 }
-
-impl Display for Fault {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(&self.message)
-	}
-}
-impl error::Error for Fault {}
 
 /// Desktop operations currently settle as one bounded result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

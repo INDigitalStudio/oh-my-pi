@@ -2,8 +2,6 @@
 //! snapshots.
 use std::{
 	collections::HashSet,
-	error,
-	fmt::{self, Display},
 	fs, io,
 	path::{Path, PathBuf},
 	str,
@@ -94,17 +92,12 @@ pub struct Payload {
 /// Empty update type because structural rewrites emit only a terminal result.
 pub enum Update {}
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, thiserror::Error)]
+#[error("{message}")]
 /// Terminal validation, target-discovery, staging, or rewrite failure.
 pub struct Fault {
 	message: Str,
 }
-impl Display for Fault {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.write_str(&self.message)
-	}
-}
-impl error::Error for Fault {}
 
 /// Workspace-scoped structural-rewrite tool exposed as `ast_edit`.
 pub struct AstEdit {

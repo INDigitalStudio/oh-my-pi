@@ -1,11 +1,6 @@
 //! Workspace path matching with mtime-ranked grouped output.
 
-use std::{
-	collections::HashSet,
-	error,
-	fmt::{self, Display},
-	sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 
 use async_stream::stream;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
@@ -149,31 +144,38 @@ pub struct Payload {
 pub enum Update {}
 
 /// Durable typed `glob@1` failure.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, thiserror::Error)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fault {
 	/// The caller supplied a non-positive or non-finite limit.
+	#[error("Limit must be a positive number")]
 	InvalidLimit,
 	/// The input contained no usable path target.
+	#[error("`path` must contain non-empty globs or paths")]
 	EmptyPath,
 	/// A traversal attempted to start at filesystem root.
+	#[error("Searching from root directory '/' is not allowed")]
 	RootSearch,
 	/// Every requested target, or the sole requested target, was missing.
+	#[error("Path not found: {}", join_strs(.paths))]
 	PathNotFound {
 		/// Missing target spellings in model input order.
 		paths: Vec<Str>,
 	},
 	/// A direct non-directory target could not be treated as a file.
+	#[error("Path is not a directory: {path}")]
 	PathNotDirectory {
 		/// Rejected target path.
 		path: Str,
 	},
 	/// A URI scheme has no local path-backed glob implementation yet.
+	#[error("{scheme}:// targets are not supported yet")]
 	UnsupportedScheme {
 		/// Lowercase URI scheme without punctuation.
 		scheme: Str,
 	},
 	/// A glob pattern could not be compiled by the workspace walker.
+	#[error("invalid glob pattern {pattern}: {message}")]
 	InvalidPattern {
 		/// Exact rejected pattern.
 		pattern: Str,
@@ -181,54 +183,32 @@ pub enum Fault {
 		message: Str,
 	},
 	/// The workspace owner rejected or failed the request.
+	#[error("{message}")]
 	Workspace {
 		/// Stable resource-owned explanation.
 		message: Str,
 	},
 	/// Durable blob storage failed while preserving complete output.
+	#[error("{message}")]
 	Blob {
 		/// Stable blob-owned explanation.
 		message: Str,
 	},
 	/// The resource observed cancellation without an invocation interrupt.
+	#[error("{reason}")]
 	Cancelled {
 		/// Stable resource-owned cancellation reason.
 		reason: Str,
 	},
 }
 
-impl Display for Fault {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::InvalidLimit => formatter.write_str("Limit must be a positive number"),
-			Self::EmptyPath => formatter.write_str("`path` must contain non-empty globs or paths"),
-			Self::RootSearch => {
-				formatter.write_str("Searching from root directory '/' is not allowed")
-			},
-			Self::PathNotFound { paths } => {
-				formatter.write_str("Path not found: ")?;
-				for (index, path) in paths.iter().enumerate() {
-					if index != 0 {
-						formatter.write_str(", ")?;
-					}
-					formatter.write_str(path)?;
-				}
-				Ok(())
-			},
-			Self::PathNotDirectory { path } => write!(formatter, "Path is not a directory: {path}"),
-			Self::UnsupportedScheme { scheme } => {
-				write!(formatter, "{scheme}:// targets are not supported yet")
-			},
-			Self::InvalidPattern { pattern, message } => {
-				write!(formatter, "invalid glob pattern {pattern}: {message}")
-			},
-			Self::Workspace { message } | Self::Blob { message } => formatter.write_str(message),
-			Self::Cancelled { reason } => formatter.write_str(reason),
-		}
-	}
+fn join_strs(values: &[Str]) -> String {
+	values
+		.iter()
+		.map(Str::as_str)
+		.collect::<Vec<_>>()
+		.join(", ")
 }
-
-impl error::Error for Fault {}
 /// Generic `glob@1` executor over environment-owned workspace and blob
 /// resources.
 pub struct Glob<W, B> {

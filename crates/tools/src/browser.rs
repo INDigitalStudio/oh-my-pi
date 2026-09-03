@@ -1,10 +1,6 @@
 //! Stateful browser automation over a harness-owned supervised daemon.
 
-use std::{
-	error,
-	fmt::{self, Display},
-	sync::Arc,
-};
+use std::sync::Arc;
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -132,7 +128,10 @@ pub struct Payload {
 	pub url:       Option<Str>,
 	/// Current document title, when available.
 	pub title:     Option<Str>,
-	/// JSON result from a run operation.
+	/// Values explicitly emitted through the run scope's `display(value)`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub display:   Vec<Value>,
+	/// JSON value returned by the run scope.
 	pub result:    Option<Value>,
 	/// Content-addressed artifacts created by the operation.
 	pub artifacts: Vec<Str>,
@@ -153,20 +152,26 @@ pub fn mode_name(headless: bool) -> Str {
 }
 
 /// Browser daemon failure.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, thiserror::Error)]
+#[error("{message}")]
 pub struct Fault {
 	/// Stable failure category.
 	pub code:    Str,
 	/// Secret-free diagnostic.
 	pub message: Str,
+	/// Stable tab name when failure happened after tab lookup.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub name:    Option<Str>,
+	/// Current committed URL when available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub url:     Option<Str>,
+	/// Current document title when available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub title:   Option<Str>,
+	/// Backend mode when known.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub browser: Option<Str>,
 }
-
-impl Display for Fault {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(&self.message)
-	}
-}
-impl error::Error for Fault {}
 
 /// Browser operations currently settle as one bounded result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -252,6 +257,7 @@ impl Tool for Browser {
 					name,
 					url: None,
 					title: None,
+					display: Vec::new(),
 					result: Some(json!({ "headless": headless })),
 					artifacts: Vec::new(),
 					browser: Some(mode_name(headless)),

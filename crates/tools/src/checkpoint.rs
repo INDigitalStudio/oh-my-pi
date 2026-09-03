@@ -1,11 +1,5 @@
 //! Durable exploration checkpoint creation and turn-boundary rewind scheduling.
 
-use std::{
-	error,
-	fmt::{self, Display},
-	future::Future,
-};
-
 use async_stream::stream;
 use futures::Stream;
 use omp_core::{Str, sf};
@@ -124,17 +118,12 @@ pub enum FaultCode {
 }
 
 /// Journal bridge or checkpoint validation failure.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, thiserror::Error)]
+#[error("{message}")]
 pub struct Fault {
 	code:    FaultCode,
 	message: Str,
 }
-impl Display for Fault {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.write_str(&self.message)
-	}
-}
-impl error::Error for Fault {}
 
 /// Creates durable checkpoint entries.
 pub struct Checkpoint<C> {
