@@ -35,9 +35,10 @@ fn document_authority_probes_the_user_config_root_for_lsp_overrides() {
 	let expected = config.path().join("lsp.json");
 	assert_eq!(user, [expected.to_str().expect("utf-8 path")]);
 	assert!(
-		!sources
-			.iter()
-			.any(|source| source.provenance.source.starts_with(data.path().to_str().unwrap())),
+		!sources.iter().any(|source| source
+			.provenance
+			.source
+			.starts_with(data.path().to_str().unwrap())),
 		"data directory must never be probed for user configuration"
 	);
 }

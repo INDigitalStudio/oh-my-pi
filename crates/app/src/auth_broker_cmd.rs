@@ -103,11 +103,7 @@ pub(crate) fn token(data_dir: &Path, regenerate: bool) -> miette::Result<()> {
 	Ok(())
 }
 
-async fn remote_login(
-	provider: &str,
-	alias: &str,
-	dry_run: bool,
-) -> miette::Result<()> {
+async fn remote_login(provider: &str, alias: &str, dry_run: bool) -> miette::Result<()> {
 	use tokio::io;
 	let callback_port = oauth_callback_port(provider)?;
 	let command = format!("omp auth-broker login {}", shell_quote(provider));

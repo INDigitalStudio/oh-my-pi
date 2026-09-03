@@ -266,11 +266,28 @@ mod tests {
 
 		let service = VaultService::load_layered(&paths).expect("layered load");
 		assert_eq!(service.names(), vec![sf!("extra"), sf!("notes")]);
-		assert_eq!(service.read("notes", "a.md", 64).expect("shadowed read").as_ref(), b"project");
-		assert!(service.list("extra", "", 8).expect("user-only vault").0.is_empty());
+		assert_eq!(
+			service
+				.read("notes", "a.md", 64)
+				.expect("shadowed read")
+				.as_ref(),
+			b"project"
+		);
+		assert!(
+			service
+				.list("extra", "", 8)
+				.expect("user-only vault")
+				.0
+				.is_empty()
+		);
 		assert!(matches!(service.read("absent", "a.md", 64), Err(VaultError::Unknown { .. })));
 
 		let missing = VaultPaths::new(&temp.path().join("nope"), &temp.path().join("nope"));
-		assert!(VaultService::load_layered(&missing).expect("missing files are empty").names().is_empty());
+		assert!(
+			VaultService::load_layered(&missing)
+				.expect("missing files are empty")
+				.names()
+				.is_empty()
+		);
 	}
 }

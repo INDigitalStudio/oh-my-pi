@@ -41,8 +41,8 @@ use crate::{
 	policy::{
 		ApplyPatchWireKind, CacheControlFormat, ComputerUseConfigSupport, ComputerUseWireSupport,
 		ExtendedContextMode, MaxOutputTokensEmission, NativeToolChoicePenalty, PromptCacheMode,
-		ReasoningBodyOverride,
-		StreamWatchdog, ToolCallIdProfile, ToolPolicy, WhenThinkingPolicy, WirePolicy,
+		ReasoningBodyOverride, StreamWatchdog, ToolCallIdProfile, ToolPolicy, WhenThinkingPolicy,
+		WirePolicy,
 	},
 	pricing::{PremiumMultiplier, Price, PriceTier, PriceUnit, Pricing, ServiceTierPrice},
 	provider::{
@@ -226,7 +226,10 @@ fn source_semver(value: &str) -> Option<SemVer> {
 	let major = parts.next()?.parse().ok()?;
 	let minor = parts.next()?.parse().ok()?;
 	let patch = parts.next().map(str::parse).transpose().ok()?.unwrap_or(0);
-	parts.next().is_none().then_some(SemVer::new(major, minor, patch))
+	parts
+		.next()
+		.is_none()
+		.then_some(SemVer::new(major, minor, patch))
 }
 
 /// Closed typed record parsed from one oracle model row.
@@ -3701,7 +3704,7 @@ fn compile_models(
 					.iter()
 					.map(|(tier, multiplier)| {
 						Ok(ServiceTierPrice {
-							tier: tier.clone(),
+							tier:       tier.clone(),
 							multiplier: PremiumMultiplier::from_millionths(decimal_millionths(
 								multiplier,
 							)?),
@@ -4378,9 +4381,15 @@ fn compile_wire_policy(
 	policy.tool.requires_skip_thought_signature = source
 		.requires_skip_thought_signature
 		.or(policy.tool.requires_skip_thought_signature);
-	policy.tool.requires_skip_thought_signature_on_first_function_call = source
+	policy
+		.tool
+		.requires_skip_thought_signature_on_first_function_call = source
 		.requires_skip_thought_signature_on_first_function_call
-		.or(policy.tool.requires_skip_thought_signature_on_first_function_call);
+		.or(
+			policy
+				.tool
+				.requires_skip_thought_signature_on_first_function_call,
+		);
 	policy.reasoning.requires_thinking_as_text = source
 		.requires_thinking_as_text
 		.or(policy.reasoning.requires_thinking_as_text);
@@ -6469,32 +6478,23 @@ facets = ["chat"]
 				_ => None,
 			})
 			.expect("Vertex application-default source");
-		assert_eq!(
-			adc.0.as_ref(),
-			&[sf!("OMP_GOOGLE_CLOUD_API_KEY"), sf!("GOOGLE_CLOUD_API_KEY")],
-		);
-		assert_eq!(
-			adc.1.as_ref(),
-			&[
-				sf!("OMP_GOOGLE_CLOUD_PROJECT"),
-				sf!("OMP_GCP_PROJECT"),
-				sf!("OMP_GCLOUD_PROJECT"),
-				sf!("GOOGLE_CLOUD_PROJECT"),
-				sf!("GCP_PROJECT"),
-				sf!("GCLOUD_PROJECT"),
-			],
-		);
-		assert_eq!(
-			adc.2.as_ref(),
-			&[
-				sf!("OMP_GOOGLE_VERTEX_LOCATION"),
-				sf!("OMP_GOOGLE_CLOUD_LOCATION"),
-				sf!("OMP_VERTEX_LOCATION"),
-				sf!("GOOGLE_VERTEX_LOCATION"),
-				sf!("GOOGLE_CLOUD_LOCATION"),
-				sf!("VERTEX_LOCATION"),
-			],
-		);
+		assert_eq!(adc.0.as_ref(), &[sf!("OMP_GOOGLE_CLOUD_API_KEY"), sf!("GOOGLE_CLOUD_API_KEY")],);
+		assert_eq!(adc.1.as_ref(), &[
+			sf!("OMP_GOOGLE_CLOUD_PROJECT"),
+			sf!("OMP_GCP_PROJECT"),
+			sf!("OMP_GCLOUD_PROJECT"),
+			sf!("GOOGLE_CLOUD_PROJECT"),
+			sf!("GCP_PROJECT"),
+			sf!("GCLOUD_PROJECT"),
+		],);
+		assert_eq!(adc.2.as_ref(), &[
+			sf!("OMP_GOOGLE_VERTEX_LOCATION"),
+			sf!("OMP_GOOGLE_CLOUD_LOCATION"),
+			sf!("OMP_VERTEX_LOCATION"),
+			sf!("GOOGLE_VERTEX_LOCATION"),
+			sf!("GOOGLE_CLOUD_LOCATION"),
+			sf!("VERTEX_LOCATION"),
+		],);
 		assert!(adc.3.iter().any(|source| matches!(
 			source,
 			ApplicationDefaultSource::CredentialFile {
@@ -6761,10 +6761,9 @@ usage = true
 
 	#[test]
 	fn thinking_tool_choice_conflict_is_a_provider_compat_fact_not_a_kdl_axis() {
-		let source: SourceWirePolicy = serde_json::from_str(
-			r#"{"thinking_tool_choice_conflict":"drop_thinking_when_any"}"#,
-		)
-		.expect("provider compat accepts the conflict policy");
+		let source: SourceWirePolicy =
+			serde_json::from_str(r#"{"thinking_tool_choice_conflict":"drop_thinking_when_any"}"#)
+				.expect("provider compat accepts the conflict policy");
 		let policy = compile_wire_policy(WirePolicy::baseline(), &source).expect("compiles");
 		assert_eq!(
 			policy.tool.thinking_conflict,

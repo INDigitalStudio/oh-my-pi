@@ -12,7 +12,10 @@ use omp_agent::{
 	LiveComponent, LiveComponentError, MutDirectorCx, Prepared, Slot, StateUpdate, TurnView,
 	Verdict,
 };
-use omp_con::{Ctx, DynamicVarSpec, Origin, TypeSpec, Value as ConValue, VarFlags};
+use omp_con::{
+	Ctx, DynamicUiOption, DynamicUiSpec, DynamicUiWidget, DynamicVarSpec, Origin, SettingTab,
+	TypeSpec, Value as ConValue, VarFlags,
+};
 use omp_core::{Str, sf};
 use omp_dom::{Node, Op, Txn};
 use omp_ext::config::{SettingSchema, SettingType, extension_setting_convar_name};
@@ -109,17 +112,44 @@ pub fn register_extension_setting_convars(
 			key:       key.clone(),
 		})?;
 		let name = extension_setting_convar_name(extension, key);
+		let ui = schema.ui.as_ref().map(|ui| {
+			let tab_name: &'static str = ui.tab.into();
+			DynamicUiSpec {
+				tab:         tab_name
+					.parse::<SettingTab>()
+					.expect("extension and con tab vocabularies match"),
+				group:       ui.group.clone(),
+				label:       ui.label.clone(),
+				description: ui.description.clone(),
+				warning:     ui.warning.clone(),
+				widget:      if ui.options.is_empty() {
+					DynamicUiWidget::Auto
+				} else {
+					DynamicUiWidget::Submenu(
+						ui.options
+							.iter()
+							.map(|option| DynamicUiOption {
+								value:       option.value.clone(),
+								label:       option.label.clone(),
+								description: option.description.clone(),
+							})
+							.collect(),
+					)
+				},
+			}
+		});
 		ctx.register_dynamic_var(DynamicVarSpec {
-			name:    name.clone(),
-			desc:    schema
+			name: name.clone(),
+			desc: schema
 				.description
 				.clone()
 				.unwrap_or_else(|| sf!("Setting {key} declared by extension {extension}")),
-			ty:      convar_type(schema),
-			flags:   VarFlags::ARCHIVE
+			ty: convar_type(schema),
+			flags: VarFlags::ARCHIVE
 				.with(VarFlags::SESSION)
 				.with(VarFlags::REPLICATED),
 			default: baseline.clone(),
+			ui,
 		})
 		.map_err(|source| ExtensionConvarError::Control {
 			extension: Str::new(extension),
@@ -637,6 +667,12 @@ id = "demo"
 type = "boolean"
 default = false
 
+[settings.verbose.ui]
+tab = "tools"
+group = "Extensions"
+label = "Verbose Demo"
+description = "Show verbose extension output"
+
 [settings.severity]
 type = "enum"
 values = ["warning", "error"]
@@ -655,6 +691,23 @@ default = "warning"
 
 		assert_eq!(ctx.get("ext::demo::verbose"), Some(ConValue::Bool(true)));
 		assert_eq!(ctx.get("ext::demo::severity"), Some(ConValue::Str("warning".into())),);
+		assert_eq!(
+			ctx.dynamic_var_spec("ext::demo::verbose")
+				.and_then(|spec| spec.ui),
+			Some(omp_con::DynamicUiSpec {
+				tab:         omp_con::SettingTab::Tools,
+				group:       "Extensions".into(),
+				label:       "Verbose Demo".into(),
+				description: "Show verbose extension output".into(),
+				warning:     None,
+				widget:      omp_con::DynamicUiWidget::Auto,
+			}),
+		);
+		assert!(
+			ctx.dynamic_var_spec("ext::demo::severity")
+				.is_some_and(|spec| spec.ui.is_none()),
+			"manifest settings without explicit ui stay config-only"
+		);
 		assert_eq!(
 			writes.try_recv().expect("effective override"),
 			("ext::demo::verbose".into(), ConValue::Bool(true)),

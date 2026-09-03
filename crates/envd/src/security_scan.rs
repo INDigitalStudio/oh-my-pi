@@ -318,17 +318,15 @@ impl SecurityScanService {
 
 	fn render_resource(&self, resource: &str) -> Result<Vec<u8>, ReadFault> {
 		let parts = security_parts(resource)?;
-		let state = self
-			.state
-			.lock();
+		let state = self.state.lock();
 		let state = state.as_ref().map_err(|()| security_state_fault())?;
 		let mut body = String::new();
 		match parts.as_slice() {
 			[] => {
 				body.push_str(
-					"# Security\n\nOMP-owned software-security scan reports and validated \
-					 advisories. This namespace is read-only; use `dyn security_scan` for \
-					 mutations.\n\n- `security://scans` — stored scans\n",
+					"# Security\n\nOMP-owned software-security scan reports and validated advisories. \
+					 This namespace is read-only; use `dyn security_scan` for mutations.\n\n- \
+					 `security://scans` — stored scans\n",
 				);
 			},
 			["scans"] => {
@@ -349,7 +347,10 @@ impl SecurityScanService {
 				}
 			},
 			["scans", scan_id] => {
-				let scan = state.scans.get(*scan_id).ok_or_else(|| unknown_scan(scan_id))?;
+				let scan = state
+					.scans
+					.get(*scan_id)
+					.ok_or_else(|| unknown_scan(scan_id))?;
 				let plan = state.plans.get(&scan.plan_id);
 				let _ = writeln!(body, "# Security scan {}\n", scan.id);
 				let _ = writeln!(body, "- Status: **{}**", scan_phase(state, &scan.id));
@@ -358,22 +359,28 @@ impl SecurityScanService {
 					let _ = writeln!(body, "- Target: **{:?}**", plan.target);
 					let _ = writeln!(body, "- Plan: `{}`", plan.id);
 				}
-				body.push_str(
-					"\nResources: `manifest`, `findings`, and `report`.\n",
-				);
+				body.push_str("\nResources: `manifest`, `findings`, and `report`.\n");
 			},
 			["scans", scan_id, "manifest"] => {
-				let scan = state.scans.get(*scan_id).ok_or_else(|| unknown_scan(scan_id))?;
-				body = serde_json::to_string_pretty(scan)
-					.map_err(|_| security_state_fault())?;
+				let scan = state
+					.scans
+					.get(*scan_id)
+					.ok_or_else(|| unknown_scan(scan_id))?;
+				body = serde_json::to_string_pretty(scan).map_err(|_| security_state_fault())?;
 				body.push('\n');
 			},
 			["scans", scan_id, "findings"] => {
-				let scan = state.scans.get(*scan_id).ok_or_else(|| unknown_scan(scan_id))?;
+				let scan = state
+					.scans
+					.get(*scan_id)
+					.ok_or_else(|| unknown_scan(scan_id))?;
 				render_findings_index(&mut body, scan);
 			},
 			["scans", scan_id, "findings", finding_id] => {
-				let scan = state.scans.get(*scan_id).ok_or_else(|| unknown_scan(scan_id))?;
+				let scan = state
+					.scans
+					.get(*scan_id)
+					.ok_or_else(|| unknown_scan(scan_id))?;
 				let finding = scan
 					.findings
 					.iter()
@@ -382,7 +389,10 @@ impl SecurityScanService {
 				render_finding(&mut body, finding);
 			},
 			["scans", scan_id, "report"] => {
-				let scan = state.scans.get(*scan_id).ok_or_else(|| unknown_scan(scan_id))?;
+				let scan = state
+					.scans
+					.get(*scan_id)
+					.ok_or_else(|| unknown_scan(scan_id))?;
 				let _ = writeln!(body, "# Security report {}\n", scan.id);
 				let _ = writeln!(body, "- Status: **{}**", scan_phase(state, &scan.id));
 				let _ = writeln!(body, "- Findings: **{}**\n", scan.findings.len());
@@ -402,38 +412,29 @@ impl SecurityScanService {
 		max_bytes: usize,
 	) -> Result<ResourceList, ReadFault> {
 		let parts = security_parts(resource)?;
-		let state = self
-			.state
-			.lock();
+		let state = self.state.lock();
 		let state = state.as_ref().map_err(|()| security_state_fault())?;
 		let mut candidates = Vec::new();
 		match parts.as_slice() {
 			[] => candidates.push(security_entry("scans", true, "scans")),
 			["scans"] => {
 				for scan in state.scans.values() {
-					candidates.push(security_entry(
-						&format!("scans/{}", scan.id),
-						true,
-						&scan.id,
-					));
+					candidates.push(security_entry(&format!("scans/{}", scan.id), true, &scan.id));
 				}
 			},
 			["scans", scan_id] => {
 				if !state.scans.contains_key(*scan_id) {
 					return Err(unknown_scan(scan_id));
 				}
-				for (name, directory) in
-					[("manifest", false), ("findings", true), ("report", false)]
-				{
-					candidates.push(security_entry(
-						&format!("scans/{scan_id}/{name}"),
-						directory,
-						name,
-					));
+				for (name, directory) in [("manifest", false), ("findings", true), ("report", false)] {
+					candidates.push(security_entry(&format!("scans/{scan_id}/{name}"), directory, name));
 				}
 			},
 			["scans", scan_id, "findings"] => {
-				let scan = state.scans.get(*scan_id).ok_or_else(|| unknown_scan(scan_id))?;
+				let scan = state
+					.scans
+					.get(*scan_id)
+					.ok_or_else(|| unknown_scan(scan_id))?;
 				for finding in &scan.findings {
 					candidates.push(security_entry(
 						&format!("scans/{scan_id}/findings/{}", finding.id),
@@ -464,28 +465,24 @@ impl SecurityScanService {
 		query: &str,
 		max_results: usize,
 	) -> Result<Vec<ResourceCompletion>, ReadFault> {
-		let state = self
-			.state
-			.lock();
+		let state = self.state.lock();
 		let state = state.as_ref().map_err(|()| security_state_fault())?;
 		let mut paths = vec![("scans".to_owned(), Str::new_static("stored security scans"))];
 		for scan in state.scans.values() {
 			let prefix = format!("scans/{}", scan.id);
 			paths.push((
 				prefix.clone(),
-				Str::new(format!("{}; {} finding(s)", scan_phase(state, &scan.id), scan.findings.len())),
+				Str::new(format!(
+					"{}; {} finding(s)",
+					scan_phase(state, &scan.id),
+					scan.findings.len()
+				)),
 			));
 			for child in ["manifest", "findings", "report"] {
-				paths.push((
-					format!("{prefix}/{child}"),
-					Str::new_static("security scan resource"),
-				));
+				paths.push((format!("{prefix}/{child}"), Str::new_static("security scan resource")));
 			}
 			for finding in &scan.findings {
-				paths.push((
-					format!("{prefix}/findings/{}", finding.id),
-					finding.summary.clone(),
-				));
+				paths.push((format!("{prefix}/findings/{}", finding.id), finding.summary.clone()));
 			}
 		}
 		let query = query
@@ -586,9 +583,7 @@ fn unknown_scan(scan_id: &str) -> ReadFault {
 }
 
 fn unknown_finding(finding_id: &str) -> ReadFault {
-	ReadFault::Source {
-		message: Str::new(format!("Unknown security finding: {finding_id}.")),
-	}
+	ReadFault::Source { message: Str::new(format!("Unknown security finding: {finding_id}.")) }
 }
 
 fn unknown_resource(resource: &str) -> ReadFault {
@@ -618,11 +613,7 @@ fn render_findings_index(body: &mut String, scan: &Scan) {
 		let _ = writeln!(
 			body,
 			"- `{}` **{}** — {} (`{}:{}`)",
-			finding.id,
-			finding.rule,
-			finding.summary,
-			finding.path,
-			finding.line
+			finding.id, finding.rule, finding.summary, finding.path, finding.line
 		);
 	}
 }

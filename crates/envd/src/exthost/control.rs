@@ -225,7 +225,10 @@ pub fn admit_direct_filesystem(
 use std::{env, io, iter, mem};
 
 use async_trait::async_trait;
-use omp_con::{Ctx, DynamicVarSpec, TypeSpec, Value as ConValue, VarFlags};
+use omp_con::{
+	Ctx, DynamicUiOption, DynamicUiSpec, DynamicUiWidget, DynamicVarSpec, SettingTab, TypeSpec,
+	Value as ConValue, VarFlags,
+};
 use omp_core::{
 	Hash32, InvocationPhase, LifecyclePhase, Principal, Provenance, Str, encoding::hex, sf,
 };
@@ -1640,6 +1643,7 @@ impl ConvarControlAuthority {
 				.with(VarFlags::SESSION)
 				.with(VarFlags::REPLICATED),
 			default,
+			ui: declaration_ui(arguments)?,
 		};
 		if let Some(existing) = self.ctx.dynamic_var_spec(name.as_str()) {
 			if existing != spec {
@@ -1709,6 +1713,72 @@ fn required_convar_argument<'a>(
 				sf!("convar operation requires a non-empty {name}"),
 			)
 		})
+}
+
+fn declaration_ui(
+	arguments: &serde_json::Map<String, Value>,
+) -> Result<Option<DynamicUiSpec>, ControlProtocolError> {
+	let Some(value) = arguments.get("ui") else {
+		return Ok(None);
+	};
+	let object = value.as_object().ok_or_else(|| {
+		ControlProtocolError::new(
+			"InvalidConvarDeclaration",
+			"extension convar ui metadata must be an object",
+		)
+	})?;
+	let tab = required_convar_argument(object, "tab")?
+		.parse::<SettingTab>()
+		.map_err(|_| {
+			ControlProtocolError::new(
+				"InvalidConvarDeclaration",
+				"extension convar ui metadata names an unknown tab",
+			)
+		})?;
+	let group = Str::new(required_convar_argument(object, "group")?);
+	let label = Str::new(required_convar_argument(object, "label")?);
+	let description = Str::new(required_convar_argument(object, "description")?);
+	let warning = object.get("warning").and_then(Value::as_str).map(Str::new);
+	let options = object.get("options").map_or(Ok(Vec::new()), |value| {
+		value
+			.as_array()
+			.ok_or_else(|| {
+				ControlProtocolError::new(
+					"InvalidConvarDeclaration",
+					"extension convar ui options must be an array",
+				)
+			})?
+			.iter()
+			.map(|value| {
+				let option = value.as_object().ok_or_else(|| {
+					ControlProtocolError::new(
+						"InvalidConvarDeclaration",
+						"extension convar ui option must be an object",
+					)
+				})?;
+				Ok(DynamicUiOption {
+					value:       Str::new(required_convar_argument(option, "value")?),
+					label:       Str::new(required_convar_argument(option, "label")?),
+					description: option
+						.get("description")
+						.and_then(Value::as_str)
+						.map_or_else(Str::default, Str::new),
+				})
+			})
+			.collect::<Result<Vec<_>, ControlProtocolError>>()
+	})?;
+	Ok(Some(DynamicUiSpec {
+		tab,
+		group,
+		label,
+		description,
+		warning,
+		widget: if options.is_empty() {
+			DynamicUiWidget::Auto
+		} else {
+			DynamicUiWidget::Submenu(options)
+		},
+	}))
 }
 
 fn declaration_value(
@@ -3121,6 +3191,12 @@ mod convar_tests {
 					"kind": "boolean",
 					"default": false,
 					"description": "Enable demo behavior",
+					"ui": {
+						"tab": "tools",
+						"group": "Extensions",
+						"label": "Demo Behavior",
+						"description": "Enable demo behavior",
+					},
 				})
 				.as_object()
 				.cloned()
@@ -3130,6 +3206,12 @@ mod convar_tests {
 			.expect("declare convar");
 		assert_eq!(declared["name"], "ext::dev.example.demo::enabled");
 		assert_eq!(ctx.get("ext::dev.example.demo::enabled"), Some(ConValue::Bool(false)),);
+		assert_eq!(
+			ctx.dynamic_var_spec("ext::dev.example.demo::enabled")
+				.and_then(|spec| spec.ui)
+				.map(|ui| ui.label),
+			Some(sf!("Demo Behavior")),
+		);
 
 		let observed = authority.request(
 			context(&identity, 2),

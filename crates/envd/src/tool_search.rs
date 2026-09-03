@@ -3,10 +3,8 @@
 use std::{
 	cmp,
 	collections::{HashMap, HashSet, VecDeque},
-	fmt::{self, Display},
-	fs,
-	future::Future,
-	io,
+	fmt::Display,
+	fs, io,
 	path::{Component, Path, PathBuf},
 	sync,
 	time::{Duration, Instant, UNIX_EPOCH},
@@ -993,21 +991,14 @@ struct GlobTargetOutcome {
 	timed_out: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, thiserror::Error)]
 enum WalkStop {
+	#[error("cancelled")]
 	Cancelled,
+	#[error("timed out")]
 	TimedOut,
+	#[error("{0}")]
 	Workspace(Str),
-}
-
-impl Display for WalkStop {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::Cancelled => formatter.write_str("cancelled"),
-			Self::TimedOut => formatter.write_str("timed out"),
-			Self::Workspace(message) => formatter.write_str(message),
-		}
-	}
 }
 
 fn walk_glob_target(
@@ -1362,40 +1353,26 @@ mod tests {
 		fs::write(vault_root.join("reports/b.txt"), "skip").expect("nonmatching vault file");
 		let user_config = fixture.path().join("config");
 		fs::create_dir_all(&user_config).expect("config directory");
-		fs::write(
-			user_config.join("vaults.toml"),
-			format!("[vaults]\nreports = {:?}\n", vault_root),
-		)
-		.expect("vault config");
-		let service = VaultService::load_layered(&VaultPaths::new(
-			&user_config,
-			fixture.path(),
-		))
-		.expect("vault service");
+		fs::write(user_config.join("vaults.toml"), format!("[vaults]\nreports = {:?}\n", vault_root))
+			.expect("vault config");
+		let service = VaultService::load_layered(&VaultPaths::new(&user_config, fixture.path()))
+			.expect("vault service");
 		let mut builder = ResolverTable::builder();
 		builder
 			.register(
-				omp_tools::read::resolver::SchemeEntry::new(
-					Scheme::Vault,
-					true,
-					false,
-					"test vault",
-				)
-				.with_capabilities(true, false, true),
+				omp_tools::read::resolver::SchemeEntry::new(Scheme::Vault, true, false, "test vault")
+					.with_capabilities(true, false, true),
 				UrlResolver::Vault(VaultResolver::new(service)),
 			)
 			.expect("vault resolver");
 		let resolvers = builder.build();
-		let result = resource_glob(
-			&resolvers,
-			glob::WalkRequest {
-				path: Str::new_static("vault://reports/**/*.json"),
-				hidden: true,
-				gitignore: true,
-				limit: 20,
-				timeout_ms: 30_000,
-			},
-		)
+		let result = resource_glob(&resolvers, glob::WalkRequest {
+			path:       Str::new_static("vault://reports/**/*.json"),
+			hidden:     true,
+			gitignore:  true,
+			limit:      20,
+			timeout_ms: 30_000,
+		})
 		.await
 		.expect("vault glob");
 		assert_eq!(result.matches.len(), 1);

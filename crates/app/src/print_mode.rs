@@ -2,8 +2,9 @@
 //!
 //! Text mode keeps stdout clean for shell captures (pi `print-mode.ts`): the
 //! only bytes written there are the final assistant response (thinking first
-//! when `--print-thoughts`), after every prompt settled. Progress (`Working...`)
-//! and failures go to stderr, and a failed or aborted turn exits non-zero.
+//! when `--print-thoughts`), after every prompt settled. Progress
+//! (`Working...`) and failures go to stderr, and a failed or aborted turn exits
+//! non-zero.
 //!
 //! JSON mode is an NDJSON lifecycle stream: one `session` header, then
 //! `agent_start` → `turn_start` → message/tool events → `turn_end` →
@@ -93,8 +94,8 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 						source:     omp_agent::ApprovalSource::Unavailable,
 						decided_by: None,
 						reason:     Some(Str::new_static(
-							"requires approval but no interactive UI is available; use \
-							 --approval-mode yolo or tools.approval.<tool> allow",
+							"requires approval but no interactive UI is available; use --approval-mode \
+							 yolo or tools.approval.<tool> allow",
 						)),
 						audited:    false,
 					},
@@ -821,7 +822,9 @@ mod tests {
 			let sid = session
 				.stream_open(assistant, PropId::Thinking.into())
 				.expect("thinking stream");
-			session.stream_append(sid, thinking).expect("thinking delta");
+			session
+				.stream_append(sid, thinking)
+				.expect("thinking delta");
 			session.stream_close(sid).expect("thinking close");
 		}
 		let sid = session

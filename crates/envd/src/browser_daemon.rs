@@ -249,8 +249,7 @@ fn run_tab(
 	let tab = view.automation();
 	let timeout = timeout(&params);
 	if let Some(url) = params.url.as_ref() {
-		tab
-			.goto(url, timeout)
+		tab.goto(url, timeout)
 			.map_err(webview_fault)
 			.map_err(|fault| tab_fault(fault, &name, view, headless))?;
 	}
@@ -322,44 +321,44 @@ fn required<'a>(value: Option<&'a str>, field: &'static str) -> Result<&'a str, 
 
 fn invalid(message: &'static str) -> Fault {
 	Fault {
-		code: sf!("invalid_browser_request"),
+		code:    sf!("invalid_browser_request"),
 		message: Str::new_static(message),
-		name: None,
-		url: None,
-		title: None,
+		name:    None,
+		url:     None,
+		title:   None,
 		browser: None,
 	}
 }
 
 fn not_found(name: &str) -> Fault {
 	Fault {
-		code: sf!("browser_tab_not_found"),
+		code:    sf!("browser_tab_not_found"),
 		message: sf!("browser tab `{name}` is not open"),
-		name: Some(Str::new(name)),
-		url: None,
-		title: None,
+		name:    Some(Str::new(name)),
+		url:     None,
+		title:   None,
 		browser: None,
 	}
 }
 
 fn daemon_closed() -> Fault {
 	Fault {
-		code: sf!("browser_daemon_closed"),
+		code:    sf!("browser_daemon_closed"),
 		message: sf!("browser daemon is not available"),
-		name: None,
-		url: None,
-		title: None,
+		name:    None,
+		url:     None,
+		title:   None,
 		browser: None,
 	}
 }
 
 fn webview_fault(error: omp_webview::Error) -> Fault {
 	Fault {
-		code: sf!("browser_automation_failed"),
+		code:    sf!("browser_automation_failed"),
 		message: Str::new(error.to_string()),
-		name: None,
-		url: None,
-		title: None,
+		name:    None,
+		url:     None,
+		title:   None,
 		browser: None,
 	}
 }

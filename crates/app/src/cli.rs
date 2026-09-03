@@ -3453,6 +3453,7 @@ async fn infer(args: InferArgs) -> miette::Result<()> {
 		deadline:       None,
 		budget:         ExecutionBudget::default(),
 		session:        None,
+		debug_session:  None,
 		response_hooks: Default::default(),
 	};
 	let mut client = Client::new(registry.service(), planner, meta);

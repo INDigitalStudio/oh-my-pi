@@ -1114,7 +1114,12 @@ mod tests {
 		assert!(matches!(layered.get("absent"), Err(SshError::UnknownHost { .. })));
 
 		let missing = HostPaths::new(&temp.path().join("nope"), &temp.path().join("nope"));
-		assert!(HostStore::load_layered(&missing).expect("missing files are empty").aliases().is_empty());
+		assert!(
+			HostStore::load_layered(&missing)
+				.expect("missing files are empty")
+				.aliases()
+				.is_empty()
+		);
 	}
 
 	#[tokio::test]

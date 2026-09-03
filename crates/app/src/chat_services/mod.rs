@@ -17,6 +17,7 @@ use omp_driver::registry::ProductionInference as ProductionStack;
 mod accounts;
 pub(crate) mod agents;
 pub(crate) mod control;
+mod debug;
 /// Production `UiControlOwner`: extension `omp.ui.*` requests as chat dialogs.
 pub mod extension_ui;
 mod extensions;
@@ -282,6 +283,17 @@ impl Services for AppServices {
 
 	fn trace_events(&self) -> ServiceResult<Vec<omp_chat::overlays::services::TraceEvent>> {
 		Ok(self.state.trace.events())
+	}
+
+	fn debug(
+		&self,
+		request: omp_chat::overlays::services::DebugRequest,
+	) -> ServiceResult<omp_chat::overlays::services::DebugOutput> {
+		debug::run(&self.state, request)
+	}
+
+	fn dump_raw_sse(&self) -> ServiceResult<PathBuf> {
+		debug::dump_raw_sse(&self.state)
 	}
 }
 

@@ -44,7 +44,10 @@ omp_con::var! {
 pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("enabledProviders", "ai_enabled_providers"),
 	("providers.openai-codex.codeMode", "ai_providers_openai_codex_code_mode"),
-	("providers.openai-codex.codeModeDirectTools", "ai_providers_openai_codex_code_mode_direct_tools"),
+	(
+		"providers.openai-codex.codeModeDirectTools",
+		"ai_providers_openai_codex_code_mode_direct_tools",
+	),
 	("inlineToolDescriptors", "ai_inline_tool_descriptors"),
 	("includeModelInPrompt", "ai_include_model_in_prompt"),
 	("includeWorkspaceTree", "ai_include_workspace_tree"),

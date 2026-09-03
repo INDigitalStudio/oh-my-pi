@@ -1,6 +1,13 @@
 //! Literal pi-settings disposition inventory for omp's convar control plane.
 
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	fs,
+	path::PathBuf,
+	process::Command,
+};
+
+use serde::Deserialize;
 
 #[derive(Clone, Copy)]
 enum Coverage {
@@ -4564,5 +4571,164 @@ fn inventory_has_no_missing_or_wrong_status_variant() {
 			.filter(|row| matches!(row.coverage, Coverage::Deviation))
 			.count(),
 		30
+	);
+}
+
+#[derive(Debug, Deserialize)]
+struct PiUi {
+	tabs:    Vec<String>,
+	groups:  BTreeMap<String, Vec<String>>,
+	entries: Vec<PiUiEntry>,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+struct PiUiEntry {
+	path:        String,
+	#[serde(default)]
+	convar:      String,
+	tab:         String,
+	group:       String,
+	label:       String,
+	description: String,
+	warning:     Option<String>,
+	options:     Vec<String>,
+}
+
+fn current_pi_ui() -> Option<PiUi> {
+	let schema = PathBuf::from("/work/pi/packages/coding-agent/src/config/settings-schema.ts");
+	if !schema.is_file() {
+		return None;
+	}
+	const SCRIPT: &str = r#"
+import {
+  SETTING_TABS, TAB_GROUPS, getPathsForTab, getType, getUi, getEnumValues
+} from "./packages/coding-agent/src/config/settings-schema.ts";
+const visible = (path) => {
+  const type = getType(path);
+  const ui = getUi(path);
+  if (!ui) return false;
+  if (type === "number" || type === "array") return Array.isArray(ui.options);
+  return ["boolean", "enum", "string", "record"].includes(type);
+};
+const entries = [];
+for (const tab of SETTING_TABS) {
+  const paths = getPathsForTab(tab);
+  const order = TAB_GROUPS[tab];
+  paths.sort((a, b) => order.indexOf(getUi(a).group) - order.indexOf(getUi(b).group));
+  for (const path of paths) {
+    if (!visible(path)) continue;
+    const ui = getUi(path);
+    const options = Array.isArray(ui.options)
+      ? ui.options.map(option => option.value)
+      : (getType(path) === "enum" ? [...(getEnumValues(path) ?? [])] : []);
+    entries.push({
+      path, tab, group: ui.group, label: ui.label, description: ui.description,
+      warning: ui.warning, options
+    });
+  }
+}
+console.log(JSON.stringify({ tabs: SETTING_TABS, groups: TAB_GROUPS, entries }));
+"#;
+	let output = Command::new("bun")
+		.args(["-e", SCRIPT])
+		.current_dir("/work/pi")
+		.output()
+		.expect("bun executes current pi settings schema");
+	assert!(
+		output.status.success(),
+		"pi metadata extraction failed: {}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	Some(serde_json::from_slice(&output.stdout).expect("pi metadata json"))
+}
+
+#[test]
+fn curated_settings_metadata_mechanically_matches_current_pi_for_every_mapped_setting() {
+	let Some(mut pi) = current_pi_ui() else {
+		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
+		return;
+	};
+	let mappings = ROWS
+		.iter()
+		.filter(|row| matches!(row.coverage, Coverage::Mapped))
+		.map(|row| (row.key, row.convar))
+		.collect::<BTreeMap<_, _>>();
+	pi.entries
+		.retain(|entry| mappings.contains_key(entry.path.as_str()));
+	for entry in &mut pi.entries {
+		entry.convar = mappings[entry.path.as_str()].to_owned();
+	}
+
+	let actual = omp_con::builtin_ui_entries()
+		.map(|entry| {
+			let tab: &'static str = entry.tab.into();
+			let options = match entry.widget {
+				omp_con::UiWidget::Enum(values) => {
+					values.iter().map(|value| (*value).to_owned()).collect()
+				},
+				omp_con::UiWidget::Submenu(options)
+				| omp_con::UiWidget::MultiSelect { options, .. } => options
+					.iter()
+					.map(|option| option.value.to_owned())
+					.collect(),
+				omp_con::UiWidget::Boolean | omp_con::UiWidget::Text { .. } => Vec::new(),
+			};
+			PiUiEntry {
+				path: entry.pi_path.to_owned(),
+				convar: entry.convar.to_owned(),
+				tab: tab.to_owned(),
+				group: entry.group.to_owned(),
+				label: entry.label.to_owned(),
+				description: entry.description.to_owned(),
+				warning: entry.warning.map(str::to_owned),
+				options,
+			}
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(actual, pi.entries);
+	assert_eq!(actual.len(), 120);
+
+	let ctx = omp_con::Ctx::new();
+	for entry in omp_con::builtin_ui_entries() {
+		let Some(omp_con::RegItem::Var(spec)) = ctx.find(entry.convar) else {
+			panic!("curated setting target is not registered: {}", entry.convar);
+		};
+		assert!(
+			spec.flags.contains(omp_con::VarFlags::ARCHIVE),
+			"curated setting target is not archived: {}",
+			entry.convar
+		);
+	}
+
+	let actual_tabs = omp_con::SETTING_TABS
+		.iter()
+		.map(|tab| {
+			let name: &'static str = tab.tab.into();
+			name.to_owned()
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(actual_tabs, pi.tabs);
+	for tab in omp_con::SETTING_TABS {
+		let name: &'static str = tab.tab.into();
+		assert_eq!(
+			tab.groups,
+			pi.groups[name]
+				.iter()
+				.map(String::as_str)
+				.collect::<Vec<_>>(),
+			"group order drifted for {name}"
+		);
+	}
+
+	assert!(
+		actual.iter().all(|entry| {
+			!entry.label.is_empty()
+				&& entry.label != entry.convar
+				&& !entry.label.starts_with("ai_")
+				&& !entry.label.starts_with("cl_")
+				&& !entry.label.starts_with("sv_")
+				&& !entry.group.is_empty()
+		}),
+		"every visible setting must carry human label/category/group metadata"
 	);
 }

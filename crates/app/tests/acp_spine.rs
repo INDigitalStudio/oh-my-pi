@@ -351,7 +351,8 @@ async fn list_and_fork_expose_stored_sessions() {
 	)
 	.await;
 
-	let capabilities = &response(&frames, "init")["result"]["agentCapabilities"]["sessionCapabilities"];
+	let capabilities =
+		&response(&frames, "init")["result"]["agentCapabilities"]["sessionCapabilities"];
 	assert!(capabilities.get("list").is_some() && capabilities.get("fork").is_some());
 
 	let listed = response(&frames, "list")["result"].clone();
@@ -375,7 +376,11 @@ async fn list_and_fork_expose_stored_sessions() {
 		.expect("source row");
 	assert_eq!(source_row["title"], "remember the fixture");
 	assert_eq!(source_row["_meta"]["messageCount"], 1);
-	assert!(source_row["_meta"]["size"].as_u64().is_some_and(|size| size > 0));
+	assert!(
+		source_row["_meta"]["size"]
+			.as_u64()
+			.is_some_and(|size| size > 0)
+	);
 	assert!(
 		source_row["updatedAt"]
 			.as_str()

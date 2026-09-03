@@ -712,8 +712,9 @@ mod tests {
 			.expect("off resolves");
 		assert!(tag_only.adaptive_tag_only);
 
-		let budget = ThinkingPolicy::new(ThinkingMode::Budget, [ThinkingEffort::Low, ThinkingEffort::High])
-			.expect("ordered efforts");
+		let budget =
+			ThinkingPolicy::new(ThinkingMode::Budget, [ThinkingEffort::Low, ThinkingEffort::High])
+				.expect("ordered efforts");
 		let budget_selection = routing
 			.resolve(&budget, Some(ThinkingEffort::Off), WireModelId::from_ref("m"))
 			.expect("off resolves");

@@ -130,8 +130,20 @@ fn checked_in_model_source_matches_current_pi_roster() {
 		.map(|models| models.as_object().expect("provider models are keyed").len())
 		.sum::<usize>();
 	assert_eq!(count, 4_763, "current pi models.json roster size");
-	assert_eq!(providers["cline-pass"].as_object().expect("ClinePass roster").len(), 18);
-	assert_eq!(providers["abliteration"].as_object().expect("Abliteration roster").len(), 3);
+	assert_eq!(
+		providers["cline-pass"]
+			.as_object()
+			.expect("ClinePass roster")
+			.len(),
+		18
+	);
+	assert_eq!(
+		providers["abliteration"]
+			.as_object()
+			.expect("Abliteration roster")
+			.len(),
+		3
+	);
 }
 
 #[test]
@@ -198,7 +210,8 @@ fn every_pi_rule_file_compiles_under_the_closed_vocabulary() {
 fn cca_gemini_three_requires_only_the_first_call_signature_bypass() {
 	let cascade = CompatCascade::bundled().expect("bundled cascade parses");
 	for provider in ["google-antigravity", "google-gemini-cli"] {
-		for (model, expected) in [("gemini-3-pro", Some(&Value::Bool(true))), ("gemini-2.5-pro", None)]
+		for (model, expected) in
+			[("gemini-3-pro", Some(&Value::Bool(true))), ("gemini-2.5-pro", None)]
 		{
 			let classification = classify(ClassificationInput {
 				phase: ClassificationPhase::CatalogCompiler,

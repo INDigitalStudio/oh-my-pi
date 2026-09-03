@@ -81,7 +81,10 @@ pub struct DiscoveryDefaults {
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DiscoveryError {
 	/// Extended context evidence lacked a pre-interned extended lowering policy.
-	#[error("discovery normalization failed: {provider} model {model} declared extended context without an extended wire policy")]
+	#[error(
+		"discovery normalization failed: {provider} model {model} declared extended context without \
+		 an extended wire policy"
+	)]
 	MissingExtendedContextPolicy {
 		/// Provider whose discovery row declared extended context.
 		provider: Box<ProviderId>,
@@ -90,7 +93,10 @@ pub enum DiscoveryError {
 	},
 	/// A discovered row was not emitted by the projector's bound provider and
 	/// route.
-	#[error("discovery normalization failed: row from {actual_provider}/{actual_route} projected for {expected_provider}/{expected_route}")]
+	#[error(
+		"discovery normalization failed: row from {actual_provider}/{actual_route} projected for \
+		 {expected_provider}/{expected_route}"
+	)]
 	RowScopeMismatch {
 		/// Expected provider.
 		expected_provider: Box<ProviderId>,
@@ -105,7 +111,10 @@ pub enum DiscoveryError {
 	#[error("discovery normalization failed: route {0} has no discovery specification")]
 	RouteDiscoveryMissing(Box<RouteId>),
 	/// The supplied discovery specification is not the one bound to the route.
-	#[error("discovery normalization failed: route {route} is bound to discovery {expected}, not {actual}")]
+	#[error(
+		"discovery normalization failed: route {route} is bound to discovery {expected}, not \
+		 {actual}"
+	)]
 	RouteDiscoveryMismatch {
 		/// Route being projected.
 		route:    Box<RouteId>,
@@ -125,7 +134,10 @@ pub enum DiscoveryError {
 		actual:   Box<ProviderId>,
 	},
 	/// The supplied provider defaults use a different wire policy.
-	#[error("discovery normalization failed: {provider} defaults use wire policy {actual}, expected {expected}")]
+	#[error(
+		"discovery normalization failed: {provider} defaults use wire policy {actual}, expected \
+		 {expected}"
+	)]
 	ProviderPolicyMismatch {
 		/// Provider being projected.
 		provider: Box<ProviderId>,
@@ -1146,7 +1158,7 @@ mod tests {
 	fn partial_discovery_pricing_overrides_only_reported_dimensions() {
 		let mut configured = defaults();
 		configured.pricing = Pricing {
-			components: vec![
+			components:    vec![
 				Price { unit: PriceUnit::MtokInput, nanos_usd: 1 },
 				Price { unit: PriceUnit::MtokOutput, nanos_usd: 2 },
 				Price { unit: PriceUnit::MtokCacheRead, nanos_usd: 3 },

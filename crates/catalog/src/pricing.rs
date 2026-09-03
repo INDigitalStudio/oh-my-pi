@@ -263,27 +263,27 @@ const fn ceil_div(numerator: u128, divisor: u64) -> u128 {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UsageDimensions {
 	/// Uncached prompt tokens.
-	pub input_tokens:       u64,
+	pub input_tokens:          u64,
 	/// Generated tokens.
-	pub output_tokens:      u64,
+	pub output_tokens:         u64,
 	/// Prompt-cache read tokens.
-	pub cache_read_tokens:  u64,
+	pub cache_read_tokens:     u64,
 	/// Prompt-cache write tokens.
-	pub cache_write_tokens: u64,
+	pub cache_write_tokens:    u64,
 	/// Subset of `cache_write_tokens` written with one-hour retention; billed
 	/// at twice the base input rate rather than the five-minute write rate.
 	#[serde(default)]
 	pub cache_write_1h_tokens: u64,
 	/// Generated images.
-	pub images:             u64,
+	pub images:                u64,
 	/// Generated video seconds.
-	pub video_seconds:      u64,
+	pub video_seconds:         u64,
 	/// Generated or transcribed audio seconds.
-	pub audio_seconds:      u64,
+	pub audio_seconds:         u64,
 	/// Input characters.
-	pub input_characters:   u64,
+	pub input_characters:      u64,
 	/// Billable requests.
-	pub requests:           u64,
+	pub requests:              u64,
 }
 
 impl UsageDimensions {
@@ -443,16 +443,16 @@ mod tests {
 		let pricing = Pricing::new(components, Vec::new()).expect("ordered dimensions");
 		let cost = pricing
 			.cost(UsageDimensions {
-				input_tokens:       1,
-				output_tokens:      1,
-				cache_read_tokens:  1,
-				cache_write_tokens: 1,
+				input_tokens:          1,
+				output_tokens:         1,
+				cache_read_tokens:     1,
+				cache_write_tokens:    1,
 				cache_write_1h_tokens: 0,
-				images:             1,
-				video_seconds:      1,
-				audio_seconds:      1,
-				input_characters:   1,
-				requests:           1,
+				images:                1,
+				video_seconds:         1,
+				audio_seconds:         1,
+				input_characters:      1,
+				requests:              1,
 			})
 			.expect("small exact cost");
 		assert_eq!(cost, NanoUsd::from_nanos(22));
@@ -462,10 +462,10 @@ mod tests {
 	fn one_hour_cache_writes_bill_at_twice_base_input() {
 		// Sonnet-shaped card: $3/M input, $3.75/M five-minute cache write.
 		let pricing = Pricing::new(
-			vec![
-				Price { unit: PriceUnit::MtokInput, nanos_usd: 3_000_000_000 },
-				Price { unit: PriceUnit::MtokCacheWrite, nanos_usd: 3_750_000_000 },
-			],
+			vec![Price { unit: PriceUnit::MtokInput, nanos_usd: 3_000_000_000 }, Price {
+				unit:      PriceUnit::MtokCacheWrite,
+				nanos_usd: 3_750_000_000,
+			}],
 			Vec::new(),
 		)
 		.expect("ordered dimensions");

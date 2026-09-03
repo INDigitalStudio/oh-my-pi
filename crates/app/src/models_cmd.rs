@@ -86,6 +86,7 @@ async fn refresh() -> miette::Result<()> {
 				deadline:       None,
 				budget:         ExecutionBudget::default(),
 				session:        None,
+				debug_session:  None,
 				response_hooks: Default::default(),
 			};
 			let mut cursor = None;

@@ -156,45 +156,45 @@ pub(crate) struct HandoffTarget {
 /// `..`): a flag clap accepts is lowered into a convar, a [`KernelOptions`]
 /// field, or a launch fact here, or the crate does not compile.
 pub(crate) struct Launch {
-	pub data_dir:       PathBuf,
-	pub project:        PathBuf,
-	pub ctx:            Arc<omp_con::Ctx>,
-	pub catalog:        Arc<Catalog>,
+	pub data_dir:      PathBuf,
+	pub project:       PathBuf,
+	pub ctx:           Arc<omp_con::Ctx>,
+	pub catalog:       Arc<Catalog>,
 	/// Configured model policy after `--config` overlays.
-	pub settings:       ModelSettings,
+	pub settings:      ModelSettings,
 	/// `settings` narrowed to the `--models` roster (pi `resolveModelScope`);
 	/// identical to `settings` without the flag.
-	pub scoped:         ModelSettings,
-	pub roles:          roles::LaunchRoles,
+	pub scoped:        ModelSettings,
+	pub roles:         roles::LaunchRoles,
 	/// Primary model selector handed to the kernel.
-	pub model:          Str,
+	pub model:         Str,
 	/// `--models` roster in flag order; the interactive cycle when non-empty.
-	pub scope:          Vec<ScopedModel>,
+	pub scope:         Vec<ScopedModel>,
 	/// Reasoning level applied after the session opened: `--thinking`, else the
 	/// first scoped pattern's explicit suffix on a fresh session.
-	pub thinking:       Option<Str>,
+	pub thinking:      Option<Str>,
 	/// `--plan-mode` / `--plan-yolo`: engage the plan Director at launch.
-	pub plan_mode:      bool,
+	pub plan_mode:     bool,
 	/// `--plan-yolo`: the target the plan Director hands off to on approval.
-	pub plan_yolo:      Option<HandoffTarget>,
+	pub plan_yolo:     Option<HandoffTarget>,
 	/// Armed prewalk hand-off target; `None` when prewalk is off or disarmed.
-	pub prewalk:        Option<HandoffTarget>,
-	pub sessions_dir:   Option<PathBuf>,
+	pub prewalk:       Option<HandoffTarget>,
+	pub sessions_dir:  Option<PathBuf>,
 	/// The launch reopens an existing session.
-	pub resuming:       bool,
-	pub ephemeral:      bool,
-	pub max_time:       Option<Duration>,
+	pub resuming:      bool,
+	pub ephemeral:     bool,
+	pub max_time:      Option<Duration>,
 	/// Initial prompt words.
-	pub prompt:         Vec<Str>,
+	pub prompt:        Vec<Str>,
 	/// Prompt templates (`/name` slash commands): the discovered directories
 	/// unless `--no-prompt-templates`, plus every `--prompt-template` path.
-	pub templates:      Arc<PromptTemplates>,
+	pub templates:     Arc<PromptTemplates>,
 	/// The named theme the interactive host paints with: `cl_theme` resolved
 	/// against `--theme` paths and the theme directories; `None` is the stock
 	/// palette.
-	pub theme:          Option<Arc<omp_tui::JsonTheme>>,
-	pub live_sessions:  Arc<omp_driver::sessions::SessionRegistry>,
-	pub options:        KernelOptions,
+	pub theme:         Option<Arc<omp_tui::JsonTheme>>,
+	pub live_sessions: Arc<omp_driver::sessions::SessionRegistry>,
+	pub options:       KernelOptions,
 }
 
 impl Launch {
@@ -307,12 +307,8 @@ impl Launch {
 		})
 		.into_diagnostic()?;
 		let config_root = omp_core::dirs::profile_config_dir(&home);
-		let templates = PromptTemplates::discover(
-			&project,
-			&config_root,
-			&prompt_template,
-			!no_prompt_templates,
-		);
+		let templates =
+			PromptTemplates::discover(&project, &config_root, &prompt_template, !no_prompt_templates);
 		for warning in &templates.warnings {
 			eprintln!("warning: {}: {}", warning.path.display(), warning.message);
 		}
@@ -1195,12 +1191,22 @@ mod tests {
 			.iter()
 			.map(|template| template.name.as_str())
 			.collect::<Vec<_>>();
-		assert_eq!(templates, ["review"], "--prompt-template loads; --no-prompt-templates suppresses discovery");
 		assert_eq!(
-			launch.templates.expand_line("/review src/lib.rs").as_deref(),
+			templates,
+			["review"],
+			"--prompt-template loads; --no-prompt-templates suppresses discovery"
+		);
+		assert_eq!(
+			launch
+				.templates
+				.expand_line("/review src/lib.rs")
+				.as_deref(),
 			Some("Review src/lib.rs closely.")
 		);
-		let theme = launch.theme.as_ref().expect("--theme file selected by cl_theme");
+		let theme = launch
+			.theme
+			.as_ref()
+			.expect("--theme file selected by cl_theme");
 		assert_eq!(theme.name, "Ocean");
 		assert_eq!(
 			theme.for_appearance(omp_tui::Appearance::Dark).accent,
@@ -1229,29 +1235,31 @@ mod tests {
 	async fn prompt_templates_are_discovered_and_expand_the_initial_prompt() {
 		let dir = tempfile::tempdir().unwrap();
 		fs::create_dir_all(dir.path().join("home/.o2/agent/prompts")).unwrap();
-		fs::write(
-			dir.path().join("home/.o2/agent/prompts/fix.md"),
-			"Fix $1 then run $2\n",
-		)
-		.unwrap();
+		fs::write(dir.path().join("home/.o2/agent/prompts/fix.md"), "Fix $1 then run $2\n").unwrap();
 		fs::create_dir_all(dir.path().join(".omp/prompts")).unwrap();
 		fs::write(dir.path().join(".omp/prompts/plain.md"), "Plain body\n").unwrap();
 		let mut args = ChatArgs::default_interactive();
 		args.model = Some(Str::new_static("openai/gpt-5"));
 		args.project = dir.path().to_path_buf();
-		args.prompt = vec![Str::new_static("/fix"), Str::new_static("lib.rs"), Str::new_static("tests")];
+		args.prompt =
+			vec![Str::new_static("/fix"), Str::new_static("lib.rs"), Str::new_static("tests")];
 		let launch = Launch::prepare(args, Arc::new(omp_con::Ctx::new()), test_env(dir.path()))
 			.await
 			.expect("launch lowers");
 		assert_eq!(launch.initial_prompt().as_deref(), Some("Fix lib.rs then run tests"));
 		assert_eq!(
-			launch.templates.expand_line("/plain extra words").as_deref(),
+			launch
+				.templates
+				.expand_line("/plain extra words")
+				.as_deref(),
 			Some("Plain body\n\nextra words"),
 			"unreferenced words are appended"
 		);
 		assert!(launch.theme.is_none(), "stock palette without --theme or cl_theme");
 
-		let ctx = omp_chat::HostMailbox::new().attach(omp_con::Ctx::builder()).build();
+		let ctx = omp_chat::HostMailbox::new()
+			.attach(omp_con::Ctx::builder())
+			.build();
 		let reserved = omp_chat::commands::prompts::register(
 			&ctx,
 			Arc::new(TemplateCommands(Arc::clone(&launch.templates))),
@@ -1278,19 +1286,21 @@ mod tests {
 		args.model = Some(Str::new_static("openai/gpt-5"));
 		args.project = dir.path().to_path_buf();
 		args.use_theme = Some(Str::new_static("nope"));
-		let launch = Launch::prepare(args.clone(), Arc::new(omp_con::Ctx::new()), test_env(dir.path()))
-			.await
-			.expect("launch lowers");
+		let launch =
+			Launch::prepare(args.clone(), Arc::new(omp_con::Ctx::new()), test_env(dir.path()))
+				.await
+				.expect("launch lowers");
 		assert!(launch.theme.is_none());
 
 		let broken = dir.path().join("broken.json");
 		fs::write(&broken, "{").unwrap();
 		args.use_theme = None;
 		args.theme = vec![broken];
-		let error = match Launch::prepare(args, Arc::new(omp_con::Ctx::new()), test_env(dir.path())).await {
-			Ok(_) => panic!("a broken explicit theme is an error"),
-			Err(error) => error,
-		};
+		let error =
+			match Launch::prepare(args, Arc::new(omp_con::Ctx::new()), test_env(dir.path())).await {
+				Ok(_) => panic!("a broken explicit theme is an error"),
+				Err(error) => error,
+			};
 		assert!(error.to_string().contains("invalid theme"), "{error}");
 	}
 

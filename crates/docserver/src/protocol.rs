@@ -1617,24 +1617,24 @@ async fn lsp_status(
 		.map(|server| {
 			let binding_id = registry.binding_id(server.name.as_str());
 			proto::LspServerStatus {
-			server_id:  binding_id.map(binding_id_bytes).unwrap_or_default(),
-			capabilities_json: binding_id
-				.and_then(|binding_id| registry.binding_capabilities(binding_id).ok())
-				.unwrap_or_default(),
-			name:       server.name.to_string(),
-			stage:      match server.state {
-				LspServerState::Available => proto::LspServerStage::Available,
-				LspServerState::Starting => proto::LspServerStage::Starting,
-				LspServerState::Indexing => proto::LspServerStage::Indexing,
-				LspServerState::Ready => proto::LspServerStage::Ready,
-				LspServerState::Failed => proto::LspServerStage::Failed,
-			} as i32,
-			file_types: server.file_types.iter().map(ToString::to_string).collect(),
-			detail:     server
-				.detail
-				.map(|detail| detail.to_string())
-				.unwrap_or_default(),
-			source:     server.source.to_owned(),
+				server_id:         binding_id.map(binding_id_bytes).unwrap_or_default(),
+				capabilities_json: binding_id
+					.and_then(|binding_id| registry.binding_capabilities(binding_id).ok())
+					.unwrap_or_default(),
+				name:              server.name.to_string(),
+				stage:             match server.state {
+					LspServerState::Available => proto::LspServerStage::Available,
+					LspServerState::Starting => proto::LspServerStage::Starting,
+					LspServerState::Indexing => proto::LspServerStage::Indexing,
+					LspServerState::Ready => proto::LspServerStage::Ready,
+					LspServerState::Failed => proto::LspServerStage::Failed,
+				} as i32,
+				file_types:        server.file_types.iter().map(ToString::to_string).collect(),
+				detail:            server
+					.detail
+					.map(|detail| detail.to_string())
+					.unwrap_or_default(),
+				source:            server.source.to_owned(),
 			}
 		})
 		.collect();

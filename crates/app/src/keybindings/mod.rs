@@ -107,3 +107,20 @@ pub fn pi_action_command(action: &str) -> Option<&'static str> {
 		.iter()
 		.find_map(|(id, command)| (*id == action).then_some(*command))
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn ctrl_shift_d_is_a_literal_debug_binding() {
+		let ctx = omp_con::Ctx::new();
+		ctx.exec(
+			DEFAULT_BINDS,
+			omp_con::Source::Config(omp_core::Str::new_static(DEFAULT_BINDS_NAME)),
+		)
+		.expect("default bindings execute");
+		let bindings = config::ConsoleKeybindings::from_ctx(&ctx).expect("bindings project");
+		assert_eq!(bindings.command_for("ctrl+shift+d"), Some("debug"));
+	}
+}

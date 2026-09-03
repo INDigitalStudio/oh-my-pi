@@ -67,6 +67,7 @@ pub async fn run(database: PathBuf, command: AuthCommand) -> miette::Result<()> 
 		deadline:       None,
 		budget:         ExecutionBudget::default(),
 		session:        None,
+		debug_session:  None,
 		response_hooks: Default::default(),
 	};
 	let planner = router::Router::new(registry.clone(), time::Duration::from_secs(30));

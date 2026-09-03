@@ -333,6 +333,7 @@ async fn sample(
 		deadline:       None,
 		budget:         ExecutionBudget::default(),
 		session:        None,
+		debug_session:  None,
 		response_hooks: Default::default(),
 	};
 	let mut request = cli::chat_request(challenge.prompt);

@@ -277,11 +277,7 @@ async fn rpc_follow_up_runs_after_the_turn_yields_and_immediately_when_idle() {
 	let temp = tempfile::tempdir().expect("tempdir");
 	let frames = converse(
 		&temp,
-		VecDeque::from([
-			Script::Pending,
-			completed_script("second"),
-			completed_script("third"),
-		]),
+		VecDeque::from([Script::Pending, completed_script("second"), completed_script("third")]),
 		"{\"id\":\"prompt\",\"type\":\"prompt\",\"message\":\"wait\"}\n{\"id\":\"queue\",\"type\":\"\
 		 follow_up\",\"message\":\"later\"}\n{\"id\":\"abort\",\"type\":\"abort\"}\n",
 		&[

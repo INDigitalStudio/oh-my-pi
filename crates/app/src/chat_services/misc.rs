@@ -144,7 +144,11 @@ pub fn ssh_hosts(state: &ServiceState) -> ServiceResult<Vec<SshHostRow>> {
 /// `/ssh add`.
 pub fn ssh_add(state: &ServiceState, spec: &SshHostSpec) -> ServiceResult<Str> {
 	let paths = ssh_paths(state)?;
-	let path = if spec.project { &paths.project } else { &paths.user };
+	let path = if spec.project {
+		&paths.project
+	} else {
+		&paths.user
+	};
 	if let Some(parent) = path.parent() {
 		fs::create_dir_all(parent).map_err(failed)?;
 	}

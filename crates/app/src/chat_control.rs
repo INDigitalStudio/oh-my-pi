@@ -259,8 +259,8 @@ impl<C: omp_agent::Inference> Controller<C> {
 			if !self.paused
 				&& let Some(input) = self.pop_queued()?
 			{
-				let quit =
-					self.run_turn(Some(input), &command_rx).await? || self.after_turn(&command_rx).await?;
+				let quit = self.run_turn(Some(input), &command_rx).await?
+					|| self.after_turn(&command_rx).await?;
 				if quit {
 					self.shutdown()?;
 					return Ok(());
@@ -422,7 +422,6 @@ impl<C: omp_agent::Inference> Controller<C> {
 		// store (pi `steer(text, images)`).
 		let blobs = self.session.blobs().clone();
 		let failure = {
-			let mut failure = None;
 			let control = omp_agent::RunControl::default();
 			let turn = match input {
 				Some(input) => futures::future::Either::Left(self.kernel.run_turn(
@@ -437,10 +436,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 			tokio::pin!(turn);
 			loop {
 				tokio::select! {
-					result = &mut turn => {
-						failure = result.err();
-						break;
-					},
+					result = &mut turn => break result.err(),
 					command = command_rx.recv_async() => match command {
 						Ok(HostCommand::Submit(text) | HostCommand::Steer(text)) => {
 							let _ = self.up.send(Up::Steer { text, attachments: Vec::new() });
@@ -523,11 +519,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 					},
 				}
 				if quit {
-					failure = turn.await.err();
-					break;
+					break turn.await.err();
 				}
 			}
-			failure
 		};
 		if let Some(error) = failure {
 			if matches!(error, omp_agent::KernelError::NothingToRetry) {
@@ -924,9 +918,12 @@ impl<C: omp_agent::Inference> Controller<C> {
 								"Agent \"{id}\" is running but not addressable from this process"
 							)))
 						})?;
-					live.up.send(Up::Steer { text, attachments: Vec::new() }).map_err(|_| {
-						ServiceError::Failed(Str::new(format!("Agent \"{id}\" stopped listening")))
-					})?;
+					live
+						.up
+						.send(Up::Steer { text, attachments: Vec::new() })
+						.map_err(|_| {
+							ServiceError::Failed(Str::new(format!("Agent \"{id}\" stopped listening")))
+						})?;
 					return Ok(Str::new(format!("Sent to {id}")));
 				}
 				self.revive(id, Some(text))?;
@@ -1019,13 +1016,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 					.kernel
 					.run_local(&mut self.session, run, omp_agent::RunControl::default());
 			tokio::pin!(local);
-			let mut failure = None;
 			loop {
 				tokio::select! {
-					result = &mut local => {
-						failure = result.err();
-						break;
-					},
+					result = &mut local => break result.err(),
 					command = command_rx.recv_async() => match command {
 						Ok(HostCommand::Interrupt) => {
 							let _ = self.up.send(Up::Interrupt);
@@ -1046,11 +1039,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 					},
 				}
 				if quit {
-					failure = local.await.err();
-					break;
+					break local.await.err();
 				}
 			}
-			failure
 		};
 		if let Some(error) = failure {
 			crate::chat_cmd::record_turn_failure(&mut self.session, &error).into_diagnostic()?;
@@ -1092,6 +1083,14 @@ impl<C: omp_agent::Inference> Controller<C> {
 			let _ = forwarder.await;
 		}
 		*self.live_journal.write() = self.session.journal_path().to_path_buf();
+		self.kernel.set_debug_session(
+			self
+				.session
+				.journal_path()
+				.file_stem()
+				.and_then(|name| name.to_str())
+				.map(Str::new),
+		);
 		let _ = self.relay.send(Event::Reset { snapshot });
 		self.forwarder = Some(forward(events, self.relay.clone()));
 		self.kernel.resync_session_state(&self.session);
@@ -1551,7 +1550,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 		let breadcrumb = TAN_DISPATCH
 			.replace("{{jobId}}", id.as_str())
 			.replace("{{work}}", work.as_str());
-		let _ = self.up.send(Up::Steer { text: Str::new(breadcrumb), attachments: Vec::new() });
+		let _ = self
+			.up
+			.send(Up::Steer { text: Str::new(breadcrumb), attachments: Vec::new() });
 		self.reply(Severity::Info, format!("Dispatched background tan {id}"));
 
 		let data_dir = self.data_dir.clone();
@@ -2260,10 +2261,7 @@ mod tests {
 			self.build_with(|_, _| {})
 		}
 
-		fn build_with(
-			self,
-			prepare: impl FnOnce(&mut Session, &Kernel<SlowInference>),
-		) -> Harness {
+		fn build_with(self, prepare: impl FnOnce(&mut Session, &Kernel<SlowInference>)) -> Harness {
 			let Self { dir, script, delay, services } = self;
 			let mut kernel = Kernel::new(
 				SlowInference { delay, script, requests: 0 },
@@ -2389,11 +2387,7 @@ mod tests {
 			.current_dir(root)
 			.output()
 			.expect("git runs");
-		assert!(
-			output.status.success(),
-			"git {args:?}: {}",
-			String::from_utf8_lossy(&output.stderr)
-		);
+		assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
 		String::from_utf8(output.stdout).expect("utf-8 git output")
 	}
 
@@ -2620,7 +2614,11 @@ mod tests {
 		assert_eq!(attachments.len(), 1);
 		assert_eq!(attachments[0].mime, "image/png");
 		assert_eq!(
-			session.blobs().get(&attachments[0].blob).expect("queued image blob").as_ref(),
+			session
+				.blobs()
+				.get(&attachments[0].blob)
+				.expect("queued image blob")
+				.as_ref(),
 			PNG,
 			"the queued bytes were content-addressed once and reach the turn"
 		);
@@ -2719,14 +2717,14 @@ mod tests {
 		let Outcome::Git(outcome) = next_outcome(&mailbox).await else {
 			panic!("stage settles as a Git outcome");
 		};
-		assert_eq!(outcome, GitOutcome { op: stage, result: Ok(Str::new_static("Staged a.txt")) });
+		assert_eq!(outcome, GitOutcome {
+			op:     stage,
+			result: Ok(Str::new_static("Staged a.txt")),
+		});
 		assert_eq!(git(&root, &["diff", "--cached", "--name-only"]).trim(), "a.txt");
 
-		let commit = GitOp::Commit {
-			message:   Str::new_static("bump a"),
-			amend:     false,
-			stage_all: false,
-		};
+		let commit =
+			GitOp::Commit { message: Str::new_static("bump a"), amend: false, stage_all: false };
 		harness
 			.commands
 			.send(HostCommand::Git(commit.clone()))
@@ -2769,40 +2767,39 @@ mod tests {
 	async fn agent_send_steers_the_live_child_and_kill_journals_it_cancelled() {
 		let (child_up, child_inbox) = flume::unbounded::<Up>();
 		let cancel = tokio_util::sync::CancellationToken::new();
-		let harness =
-			HarnessSpec::new(Script::Text, Duration::ZERO).build_with(|session, kernel| {
-				let cause = session.head().expect("head");
-				let txn = jobs::insert(session.dom(), cause, jobs::JobSpec {
-					id:      Str::new_static("child"),
-					kind:    Str::new_static("subagent"),
-					owner:   Str::new_static("Main"),
-					started: Str::new_static("0"),
-					agent:   Some(Str::new_static("task")),
-				})
-				.expect("jobs component");
-				session.patch(txn).expect("journal the child");
-				let handle = session
-					.dom()
-					.select("meta jobs subagent")
-					.expect("selector")
-					.next()
-					.expect("child element");
-				let unit = cancel.clone();
-				let attached = kernel.jobs().attach_task(
-					session.dom(),
-					handle,
-					cancel.clone(),
-					tokio::spawn(async move {
-						unit.cancelled().await;
-						omp_agent::JobSettlement {
-							status: Str::new_static("completed"),
-							output: None,
-							error:  None,
-						}
-					}),
-				);
-				assert!(attached, "the child has a runtime kill boundary");
-			});
+		let harness = HarnessSpec::new(Script::Text, Duration::ZERO).build_with(|session, kernel| {
+			let cause = session.head().expect("head");
+			let txn = jobs::insert(session.dom(), cause, jobs::JobSpec {
+				id:      Str::new_static("child"),
+				kind:    Str::new_static("subagent"),
+				owner:   Str::new_static("Main"),
+				started: Str::new_static("0"),
+				agent:   Some(Str::new_static("task")),
+			})
+			.expect("jobs component");
+			session.patch(txn).expect("journal the child");
+			let handle = session
+				.dom()
+				.select("meta jobs subagent")
+				.expect("selector")
+				.next()
+				.expect("child element");
+			let unit = cancel.clone();
+			let attached = kernel.jobs().attach_task(
+				session.dom(),
+				handle,
+				cancel.clone(),
+				tokio::spawn(async move {
+					unit.cancelled().await;
+					omp_agent::JobSettlement {
+						status: Str::new_static("completed"),
+						output: None,
+						error:  None,
+					}
+				}),
+			);
+			assert!(attached, "the child has a runtime kill boundary");
+		});
 		harness
 			.live
 			.register(Str::new_static("child"), omp_driver::sessions::KernelHandle {
@@ -2826,7 +2823,9 @@ mod tests {
 			op:     send,
 			result: Ok(Str::new_static("Sent to child")),
 		});
-		let steer = child_inbox.try_recv().expect("the child's mailbox received the message");
+		let steer = child_inbox
+			.try_recv()
+			.expect("the child's mailbox received the message");
 		assert!(matches!(&steer, Up::Steer { text, .. } if text == "please adjust"), "{steer:?}");
 
 		harness
@@ -2873,9 +2872,8 @@ mod tests {
 		fn sessions(
 			&self,
 			scope: omp_chat::overlays::services::SessionScope,
-		) -> omp_chat::overlays::services::ServiceResult<
-			Vec<omp_chat::overlays::services::SessionRow>,
-		> {
+		) -> omp_chat::overlays::services::ServiceResult<Vec<omp_chat::overlays::services::SessionRow>>
+		{
 			crate::chat_services::sessions::rows_in(
 				&self.data_dir,
 				&self.sessions_dir,
@@ -2937,11 +2935,16 @@ mod tests {
 		expected.sort();
 		assert_eq!(ids, expected);
 		assert!(
-			rows.iter().any(|row| row.id == "alpha-1" && row.path.starts_with(data_dir.join("projects/alpha"))),
+			rows
+				.iter()
+				.any(|row| row.id == "alpha-1" && row.path.starts_with(data_dir.join("projects/alpha"))),
 			"rows keep their project's journal path"
 		);
 		assert_eq!(
-			rows.iter().find(|row| row.id == "alpha-1").and_then(|row| row.title.as_deref()),
+			rows
+				.iter()
+				.find(|row| row.id == "alpha-1")
+				.and_then(|row| row.title.as_deref()),
 			Some("work in alpha")
 		);
 
@@ -2973,8 +2976,8 @@ mod tests {
 			.commands
 			.send(HostCommand::Submit(Str::new_static("use bash")))
 			.expect("submit");
-		let ready = next_event(&harness.events, |event| matches!(event, KernelEvent::ToolReady { .. }))
-			.await;
+		let ready =
+			next_event(&harness.events, |event| matches!(event, KernelEvent::ToolReady { .. })).await;
 		assert_eq!(ready, KernelEvent::ToolReady {
 			call_id: Str::new_static(SCRIPTED_CALL),
 			name:    Str::new_static("bash"),
@@ -2988,8 +2991,8 @@ mod tests {
 		assert_eq!(ended, KernelEvent::TurnEnded { stop: TurnStop::Cancelled });
 
 		harness.commands.send(HostCommand::Retry).expect("retry");
-		let ready = next_event(&harness.events, |event| matches!(event, KernelEvent::ToolReady { .. }))
-			.await;
+		let ready =
+			next_event(&harness.events, |event| matches!(event, KernelEvent::ToolReady { .. })).await;
 		assert_eq!(
 			ready,
 			KernelEvent::ToolReady {
@@ -3050,7 +3053,10 @@ mod tests {
 			matches!(event, KernelEvent::TurnEnded { stop: TurnStop::Completed })
 		})
 		.await;
-		harness.commands.send(HostCommand::Retry).expect("retry again");
+		harness
+			.commands
+			.send(HostCommand::Retry)
+			.expect("retry again");
 		let (severity, text) = next_reply(&harness.mailbox()).await;
 		assert_eq!(severity, Severity::Info);
 		assert_eq!(text, "Nothing to retry");

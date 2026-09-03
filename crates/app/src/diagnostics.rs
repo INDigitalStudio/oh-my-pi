@@ -301,3 +301,33 @@ fn sanitized_environment() -> BTreeMap<&'static str, String> {
 		})
 		.collect()
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn bundle_writes_real_bounded_archive_with_profiles() {
+		let directory = tempfile::tempdir().expect("temp directory");
+		let journal = directory.path().join("session.oms");
+		fs::write(&journal, "event: journal@1\ndata: {}\n").expect("journal");
+		let output = directory.path().join("report.tar.gz");
+		let mut spec =
+			BundleSpec::new(output.clone(), journal, serde_json::json!({ "model": "test" }));
+		spec.profiles.push(ProfilePayload {
+			path:   "work.folded".to_owned(),
+			format: "folded-stacks-microseconds".to_owned(),
+			bytes:  b"omp;test 1\n".to_vec(),
+		});
+		let summary = create_bundle(spec).expect("bundle");
+		assert_eq!(summary.output, output);
+		assert!(summary.files >= 5);
+		assert!(summary.uncompressed_bytes > 0);
+		assert!(summary.output.is_file());
+		assert!(
+			fs::metadata(summary.output)
+				.expect("archive metadata")
+				.len() > 0
+		);
+	}
+}

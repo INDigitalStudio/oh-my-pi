@@ -261,7 +261,9 @@ where
 	let (mut kernel, mut session) = current.take().expect("idle RPC owns kernel and session");
 	let turn_tx = turn_tx.clone();
 	drop(tokio::spawn(async move {
-		let result = kernel.run_turn(&mut session, input, RunControl::default()).await;
+		let result = kernel
+			.run_turn(&mut session, input, RunControl::default())
+			.await;
 		let _ = turn_tx.send_async((kernel, session, result)).await;
 	}));
 	outgoing_tx
@@ -977,10 +979,7 @@ fn approve_response(
 			scope,
 			source: omp_agent::ApprovalSource::External,
 			decided_by: None,
-			reason: params
-				.get("reason")
-				.and_then(Value::as_str)
-				.map(Str::new),
+			reason: params.get("reason").and_then(Value::as_str).map(Str::new),
 			audited: false,
 		},
 	});

@@ -126,8 +126,17 @@ fn literal_full_pi_keymap_is_expressed_by_default_cfg() {
 			);
 		}
 	}
+	// Owner override: Ctrl+Shift+D is omp's direct Debug menu chord. Pi has
+	// the menu but no default chord; keep the deviation explicit instead of
+	// weakening the literal pi oracle.
+	let debug = normalize_chord("ctrl+shift+d").expect("debug chord normalizes");
+	assert_eq!(bindings.command_for(debug.as_str()), Some("debug"));
+	oracle_chords.insert(debug);
 	let actual_chords: BTreeSet<_> = bindings.bindings.keys().cloned().collect();
-	assert_eq!(actual_chords, oracle_chords, "default cfg has a non-pi chord or misses a pi chord");
+	assert_eq!(
+		actual_chords, oracle_chords,
+		"default cfg has an unreviewed chord or misses a pi/owner chord"
+	);
 }
 
 #[test]

@@ -278,13 +278,13 @@ mod tests {
 		session.assistant_end("tool_calls").unwrap();
 		session
 			.receipt(TurnReceipt {
-				tokens_in:     100,
-				tokens_out:    10,
-				cost_nano_usd: 5_000,
-				cache_read:    0,
-				cache_write:   0,
-				ttft_ms:       Some(100),
-				duration_ms:   Some(1_000),
+				tokens_in:                   100,
+				tokens_out:                  10,
+				cost_nano_usd:               5_000,
+				cache_read:                  0,
+				cache_write:                 0,
+				ttft_ms:                     Some(100),
+				duration_ms:                 Some(1_000),
 				premium_requests_millionths: 0,
 			})
 			.unwrap();
@@ -294,13 +294,13 @@ mod tests {
 		session.assistant_end("error").unwrap();
 		session
 			.receipt(TurnReceipt {
-				tokens_in:     50,
-				tokens_out:    0,
-				cost_nano_usd: 0,
-				cache_read:    0,
-				cache_write:   0,
-				ttft_ms:       None,
-				duration_ms:   None,
+				tokens_in:                   50,
+				tokens_out:                  0,
+				cost_nano_usd:               0,
+				cache_read:                  0,
+				cache_write:                 0,
+				ttft_ms:                     None,
+				duration_ms:                 None,
 				premium_requests_millionths: 0,
 			})
 			.unwrap();

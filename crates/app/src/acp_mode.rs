@@ -570,16 +570,20 @@ fn list_sessions(home: &SessionHome, params: &Map<String, Value>) -> Result<Valu
 		Some(cursor) => cursor
 			.as_str()
 			.and_then(|cursor| cursor.parse::<usize>().ok())
-			.or_else(|| cursor.as_u64().and_then(|cursor| usize::try_from(cursor).ok()))
+			.or_else(|| {
+				cursor
+					.as_u64()
+					.and_then(|cursor| usize::try_from(cursor).ok())
+			})
 			.ok_or("invalid session cursor")?,
 	};
-	let index = SessionIndex::open(&home.sessions_dir).map_err(|_| "session directory unreadable")?;
+	let index =
+		SessionIndex::open(&home.sessions_dir).map_err(|_| "session directory unreadable")?;
 	let mut rows = index.list();
 	if let Some(cwd) = &cwd {
 		rows.retain(|row| {
 			let recorded = Path::new(row.cwd.as_str());
-			recorded == cwd
-				|| fs::canonicalize(recorded).is_ok_and(|recorded| recorded == *cwd)
+			recorded == cwd || fs::canonicalize(recorded).is_ok_and(|recorded| recorded == *cwd)
 		});
 	}
 	let total = rows.len();
@@ -656,7 +660,10 @@ fn prompt_input(params: &Map<String, Value>) -> Result<PromptInput, &'static str
 		match block.get("type").and_then(Value::as_str) {
 			Some("text") => {
 				texts.push(Cow::Borrowed(
-					block.get("text").and_then(Value::as_str).unwrap_or_default(),
+					block
+						.get("text")
+						.and_then(Value::as_str)
+						.unwrap_or_default(),
 				));
 			},
 			Some("image") => {
@@ -671,7 +678,9 @@ fn prompt_input(params: &Map<String, Value>) -> Result<PromptInput, &'static str
 				images.push(decode_image(data, mime)?);
 			},
 			Some("resource") => {
-				let resource = block.get("resource").ok_or("resource block requires a resource")?;
+				let resource = block
+					.get("resource")
+					.ok_or("resource block requires a resource")?;
 				if let Some(text) = resource.get("text").and_then(Value::as_str) {
 					texts.push(Cow::Borrowed(text));
 				} else if let Some(mime) = resource
@@ -682,7 +691,10 @@ fn prompt_input(params: &Map<String, Value>) -> Result<PromptInput, &'static str
 				{
 					images.push(decode_image(blob, mime)?);
 				} else {
-					let uri = resource.get("uri").and_then(Value::as_str).unwrap_or_default();
+					let uri = resource
+						.get("uri")
+						.and_then(Value::as_str)
+						.unwrap_or_default();
 					texts.push(Cow::Owned(format!("[embedded resource: {uri}]")));
 				}
 			},
@@ -810,7 +822,10 @@ mod tests {
 			.iter()
 			.map(|image| (image.mime.as_str(), image.bytes.as_ref()))
 			.collect::<Vec<_>>();
-		assert_eq!(images, vec![("image/png", b"hello".as_slice()), ("image/png", b"world".as_slice())]);
+		assert_eq!(images, vec![
+			("image/png", b"hello".as_slice()),
+			("image/png", b"world".as_slice())
+		]);
 		assert_eq!(
 			prompt_input(&params(json!({"prompt": [{"type": "image", "data": "aGVsbG8="}]}))).err(),
 			Some("image content block requires mimeType")
@@ -819,17 +834,16 @@ mod tests {
 
 	#[test]
 	fn prompt_rejects_missing_and_malformed_content() {
-		assert_eq!(
-			prompt_input(&params(json!({}))).err(),
-			Some("session/prompt requires a prompt")
-		);
+		assert_eq!(prompt_input(&params(json!({}))).err(), Some("session/prompt requires a prompt"));
 		assert_eq!(
 			prompt_input(&params(json!({"prompt": [{"type": "text", "text": "  "}]}))).err(),
 			Some("prompt contains no text")
 		);
 		assert_eq!(
-			prompt_input(&params(json!({"prompt": [{"type": "image", "data": "%%%", "mimeType": "image/png"}]})))
-				.err(),
+			prompt_input(&params(
+				json!({"prompt": [{"type": "image", "data": "%%%", "mimeType": "image/png"}]})
+			))
+			.err(),
 			Some("image content block data is not valid base64")
 		);
 		assert_eq!(
