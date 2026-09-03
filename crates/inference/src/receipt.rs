@@ -147,6 +147,11 @@ pub struct Usage {
 	pub cache_read_tokens:  u64,
 	/// Prompt-cache tokens written.
 	pub cache_write_tokens: u64,
+	/// Subset of `cache_write_tokens` written with one-hour retention (pi
+	/// `usage.cttl.ephemeral1h`); Anthropic bills these at twice the base
+	/// input rate instead of the five-minute cache-write rate.
+	#[serde(default)]
+	pub cache_write_1h_tokens: u64,
 	/// Images processed or generated.
 	pub images:             u32,
 	/// Input audio duration in milliseconds.
@@ -182,6 +187,9 @@ impl Usage {
 		self.cache_write_tokens = self
 			.cache_write_tokens
 			.saturating_add(other.cache_write_tokens);
+		self.cache_write_1h_tokens = self
+			.cache_write_1h_tokens
+			.saturating_add(other.cache_write_1h_tokens);
 		self.images = self.images.saturating_add(other.images);
 		self.audio_input_ms = self.audio_input_ms.saturating_add(other.audio_input_ms);
 		self.audio_output_ms = self.audio_output_ms.saturating_add(other.audio_output_ms);
@@ -622,6 +630,7 @@ mod tests {
 			reasoning_tokens:   3,
 			cache_read_tokens:  4,
 			cache_write_tokens: 5,
+			cache_write_1h_tokens: 2,
 			images:             1,
 			audio_input_ms:     6,
 			audio_output_ms:    7,
@@ -636,6 +645,7 @@ mod tests {
 			reasoning_tokens:   30,
 			cache_read_tokens:  40,
 			cache_write_tokens: 50,
+			cache_write_1h_tokens: 20,
 			images:             2,
 			audio_input_ms:     60,
 			audio_output_ms:    70,
@@ -646,6 +656,7 @@ mod tests {
 		};
 		assert_eq!((usage.input_tokens, usage.output_tokens, usage.reasoning_tokens), (11, 22, 33));
 		assert_eq!((usage.cache_read_tokens, usage.cache_write_tokens, usage.images), (44, 55, 3));
+		assert_eq!(usage.cache_write_1h_tokens, 22);
 		assert_eq!(
 			(usage.audio_input_ms, usage.audio_output_ms, usage.video_ms, usage.search_calls),
 			(66, 77, 88, 3)

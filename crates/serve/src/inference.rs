@@ -3354,6 +3354,7 @@ fn speak_event(chunk: AudioChunk) -> pb::SpeakEvent {
 
 fn search_response(answer: SearchResults) -> pb::SearchResponse {
 	let omp_inference::answer::SearchResults { results, answer, usage, metadata } = answer;
+	let projected_at = SystemTime::now();
 	let engine = metadata
 		.provider
 		.as_ref()
@@ -3377,6 +3378,10 @@ fn search_response(answer: SearchResults) -> pb::SearchResponse {
 					.author
 					.map_or_else(String::new, |author| author.as_str().to_owned()),
 				score:        result.score.map(f64::from),
+				age_seconds:  result
+					.published_at
+					.and_then(|time| projected_at.duration_since(time).ok())
+					.map_or(0, |age| age.as_secs()),
 			})
 			.collect(),
 		citations: metadata

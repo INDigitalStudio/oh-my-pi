@@ -2,8 +2,7 @@
 
 use std::{
 	collections::VecDeque,
-	error,
-	fmt::{self, Display},
+	fmt,
 	fs::{File as StdFile, OpenOptions as StdOpenOptions},
 	future::Future,
 	io::{Read as _, Seek as _, SeekFrom, Write as _},
@@ -88,16 +87,9 @@ pub trait OperatingSystemStagingKey: Send + Sync + 'static {
 }
 
 /// Typed evidence that an operating-system staging key could not be obtained.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("secure staging key is unavailable")]
 pub struct StagingKeyUnavailable;
-
-impl Display for StagingKeyUnavailable {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str("secure staging key is unavailable")
-	}
-}
-
-impl error::Error for StagingKeyUnavailable {}
 
 /// Explicit source of temporary-file encryption key material.
 #[derive(Clone)]
@@ -198,10 +190,11 @@ impl StagingPolicy {
 }
 
 /// Typed staging policy validation failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum StagingPolicyError {
 	/// The authenticated plaintext chunk size was zero or exceeded the
 	/// implementation bound.
+	#[error("staging chunk size {provided} is outside 1..={maximum}")]
 	InvalidChunkBytes {
 		/// Rejected caller value.
 		provided: usize,
@@ -209,18 +202,6 @@ pub enum StagingPolicyError {
 		maximum:  usize,
 	},
 }
-
-impl Display for StagingPolicyError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::InvalidChunkBytes { provided, maximum } => {
-				write!(formatter, "staging chunk size {provided} is outside 1..={maximum}")
-			},
-		}
-	}
-}
-
-impl error::Error for StagingPolicyError {}
 
 /// Cloneable cancellation signal shared by staging and every staged reader.
 #[derive(Clone, Debug, Default)]
@@ -2055,6 +2036,7 @@ fn encode_usage(usage: Usage, out: &mut Vec<u8>) {
 		usage.reasoning_tokens,
 		usage.cache_read_tokens,
 		usage.cache_write_tokens,
+		usage.cache_write_1h_tokens,
 		usage.audio_input_ms,
 		usage.audio_output_ms,
 		usage.video_ms,
@@ -2206,6 +2188,7 @@ impl<'a> GateCursor<'a> {
 			reasoning_tokens:   self.u64()?,
 			cache_read_tokens:  self.u64()?,
 			cache_write_tokens: self.u64()?,
+			cache_write_1h_tokens: self.u64()?,
 			audio_input_ms:     self.u64()?,
 			audio_output_ms:    self.u64()?,
 			video_ms:           self.u64()?,

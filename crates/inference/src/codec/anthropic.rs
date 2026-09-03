@@ -1353,10 +1353,14 @@ pub fn lower_chat(
 		return Err(capability_error("anthropic.verbosity_unsupported"));
 	}
 	let cache = cache_control(&request.cache_retention);
+	// The Messages API requires `max_tokens`; mirror pi's
+	// `model.maxTokens ?? CLAUDE_CODE_MAX_OUTPUT_TOKENS` when the catalog
+	// carries no output limit for the route.
 	let max_tokens = match (request.max_output_tokens, catalog_max_output_tokens) {
 		(Some(requested), Some(limit)) => Some(requested.min(limit)),
 		(Some(requested), None) => Some(requested),
-		(None, limit) => limit,
+		(None, Some(limit)) => Some(limit),
+		(None, None) => Some(CLAUDE_CODE_MAX_OUTPUT_TOKENS),
 	};
 	let mut body = MessagesRequest {
 		model: Some(model),
@@ -3036,7 +3040,18 @@ struct IncomingUsage {
 	#[serde(default)]
 	cache_creation_input_tokens: Option<u64>,
 	#[serde(default)]
+	cache_creation:              Option<CacheCreationUsage>,
+	#[serde(default)]
 	server_tool_use:             Option<ServerToolUsage>,
+}
+
+/// Cache-write retention breakdown (pi `usage.cttl`). The five-minute
+/// component is the remainder of `cache_creation_input_tokens`, so only the
+/// one-hour subset is carried.
+#[derive(Debug, Default, Deserialize)]
+struct CacheCreationUsage {
+	#[serde(default)]
+	ephemeral_1h_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3066,6 +3081,15 @@ const fn merge_usage(target: &mut Usage, incoming: IncomingUsage) {
 	}
 	if let Some(value) = incoming.cache_creation_input_tokens {
 		target.cache_write_tokens = value;
+	}
+	if let Some(breakdown) = incoming.cache_creation {
+		// An explicit breakdown replaces any earlier snapshot; the one-hour
+		// component is a subset of `cache_write_tokens`, so an all-zero
+		// object clears it (pi `applyAnthropicUsageExtras`).
+		target.cache_write_1h_tokens = match breakdown.ephemeral_1h_input_tokens {
+			Some(value) => value,
+			None => 0,
+		};
 	}
 	if let Some(server) = incoming.server_tool_use {
 		target.search_calls = server
@@ -3576,6 +3600,41 @@ mod tests {
 		)
 		.expect("oversized maximum lowers");
 		assert_eq!(clamped.max_tokens, Some(16_384));
+	}
+
+	#[test]
+	fn max_tokens_defaults_to_claude_code_ceiling_without_catalog_limit() {
+		let mut request = canonical_chat(&[]);
+		request.max_output_tokens = None;
+		let body = lower_chat(
+			sf!("claude-unlisted"),
+			ProviderId::from_ref("anthropic"),
+			CodecId::from_ref("anthropic"),
+			&WirePolicy::baseline(),
+			None,
+			None,
+			None,
+			&request,
+		)
+		.expect("unconstrained request lowers");
+		assert_eq!(body.max_tokens, Some(CLAUDE_CODE_MAX_OUTPUT_TOKENS));
+		let wire: serde_json::Value =
+			serde_json::from_slice(&serialize_body(&body).expect("serializes")).expect("json");
+		assert_eq!(wire["max_tokens"], serde_json::json!(CLAUDE_CODE_MAX_OUTPUT_TOKENS));
+
+		request.max_output_tokens = Some(8_192);
+		let explicit = lower_chat(
+			sf!("claude-unlisted"),
+			ProviderId::from_ref("anthropic"),
+			CodecId::from_ref("anthropic"),
+			&WirePolicy::baseline(),
+			None,
+			None,
+			None,
+			&request,
+		)
+		.expect("explicit maximum lowers");
+		assert_eq!(explicit.max_tokens, Some(8_192));
 	}
 
 	fn lower_with_policy(
@@ -4574,6 +4633,40 @@ mod tests {
 			br#"{"error":{"status":"INVALID_ARGUMENT","message":"blocked by safety policy"}}"#,
 		);
 		assert_eq!(safety.kind, ErrorKind::ContentFilter);
+	}
+
+	#[test]
+	fn cache_creation_breakdown_carries_one_hour_subset() {
+		let mut decoder = AnthropicDecoder::new();
+		decoder
+			.push_data(
+				br#"{"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":12,"output_tokens":0,"cache_read_input_tokens":4,"cache_creation_input_tokens":800,"cache_creation":{"ephemeral_5m_input_tokens":300,"ephemeral_1h_input_tokens":500}}}}"#,
+			)
+			.unwrap();
+		assert_eq!(decoder.outcome().usage, Usage {
+			input_tokens: 12,
+			cache_read_tokens: 4,
+			cache_write_tokens: 800,
+			cache_write_1h_tokens: 500,
+			source: UsageSource::Provider,
+			..Usage::default()
+		});
+
+		// A later snapshot without the breakdown keeps the subset; an
+		// explicit all-zero breakdown clears it.
+		decoder
+			.push_data(
+				br#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9,"cache_creation_input_tokens":800}}"#,
+			)
+			.unwrap();
+		assert_eq!(decoder.outcome().usage.cache_write_1h_tokens, 500);
+		decoder
+			.push_data(
+				br#"{"type":"message_delta","delta":{},"usage":{"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}"#,
+			)
+			.unwrap();
+		assert_eq!(decoder.outcome().usage.cache_write_1h_tokens, 0);
+		assert_eq!(decoder.outcome().usage.cache_write_tokens, 800);
 	}
 
 	#[test]

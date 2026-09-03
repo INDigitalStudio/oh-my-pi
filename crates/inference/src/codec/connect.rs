@@ -6,33 +6,29 @@ use omp_core::Str;
 use serde::Deserialize;
 use serde_json::Value;
 use smallvec::SmallVec;
+use strum::{AsRefStr, EnumString};
 
 /// Maximum number of Unicode scalar values retained in a display diagnostic.
 pub(crate) const MAX_CONNECT_DIAGNOSTIC_CHARS: usize = 2_000;
 
 /// Typed source carried by a Connect status detail.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `AsRef<str>` yields the stable wire label used for display; `FromStr` is
+/// infallible because every unrecognized type name lands in `Other`.
+#[derive(AsRefStr, Clone, Debug, EnumString, Eq, PartialEq)]
 pub(crate) enum ConnectDetailSource {
 	/// `google.rpc.ErrorInfo` evidence.
+	#[strum(serialize = "google.rpc.ErrorInfo")]
 	ErrorInfo,
 	/// `google.rpc.DebugInfo` evidence.
+	#[strum(serialize = "google.rpc.DebugInfo")]
 	DebugInfo,
 	/// Another explicitly identified detail type.
+	#[strum(default, transparent)]
 	Other(Str),
 	/// A detail without a type identifier.
+	#[strum(serialize = "")]
 	Unspecified,
-}
-
-impl ConnectDetailSource {
-	/// Returns the stable wire label used for display.
-	pub(crate) fn as_str(&self) -> &str {
-		match self {
-			Self::ErrorInfo => "google.rpc.ErrorInfo",
-			Self::DebugInfo => "google.rpc.DebugInfo",
-			Self::Other(value) => value,
-			Self::Unspecified => "",
-		}
-	}
 }
 
 /// One structured Connect status detail with its source identity preserved.
@@ -86,7 +82,7 @@ impl ConnectErrorDiagnostic {
 				if index != 0 {
 					rendered.push_str("; ");
 				}
-				let source = detail.source.as_str();
+				let source = detail.source.as_ref();
 				if !source.is_empty() {
 					rendered.push_str(source);
 					if !detail.evidence.is_null() {
@@ -155,12 +151,10 @@ pub(crate) fn parse_connect_end_stream(
 					unstructured.push(Value::Object(record));
 					continue;
 				}
-				let source = match type_name.as_deref() {
-					Some("google.rpc.ErrorInfo") => ConnectDetailSource::ErrorInfo,
-					Some("google.rpc.DebugInfo") => ConnectDetailSource::DebugInfo,
-					Some(other) => ConnectDetailSource::Other(Str::new(other)),
-					None => ConnectDetailSource::Unspecified,
-				};
+				let source = type_name
+					.as_deref()
+					.and_then(|name| name.parse().ok())
+					.unwrap_or(ConnectDetailSource::Unspecified);
 				details.push(ConnectErrorDetail { source, evidence: evidence.unwrap_or(Value::Null) });
 			}
 			if details.is_empty() && !unstructured.is_empty() {
@@ -220,6 +214,28 @@ mod tests {
 		assert_eq!(parsed.details[0].evidence["reason"], "MODEL_UNAVAILABLE");
 		assert_eq!(parsed.details[1].source, ConnectDetailSource::DebugInfo);
 		assert!(parsed.display_message().contains("field X rejected"));
+	}
+
+	#[test]
+	fn detail_source_labels_round_trip_including_unknown_and_absent_types() {
+		let parsed = parse_connect_end_stream(
+			br#"{"error":{"code":"internal","message":"Error","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","value":{"retry":1}},{"value":{"bare":true}},{"type":"","value":{"empty":true}}]}}"#,
+		)
+		.expect("valid trailer")
+		.expect("error status");
+		assert_eq!(
+			parsed.details[0].source,
+			ConnectDetailSource::Other(Str::new("type.googleapis.com/google.rpc.RetryInfo"))
+		);
+		assert_eq!(parsed.details[0].source.as_ref(), "type.googleapis.com/google.rpc.RetryInfo");
+		assert_eq!(parsed.details[1].source, ConnectDetailSource::Unspecified);
+		assert_eq!(parsed.details[2].source, ConnectDetailSource::Unspecified);
+		assert_eq!(ConnectDetailSource::ErrorInfo.as_ref(), "google.rpc.ErrorInfo");
+		assert_eq!(ConnectDetailSource::DebugInfo.as_ref(), "google.rpc.DebugInfo");
+		assert_eq!(ConnectDetailSource::Unspecified.as_ref(), "");
+		let rendered = parsed.display_message();
+		assert!(rendered.contains("type.googleapis.com/google.rpc.RetryInfo: "));
+		assert!(rendered.contains(r#"{"bare":true}"#));
 	}
 
 	#[test]

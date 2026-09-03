@@ -796,6 +796,7 @@ fn billable_dimensions(usage: &crate::receipt::Usage) -> UsageDimensions {
 		output_tokens:      usage.output_tokens,
 		cache_read_tokens:  usage.cache_read_tokens,
 		cache_write_tokens: usage.cache_write_tokens,
+		cache_write_1h_tokens: usage.cache_write_1h_tokens,
 		images:             u64::from(usage.images),
 		video_seconds:      usage.video_ms.div_ceil(1_000),
 		audio_seconds:      usage
