@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in normal-buffer SGR mouse tracking with low-noise button-motion reports and passive bottom-right overlays for hosts that need application-owned pointer interactions.
+
 ## [18.1.9] - 2026-09-04
 
 ### Added
